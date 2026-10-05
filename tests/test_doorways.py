@@ -128,6 +128,26 @@ def _send_drag_move(canvas: BlueprintCanvas, image_position: QPoint) -> None:
     QApplication.sendEvent(canvas, event)
 
 
+def _send_hover_move(
+    canvas: BlueprintCanvas,
+    image_position: QPoint,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+) -> None:
+    """Move the Canvas pointer while preserving explicit keyboard modifiers."""
+
+    local_position = QPointF(image_position)
+    global_position = QPointF(canvas.mapToGlobal(image_position))
+    event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        local_position,
+        global_position,
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        modifiers,
+    )
+    QApplication.sendEvent(canvas, event)
+
+
 def _build_intersected_wall_level() -> LevelData:
     vertex_data = VertexData()
     _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
@@ -676,6 +696,186 @@ class DoorwayTests(unittest.TestCase):
         self.assertEqual(tuple(vertex_data.vertices), original_vertices)
         self.assertEqual(tuple(vertex_data.edges), original_edges)
 
+    def test_shift_placement_bridges_two_wall_endpoints_and_connects_them(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        left_outer = vertex_data.add_vertex(10.0, 50.0)
+        left_gap = vertex_data.add_vertex(40.0, 50.0)
+        right_gap = vertex_data.add_vertex(60.0, 50.0)
+        right_outer = vertex_data.add_vertex(90.0, 50.0)
+        vertex_data.add_edge(left_outer.id, left_gap.id)
+        vertex_data.add_edge(right_gap.id, right_outer.id)
+        canvas = self._track_widget(_build_canvas(vertex_data))
+        original_edges = tuple(vertex_data.edges)
+        preset = DoorwayPreset(width_meters=0.9, height_meters=2.1)
+        canvas.start_doorway_placement(preset)
+        gap_position = _image_position(canvas, 50.0, 50.0)
+
+        _send_hover_move(
+            canvas,
+            gap_position,
+            Qt.KeyboardModifier.ShiftModifier,
+        )
+        _qt_application.processEvents()
+
+        pending_doorway = canvas.pending_doorway
+        self.assertIsNotNone(pending_doorway)
+        assert pending_doorway is not None
+        self.assertAlmostEqual(pending_doorway.center_x, 50.0)
+        self.assertAlmostEqual(pending_doorway.center_y, 50.0)
+        self.assertAlmostEqual(
+            pending_doorway.width_meters,
+            20.0 * PIXEL_TO_METER,
+        )
+        snapped_width_points = {
+            tuple(
+                round(coordinate, 6)
+                for coordinate in _get_width_border_image_position(
+                    pending_doorway,
+                    side_sign,
+                )
+            )
+            for side_sign in (-1.0, 1.0)
+        }
+        self.assertEqual(snapped_width_points, {(40.0, 50.0), (60.0, 50.0)})
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ShiftModifier,
+            pos=gap_position,
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(len(canvas.doorways), 1)
+        self.assertEqual(len(vertex_data.edges), len(original_edges) + 1)
+        self.assertTrue(
+            any(
+                {edge.start_vertex_id, edge.end_vertex_id}
+                == {left_gap.id, right_gap.id}
+                for edge in vertex_data.edges
+            )
+        )
+        bridged_level = LevelData(
+            index=2,
+            name="Ground",
+            vertex_data=vertex_data,
+            doorways=list(canvas.doorways),
+        )
+        bridged_model = convert_to_glb([bridged_level])
+        self.assertFalse(
+            _mesh_covers_point_on_plane(
+                bridged_model.mesh,
+                (1.0, -1.0, 1.0),
+                fixed_axis=1,
+            )
+        )
+        self.assertTrue(
+            _mesh_covers_point_on_plane(
+                bridged_model.mesh,
+                (1.0, -1.0, 2.5),
+                fixed_axis=1,
+            )
+        )
+
+        canvas.undo_last_step()
+
+        self.assertEqual(canvas.doorways, [])
+        self.assertEqual(tuple(vertex_data.edges), original_edges)
+
+    def test_regular_doorway_placement_does_not_connect_wall_endpoints(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        left_outer = vertex_data.add_vertex(10.0, 50.0)
+        left_gap = vertex_data.add_vertex(40.0, 50.0)
+        right_gap = vertex_data.add_vertex(60.0, 50.0)
+        right_outer = vertex_data.add_vertex(90.0, 50.0)
+        vertex_data.add_edge(left_outer.id, left_gap.id)
+        vertex_data.add_edge(right_gap.id, right_outer.id)
+        canvas = self._track_widget(_build_canvas(vertex_data))
+        original_edges = tuple(vertex_data.edges)
+        preset = DoorwayPreset(width_meters=0.9, height_meters=2.1)
+        canvas.start_doorway_placement(preset)
+        gap_position = _image_position(canvas, 50.0, 50.0)
+
+        _send_hover_move(canvas, gap_position)
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=gap_position,
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(len(canvas.doorways), 1)
+        self.assertAlmostEqual(canvas.doorways[0].width_meters, preset.width_meters)
+        self.assertEqual(tuple(vertex_data.edges), original_edges)
+
+    def test_shift_placement_bridges_two_aligned_free_vertices(self) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(40.0, 50.0)
+        second = vertex_data.add_vertex(60.0, 50.0)
+        canvas = self._track_widget(_build_canvas(vertex_data))
+        canvas.start_doorway_placement(
+            DoorwayPreset(width_meters=0.9, height_meters=2.1)
+        )
+        gap_position = _image_position(canvas, 50.0, 50.0)
+
+        _send_hover_move(
+            canvas,
+            gap_position,
+            Qt.KeyboardModifier.ShiftModifier,
+        )
+
+        self.assertEqual(
+            set(canvas.pending_doorway_bridge_vertex_ids or ()),
+            {first.id, second.id},
+        )
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ShiftModifier,
+            pos=gap_position,
+        )
+        _qt_application.processEvents()
+
+        self.assertTrue(vertex_data.has_edge(first.id, second.id))
+        self.assertEqual(len(canvas.doorways), 1)
+
+    def test_shift_key_refreshes_stationary_doorway_bridge_preview(self) -> None:
+        vertex_data = VertexData()
+        left_outer = vertex_data.add_vertex(10.0, 50.0)
+        left_gap = vertex_data.add_vertex(40.0, 50.0)
+        right_gap = vertex_data.add_vertex(60.0, 50.0)
+        right_outer = vertex_data.add_vertex(90.0, 50.0)
+        vertex_data.add_edge(left_outer.id, left_gap.id)
+        vertex_data.add_edge(right_gap.id, right_outer.id)
+        canvas = self._track_widget(_build_canvas(vertex_data))
+        preset = DoorwayPreset(width_meters=0.9, height_meters=2.1)
+        canvas.start_doorway_placement(preset)
+        gap_position = _image_position(canvas, 50.0, 50.0)
+        _send_hover_move(canvas, gap_position)
+
+        QTest.keyPress(canvas, Qt.Key.Key_Shift)
+        _qt_application.processEvents()
+
+        self.assertIsNotNone(canvas.pending_doorway)
+        assert canvas.pending_doorway is not None
+        self.assertAlmostEqual(
+            canvas.pending_doorway.width_meters,
+            20.0 * PIXEL_TO_METER,
+        )
+
+        QTest.keyRelease(canvas, Qt.Key.Key_Shift)
+        _qt_application.processEvents()
+
+        self.assertIsNotNone(canvas.pending_doorway)
+        assert canvas.pending_doorway is not None
+        self.assertAlmostEqual(canvas.pending_doorway.width_meters, preset.width_meters)
+        self.assertIsNone(canvas.pending_doorway_bridge_vertex_ids)
+
     def test_canvas_doorway_borders_move_without_resizing(self) -> None:
         vertex_data = VertexData()
         _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
@@ -1023,6 +1223,71 @@ class DoorwayTests(unittest.TestCase):
         self.assertEqual(resize_events, ["started", True])
         self.assertEqual(move_events, [])
         canvas.undo_last_step()
+        self.assertEqual(canvas.doorways[0], doorway)
+
+    def test_extending_doorway_depth_connects_second_aligned_vertex_pair(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
+        second_left_outer = vertex_data.add_vertex(10.0, 70.0)
+        second_left_gap = vertex_data.add_vertex(40.0, 70.0)
+        second_right_gap = vertex_data.add_vertex(60.0, 70.0)
+        second_right_outer = vertex_data.add_vertex(90.0, 70.0)
+        vertex_data.add_edge(second_left_outer.id, second_left_gap.id)
+        vertex_data.add_edge(second_right_gap.id, second_right_outer.id)
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=0.4,
+            height_meters=2.1,
+            depth_meters=0.2,
+            rotation_degrees=90.0,
+        )
+        canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=_image_position(canvas, doorway.center_x, doorway.center_y),
+        )
+        depth_handle_position = _find_depth_handle_widget_position(
+            canvas,
+            doorway,
+            1.0,
+        )
+        target_position = _image_position(canvas, 50.0, 75.0)
+        bridge_events: list[None] = []
+        canvas.doorway_bridge_edges_added.connect(
+            lambda: bridge_events.append(None)
+        )
+
+        QTest.mousePress(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=depth_handle_position,
+        )
+        _send_drag_move(canvas, target_position)
+
+        self.assertFalse(
+            vertex_data.has_edge(second_left_gap.id, second_right_gap.id)
+        )
+
+        QTest.mouseRelease(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=target_position,
+        )
+
+        self.assertTrue(
+            vertex_data.has_edge(second_left_gap.id, second_right_gap.id)
+        )
+        self.assertEqual(bridge_events, [None])
+
+        canvas.undo_last_step()
+
+        self.assertFalse(
+            vertex_data.has_edge(second_left_gap.id, second_right_gap.id)
+        )
         self.assertEqual(canvas.doorways[0], doorway)
 
     def test_doorway_depth_resize_respects_minimum_depth(self) -> None:
@@ -1580,6 +1845,7 @@ class DoorwayTests(unittest.TestCase):
             workspace.canvas.pending_doorway_preset,
             workspace.doorway_presets[0],
         )
+        self.assertTrue(workspace.canvas.hasFocus())
 
     def test_general_tab_saves_selected_doorway_as_new_template(self) -> None:
         from housemaker.main import BlueprintWorkspace
@@ -1872,6 +2138,76 @@ class DoorwayTests(unittest.TestCase):
                 workspace.current_level.doorways[0].width_meters,
                 committed_doorways[0].width_meters,
             )
+
+    def test_workspace_delays_extended_doorway_bridge_mesh_until_timer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=0.1,
+            )
+            vertex_data = workspace.current_level.vertex_data
+            _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
+            left_outer = vertex_data.add_vertex(10.0, 70.0)
+            left_gap = vertex_data.add_vertex(40.0, 70.0)
+            right_gap = vertex_data.add_vertex(60.0, 70.0)
+            right_outer = vertex_data.add_vertex(90.0, 70.0)
+            vertex_data.add_edge(left_outer.id, left_gap.id)
+            vertex_data.add_edge(right_gap.id, right_outer.id)
+            doorway = DoorwayData(
+                center_x=50.0,
+                center_y=50.0,
+                width_meters=0.4,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=90.0,
+            )
+            workspace.current_level.doorways[0] = doorway
+            workspace._reset_viewer_doorway_snapshots()
+            workspace.canvas._set_selected_doorway_index(0)
+            handle_position = _find_depth_handle_widget_position(
+                workspace.canvas,
+                doorway,
+                1.0,
+            )
+            target_position = _image_position(workspace.canvas, 50.0, 75.0)
+
+            with patch.object(
+                workspace,
+                "_schedule_viewer_preview_refresh",
+                wraps=workspace._schedule_viewer_preview_refresh,
+            ) as schedule_refresh:
+                QTest.mousePress(
+                    workspace.canvas,
+                    Qt.MouseButton.LeftButton,
+                    pos=handle_position,
+                )
+                _send_drag_move(workspace.canvas, target_position)
+
+                self.assertFalse(vertex_data.has_edge(left_gap.id, right_gap.id))
+                schedule_refresh.assert_not_called()
+
+                QTest.mouseRelease(
+                    workspace.canvas,
+                    Qt.MouseButton.LeftButton,
+                    pos=target_position,
+                )
+
+                self.assertTrue(vertex_data.has_edge(left_gap.id, right_gap.id))
+                self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
+                self.assertTrue(
+                    workspace._pending_doorway_bridge_topology_change
+                )
+                schedule_refresh.assert_not_called()
+
+                QTest.qWait(workspace._doorway_mesh_update_timer.interval() + 50)
+                _qt_application.processEvents()
+
+                schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+            self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
+            self.assertFalse(workspace._pending_doorway_bridge_topology_change)
 
     def test_stationary_drag_does_not_replace_another_doorway_outline(
         self,

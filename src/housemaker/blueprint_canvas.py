@@ -26,6 +26,10 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from housemaker.camera_models import CameraPose
+from housemaker.doorway_bridge import (
+    find_doorway_bridge_target,
+    find_doorway_bridges_covered_by_rectangle,
+)
 from housemaker.doorway_geometry import doorway_indices_on_removed_wall_edges
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
@@ -121,6 +125,7 @@ DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
 DOORWAY_DEPTH_HANDLE_RADIUS_SCREEN = 7.0
 DOORWAY_DEPTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
 DOORWAY_DEPTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
+DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN = 24.0
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
 ZOOM_STEP_FACTOR = 1.15
@@ -474,6 +479,7 @@ class BlueprintCanvas(QWidget):
     doorway_move_drag_finished = Signal(bool)
     doorway_resize_drag_started = Signal()
     doorway_resize_drag_finished = Signal(bool)
+    doorway_bridge_edges_added = Signal()
     selected_doorway_changed = Signal(int)
     stair_start_placed = Signal(object)
     stair_placement_ready = Signal(object)
@@ -542,6 +548,8 @@ class BlueprintCanvas(QWidget):
         self.snap_middle_equal_angle_only = True
         self.pending_doorway_preset: DoorwayPreset | None = None
         self.pending_doorway: DoorwayData | None = None
+        self.pending_doorway_image_point: QPointF | None = None
+        self.pending_doorway_bridge_vertex_ids: tuple[int, int] | None = None
         self.selected_doorway_index: int | None = None
         self.pressed_doorway_index: int | None = None
         self.drag_doorway_index: int | None = None
@@ -1788,7 +1796,10 @@ class BlueprintCanvas(QWidget):
         self._reset_doorway_pointer_state()
         self.pending_doorway_preset = preset
         self.pending_doorway = None
+        self.pending_doorway_image_point = None
+        self.pending_doorway_bridge_vertex_ids = None
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.update()
 
     def _set_level_contents(
@@ -1920,6 +1931,16 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Shift
+            and not event.isAutoRepeat()
+            and self._refresh_pending_doorway_modifier_preview(
+                event.modifiers() | Qt.KeyboardModifier.ShiftModifier
+            )
+        ):
+            event.accept()
+            return
+
         comparison_direction = _level_comparison_key_direction(event.key())
         if (
             comparison_direction is not None
@@ -2021,6 +2042,16 @@ class BlueprintCanvas(QWidget):
 
     def keyReleaseEvent(self, event) -> None:  # type: ignore[override]
         if (
+            event.key() == Qt.Key.Key_Shift
+            and not event.isAutoRepeat()
+            and self._refresh_pending_doorway_modifier_preview(
+                event.modifiers() & ~Qt.KeyboardModifier.ShiftModifier
+            )
+        ):
+            event.accept()
+            return
+
+        if (
             not event.isAutoRepeat()
             and event.key() in self._held_level_comparison_keys
         ):
@@ -2041,6 +2072,9 @@ class BlueprintCanvas(QWidget):
         """Prevent a held comparison from sticking after focus changes."""
 
         self.clear_level_comparison_keys()
+        self._refresh_pending_doorway_modifier_preview(
+            Qt.KeyboardModifier.NoModifier
+        )
         super().focusOutEvent(event)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -2165,7 +2199,10 @@ class BlueprintCanvas(QWidget):
         if self.pending_doorway_preset is not None:
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
-                self._update_pending_doorway(image_point)
+                self._update_pending_doorway(
+                    image_point,
+                    event.modifiers(),
+                )
                 self._commit_pending_doorway()
             event.accept()
             return
@@ -2366,8 +2403,13 @@ class BlueprintCanvas(QWidget):
             image_point = self._widget_to_image(event.position())
             if image_point is None:
                 self.pending_doorway = None
+                self.pending_doorway_image_point = None
+                self.pending_doorway_bridge_vertex_ids = None
             else:
-                self._update_pending_doorway(image_point)
+                self._update_pending_doorway(
+                    image_point,
+                    event.modifiers(),
+                )
             self.update()
             event.accept()
             return
@@ -2508,7 +2550,10 @@ class BlueprintCanvas(QWidget):
                 event.button() == Qt.MouseButton.LeftButton
                 and self.pressed_doorway_index is not None
             ):
+                bridge_edges_added = self._commit_extended_doorway_bridges()
                 self._reset_doorway_pointer_state()
+                if bridge_edges_added:
+                    self.doorway_bridge_edges_added.emit()
                 self._update_edit_hover_cursor(event.position())
                 self.update()
                 event.accept()
@@ -2561,6 +2606,8 @@ class BlueprintCanvas(QWidget):
             self.update()
         if self.pending_doorway_preset is not None:
             self.pending_doorway = None
+            self.pending_doorway_image_point = None
+            self.pending_doorway_bridge_vertex_ids = None
             self.update()
         if self._open_space_placement_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -3988,12 +4035,19 @@ class BlueprintCanvas(QWidget):
             f"{doorway.width_meters:.2f} × {doorway.height_meters:.2f} m"
         )
 
-    def _update_pending_doorway(self, image_point: QPointF) -> None:
+    def _update_pending_doorway(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+    ) -> None:
         preset = self.pending_doorway_preset
         if preset is None:
             self.pending_doorway = None
+            self.pending_doorway_image_point = None
+            self.pending_doorway_bridge_vertex_ids = None
             return
 
+        self.pending_doorway_image_point = QPointF(image_point)
         unsnapped_center = self._clamp_image_point(image_point.x(), image_point.y())
         doorway = DoorwayData(
             center_x=unsnapped_center[0],
@@ -4005,6 +4059,32 @@ class BlueprintCanvas(QWidget):
             shape=preset.shape,
             arch_amount=preset.arch_amount,
         )
+        bridge_target = None
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            bridge_target = find_doorway_bridge_target(
+                self.vertex_data,
+                {room.center_vertex_id for room in self.rooms},
+                unsnapped_center,
+                float(preset.width_meters),
+                self._screen_distance_to_image(
+                    DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN
+                ),
+            )
+        if bridge_target is not None:
+            self.pending_doorway = self._copy_doorway_with(
+                doorway,
+                center_x=bridge_target.center[0],
+                center_y=bridge_target.center[1],
+                width_meters=bridge_target.width_meters,
+                rotation_degrees=bridge_target.rotation_degrees,
+            )
+            self.pending_doorway_bridge_vertex_ids = (
+                bridge_target.first_vertex_id,
+                bridge_target.second_vertex_id,
+            )
+            return
+
+        self.pending_doorway_bridge_vertex_ids = None
         self.pending_doorway = self._snap_doorway_to_walls(
             doorway,
             unsnapped_center,
@@ -4016,16 +4096,21 @@ class BlueprintCanvas(QWidget):
             return
 
         self._push_undo_state()
+        bridge_edge_added = self._commit_pending_doorway_bridge()
         self.doorways.append(copy.deepcopy(doorway))
         self._set_selected_doorway_index(len(self.doorways) - 1)
         self._reset_doorway_placement()
         self.unsetCursor()
+        if bridge_edge_added:
+            self.geometry_changed.emit()
         self.doorways_changed.emit()
         self.update()
 
     def _reset_doorway_placement(self) -> None:
         self.pending_doorway_preset = None
         self.pending_doorway = None
+        self.pending_doorway_image_point = None
+        self.pending_doorway_bridge_vertex_ids = None
 
     def _reset_doorway_pointer_state(self) -> None:
         drag_was_active = self.pressed_doorway_index is not None
@@ -4413,6 +4498,80 @@ class BlueprintCanvas(QWidget):
         self.doorways[doorway_index] = moved_doorway
         self.doorway_drag_changed = True
         self.doorway_dimension_preview_changed.emit()
+
+    # ### Doorway bridge helpers ###
+    def _refresh_pending_doorway_modifier_preview(
+        self,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        """Refresh the hover preview when Shift changes without pointer motion."""
+
+        image_point = self.pending_doorway_image_point
+        if self.pending_doorway_preset is None or image_point is None:
+            return False
+        self._update_pending_doorway(image_point, modifiers)
+        self.update()
+        return True
+
+    def _commit_pending_doorway_bridge(self) -> bool:
+        """Connect the exact previewed endpoints before adding the doorway."""
+
+        vertex_ids = self.pending_doorway_bridge_vertex_ids
+        if vertex_ids is None:
+            return False
+        first_vertex = self.vertex_data.get_vertex(vertex_ids[0])
+        second_vertex = self.vertex_data.get_vertex(vertex_ids[1])
+        if first_vertex is None or second_vertex is None:
+            return False
+        return self.vertex_data.add_edge(*vertex_ids) is not None
+
+    def _connect_doorway_covered_bridges(self, doorway: DoorwayData) -> bool:
+        """Connect every straight vertex gap covered by a resized doorway."""
+
+        targets = find_doorway_bridges_covered_by_rectangle(
+            self.vertex_data,
+            {room.center_vertex_id for room in self.rooms},
+            (doorway.center_x, doorway.center_y),
+            self._get_doorway_width_direction(doorway),
+            doorway.width_meters / PIXEL_TO_METER,
+            doorway.depth_meters / PIXEL_TO_METER,
+        )
+        edge_added = False
+        for target in targets:
+            edge_added = bool(
+                self.vertex_data.add_edge(
+                    target.first_vertex_id,
+                    target.second_vertex_id,
+                )
+            ) or edge_added
+        if edge_added:
+            self.update()
+        return edge_added
+
+    def _commit_extended_doorway_bridges(self) -> bool:
+        """Connect gaps reached by a completed doorway expansion."""
+
+        doorway_index = self.pressed_doorway_index
+        initial_doorway = self.doorway_drag_initial_doorway
+        if (
+            not self.doorway_drag_changed
+            or not (
+                self.doorway_drag_width_side_sign
+                or self.doorway_drag_depth_side_sign
+            )
+            or doorway_index is None
+            or not 0 <= doorway_index < len(self.doorways)
+            or initial_doorway is None
+        ):
+            return False
+        final_doorway = self.doorways[doorway_index]
+        doorway_extended = (
+            final_doorway.width_meters > initial_doorway.width_meters + 1e-9
+            or final_doorway.depth_meters > initial_doorway.depth_meters + 1e-9
+        )
+        if not doorway_extended:
+            return False
+        return self._connect_doorway_covered_bridges(final_doorway)
 
     def _snap_doorway_to_walls(
         self,

@@ -1395,6 +1395,7 @@ class BlueprintWorkspace(QWidget):
         self._pending_canvas_opening_key: str | None = None
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
+        self._pending_doorway_bridge_topology_change = False
         self._pending_doorway_mesh_level_index: int | None = None
         self._pending_window_mesh_level_index: int | None = None
         self._doorway_outline_commit_revision: int | None = None
@@ -3754,6 +3755,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.doorway_resize_drag_finished.connect(
             self._handle_doorway_resize_drag_finished
+        )
+        self.canvas.doorway_bridge_edges_added.connect(
+            self._handle_doorway_bridge_edges_added
         )
         self.canvas.selected_doorway_changed.connect(
             self._handle_canvas_doorway_selection_changed
@@ -14642,6 +14646,7 @@ class BlueprintWorkspace(QWidget):
         self._pending_canvas_opening_key = None
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
+        self._pending_doorway_bridge_topology_change = False
         self._is_canvas_opening_drag_active = False
         self._active_canvas_opening_reference = None
         self._active_canvas_opening_start_edit = None
@@ -14670,14 +14675,20 @@ class BlueprintWorkspace(QWidget):
         self._stage_pending_canvas_opening_snapshots()
         snapshot_changed = self._staged_canvas_opening_mesh_update
         doorway_snapshot_changed = self._staged_doorway_mesh_update
+        topology_changed = self._pending_doorway_bridge_topology_change
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
-        if not snapshot_changed:
+        self._pending_doorway_bridge_topology_change = False
+        if not snapshot_changed and not topology_changed:
             self._clear_committed_doorway_outline_if_displayed()
             if self._doorway_outline_commit_revision is None:
                 self.viewer.set_doorway_preview_outline(None)
             return
-        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        if topology_changed:
+            self._sync_canvas_wall_mirror_state()
+            self._reconcile_canvas_surface_edit_and_refresh()
+        else:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
         if doorway_snapshot_changed:
             self._doorway_outline_commit_revision = self._viewer_preview_revision
 
@@ -17529,8 +17540,8 @@ class BlueprintWorkspace(QWidget):
         if doorway_preset is None:
             return
 
-        self.canvas.start_doorway_placement(doorway_preset)
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+        self.canvas.start_doorway_placement(doorway_preset)
 
     # ### Wall level mirror controls ###
     def _handle_wall_mirror_up_clicked(self) -> None:
@@ -17887,6 +17898,15 @@ class BlueprintWorkspace(QWidget):
 
         self._is_doorway_resize_drag_active = False
         if changed and self._pending_doorway_mesh_level_index is None:
+            self._handle_doorway_dimension_preview_changed()
+        if self._pending_doorway_mesh_level_index is not None:
+            self._doorway_mesh_update_timer.start()
+
+    def _handle_doorway_bridge_edges_added(self) -> None:
+        """Defer new doorway bridge topology through the opening mesh timer."""
+
+        self._pending_doorway_bridge_topology_change = True
+        if self._pending_doorway_mesh_level_index is None:
             self._handle_doorway_dimension_preview_changed()
         if self._pending_doorway_mesh_level_index is not None:
             self._doorway_mesh_update_timer.start()
