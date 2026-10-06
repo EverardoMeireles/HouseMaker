@@ -24,8 +24,22 @@ DEFAULT_WAIT_INPUT_TOKEN = "any"
 DEFAULT_IDLE_CAMERA_RADIUS_METERS = 0.08
 DEFAULT_IDLE_CAMERA_CYCLE_DURATION_SECONDS = 6.0
 DEFAULT_TOOLTIP_POSITION = "opposite"
-DEFAULT_TOOLTIP_HTML_BODY = "<p>Tooltip</p>"
-DEFAULT_TOOLTIP_STYLE = ""
+DEFAULT_TOOLTIP_HTML_BODY = (
+    "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+    "eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut</p>"
+)
+DEFAULT_TOOLTIP_STYLE = """\
+box-sizing: border-box;
+max-width: 360px;
+padding: 14px 16px;
+color: #f5f7fb;
+background: rgba(24, 27, 34, 0.94);
+border: 1px solid rgba(255, 255, 255, 0.24);
+border-radius: 8px;
+font-family: sans-serif;
+font-size: 14px;
+line-height: 1.5;
+""".strip()
 LEGACY_TEXT_POINTS_PER_METER = 48.0
 MAX_TOUR_NAME_LENGTH = 256
 MAX_TOUR_TEXT_LENGTH = 10_000

@@ -358,6 +358,32 @@ class TourModelTests(unittest.TestCase):
         self.assertEqual(speed_action.speed, DEFAULT_SPEED_OVERRIDE)
         self.assertEqual(speed_action.easing, DEFAULT_SPEED_EASING)
 
+    def test_floating_tooltip_defaults_have_lorem_body_and_standard_css(
+        self,
+    ) -> None:
+        visible_body = (
+            DEFAULT_TOOLTIP_HTML_BODY.removeprefix("<p>")
+            .removesuffix("</p>")
+        )
+
+        self.assertEqual(
+            visible_body,
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+            "eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut",
+        )
+        self.assertEqual(len(visible_body.split()), 20)
+        for declaration in (
+            "box-sizing: border-box;",
+            "max-width: 360px;",
+            "background: rgba(24, 27, 34, 0.94);",
+            "border-radius: 8px;",
+            "font-family: sans-serif;",
+            "font-size: 14px;",
+            "line-height: 1.5;",
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertIn(declaration, DEFAULT_TOOLTIP_STYLE)
+
     def test_floating_tooltip_project_round_trip_preserves_html_and_style(
         self,
     ) -> None:
