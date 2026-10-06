@@ -9,9 +9,28 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QRect, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPaintEvent, QPen, QShortcut
+from PySide6.QtCore import (
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QMimeData,
+    QRect,
+    Qt,
+    QThread,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import (
+    QColor,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPaintEvent,
+    QPen,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -90,6 +109,10 @@ OBJECT_REFERENCE_EDIT_PROMPT_PRESETS = (
     "slightly rotated to the right",
     "slightly isometric",
     "top-down view",
+)
+REFERENCE_IMAGE_FILE_FILTER = (
+    "Image files (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;"
+    "All files (*.*)"
 )
 CANCELLABLE_GENERATION_JOB_KINDS = frozenset(
     {
@@ -367,6 +390,12 @@ class MergedGenerationWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        try:
+            QApplication.clipboard().dataChanged.disconnect(
+                self.sync_shared_controls
+            )
+        except (RuntimeError, TypeError):
+            pass
         runtimes = tuple(
             runtime
             for runtime in (
@@ -592,7 +621,38 @@ class MergedGenerationWorkspace(QWidget):
         shared_column, shared_layout = _build_controls_column(
             "merged_generation_shared_primary_column"
         )
-        shared_layout.addWidget(self.load_video_button)
+        reference_media_actions = QWidget()
+        reference_media_actions.setObjectName(
+            "merged_generation_reference_media_actions"
+        )
+        reference_media_layout = QHBoxLayout(reference_media_actions)
+        reference_media_layout.setContentsMargins(0, 0, 0, 0)
+        reference_media_layout.setSpacing(6)
+        self.load_video_button.setObjectName("load_video_button")
+        self.copy_inpaint_button = QPushButton("Copy inpaint")
+        self.copy_inpaint_button.setObjectName("copy_inpaint_button")
+        self.copy_inpaint_button.setToolTip(
+            "Copy the masked object or active temporary reference with "
+            "transparency."
+        )
+        self.paste_inpaint_button = QPushButton("Paste inpaint")
+        self.paste_inpaint_button.setObjectName("paste_inpaint_button")
+        self.paste_inpaint_button.setToolTip(
+            "Use a clipboard image as the next Object generation reference."
+        )
+        self.load_reference_image_button = QPushButton("Load image")
+        self.load_reference_image_button.setObjectName(
+            "load_reference_image_button"
+        )
+        self.load_reference_image_button.setToolTip(
+            "Use an image as the next Object generation reference without "
+            "replacing the loaded video."
+        )
+        reference_media_layout.addWidget(self.load_video_button)
+        reference_media_layout.addWidget(self.copy_inpaint_button)
+        reference_media_layout.addWidget(self.paste_inpaint_button)
+        reference_media_layout.addWidget(self.load_reference_image_button)
+        shared_layout.addWidget(reference_media_actions)
 
         self.ceiling_height_section, ceiling_height_layout = (
             _build_boxed_section(
@@ -853,6 +913,18 @@ class MergedGenerationWorkspace(QWidget):
         except (RuntimeError, TypeError):
             pass
         self.load_video_button.clicked.connect(self._handle_load_video_clicked)
+        self.copy_inpaint_button.clicked.connect(
+            self._handle_copy_inpaint_clicked
+        )
+        self.paste_inpaint_button.clicked.connect(
+            self._handle_paste_inpaint_clicked
+        )
+        self.load_reference_image_button.clicked.connect(
+            self._handle_load_reference_image_clicked
+        )
+        QApplication.clipboard().dataChanged.connect(
+            self.sync_shared_controls
+        )
         self.infer_ceiling_height_button.clicked.connect(
             self._start_ceiling_height_inference
         )
@@ -1284,6 +1356,101 @@ class MergedGenerationWorkspace(QWidget):
         except (OSError, RuntimeError, ValueError) as error:
             QMessageBox.critical(self, "Video load failed", str(error))
 
+    @Slot()
+    def _handle_copy_inpaint_clicked(self) -> None:
+        """Copy the exact current Object reference with its alpha mask."""
+
+        reference = (
+            self.object_workspace.get_current_object_generation_reference()
+        )
+        if reference is None:
+            QMessageBox.information(
+                self,
+                "Nothing to copy",
+                "Paint an object mask or load a reference image first.",
+            )
+            return
+
+        image = _bgra_array_to_qimage(reference)
+        mime_data = QMimeData()
+        mime_data.setImageData(image)
+        encoded_png = _encode_qimage_png(image)
+        if encoded_png:
+            mime_data.setData("image/png", encoded_png)
+        QApplication.clipboard().setMimeData(mime_data)
+        self.object_workspace.status_label.setText(
+            "Object reference copied to the clipboard."
+        )
+        self.sync_shared_controls()
+
+    @Slot()
+    def _handle_paste_inpaint_clicked(self) -> None:
+        """Use the clipboard image as a non-destructive Object reference."""
+
+        image = _read_clipboard_image()
+        if image is None:
+            QMessageBox.warning(
+                self,
+                "Paste inpaint",
+                "The clipboard does not contain a usable image.",
+            )
+            return
+        self._activate_temporary_object_reference(
+            _qimage_to_bgra_array(image),
+            source_label="Clipboard image",
+        )
+
+    @Slot()
+    def _handle_load_reference_image_clicked(self) -> None:
+        """Load a temporary Object reference without replacing the video."""
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load generation reference image",
+            str(Path.cwd()),
+            REFERENCE_IMAGE_FILE_FILTER,
+        )
+        if not file_path:
+            return
+        image = QImage(file_path)
+        if image.isNull():
+            QMessageBox.critical(
+                self,
+                "Image load failed",
+                "The selected file could not be decoded as an image.",
+            )
+            return
+        self._activate_temporary_object_reference(
+            _qimage_to_bgra_array(image),
+            source_label="Loaded image",
+        )
+
+    def _activate_temporary_object_reference(
+        self,
+        reference_bgra: np.ndarray,
+        *,
+        source_label: str,
+    ) -> None:
+        """Display and bind one temporary reference to Object generation."""
+
+        try:
+            self.object_workspace.set_temporary_object_reference(
+                reference_bgra
+            )
+        except ValueError as error:
+            QMessageBox.critical(self, "Reference image failed", str(error))
+            return
+        self.video_view.set_reference_preview_bgra(reference_bgra)
+        message = (
+            f"{source_label} is active for Object generation. Move the "
+            "video seekbar to return to the video."
+            if self.object_workspace._video_source is not None
+            else f"{source_label} is active for Object generation."
+        )
+        self.object_workspace.status_label.setText(message)
+        self.reference_edit_status_label.setText(message)
+        self.sync_shared_controls()
+
     @Slot(int)
     def _handle_seekbar_changed(self, frame_index: int) -> None:
         """Seek once without letting one backend overwrite the other's old frame."""
@@ -1351,11 +1518,29 @@ class MergedGenerationWorkspace(QWidget):
         accepted_edit_is_available = (
             objects.has_current_accepted_object_reference()
         )
-        inpainting_is_available = (
-            editor_is_available and not accepted_edit_is_available
+        temporary_reference_is_available = (
+            objects.has_temporary_object_reference()
         )
-        self.load_video_button.setEnabled(
+        inpainting_is_available = (
+            editor_is_available
+            and not accepted_edit_is_available
+            and not temporary_reference_is_available
+        )
+        reference_media_changes_are_available = (
             not has_untracked_object_job and not reference_edit_is_running
+        )
+        self.load_video_button.setEnabled(reference_media_changes_are_available)
+        self.load_reference_image_button.setEnabled(
+            reference_media_changes_are_available
+        )
+        self.paste_inpaint_button.setEnabled(
+            reference_media_changes_are_available
+            and _clipboard_has_usable_image()
+        )
+        self.copy_inpaint_button.setEnabled(
+            objects.has_temporary_object_reference()
+            or accepted_edit_is_available
+            or self.video_view.has_selection()
         )
         self.seekbar.setEnabled(editor_is_available)
         self.paint_mask_button.setEnabled(inpainting_is_available)
@@ -1386,15 +1571,23 @@ class MergedGenerationWorkspace(QWidget):
         )
         self.edit_reference_button.setEnabled(
             editor_is_available
+            and not temporary_reference_is_available
             and has_object_mask
             and has_edit_prompt
             and has_reference_edit_credentials
         )
-        self.reference_edit_prompt.setEnabled(editor_is_available)
-        self.reference_edit_prompt_preset_combo.setEnabled(
-            editor_is_available
+        reference_edit_inputs_are_available = (
+            editor_is_available and not temporary_reference_is_available
         )
-        self.reference_edit_model_combo.setEnabled(editor_is_available)
+        self.reference_edit_prompt.setEnabled(
+            reference_edit_inputs_are_available
+        )
+        self.reference_edit_prompt_preset_combo.setEnabled(
+            reference_edit_inputs_are_available
+        )
+        self.reference_edit_model_combo.setEnabled(
+            reference_edit_inputs_are_available
+        )
         ceiling_inference_is_running = self._ceiling_height_runtime is not None
         self.infer_ceiling_height_button.setEnabled(
             not self._is_shutdown
@@ -1430,6 +1623,89 @@ class MergedGenerationWorkspace(QWidget):
             ),
             None,
         )
+
+
+# ### Reference image helpers ###
+def _bgra_array_to_qimage(image_bgra: np.ndarray) -> QImage:
+    """Build an owned Qt image while preserving BGRA alpha exactly."""
+
+    image = np.asarray(image_bgra)
+    if image.ndim != 3 or image.shape[2] != 4 or image.size == 0:
+        return QImage()
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    rgba = np.ascontiguousarray(image[:, :, (2, 1, 0, 3)])
+    height, width = rgba.shape[:2]
+    return QImage(
+        rgba.data,
+        width,
+        height,
+        int(rgba.strides[0]),
+        QImage.Format.Format_RGBA8888,
+    ).copy()
+
+
+def _qimage_to_bgra_array(image: QImage) -> np.ndarray:
+    """Normalize any decoded Qt image to an owned contiguous BGRA array."""
+
+    if image.isNull() or image.width() <= 0 or image.height() <= 0:
+        raise ValueError("The reference image is empty.")
+    converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    height = converted.height()
+    width = converted.width()
+    bytes_per_line = converted.bytesPerLine()
+    rgba_rows = np.frombuffer(
+        converted.constBits(),
+        dtype=np.uint8,
+        count=height * bytes_per_line,
+    ).reshape(height, bytes_per_line)
+    rgba = rgba_rows[:, : width * 4].reshape(height, width, 4)
+    return np.ascontiguousarray(rgba[:, :, (2, 1, 0, 3)])
+
+
+def _encode_qimage_png(image: QImage) -> QByteArray:
+    """Encode a clipboard image explicitly so external apps retain alpha."""
+
+    encoded = QByteArray()
+    buffer = QBuffer(encoded)
+    if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        return QByteArray()
+    try:
+        if not image.save(buffer, "PNG"):
+            return QByteArray()
+    finally:
+        buffer.close()
+    return encoded
+
+
+def _read_clipboard_image() -> QImage | None:
+    """Prefer lossless PNG clipboard data, then use Qt's image fallback."""
+
+    clipboard = QApplication.clipboard()
+    mime_data = clipboard.mimeData()
+    if mime_data is not None and mime_data.hasFormat("image/png"):
+        image = QImage.fromData(mime_data.data("image/png"), "PNG")
+        if not image.isNull():
+            return image
+    image = clipboard.image()
+    return None if image.isNull() else image
+
+
+def _clipboard_has_usable_image() -> bool:
+    """Return whether Paste inpaint can resolve an image right now."""
+
+    clipboard = QApplication.clipboard()
+    mime_data = clipboard.mimeData()
+    return bool(
+        (
+            mime_data is not None
+            and (
+                mime_data.hasImage()
+                or mime_data.hasFormat("image/png")
+            )
+        )
+        or not clipboard.image().isNull()
+    )
 
 
 # ### Widget helpers ###

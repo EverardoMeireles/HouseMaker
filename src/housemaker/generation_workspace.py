@@ -3550,6 +3550,7 @@ class GenerationWorkspace(QWidget):
             tuple[int, tuple[int, ...], str] | None
         ) = None
         self._accepted_reference_edits: dict[int, np.ndarray] = {}
+        self._temporary_object_reference_bgra: np.ndarray | None = None
         self._reference_edit_signature_cache_key: tuple[int, int] | None = None
         self._reference_edit_signature_cache_value: tuple[object, ...] | None = None
         self._generation_thread: QThread | None = None
@@ -3677,16 +3678,81 @@ class GenerationWorkspace(QWidget):
 
         return self._has_cached_reference_edit_for_current_frame()
 
+    def set_temporary_object_reference(
+        self,
+        reference_bgra: np.ndarray,
+    ) -> None:
+        """Use an external image without replacing the loaded video state."""
+
+        reference = np.asarray(reference_bgra)
+        if (
+            reference.ndim != 3
+            or reference.shape[2] != 4
+            or reference.size == 0
+        ):
+            raise ValueError("The object reference must be a non-empty BGRA image.")
+        if reference.dtype != np.uint8:
+            reference = np.clip(reference, 0, 255).astype(np.uint8)
+        if not np.any(reference[:, :, 3] > 0):
+            raise ValueError("The object reference is fully transparent.")
+
+        self._temporary_object_reference_bgra = (
+            np.ascontiguousarray(reference).copy()
+        )
+        self._discard_reference_edits_for_frame(
+            self._data.current_frame_index
+        )
+        self.reference_edit_state_changed.emit()
+        self._sync_controls()
+
+    def clear_temporary_object_reference(self) -> bool:
+        """Discard an external image while preserving video and mask data."""
+
+        if self._temporary_object_reference_bgra is None:
+            return False
+        self._temporary_object_reference_bgra = None
+        self.video_view.clear_reference_preview()
+        self.reference_edit_state_changed.emit()
+        self._sync_controls()
+        return True
+
+    def get_temporary_object_reference(self) -> np.ndarray | None:
+        """Return a defensive copy of the active external reference image."""
+
+        reference = self._temporary_object_reference_bgra
+        return None if reference is None else reference.copy()
+
+    def has_temporary_object_reference(self) -> bool:
+        """Report whether an external reference overrides the video mask."""
+
+        return self._temporary_object_reference_bgra is not None
+
+    def get_current_object_generation_reference(self) -> np.ndarray | None:
+        """Return the exact image that the next Object request would use."""
+
+        if not self._has_current_object_generation_reference():
+            return None
+        try:
+            reference = self._build_current_object_generation_reference()
+        except ValueError:
+            return None
+        return np.ascontiguousarray(reference).copy()
+
     def _has_current_object_generation_reference(self) -> bool:
-        """Report whether the frame has an accepted edit or painted source."""
+        """Report whether an external, edited, or painted source is active."""
 
         return bool(
-            self.has_current_accepted_object_reference()
+            self.has_temporary_object_reference()
+            or self.has_current_accepted_object_reference()
             or self.video_view.has_selection()
         )
 
     def _build_current_object_generation_reference(self) -> np.ndarray:
-        """Resolve the frame-scoped edit before falling back to its live mask."""
+        """Resolve reference overrides before falling back to the live mask."""
+
+        temporary_reference = self.get_temporary_object_reference()
+        if temporary_reference is not None:
+            return temporary_reference
 
         accepted_reference = self.get_current_accepted_object_reference()
         if accepted_reference is not None:
@@ -3697,22 +3763,23 @@ class GenerationWorkspace(QWidget):
         self,
         next_frame_index: int,
     ) -> bool:
-        """Permanently expire the accepted square when leaving its frame."""
+        """Expire temporary input, and accepted edits when leaving a frame."""
 
+        did_discard = self.clear_temporary_object_reference()
         current_frame_index = self._displayed_frame_index
         if (
             current_frame_index is None
             or int(current_frame_index) == int(next_frame_index)
         ):
-            return False
+            return did_discard
         self._reference_edit_signature_cache_key = None
         self._reference_edit_signature_cache_value = None
-        did_discard = self._discard_reference_edits_for_frame(
+        did_discard_accepted = self._discard_reference_edits_for_frame(
             current_frame_index
         )
-        if did_discard:
+        if did_discard_accepted:
             self.reference_edit_state_changed.emit()
-        return did_discard
+        return did_discard or did_discard_accepted
 
     def _has_cached_reference_edit_for_current_frame(self) -> bool:
         frame_index = int(self._data.current_frame_index)
@@ -4595,6 +4662,7 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_member_ids.clear()
         self._latest_generation_batch_mask_signature = None
         self._accepted_reference_edits.clear()
+        self._temporary_object_reference_bgra = None
         self._reference_edit_signature_cache_key = None
         self._reference_edit_signature_cache_value = None
         self._close_video_source()
@@ -5935,6 +6003,7 @@ class GenerationWorkspace(QWidget):
         self._data.current_frame_index = 0
         self._data.frame_strokes = {}
         self._accepted_reference_edits.clear()
+        self._temporary_object_reference_bgra = None
         self._reference_edit_signature_cache_key = None
         self._reference_edit_signature_cache_value = None
         self._sync_video_controls()
@@ -8509,8 +8578,14 @@ class GenerationWorkspace(QWidget):
         *,
         geometry_only: bool = False,
     ) -> GenerationRequest | None:
-        if self.video_view.get_frame_bgr() is None:
-            self.status_label.setText("Load a video before generating.")
+        has_temporary_reference = self.has_temporary_object_reference()
+        if (
+            self.video_view.get_frame_bgr() is None
+            and not has_temporary_reference
+        ):
+            self.status_label.setText(
+                "Load a video or reference image before generating."
+            )
             return None
         if not self._has_current_object_generation_reference():
             self.status_label.setText("Paint over the object to generate first.")
@@ -8569,7 +8644,10 @@ class GenerationWorkspace(QWidget):
         template = self._build_generation_request(geometry_only=geometry_only)
         if template is None:
             return ()
-        if self.has_current_accepted_object_reference():
+        if (
+            self.has_temporary_object_reference()
+            or self.has_current_accepted_object_reference()
+        ):
             selected_crops = (template.selected_object_bgra,)
         else:
             selected_crops = self.video_view.build_selected_object_crops()
@@ -8780,6 +8858,8 @@ class GenerationWorkspace(QWidget):
             and self._door_slot_editing_target.slot_id == DOOR_SLOT_BODY
         )
         has_video = self._video_source is not None
+        has_temporary_reference = self.has_temporary_object_reference()
+        has_reference_source = has_video or has_temporary_reference
         has_untracked_legacy_job = (
             self._generation_thread is not None
             and not self._object_job_runtimes
@@ -8797,7 +8877,11 @@ class GenerationWorkspace(QWidget):
                 selected_record.object_id
             )
         )
-        mask_tool_is_available = has_video and not has_untracked_legacy_job
+        mask_tool_is_available = (
+            has_video
+            and not has_temporary_reference
+            and not has_untracked_legacy_job
+        )
         if not self._shared_control_state_managed_externally:
             self.load_video_button.setEnabled(not has_untracked_legacy_job)
             self.seekbar.setEnabled(mask_tool_is_available)
@@ -8841,8 +8925,7 @@ class GenerationWorkspace(QWidget):
             and selected_face_count > 0
             and not selected_object_is_busy
             and required_key_is_available
-            and self._video_source is not None
-            and self.video_view.get_frame_bgr() is not None
+            and has_reference_source
             and has_generation_reference
             and projection_camera_percentages_are_valid
         )
@@ -8870,7 +8953,7 @@ class GenerationWorkspace(QWidget):
             self._can_regenerate_object_texture(selected_record)
             if door_slot_mode
             else (
-                has_video
+                has_reference_source
                 and has_generation_reference
                 and required_key_is_available
                 and projection_camera_percentages_are_valid
@@ -8879,7 +8962,7 @@ class GenerationWorkspace(QWidget):
         )
         self.generate_geometry_button.setEnabled(
             not door_slot_mode
-            and has_video
+            and has_reference_source
             and has_generation_reference
             and required_key_is_available
             and not self.symmetric_division_checkbox.isChecked()
@@ -8935,8 +9018,10 @@ class GenerationWorkspace(QWidget):
                 and not self._object_job_runtimes
             )
             or not self._settings.meshy_api_key
-            or self._video_source is None
-            or self.video_view.get_frame_bgr() is None
+            or (
+                self._video_source is None
+                and not self.has_temporary_object_reference()
+            )
             or not self._has_current_object_generation_reference()
             or (
                 record.provider != GENERATION_BACKEND_MESHY
