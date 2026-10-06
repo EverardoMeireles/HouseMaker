@@ -130,6 +130,23 @@ from housemaker.canvas_surface_edits import (
     validate_canvas_surface_edit_geometry,
     validate_canvas_wall_edit_batch_geometry,
 )
+from housemaker.door_geometry import (
+    DoorBodyMirrorConfiguration,
+    assemble_door_model,
+    build_default_door_slot_models,
+    mirror_door_model_horizontally,
+)
+from housemaker.door_state import (
+    DOOR_SLOT_BODY,
+    DoorDefinition,
+    DoorLibraryData,
+    DoorPlacement,
+    DoorSideDuplication,
+    create_door_definition_for_doorway,
+    door_fits_doorway,
+    next_door_name,
+)
+from housemaker.doors_workspace import DoorsWorkspace
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.generation_jobs import GenerationJobManager, JobsWindow
 from housemaker.generation_state import (
@@ -141,6 +158,7 @@ from housemaker.generation_state import (
 from housemaker.generation_workspace import (
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
     GenerationWorkspace,
+    is_door_component_record,
 )
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
@@ -150,6 +168,7 @@ from housemaker.glb import (
     PlacedGeneratedModel,
     PreviewStairPart,
     build_canvas_stair_part_targets,
+    build_placed_generated_model_gltf_mirror_plane,
     build_placed_generated_model_top_down_footprint,
     build_stair_meshes,
     build_texture_preview_plane_model,
@@ -258,7 +277,10 @@ from housemaker.qwen_plan_image_correction import (
     QwenPlanCorrectionError,
     create_default_qwen_plan_image_editor,
 )
-from housemaker.scene_export import write_runtime_scene_manifest
+from housemaker.scene_export import (
+    DoorBodyReconstruction,
+    write_runtime_scene_manifest,
+)
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
@@ -375,6 +397,7 @@ DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
     )
 )
 LEVEL_POSITION_ITEM_ROLE = int(Qt.ItemDataRole.UserRole)
+DOOR_LIBRARY_ITEM_ID_ROLE = int(Qt.ItemDataRole.UserRole)
 GROUND_LEVEL_BACKGROUND_BLEND = 0.12
 LEVEL_SCALE_SLIDER_FACTOR = 1000
 LEVEL_OFFSET_SLIDER_FACTOR = 100
@@ -541,7 +564,11 @@ class _PreAtlasExportScene:
         return tuple(
             dict.fromkeys(
                 (
-                    *(placement.object_id for placement in self.placed_models),
+                    *(
+                        placement.object_id
+                        for placement in self.placed_models
+                        if not placement.object_id.startswith("door-placement:")
+                    ),
                     *(
                         str(placement.source_object_id)
                         for placement in self.instance_source_models
@@ -1476,6 +1503,7 @@ class BlueprintWorkspace(QWidget):
         self._direct_object_placement_session: _DirectObjectPlacementSession | None = (
             None
         )
+        self._is_syncing_door_selection = False
         self._tour_viewer_preview_revision = -1
         self._tour_point_request_revision = 0
         self._tour_draft_overlay: dict[str, object] | None = None
@@ -1989,6 +2017,31 @@ class BlueprintWorkspace(QWidget):
         self._external_generation_host.viewer_restored.connect(
             self._handle_external_generation_workspace_restored
         )
+        self.doors_workspace = DoorsWorkspace(self)
+        self.doors_workspace.selection_changed.connect(
+            self._handle_door_workspace_selection_changed
+        )
+        self.doors_workspace.door_definition_changed.connect(
+            self._handle_door_definition_changed
+        )
+        self.doors_workspace.slot_edit_requested.connect(
+            self._handle_door_slot_edit_requested
+        )
+        self.doors_workspace.slot_confirmation_requested.connect(
+            self._handle_door_slot_confirmation_requested
+        )
+        self.doors_workspace.preview_viewer.set_pbr_maps_enabled(
+            tuple(
+                map_type
+                for map_type, checkbox in (
+                    self.merged_generation_workspace.pbr_map_checkboxes.items()
+                )
+                if checkbox.isChecked()
+            )
+        )
+        self.generation.door_slot_transform_changed.connect(
+            self._handle_door_slot_transform_changed
+        )
         self.tour_workspace = TourWorkspace(self)
         self.tour_preview_viewer: GlbViewerWidget | None = None
         self.tour_workspace.point_placement_requested.connect(
@@ -2099,6 +2152,9 @@ class BlueprintWorkspace(QWidget):
         self.generation.texture_regeneration_completed.connect(
             self._handle_generated_object_generated_for_atlases
         )
+        self.generation.generated_object_changed.connect(
+            self._handle_door_component_model_changed
+        )
         self.generation.generation_completed.connect(
             self._handle_generated_object_completed_for_canvas
         )
@@ -2135,6 +2191,12 @@ class BlueprintWorkspace(QWidget):
         self.viewer.object_placement_cancelled.connect(
             self._handle_direct_object_placement_cancelled
         )
+        self.viewer.door_creation_requested.connect(
+            self._handle_door_creation_requested
+        )
+        self.viewer.door_placement_requested.connect(
+            self._handle_door_placement_requested
+        )
         self.generation.operation_finished.connect(
             self._handle_object_placement_operation_finished
         )
@@ -2157,6 +2219,10 @@ class BlueprintWorkspace(QWidget):
         self.generation_workspace_tab_index = self.workspace_tabs.addTab(
             self.merged_generation_workspace,
             "Generation",
+        )
+        self.doors_workspace_tab_index = self.workspace_tabs.addTab(
+            self.doors_workspace,
+            "Doors",
         )
         self.tour_workspace_tab_index = self.workspace_tabs.addTab(
             self.tour_workspace,
@@ -3323,6 +3389,36 @@ class BlueprintWorkspace(QWidget):
         doorways_layout.addLayout(doorway_buttons_layout)
         side_layout.addWidget(self.doorways_group)
 
+        self.doors_group = QGroupBox("Doors")
+        doors_layout = QVBoxLayout(self.doors_group)
+
+        self.canvas_door_list = QListWidget()
+        self.canvas_door_list.setObjectName("canvas_door_list")
+        self.canvas_door_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.canvas_door_list.setMinimumHeight(96)
+        self.canvas_door_list.currentItemChanged.connect(
+            self._handle_canvas_door_selection_changed
+        )
+        doors_layout.addWidget(self.canvas_door_list)
+
+        self.place_selected_door_button = QPushButton("Place selected door")
+        self.place_selected_door_button.setObjectName(
+            "place_selected_door_button"
+        )
+        self.place_selected_door_button.setMinimumHeight(40)
+        self.place_selected_door_button.setEnabled(False)
+        self.place_selected_door_button.setToolTip(
+            "Place this reusable door into a doorway with the same profile. "
+            "Use the mouse wheel before clicking to mirror it horizontally."
+        )
+        self.place_selected_door_button.clicked.connect(
+            self._handle_place_selected_door_clicked
+        )
+        doors_layout.addWidget(self.place_selected_door_button)
+        side_layout.addWidget(self.doors_group)
+
         self.wall_mirrors_group = QGroupBox("Wall mirrors")
         wall_mirrors_layout = QHBoxLayout(self.wall_mirrors_group)
         wall_mirrors_layout.setSpacing(10)
@@ -3677,6 +3773,7 @@ class BlueprintWorkspace(QWidget):
         side_layout.addLayout(buttons_layout)
 
         self._refresh_doorway_preset_list(selected_index=0)
+        self._refresh_canvas_door_list()
         self._update_image_correction_button_state()
         self._update_plan_wall_generation_controls_state()
         self._update_plan_image_erase_button_state()
@@ -4256,8 +4353,15 @@ class BlueprintWorkspace(QWidget):
         finally:
             self._is_syncing_canvas_scene_selection = False
         try:
+            opening_levels = []
+            for level in self.levels:
+                opening_level = copy.copy(level)
+                # Include is an export decision; it must not remove doorway
+                # controls or door-placement targets from the live scene.
+                opening_level.include_in_export = True
+                opening_levels.append(opening_level)
             opening_targets = build_canvas_opening_targets(
-                self.levels,
+                opening_levels,
                 surface_targets,
             )
         except (TypeError, ValueError):
@@ -9941,12 +10045,18 @@ class BlueprintWorkspace(QWidget):
                 placement.object_id: placement
                 for placement in source_placements
             }
+            door_body_reconstructions = (
+                self._build_export_door_body_reconstructions(
+                    source_placements
+                )
+            )
             exported_path = export_glb_file(generated_model, export_path)
             manifest_path = write_runtime_scene_manifest(
                 exported_path,
                 source_placements=source_placements_by_id,
                 instance_placements=instance_placements,
                 tours=self.tour_workspace.tours(),
+                door_body_reconstructions=door_body_reconstructions,
             )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
@@ -10045,12 +10155,14 @@ class BlueprintWorkspace(QWidget):
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
         selected_widget = self.workspace_tabs.widget(tab_index)
         is_atlas_workspace = selected_widget is self.texture_atlas_workspace
+        is_doors_workspace = selected_widget is self.doors_workspace
         is_tour_workspace = selected_widget is self.tour_workspace
         is_full_width_workspace = bool(
             is_atlas_workspace
             or selected_widget
             in (
                 self.merged_generation_workspace,
+                self.doors_workspace,
                 self.tour_workspace,
                 self.settings_widget,
             )
@@ -10063,6 +10175,8 @@ class BlueprintWorkspace(QWidget):
         elif is_atlas_workspace:
             self._sync_atlas_object_texture_sources()
             self._schedule_atlas_draw_call_estimate()
+        elif is_doors_workspace:
+            self._sync_selected_door_slot_preview()
         elif is_tour_workspace:
             self._ensure_tour_preview_viewer()
             self._sync_tour_overlays()
@@ -12724,6 +12838,8 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Move pinned Atlas placements to the object's latest exact PNGs."""
 
+        if is_door_component_record(raw_record):
+            return
         object_id = getattr(raw_record, "object_id", None)
         if not isinstance(object_id, str) or not object_id:
             return
@@ -12737,6 +12853,8 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Pulse one newly generated object or texture until it is clicked."""
 
+        if is_door_component_record(raw_record):
+            return
         object_id = getattr(raw_record, "object_id", None)
         if not isinstance(object_id, str) or not object_id.strip():
             return
@@ -14179,6 +14297,7 @@ class BlueprintWorkspace(QWidget):
             (self.scene_3d_workspace, "3D scene"),
             (self.texture_atlas_workspace, "Atlas"),
             (self.merged_generation_workspace, "Generation"),
+            (self.doors_workspace, "Doors"),
             (self.tour_workspace, "Tour"),
             (self.settings_widget, "Settings"),
         )
@@ -14194,6 +14313,8 @@ class BlueprintWorkspace(QWidget):
             self.atlas_workspace_tab_index = index
         elif workspace is self.merged_generation_workspace:
             self.generation_workspace_tab_index = index
+        elif workspace is self.doors_workspace:
+            self.doors_workspace_tab_index = index
         elif workspace is self.tour_workspace:
             self.tour_workspace_tab_index = index
         elif workspace is self.settings_widget:
@@ -14556,6 +14677,12 @@ class BlueprintWorkspace(QWidget):
                 for instance in self.generation.get_generated_object_instances()
             }
         )
+        placed_object_levels.update(
+            {
+                f"door-placement:{placement.placement_id}": placement.level_index
+                for placement in self.doors_workspace.data().placements
+            }
+        )
         self.viewer.set_canvas_scene_levels(
             level_items,
             placed_object_levels=placed_object_levels,
@@ -14810,6 +14937,59 @@ class BlueprintWorkspace(QWidget):
             tuple(instance_models),
         )
 
+    def _build_export_door_body_reconstructions(
+        self,
+        source_placements: Sequence[PlacedGeneratedModel],
+    ) -> tuple[DoorBodyReconstruction, ...]:
+        """Describe every omitted door-depth half in glTF world space."""
+
+        placements_by_id = {
+            placement.object_id: placement
+            for placement in source_placements
+        }
+        records_by_id = {
+            record.object_id: record
+            for record in self.generation.get_data().generated_objects
+        }
+        reconstructions: list[DoorBodyReconstruction] = []
+        library = self.doors_workspace.data()
+        for door_placement in library.placements:
+            door = library.get_door(door_placement.door_id)
+            body_slot = None if door is None else door.get_slot(DOOR_SLOT_BODY)
+            if body_slot is None:
+                continue
+            body_record = records_by_id.get(body_slot.source_object_id)
+            if body_record is None:
+                continue
+            side_duplication = (
+                self.generation.resolve_door_side_duplication_for_record(
+                    body_record
+                )
+            )
+            if side_duplication is None:
+                continue
+            placement_object_id = (
+                f"door-placement:{door_placement.placement_id}"
+            )
+            placed_door = placements_by_id.get(placement_object_id)
+            if placed_door is None:
+                continue
+            mirror_plane = build_placed_generated_model_gltf_mirror_plane(
+                placed_door,
+                axis=1,
+                plane_coordinate=side_duplication.plane_coordinate,
+            )
+            reconstructions.append(
+                DoorBodyReconstruction(
+                    placement_object_id=placement_object_id,
+                    body_object_id=body_slot.source_object_id,
+                    kept_side=side_duplication.kept_side,
+                    mirror_point=tuple(mirror_plane["point"]),
+                    mirror_normal=tuple(mirror_plane["normal"]),
+                )
+            )
+        return tuple(reconstructions)
+
     def _build_viewer_preview_model(
         self,
         failure_title: str | None,
@@ -14896,6 +15076,107 @@ class BlueprintWorkspace(QWidget):
                 )
                 if placed_model is not None:
                     placed_models.append(placed_model)
+        placed_models.extend(
+            self._build_placed_door_models(
+                visible_level_by_index=visible_level_by_index,
+                base_z_by_level_index=base_z_by_level_index,
+            )
+        )
+        return tuple(placed_models)
+
+    def _build_placed_door_models(
+        self,
+        *,
+        visible_level_by_index: Mapping[int, LevelData],
+        base_z_by_level_index: Mapping[int, float],
+    ) -> tuple[PlacedGeneratedModel, ...]:
+        """Resolve doorway-bound doors into ordinary authored scene meshes."""
+
+        library = self.doors_workspace.data()
+        placed_models: list[PlacedGeneratedModel] = []
+        for placement in library.placements:
+            door = library.get_door(placement.door_id)
+            level = visible_level_by_index.get(placement.level_index)
+            base_z = base_z_by_level_index.get(placement.level_index)
+            if door is None or level is None or base_z is None:
+                continue
+            doorway = next(
+                (
+                    candidate
+                    for candidate in level.doorways
+                    if candidate.doorway_id == placement.doorway_id
+                ),
+                None,
+            )
+            if doorway is None or not door_fits_doorway(door, doorway):
+                continue
+            try:
+                model = assemble_door_model(
+                    door,
+                    self._get_door_slot_models(door),
+                    include_unjoined=False,
+                    body_mirror=(
+                        self._resolve_door_body_mirror_configuration(door)
+                    ),
+                )
+                if placement.mirrored_horizontally:
+                    model = mirror_door_model_horizontally(model)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+
+            center_x, center_y = level_image_to_world_xy(
+                level,
+                doorway.center_x,
+                doorway.center_y,
+            )
+            rotation_radians = math.radians(doorway.rotation_degrees)
+            sample_x, sample_y = level_image_to_world_xy(
+                level,
+                doorway.center_x - math.sin(rotation_radians),
+                doorway.center_y + math.cos(rotation_radians),
+            )
+            width_dx = sample_x - center_x
+            width_dy = sample_y - center_y
+            if math.hypot(width_dx, width_dy) <= 1e-9:
+                continue
+            yaw_degrees = math.degrees(math.atan2(width_dy, width_dx))
+            yaw_radians = math.radians(yaw_degrees)
+
+            # PlacedGeneratedModel normally anchors the assembled mesh's
+            # bottom-center. Door hardware can extend beyond the body after a
+            # slot edit, moving that bounds-derived pivot. Compensate here so
+            # the door's canonical local origin (the body bottom-center)
+            # remains fixed to the doorway regardless of hardware bounds.
+            minimum, maximum = model.mesh.bounds
+            local_pivot_x = float((minimum[0] + maximum[0]) / 2.0)
+            local_pivot_y = float((minimum[1] + maximum[1]) / 2.0)
+            local_pivot_z = float(minimum[2])
+            scaled_pivot_x = local_pivot_x * level.scale
+            scaled_pivot_y = local_pivot_y * level.scale
+            rotated_pivot_x = (
+                math.cos(yaw_radians) * scaled_pivot_x
+                - math.sin(yaw_radians) * scaled_pivot_y
+            )
+            rotated_pivot_y = (
+                math.sin(yaw_radians) * scaled_pivot_x
+                + math.cos(yaw_radians) * scaled_pivot_y
+            )
+            scene_object_id = f"door-placement:{placement.placement_id}"
+            placed_models.append(
+                PlacedGeneratedModel(
+                    object_id=scene_object_id,
+                    source_object_id=scene_object_id,
+                    object_name=door.name,
+                    model=model,
+                    world_position=(
+                        center_x + rotated_pivot_x,
+                        center_y + rotated_pivot_y,
+                        base_z + doorway.bottom_height_meters + local_pivot_z,
+                    ),
+                    rotation_degrees=(0.0, 0.0, yaw_degrees),
+                    axis_scales=(level.scale, level.scale, 1.0),
+                )
+            )
         return tuple(placed_models)
 
     def _resolve_placed_generated_model(
@@ -15029,6 +15310,7 @@ class BlueprintWorkspace(QWidget):
             if checkbox.isChecked()
         )
         self.viewer.set_pbr_maps_enabled(enabled_maps)
+        self.doors_workspace.preview_viewer.set_pbr_maps_enabled(enabled_maps)
         if self.tour_preview_viewer is not None:
             self.tour_preview_viewer.set_pbr_maps_enabled(enabled_maps)
 
@@ -15241,6 +15523,7 @@ class BlueprintWorkspace(QWidget):
                 stairs=self.stairs,
                 wall_mirror_links=self.wall_mirror_links,
                 tours=self.tour_workspace.tours(),
+                doors=self.doors_workspace.data(),
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -17543,6 +17826,551 @@ class BlueprintWorkspace(QWidget):
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self.canvas.start_doorway_placement(doorway_preset)
 
+    # ### Reusable door library ###
+    def _handle_door_creation_requested(self, raw_reference: object) -> None:
+        """Create one exact-fit reusable door from a selected doorway."""
+
+        if not isinstance(raw_reference, CanvasOpeningReference):
+            return
+        resolved = self._resolve_doorway_reference(raw_reference)
+        if resolved is None:
+            QMessageBox.warning(
+                self,
+                "Create door",
+                "The selected doorway no longer exists.",
+            )
+            return
+        _level, doorway = resolved
+        door = create_door_definition_for_doorway(
+            doorway,
+            name=next_door_name(self.doors_workspace.doors()),
+        )
+        slot_models = build_default_door_slot_models(door)
+        registered_object_ids: list[str] = []
+        try:
+            for slot in door.slots:
+                model = slot_models[slot.slot_id]
+                self.generation.register_door_component_model(
+                    object_id=slot.source_object_id,
+                    object_name=f"{door.name} - {slot.display_name}",
+                    door_id=door.door_id,
+                    slot_id=slot.slot_id,
+                    model=model,
+                )
+                registered_object_ids.append(slot.source_object_id)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            for object_id in reversed(registered_object_ids):
+                self.generation.delete_generated_object(object_id)
+            QMessageBox.warning(
+                self,
+                "Create door",
+                f"The door could not be created: {error}",
+            )
+            return
+
+        self.doors_workspace.upsert_door(door, select_body=True)
+        self._refresh_canvas_door_list(selected_door_id=door.door_id)
+        self._sync_selected_door_slot_preview()
+        self.workspace_tabs.setCurrentWidget(self.doors_workspace)
+
+    def _resolve_doorway_reference(
+        self,
+        reference: CanvasOpeningReference,
+    ) -> tuple[LevelData, DoorwayData] | None:
+        """Resolve a viewer reference through the doorway's stable identity."""
+
+        if reference.kind != CANVAS_OPENING_DOORWAY:
+            return None
+        level = self._get_level_by_index(reference.level_index)
+        if level is None:
+            return None
+        if reference.stable_id:
+            doorway = next(
+                (
+                    candidate
+                    for candidate in level.doorways
+                    if candidate.doorway_id == reference.stable_id
+                ),
+                None,
+            )
+            if doorway is not None:
+                return level, doorway
+        if not 0 <= reference.item_index < len(level.doorways):
+            return None
+        return level, level.doorways[reference.item_index]
+
+    def _get_door_slot_models(
+        self,
+        door: DoorDefinition,
+    ) -> dict[str, GeneratedModel]:
+        """Load generated slot assets, falling back to exact procedural parts."""
+
+        models: dict[str, GeneratedModel] = {}
+        missing_slots = []
+        for slot in door.slots:
+            model = self.generation.get_generated_object_model(
+                slot.source_object_id
+            )
+            if model is None:
+                missing_slots.append(slot.slot_id)
+                continue
+            models[slot.source_object_id] = model
+        if missing_slots:
+            procedural_models = build_default_door_slot_models(door)
+            for slot in door.slots:
+                if slot.source_object_id not in models:
+                    models[slot.source_object_id] = procedural_models[slot.slot_id]
+        return models
+
+    def _build_door_assembly_preview(
+        self,
+        door: DoorDefinition,
+    ) -> GeneratedModel:
+        """Build a complete editor preview, including unconfirmed parts."""
+
+        return assemble_door_model(
+            door,
+            self._get_door_slot_models(door),
+            include_unjoined=True,
+            body_mirror=self._resolve_door_body_mirror_configuration(door),
+        )
+
+    def _resolve_door_body_mirror_configuration(
+        self,
+        door: DoorDefinition,
+    ) -> DoorBodyMirrorConfiguration | None:
+        """Resolve only reconstruction transforms persisted on the body asset."""
+
+        body_record = self._resolve_door_body_record(door)
+        if body_record is None:
+            return None
+        symmetry = self.generation.resolve_symmetric_division_for_record(
+            body_record
+        )
+        side_duplication = (
+            self.generation.resolve_door_side_duplication_for_record(
+                body_record
+            )
+        )
+        if symmetry is None and side_duplication is None:
+            return None
+        return DoorBodyMirrorConfiguration(
+            symmetric_orientation=(
+                None if symmetry is None else symmetry.orientation
+            ),
+            symmetric_plane_coordinate=(
+                None if symmetry is None else symmetry.plane_coordinate
+            ),
+            side_duplication_plane_coordinate=(
+                None
+                if side_duplication is None
+                else side_duplication.plane_coordinate
+            ),
+        )
+
+    def _resolve_door_body_record(
+        self,
+        door: DoorDefinition,
+    ) -> GeneratedObjectRecord | None:
+        """Return the generated record used by a reusable door's body slot."""
+
+        body_slot = door.get_slot(DOOR_SLOT_BODY)
+        if body_slot is None:
+            return None
+        return next(
+            (
+                record
+                for record in self.generation.get_data().generated_objects
+                if record.object_id == body_slot.source_object_id
+            ),
+            None,
+        )
+
+    def _sync_persisted_door_side_duplication(
+        self,
+        door: DoorDefinition,
+    ) -> DoorDefinition:
+        """Make immutable generated geometry authoritative in the Doors UI."""
+
+        body_record = self._resolve_door_body_record(door)
+        metadata = (
+            None
+            if body_record is None
+            else self.generation.resolve_door_side_duplication_for_record(
+                body_record
+            )
+        )
+        applied_setting = (
+            None
+            if metadata is None
+            else DoorSideDuplication(kept_side=metadata.kept_side)
+        )
+        synchronized = self.doors_workspace.set_persisted_side_duplication(
+            door.door_id,
+            applied_setting,
+        )
+        return door if synchronized is None else synchronized
+
+    def _handle_door_definition_changed(
+        self,
+        raw_door: object,
+    ) -> None:
+        """Refresh the body generation target after door options change."""
+
+        if not isinstance(raw_door, DoorDefinition):
+            return
+        selected_door = self.doors_workspace.selected_door()
+        if (
+            selected_door is not None
+            and selected_door.door_id == raw_door.door_id
+        ):
+            self._sync_selected_door_slot_preview()
+        self._refresh_canvas_door_list(selected_door_id=raw_door.door_id)
+
+    def _handle_door_workspace_selection_changed(
+        self,
+        raw_door_id: object,
+        _raw_slot_id: object,
+    ) -> None:
+        """Keep the Canvas library and Generation slot target synchronized."""
+
+        door_id = str(raw_door_id).strip() if raw_door_id else None
+        self._refresh_canvas_door_list(selected_door_id=door_id)
+        self.place_selected_door_button.setEnabled(door_id is not None)
+        self._sync_selected_door_slot_preview()
+
+    def _handle_door_slot_edit_requested(
+        self,
+        door_id: str,
+        slot_id: str,
+    ) -> None:
+        """Open Generation with the double-clicked door component active."""
+
+        if not self.doors_workspace.select_door_slot(door_id, slot_id):
+            return
+        self._sync_selected_door_slot_preview()
+        self.merged_generation_workspace.refresh_file_backed_previews()
+        if self._external_generation_host.is_active:
+            generation_window = self._external_generation_host.window
+            generation_window.show()
+            generation_window.raise_()
+            generation_window.activateWindow()
+            return
+        generation_index = self.workspace_tabs.indexOf(
+            self.merged_generation_workspace
+        )
+        if generation_index >= 0:
+            self.workspace_tabs.setCurrentIndex(generation_index)
+
+    def _handle_canvas_door_selection_changed(
+        self,
+        current: QListWidgetItem | None,
+        _previous: QListWidgetItem | None,
+    ) -> None:
+        """Select the matching reusable door and its body slot."""
+
+        if self._is_syncing_door_selection:
+            return
+        door_id = (
+            None
+            if current is None
+            else current.data(DOOR_LIBRARY_ITEM_ID_ROLE)
+        )
+        if not isinstance(door_id, str) or not door_id:
+            self.place_selected_door_button.setEnabled(False)
+            return
+        self.doors_workspace.select_door_slot(door_id, DOOR_SLOT_BODY)
+
+    def _refresh_canvas_door_list(
+        self,
+        *,
+        selected_door_id: str | None = None,
+    ) -> None:
+        """Rebuild the compact Canvas door chooser from persistent state."""
+
+        if not hasattr(self, "canvas_door_list"):
+            return
+        if selected_door_id is None:
+            current_item = self.canvas_door_list.currentItem()
+            current_value = (
+                None
+                if current_item is None
+                else current_item.data(DOOR_LIBRARY_ITEM_ID_ROLE)
+            )
+            selected_door_id = (
+                current_value if isinstance(current_value, str) else None
+            )
+        self._is_syncing_door_selection = True
+        try:
+            self.canvas_door_list.clear()
+            selected_item = None
+            for door in self.doors_workspace.doors():
+                item = QListWidgetItem(
+                    f"{door.name}  ({door.width_meters:.2f} x "
+                    f"{door.height_meters:.2f} m)"
+                )
+                item.setData(DOOR_LIBRARY_ITEM_ID_ROLE, door.door_id)
+                self.canvas_door_list.addItem(item)
+                if door.door_id == selected_door_id:
+                    selected_item = item
+            if selected_item is None and self.canvas_door_list.count() > 0:
+                selected_item = self.canvas_door_list.item(0)
+            self.canvas_door_list.setCurrentItem(selected_item)
+        finally:
+            self._is_syncing_door_selection = False
+        self.place_selected_door_button.setEnabled(
+            self.canvas_door_list.currentItem() is not None
+        )
+
+    def _sync_selected_door_slot_preview(self) -> None:
+        """Show one complete door in Doors and its active slot in Generation."""
+
+        door = self.doors_workspace.selected_door()
+        if door is None:
+            self.doors_workspace.set_preview_model(None)
+            self.generation.clear_door_slot_editing_target()
+            return
+        door = self._sync_persisted_door_side_duplication(door)
+        slot_id = self.doors_workspace.selected_slot_id() or DOOR_SLOT_BODY
+        slot = door.get_slot(slot_id)
+        if slot is None:
+            self.doors_workspace.set_preview_model(None)
+            self.generation.clear_door_slot_editing_target()
+            return
+        try:
+            preview_model = self._build_door_assembly_preview(door)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self.doors_workspace.set_preview_model(None)
+            self.generation.clear_door_slot_editing_target()
+            return
+        self.doors_workspace.set_preview_model(preview_model)
+        try:
+            accepted = self.generation.set_door_slot_editing_target(
+                door_id=door.door_id,
+                slot_id=slot.slot_id,
+                object_id=slot.source_object_id,
+                preview_model=preview_model,
+                editable_transform=slot.slot_id != DOOR_SLOT_BODY,
+                side_duplication=(
+                    door.side_duplication
+                    if slot.slot_id == DOOR_SLOT_BODY
+                    else None
+                ),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            accepted = False
+        if not accepted:
+            self.generation.clear_door_slot_editing_target()
+
+    def _handle_door_slot_transform_changed(
+        self,
+        door_id: str,
+        slot_id: str,
+        raw_position: object,
+        raw_rotation: object,
+    ) -> None:
+        """Persist one component gizmo transform as an unconfirmed slot edit."""
+
+        door = self.doors_workspace.data().get_door(door_id)
+        slot = None if door is None else door.get_slot(slot_id)
+        if door is None or slot is None or slot.slot_id == DOOR_SLOT_BODY:
+            return
+        try:
+            updated_slot = slot.with_transform(
+                position_meters=raw_position,
+                rotation_degrees=raw_rotation,
+                joined=False,
+            )
+        except (TypeError, ValueError):
+            return
+        self.doors_workspace.replace_slot(door.door_id, updated_slot)
+        self.doors_workspace.set_slot_position_pending(
+            door.door_id,
+            updated_slot.slot_id,
+            True,
+        )
+        self._sync_selected_door_slot_preview()
+
+    def _handle_door_slot_confirmation_requested(
+        self,
+        door_id: str,
+        slot_id: str,
+    ) -> None:
+        """Join one positioned component into future door assemblies."""
+
+        door = self.doors_workspace.data().get_door(door_id)
+        slot = None if door is None else door.get_slot(slot_id)
+        if door is None or slot is None or slot.slot_id == DOOR_SLOT_BODY:
+            return
+        self.doors_workspace.replace_slot(
+            door.door_id,
+            slot.with_transform(joined=True),
+        )
+        self.doors_workspace.set_slot_position_pending(
+            door.door_id,
+            slot.slot_id,
+            False,
+        )
+        self._sync_selected_door_slot_preview()
+        if self._door_has_placements(door.door_id):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _handle_door_component_model_changed(
+        self,
+        raw_record: object,
+        _generated_model: object,
+    ) -> None:
+        """Reassemble doors after an asynchronous slot texture update."""
+
+        object_id = getattr(raw_record, "object_id", None)
+        if not isinstance(object_id, str):
+            return
+        matched_door = next(
+            (
+                door
+                for door in self.doors_workspace.doors()
+                if any(
+                    slot.source_object_id == object_id for slot in door.slots
+                )
+            ),
+            None,
+        )
+        if matched_door is None:
+            return
+        selected_door = self.doors_workspace.selected_door()
+        if selected_door is not None and selected_door.door_id == matched_door.door_id:
+            self._sync_selected_door_slot_preview()
+        if self._door_has_placements(matched_door.door_id):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _door_has_placements(self, door_id: str) -> bool:
+        return any(
+            placement.door_id == door_id
+            for placement in self.doors_workspace.data().placements
+        )
+
+    def _reconcile_door_placements(self) -> bool:
+        """Remove bindings whose doorway vanished or no longer fits."""
+
+        library = self.doors_workspace.data()
+        retained: list[DoorPlacement] = []
+        for placement in library.placements:
+            door = library.get_door(placement.door_id)
+            level = self._get_level_by_index(placement.level_index)
+            doorway = (
+                None
+                if level is None
+                else next(
+                    (
+                        candidate
+                        for candidate in level.doorways
+                        if candidate.doorway_id == placement.doorway_id
+                    ),
+                    None,
+                )
+            )
+            if door is not None and doorway is not None and door_fits_doorway(
+                door,
+                doorway,
+            ):
+                retained.append(placement)
+        if len(retained) == len(library.placements):
+            return False
+        self.doors_workspace.set_data(
+            DoorLibraryData(
+                doors=list(library.doors),
+                placements=retained,
+            )
+        )
+        self._refresh_canvas_door_list()
+        self._sync_viewer_scene_levels()
+        return True
+
+    def _handle_place_selected_door_clicked(self) -> None:
+        """Arm the 3D viewer for placement into a profile-compatible doorway."""
+
+        item = self.canvas_door_list.currentItem()
+        door_id = (
+            None if item is None else item.data(DOOR_LIBRARY_ITEM_ID_ROLE)
+        )
+        door = (
+            self.doors_workspace.data().get_door(door_id)
+            if isinstance(door_id, str)
+            else None
+        )
+        if door is None:
+            return
+        compatible_keys = tuple(
+            target.key
+            for target in self._canvas_opening_targets_by_key.values()
+            if (
+                target.reference.kind == CANVAS_OPENING_DOORWAY
+                and (
+                    resolved := self._resolve_doorway_reference(target.reference)
+                )
+                is not None
+                and door_fits_doorway(door, resolved[1])
+            )
+        )
+        if not compatible_keys:
+            QMessageBox.information(
+                self,
+                "Place selected door",
+                "No doorway in the current 3D scene matches this door's "
+                "width, height, and silhouette.",
+            )
+            return
+        self.workspace_tabs.setCurrentWidget(self.scene_3d_workspace)
+        if not self.viewer.begin_door_placement(door.door_id, compatible_keys):
+            QMessageBox.warning(
+                self,
+                "Place selected door",
+                "Door placement could not be started.",
+            )
+
+    def _handle_door_placement_requested(
+        self,
+        door_id: str,
+        raw_reference: object,
+        mirrored_horizontally: bool,
+    ) -> None:
+        """Bind one reusable door to a matching stable doorway."""
+
+        if not isinstance(raw_reference, CanvasOpeningReference):
+            return
+        resolved = self._resolve_doorway_reference(raw_reference)
+        library = self.doors_workspace.data()
+        door = library.get_door(door_id)
+        if resolved is None or door is None or not door_fits_doorway(door, resolved[1]):
+            return
+        level, doorway = resolved
+        placements = [
+            placement
+            for placement in library.placements
+            if not (
+                placement.level_index == level.index
+                and placement.doorway_id == doorway.doorway_id
+            )
+        ]
+        placements.append(
+            DoorPlacement(
+                placement_id=uuid.uuid4().hex,
+                door_id=door.door_id,
+                level_index=level.index,
+                doorway_id=doorway.doorway_id,
+                mirrored_horizontally=bool(mirrored_horizontally),
+            )
+        )
+        self.doors_workspace.set_data(
+            DoorLibraryData(
+                doors=list(library.doors),
+                placements=placements,
+            )
+        )
+        self._refresh_canvas_door_list(selected_door_id=door.door_id)
+        self._sync_viewer_scene_levels()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+
     # ### Wall level mirror controls ###
     def _handle_wall_mirror_up_clicked(self) -> None:
         """Mirror the selected wall-vertex group onto the next upper level."""
@@ -17861,13 +18689,14 @@ class BlueprintWorkspace(QWidget):
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
         self.current_level.doorways = self.canvas.doorways
+        placements_changed = self._reconcile_door_placements()
         next_snapshot = self._copy_doorways(self.current_level.doorways)
         snapshot_changed = bool(
             self._viewer_doorways_by_level_index.get(self.current_level.index)
             != next_snapshot
         )
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
-        if not snapshot_changed:
+        if not snapshot_changed and not placements_changed:
             return
         self._viewer_doorways_by_level_index[self.current_level.index] = next_snapshot
         self._schedule_viewer_preview_refresh()
@@ -18495,6 +19324,7 @@ class BlueprintWorkspace(QWidget):
             stairs=project_data.stairs,
             wall_mirror_links=project_data.wall_mirror_links,
             tours=project_data.tours,
+            doors=project_data.doors,
         )
 
     def _apply_project_state(
@@ -18509,6 +19339,7 @@ class BlueprintWorkspace(QWidget):
         stairs: list[StairData] | None = None,
         wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
         tours: Sequence[TourData] | None = None,
+        doors: DoorLibraryData | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -18531,6 +19362,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_and_join_surface_texture_tiling_preparations()
         self._pending_generation_placement_anchor = None
         self._cancel_direct_object_placement()
+        self.viewer.cancel_door_placement()
         self._tour_point_request_revision += 1
         self.viewer.clear_tour(restore_camera=True)
         if self.tour_preview_viewer is not None:
@@ -18634,6 +19466,14 @@ class BlueprintWorkspace(QWidget):
             )
         )
         self.generation.set_data(generation)
+        self.doors_workspace.set_data(
+            DoorLibraryData() if doors is None else doors
+        )
+        self._reconcile_door_placements()
+        self._refresh_canvas_door_list(
+            selected_door_id=self.doors_workspace.selected_door_id()
+        )
+        self._sync_selected_door_slot_preview()
         self._sync_canvas_placed_object_profiles()
         self._sync_viewer_scene_levels(reset_visibility=True)
         self.texture_atlas_workspace.set_data(texture_atlases)

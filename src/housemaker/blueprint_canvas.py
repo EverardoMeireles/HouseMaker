@@ -4901,6 +4901,7 @@ class BlueprintCanvas(QWidget):
         bottom_height_meters: float | None = None,
     ) -> DoorwayData:
         return DoorwayData(
+            doorway_id=doorway.doorway_id,
             center_x=doorway.center_x if center_x is None else center_x,
             center_y=doorway.center_y if center_y is None else center_y,
             width_meters=(

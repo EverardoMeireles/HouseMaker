@@ -6,6 +6,7 @@ import json
 import math
 import os
 import queue
+import re
 import tempfile
 import threading
 import uuid
@@ -15,6 +16,7 @@ from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import cv2
@@ -44,6 +46,8 @@ OPENAI_IMAGE_MODEL = PLAN_CORRECTION_MODEL_GPT_IMAGE_2
 OPENAI_IMAGE_QUALITY = "high"
 OPENAI_NETWORK_TIMEOUT_SECONDS = 300.0
 MAX_API_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_API_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_PROVIDER_ERROR_MESSAGE_CHARACTERS = 600
 MAX_API_INPUT_BYTES = 50 * 1024 * 1024
 OUTPUT_DIMENSION_MULTIPLE = 32
 MAX_OUTPUT_EDGE_PIXELS = 2048
@@ -532,8 +536,9 @@ def openai_responses_image_edit(
     output_size: tuple[int, int],
     cancellation_check: CancellationCheck | None,
     background: str | None = None,
+    action: str = "edit",
 ) -> bytes:
-    """Use a GPT-5.6 model to direct an image-generation edit."""
+    """Use a GPT-5.6 model to direct an image-generation request."""
 
     if model not in {
         PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
@@ -552,12 +557,16 @@ def openai_responses_image_edit(
         raise PlanImageCorrectionInferenceError(
             "The requested OpenAI image background is unsupported."
         )
+    if action not in {"auto", "edit", "generate"}:
+        raise PlanImageCorrectionInferenceError(
+            "The requested OpenAI image action is unsupported."
+        )
     _raise_if_cancelled(cancellation_check)
     encoded_input = base64.b64encode(bytes(image_bytes)).decode("ascii")
     image_tool = {
         "type": "image_generation",
         "model": OPENAI_IMAGE_MODEL,
-        "action": "edit",
+        "action": action,
         "quality": OPENAI_IMAGE_QUALITY,
         "size": f"{output_size[0]}x{output_size[1]}",
         "output_format": "png",
@@ -600,25 +609,44 @@ def openai_responses_image_edit(
         with urlopen(request, timeout=OPENAI_NETWORK_TIMEOUT_SECONDS) as response:
             raw_response = _read_response_limited(response, cancellation_check)
         parsed = json.loads(raw_response.decode("utf-8"))
-        return _decode_openai_image_generation_result(parsed)
+        return _decode_openai_image_generation_result(
+            parsed,
+            secrets=(key, prompt),
+        )
     except PlanImageCorrectionCancelled:
         raise
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-    ):
+    except PlanImageCorrectionInferenceError:
+        raise
+    except HTTPError as error:
+        raise _build_openai_responses_http_error(
+            error,
+            model=model,
+            secrets=(key, prompt),
+        ) from None
+    except (URLError, TimeoutError, OSError):
         raise PlanImageCorrectionInferenceError(
-            f"The {model} image correction did not return a usable image."
+            f"Unable to reach OpenAI for the {model} image request."
+        ) from None
+    except (UnicodeError, ValueError, KeyError, TypeError):
+        raise PlanImageCorrectionInferenceError(
+            f"The {model} image request did not return a usable image."
         ) from None
 
 
-def _decode_openai_image_generation_result(payload: object) -> bytes:
+def _decode_openai_image_generation_result(
+    payload: object,
+    *,
+    secrets: tuple[str, ...] = (),
+) -> bytes:
     """Decode the first completed image-generation call in a response."""
 
     if not isinstance(payload, dict):
         raise TypeError
+    response_error = _extract_openai_error_message(payload)
+    if response_error:
+        raise PlanImageCorrectionInferenceError(
+            _sanitize_openai_error_message(response_error, secrets)
+        )
     output = payload.get("output")
     if not isinstance(output, list):
         raise TypeError
@@ -627,6 +655,11 @@ def _decode_openai_image_generation_result(payload: object) -> bytes:
             continue
         encoded = item.get("result")
         if not isinstance(encoded, str) or not encoded:
+            call_error = _extract_openai_error_message(item)
+            if call_error:
+                raise PlanImageCorrectionInferenceError(
+                    _sanitize_openai_error_message(call_error, secrets)
+                )
             raise ValueError
         maximum_encoded_characters = ((MAX_API_RESPONSE_BYTES + 2) // 3) * 4
         if len(encoded) > maximum_encoded_characters:
@@ -635,7 +668,99 @@ def _decode_openai_image_generation_result(payload: object) -> bytes:
         if not decoded or len(decoded) > MAX_API_RESPONSE_BYTES:
             raise ValueError
         return decoded
+    refusal = _extract_openai_refusal_message(output)
+    if refusal:
+        raise PlanImageCorrectionInferenceError(
+            _sanitize_openai_error_message(refusal, secrets)
+        )
     raise ValueError
+
+
+def _build_openai_responses_http_error(
+    error: HTTPError,
+    *,
+    model: str,
+    secrets: tuple[str, ...],
+) -> PlanImageCorrectionInferenceError:
+    """Convert one bounded OpenAI error response into safe UI text."""
+
+    status_code = int(error.code)
+    detail = "request rejected"
+    try:
+        payload = error.read(MAX_API_ERROR_RESPONSE_BYTES + 1)
+        if len(payload) <= MAX_API_ERROR_RESPONSE_BYTES:
+            decoded = json.loads(payload.decode("utf-8"))
+            provider_message = _extract_openai_error_message(decoded)
+            if provider_message:
+                detail = _sanitize_openai_error_message(
+                    provider_message,
+                    secrets,
+                )
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        pass
+    return PlanImageCorrectionInferenceError(
+        f"OpenAI {model} image request failed ({status_code}): {detail}"
+    )
+
+
+def _extract_openai_error_message(payload: object) -> str:
+    """Return only a provider-selected error message, never arbitrary fields."""
+
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    message = payload.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return ""
+
+
+def _extract_openai_refusal_message(output: list[object]) -> str:
+    """Return the first explicit refusal when no image tool result exists."""
+
+    for item in output:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if not isinstance(content_item, dict):
+                continue
+            if content_item.get("type") != "refusal":
+                continue
+            refusal = content_item.get("refusal")
+            if isinstance(refusal, str) and refusal.strip():
+                return refusal.strip()
+    return ""
+
+
+def _sanitize_openai_error_message(
+    message: str,
+    secrets: tuple[str, ...],
+) -> str:
+    """Normalize provider text while removing credentials and image payloads."""
+
+    safe_message = " ".join(str(message).split())
+    for secret in secrets:
+        if secret:
+            safe_message = safe_message.replace(secret, "[redacted]")
+    safe_message = re.sub(
+        r"data:image/[^;\s]+;base64,[A-Za-z0-9+/=_-]+",
+        "data:image/[redacted]",
+        safe_message,
+        flags=re.IGNORECASE,
+    )
+    safe_message = re.sub(
+        r"\bsk-[A-Za-z0-9_-]{8,}\b",
+        "[redacted]",
+        safe_message,
+    )
+    return safe_message[:MAX_PROVIDER_ERROR_MESSAGE_CHARACTERS] or "request rejected"
 
 
 def _build_multipart_body(

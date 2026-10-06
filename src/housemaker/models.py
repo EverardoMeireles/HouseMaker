@@ -50,6 +50,7 @@ MIN_DOORWAY_DEPTH_METERS = 0.01
 MAX_DOORWAY_DEPTH_METERS = 10.0
 MIN_DOORWAY_BOTTOM_HEIGHT_METERS = 0.0
 MAX_DOORWAY_BOTTOM_HEIGHT_METERS = 20.0
+MAX_DOORWAY_ID_LENGTH = 128
 MAX_WINDOW_ID_LENGTH = 128
 MAX_WINDOW_SURFACE_ID_LENGTH = 512
 MIN_WINDOW_RATIO_SPAN = 1e-6
@@ -248,8 +249,10 @@ class DoorwayData:
     shape: str = DEFAULT_DOORWAY_SHAPE
     arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT
     bottom_height_meters: float = DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS
+    doorway_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self) -> None:
+        self.doorway_id = _normalize_doorway_id(self.doorway_id)
         self.shape = normalize_doorway_shape(self.shape)
         self.arch_amount = normalize_doorway_arch_amount(self.arch_amount)
         self.bottom_height_meters = normalize_doorway_bottom_height_meters(
@@ -1524,6 +1527,19 @@ class LevelData:
 
 
 # ### Doorway validation helpers ###
+def _normalize_doorway_id(value: object) -> str:
+    """Return one non-empty persistent doorway identifier."""
+
+    if not isinstance(value, str):
+        raise TypeError("Doorway ID must be a string.")
+    doorway_id = value.strip()
+    if not doorway_id:
+        raise ValueError("Doorway ID cannot be empty.")
+    if len(doorway_id) > MAX_DOORWAY_ID_LENGTH:
+        raise ValueError("Doorway ID is too long.")
+    return doorway_id
+
+
 def normalize_doorway_shape(value: object) -> str:
     """Return one canonical doorway shape or raise a validation error."""
 

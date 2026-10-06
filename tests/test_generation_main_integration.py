@@ -120,6 +120,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 "3D scene",
                 "Atlas",
                 "Generation",
+                "Doors",
                 "Tour",
                 "Settings",
             ],
@@ -130,6 +131,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "3D scene": True,
             "Atlas": False,
             "Generation": False,
+            "Doors": False,
             "Tour": False,
             "Settings": False,
         }
@@ -153,6 +155,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         for full_width_workspace in (
             self.workspace.texture_atlas_workspace,
             self.workspace.merged_generation_workspace,
+            self.workspace.doors_workspace,
             self.workspace.tour_workspace,
             self.workspace.settings_widget,
         ):

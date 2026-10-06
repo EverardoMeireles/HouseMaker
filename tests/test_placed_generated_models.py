@@ -631,6 +631,61 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
         )
         self.assertEqual(retained_model.glb_bytes, source_payload)
 
+    def test_nested_explicit_mirror_is_preserved_by_outer_placement(self) -> None:
+        base_model = _base_box_model()
+        retained_mesh = trimesh.creation.box(extents=(1.0, 0.4, 2.0))
+        retained_mesh.apply_translation((-0.5, 0.0, 1.0))
+        mirrored_mesh = copy.deepcopy(retained_mesh)
+        mirrored_vertices = np.asarray(mirrored_mesh.vertices, dtype=float).copy()
+        mirrored_vertices[:, 0] *= -1.0
+        mirrored_mesh.vertices = mirrored_vertices
+        mirrored_mesh.faces = np.asarray(
+            mirrored_mesh.faces,
+            dtype=np.int64,
+        )[:, (0, 2, 1)]
+        nested_model = _single_mesh_model(retained_mesh)
+        nested_model.preview_symmetric_objects = [
+            PreviewSymmetricObject(
+                object_id="door-body",
+                meshes=(retained_mesh,),
+                orientation="vertical",
+                plane_coordinate=0.0,
+                mirrored_meshes=(mirrored_mesh,),
+            )
+        ]
+
+        composed = compose_placed_generated_models(
+            base_model,
+            (
+                PlacedGeneratedModel(
+                    object_id="complete-door",
+                    model=nested_model,
+                    world_position=(8.0, 3.0, 2.0),
+                    rotation_degrees=(0.0, 0.0, 90.0),
+                ),
+            ),
+        )
+
+        self.assertEqual(len(composed.preview_symmetric_objects), 1)
+        preview = composed.preview_symmetric_objects[0]
+        self.assertEqual(
+            preview.object_id,
+            "complete-door:nested:1:door-body",
+        )
+        placement_transform = composed.preview_placed_objects[0].placement_transform
+        expected_retained = copy.deepcopy(retained_mesh)
+        expected_retained.apply_transform(placement_transform)
+        expected_mirrored = copy.deepcopy(mirrored_mesh)
+        expected_mirrored.apply_transform(placement_transform)
+        np.testing.assert_allclose(
+            preview.meshes[0].vertices,
+            expected_retained.vertices,
+        )
+        np.testing.assert_allclose(
+            preview.mirrored_meshes[0].vertices,
+            expected_mirrored.vertices,
+        )
+
     def test_rotated_symmetric_preview_keeps_local_mesh_and_full_transform(
         self,
     ) -> None:

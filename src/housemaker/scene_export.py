@@ -7,10 +7,15 @@ import math
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from housemaker.door_state import (
+    DOOR_SIDE_DUPLICATION_SIDES,
+    DOOR_SIDE_DUPLICATION_UV_MODE,
+)
 from housemaker.glb import (
     HALF_MESH_EXTRAS_KEY,
     INSTANCE_SOURCE_ID_METADATA_KEY,
@@ -22,7 +27,7 @@ from housemaker.tour_state import TourData, tours_to_runtime_dicts
 
 # ### Constants ###
 RUNTIME_SCENE_FORMAT = "housemaker-r3f-scene"
-RUNTIME_SCENE_VERSION = 7
+RUNTIME_SCENE_VERSION = 8
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 GLB_JSON_CHUNK_TYPE = b"JSON"
@@ -30,6 +35,51 @@ GLB_BINARY_CHUNK_TYPE = b"BIN\0"
 GLB_HEADER_BYTE_COUNT = 12
 GLB_CHUNK_HEADER_BYTE_COUNT = 8
 INSTANCE_SOURCE_SCENE_NAME = "HouseMaker Instance Sources"
+
+
+# ### Runtime door reconstruction models ###
+@dataclass(frozen=True, slots=True)
+class DoorBodyReconstruction:
+    """Runtime instructions for recreating one omitted door-body depth half."""
+
+    placement_object_id: str
+    body_object_id: str
+    kept_side: str
+    mirror_point: tuple[float, float, float]
+    mirror_normal: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        placement_object_id = str(self.placement_object_id).strip()
+        body_object_id = str(self.body_object_id).strip()
+        kept_side = str(self.kept_side).strip().lower()
+        if not placement_object_id or not body_object_id:
+            raise ValueError("Door reconstruction object IDs cannot be empty.")
+        if kept_side not in DOOR_SIDE_DUPLICATION_SIDES:
+            raise ValueError("Door reconstruction must keep Front or Back.")
+        point = _normalize_runtime_vector(self.mirror_point, "point")
+        normal = _normalize_runtime_vector(self.mirror_normal, "normal")
+        if float(np.linalg.norm(normal)) <= 0.0:
+            raise ValueError("Door reconstruction mirror normals cannot be zero.")
+        object.__setattr__(self, "placement_object_id", placement_object_id)
+        object.__setattr__(self, "body_object_id", body_object_id)
+        object.__setattr__(self, "kept_side", kept_side)
+        object.__setattr__(self, "mirror_point", point)
+        object.__setattr__(self, "mirror_normal", normal)
+
+    def to_runtime_dict(self) -> dict[str, object]:
+        return {
+            "placementObjectId": self.placement_object_id,
+            "bodyObjectId": self.body_object_id,
+            "sideDuplication": {
+                "keptSide": self.kept_side,
+                "mirrorPlane": {
+                    "point": list(self.mirror_point),
+                    "normal": list(self.mirror_normal),
+                },
+                "uvMode": DOOR_SIDE_DUPLICATION_UV_MODE,
+                "applyAfter": HALF_MESH_EXTRAS_KEY,
+            },
+        }
 
 
 # ### Public helpers ###
@@ -41,6 +91,7 @@ def write_runtime_scene_manifest(
     source_placements: Mapping[str, PlacedGeneratedModel],
     instance_placements: Sequence[PlacedGeneratedModel],
     tours: Sequence[TourData] = (),
+    door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
 ) -> Path:
     """Write the R3F runtime companion JSON next to an exported GLB."""
 
@@ -72,6 +123,7 @@ def write_runtime_scene_manifest(
         source_placements=normalized_sources,
         instance_placements=normalized_instances,
         tours=tours,
+        door_body_reconstructions=door_body_reconstructions,
     )
     manifest_path = normalized_glb_path.with_suffix(".json")
     _write_json_atomically(manifest_path, manifest)
@@ -85,6 +137,7 @@ def build_runtime_scene_manifest(
     source_placements: Mapping[str, PlacedGeneratedModel],
     instance_placements: Sequence[PlacedGeneratedModel],
     tours: Sequence[TourData] = (),
+    door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
 ) -> dict[str, object]:
     """Build a versioned runtime manifest for instances and camera tours."""
 
@@ -94,6 +147,9 @@ def build_runtime_scene_manifest(
     normalized_instances = _normalize_instance_placements(
         instance_placements,
         normalized_sources,
+    )
+    normalized_door_reconstructions = _normalize_door_body_reconstructions(
+        door_body_reconstructions
     )
 
     groups: list[dict[str, object]] = []
@@ -132,11 +188,65 @@ def build_runtime_scene_manifest(
             "sha256": hashlib.sha256(glb_bytes).hexdigest(),
         },
         "instanceGroups": groups,
+        "doorBodyReconstructions": [
+            reconstruction.to_runtime_dict()
+            for reconstruction in normalized_door_reconstructions
+        ],
         "tours": tours_to_runtime_dicts(tours),
     }
 
 
 # ### Validation helpers ###
+def _normalize_runtime_vector(
+    raw_values: object,
+    field_name: str,
+) -> tuple[float, float, float]:
+    if (
+        isinstance(raw_values, (str, bytes, bytearray))
+        or not isinstance(raw_values, Sequence)
+        or len(raw_values) != 3
+    ):
+        raise ValueError(
+            f"Door reconstruction mirror {field_name} must contain XYZ values."
+        )
+    values = tuple(float(value) for value in raw_values)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError(
+            f"Door reconstruction mirror {field_name} must be finite."
+        )
+    return tuple(0.0 if abs(value) <= 1e-12 else value for value in values)
+
+
+def _normalize_door_body_reconstructions(
+    values: Sequence[DoorBodyReconstruction],
+) -> tuple[DoorBodyReconstruction, ...]:
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(
+        values,
+        Sequence,
+    ):
+        raise TypeError("Door body reconstructions must contain a sequence.")
+    normalized = tuple(values)
+    if not all(isinstance(value, DoorBodyReconstruction) for value in normalized):
+        raise TypeError(
+            "Door body reconstructions require DoorBodyReconstruction values."
+        )
+    keys = [
+        (value.placement_object_id, value.body_object_id)
+        for value in normalized
+    ]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Door body reconstruction targets must be unique.")
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda value: (
+                value.placement_object_id,
+                value.body_object_id,
+            ),
+        )
+    )
+
+
 def _normalize_source_placements(
     source_placements: Mapping[str, PlacedGeneratedModel],
 ) -> dict[str, PlacedGeneratedModel]:

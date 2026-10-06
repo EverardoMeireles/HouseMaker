@@ -15,9 +15,12 @@ from PySide6.QtWidgets import QApplication
 from trimesh.visual.material import SimpleMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.glb import GeneratedModel, PreviewSymmetricObject
+from housemaker.glb import (
+    GeneratedModel,
+    PreviewPlacedObject,
+    PreviewSymmetricObject,
+)
 from housemaker.viewer import GlbViewerWidget
-
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -149,6 +152,81 @@ class SymmetricViewerPreviewTests(unittest.TestCase):
         self.viewer.clear_model()
         self.assertEqual(self.viewer._embedded_symmetric_preview_groups, [])
         self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
+
+    def test_editable_placed_object_keeps_nested_mirrors_without_duplicates(
+        self,
+    ) -> None:
+        self.viewer.close()
+        self.viewer.deleteLater()
+        self.viewer = GlbViewerWidget(placed_object_editing_enabled=True)
+        self.viewer.resize(640, 480)
+        self.viewer.show()
+        _qt_application.processEvents()
+
+        model = _textured_half_model()
+        retained_mesh = model.mesh.copy()
+        placement_transform = np.eye(4, dtype=float)
+        placement_transform[:3, 3] = (4.0, 2.0, 1.0)
+        ordinary_mirror = retained_mesh.copy()
+        ordinary_mirror.vertices[:, 0] *= -1.0
+        ordinary_mirror.faces = np.asarray(
+            ordinary_mirror.faces,
+            dtype=np.int64,
+        )[:, (0, 2, 1)]
+        ordinary_mirror.apply_transform(placement_transform)
+
+        nested_mirror = retained_mesh.copy()
+        nested_mirror.vertices[:, 1] *= -1.0
+        nested_mirror.faces = np.asarray(
+            nested_mirror.faces,
+            dtype=np.int64,
+        )[:, (0, 2, 1)]
+        nested_mirror.apply_transform(placement_transform)
+        retained_world = retained_mesh.copy()
+        retained_world.apply_transform(placement_transform)
+
+        model.preview_base_mesh = model.mesh.copy()
+        model.preview_placed_objects = [
+            PreviewPlacedObject(
+                object_id="placed-door",
+                meshes=(retained_mesh,),
+                placement_transform=placement_transform,
+                world_position=(4.0, 2.0, 1.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+                symmetric_preview_orientation="vertical",
+                symmetric_preview_plane_coordinate=0.0,
+            )
+        ]
+        model.preview_symmetric_objects = [
+            PreviewSymmetricObject(
+                object_id="placed-door",
+                meshes=(retained_world,),
+                orientation="vertical",
+                plane_coordinate=4.0,
+                mirrored_meshes=(ordinary_mirror,),
+            ),
+            PreviewSymmetricObject(
+                object_id="placed-door:nested:1:door-body:side",
+                meshes=(retained_world,),
+                orientation="depth",
+                plane_coordinate=2.0,
+                mirrored_meshes=(nested_mirror,),
+            ),
+        ]
+
+        self.viewer.set_model(model)
+
+        placed_group = self.viewer._placed_object_render_groups["placed-door"]
+        self.assertEqual(len(placed_group.symmetric_groups), 1)
+        self.assertEqual(len(self.viewer._embedded_symmetric_preview_groups), 1)
+        nested_group = self.viewer._embedded_symmetric_preview_groups[0]
+        np.testing.assert_allclose(
+            nested_group.vertices,
+            np.asarray(nested_mirror.vertices)
+            - np.asarray((4.0, 2.0, 1.0)),
+        )
+        self.assertIs(nested_group.mesh_item.parentItem(), placed_group.root_item)
+        self.assertEqual(len(self.viewer._get_symmetric_preview_groups()), 2)
 
     def test_texture_wireframe_visibility_and_timer_lifecycle(self) -> None:
         self.viewer.set_model(_textured_half_model())

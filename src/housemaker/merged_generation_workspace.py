@@ -342,6 +342,7 @@ class MergedGenerationWorkspace(QWidget):
         self._object_reference_edit_runtime: (
             _ObjectReferenceEditRuntime | None
         ) = None
+        self._door_slot_editing_active = False
         self._is_shutdown = False
 
         self.surface_workspace.setParent(self)
@@ -875,6 +876,9 @@ class MergedGenerationWorkspace(QWidget):
         )
         self.video_view.frame_changed.connect(self._handle_video_frame_changed)
         objects.reference_edit_state_changed.connect(self.sync_shared_controls)
+        objects.door_slot_editing_changed.connect(
+            self._handle_door_slot_editing_changed
+        )
         try:
             self.seekbar.valueChanged.disconnect()
         except (RuntimeError, TypeError):
@@ -894,6 +898,13 @@ class MergedGenerationWorkspace(QWidget):
 
         objects._sync_controls()
         surface._sync_controls()
+
+    @Slot(bool)
+    def _handle_door_slot_editing_changed(self, active: bool) -> None:
+        """Keep shared analysis controls out of the door-slot workflow."""
+
+        self._door_slot_editing_active = bool(active)
+        self.sync_shared_controls()
 
     @Slot()
     def _handle_video_frame_changed(self) -> None:
@@ -1387,6 +1398,7 @@ class MergedGenerationWorkspace(QWidget):
         ceiling_inference_is_running = self._ceiling_height_runtime is not None
         self.infer_ceiling_height_button.setEnabled(
             not self._is_shutdown
+            and not self._door_slot_editing_active
             and self.video_view.has_frame()
             and not ceiling_inference_is_running
         )

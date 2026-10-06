@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from housemaker.door_state import DoorLibraryData
 from housemaker.generation_state import GenerationData
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
@@ -33,6 +34,7 @@ from housemaker.models import (
     MAX_DOORWAY_BOTTOM_HEIGHT_METERS,
     MAX_DOORWAY_DEPTH_METERS,
     MAX_DOORWAY_HEIGHT_METERS,
+    MAX_DOORWAY_ID_LENGTH,
     MAX_DOORWAY_WIDTH_METERS,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_INDEX,
@@ -82,6 +84,7 @@ from housemaker.wall_mirroring import (
 # ### Constants ###
 PROJECT_FILE_VERSION = 1
 LEGACY_STAIR_ID_NAMESPACE = uuid.UUID("f630724a-0932-47ba-b363-aad661d86435")
+LEGACY_DOORWAY_ID_NAMESPACE = uuid.UUID("158b1a0b-42aa-4cbf-9eda-415682c311a1")
 
 
 # ### Data models ###
@@ -102,6 +105,7 @@ class ProjectData:
     texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
     wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
     tours: tuple[TourData, ...] = ()
+    doors: DoorLibraryData = field(default_factory=DoorLibraryData)
 
     def __post_init__(self) -> None:
         if not self.doorway_presets:
@@ -123,6 +127,7 @@ def save_project(
     texture_atlases: TextureAtlasData | None = None,
     wall_mirror_links: Iterable[WallMirrorVertexLink] | None = None,
     tours: Iterable[TourData] | None = None,
+    doors: DoorLibraryData | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -155,6 +160,11 @@ def save_project(
         "stairs": _serialize_stairs(stairs or []),
         "wall_mirror_links": wall_mirror_links_to_dicts(wall_mirror_links or ()),
         "tours": tours_to_dicts(tours or ()),
+        "doors": (
+            doors.to_dict()
+            if doors is not None
+            else DoorLibraryData().to_dict()
+        ),
         "levels": [
             {
                 "index": level.index,
@@ -325,6 +335,7 @@ def load_project(path: str | Path) -> ProjectData:
         valid_level_indices=set(level_lookup),
     )
     tours = tours_from_payload(payload.get("tours"))
+    doors = _deserialize_doors(payload.get("doors"))
     loaded_wall_mirror_links = wall_mirror_links_from_payload(
         payload.get("wall_mirror_links"),
         levels=levels,
@@ -356,6 +367,7 @@ def load_project(path: str | Path) -> ProjectData:
         stairs=stairs,
         wall_mirror_links=materialized_wall_mirrors.links,
         tours=tours,
+        doors=doors,
     )
 
 
@@ -435,6 +447,17 @@ def _deserialize_texture_atlases(
         return TextureAtlasData.from_dict(raw_texture_atlases)
     except (KeyError, TypeError, ValueError, OverflowError):
         return TextureAtlasData()
+
+
+def _deserialize_doors(raw_doors: object) -> DoorLibraryData:
+    """Load optional door-library state without breaking older projects."""
+
+    if raw_doors is None:
+        return DoorLibraryData()
+    try:
+        return DoorLibraryData.from_dict(raw_doors)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return DoorLibraryData()
 
 
 def _normalize_optional_path(path_value: object) -> str | None:
@@ -631,6 +654,7 @@ def _deserialize_doorway_presets(raw_presets: object) -> list[DoorwayPreset]:
 
 def _serialize_doorway(doorway: DoorwayData) -> dict[str, float | str]:
     return {
+        "doorway_id": doorway.doorway_id,
         "center_x": float(doorway.center_x),
         "center_y": float(doorway.center_y),
         "width_meters": float(doorway.width_meters),
@@ -648,7 +672,8 @@ def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
         return []
 
     doorways: list[DoorwayData] = []
-    for raw_doorway in raw_doorways:
+    occupied_doorway_ids: set[str] = set()
+    for doorway_position, raw_doorway in enumerate(raw_doorways):
         if not isinstance(raw_doorway, dict):
             continue
 
@@ -657,52 +682,97 @@ def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
         if center_x is None or center_y is None:
             continue
 
-        doorways.append(
-            DoorwayData(
-                center_x=center_x,
-                center_y=center_y,
-                width_meters=_deserialize_doorway_width_meters(
-                    raw_doorway.get(
-                        "width_meters",
-                        DEFAULT_DOORWAY_WIDTH_METERS,
-                    )
-                ),
-                height_meters=_deserialize_doorway_height_meters(
-                    raw_doorway.get(
-                        "height_meters",
-                        DEFAULT_DOORWAY_HEIGHT_METERS,
-                    )
-                ),
-                depth_meters=_deserialize_doorway_depth_meters(
-                    raw_doorway.get(
-                        "depth_meters",
-                        DEFAULT_DOORWAY_DEPTH_METERS,
-                    )
-                ),
-                rotation_degrees=_deserialize_doorway_rotation_degrees(
-                    raw_doorway.get("rotation_degrees", 0.0)
-                ),
-                shape=_deserialize_doorway_shape(
-                    raw_doorway.get("shape", DEFAULT_DOORWAY_SHAPE)
-                ),
-                arch_amount=_deserialize_doorway_arch_amount(
-                    raw_doorway.get(
-                        "arch_amount",
-                        DEFAULT_DOORWAY_ARCH_AMOUNT,
-                    )
-                ),
-                bottom_height_meters=(
-                    _deserialize_doorway_bottom_height_meters(
-                        raw_doorway.get(
-                            "bottom_height_meters",
-                            DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
-                        )
-                    )
-                ),
-            )
+        doorway_id = _deserialize_doorway_id(
+            raw_doorway,
+            doorway_position,
+            occupied_doorway_ids,
         )
+        doorway = DoorwayData(
+            doorway_id=doorway_id,
+            center_x=center_x,
+            center_y=center_y,
+            width_meters=_deserialize_doorway_width_meters(
+                raw_doorway.get(
+                    "width_meters",
+                    DEFAULT_DOORWAY_WIDTH_METERS,
+                )
+            ),
+            height_meters=_deserialize_doorway_height_meters(
+                raw_doorway.get(
+                    "height_meters",
+                    DEFAULT_DOORWAY_HEIGHT_METERS,
+                )
+            ),
+            depth_meters=_deserialize_doorway_depth_meters(
+                raw_doorway.get(
+                    "depth_meters",
+                    DEFAULT_DOORWAY_DEPTH_METERS,
+                )
+            ),
+            rotation_degrees=_deserialize_doorway_rotation_degrees(
+                raw_doorway.get("rotation_degrees", 0.0)
+            ),
+            shape=_deserialize_doorway_shape(
+                raw_doorway.get("shape", DEFAULT_DOORWAY_SHAPE)
+            ),
+            arch_amount=_deserialize_doorway_arch_amount(
+                raw_doorway.get(
+                    "arch_amount",
+                    DEFAULT_DOORWAY_ARCH_AMOUNT,
+                )
+            ),
+            bottom_height_meters=(
+                _deserialize_doorway_bottom_height_meters(
+                    raw_doorway.get(
+                        "bottom_height_meters",
+                        DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
+                    )
+                )
+            ),
+        )
+        doorways.append(doorway)
+        occupied_doorway_ids.add(doorway.doorway_id)
 
     return doorways
+
+
+def _deserialize_doorway_id(
+    raw_doorway: dict[object, object],
+    doorway_position: int,
+    occupied_doorway_ids: set[str],
+) -> str:
+    """Load an ID or derive a repeatable one for a legacy doorway."""
+
+    raw_id = raw_doorway.get("doorway_id")
+    if (
+        isinstance(raw_id, str)
+        and raw_id.strip()
+        and len(raw_id.strip()) <= MAX_DOORWAY_ID_LENGTH
+    ):
+        doorway_id = raw_id.strip()
+    else:
+        try:
+            canonical_payload = json.dumps(
+                raw_doorway,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            canonical_payload = repr(sorted(raw_doorway.items(), key=str))
+        doorway_id = uuid.uuid5(
+            LEGACY_DOORWAY_ID_NAMESPACE,
+            f"{doorway_position}:{canonical_payload}",
+        ).hex
+
+    duplicate_index = 0
+    candidate = doorway_id
+    while candidate in occupied_doorway_ids:
+        candidate = uuid.uuid5(
+            LEGACY_DOORWAY_ID_NAMESPACE,
+            f"duplicate:{doorway_position}:{duplicate_index}:{doorway_id}",
+        ).hex
+        duplicate_index += 1
+    return candidate
 
 
 def _deserialize_doorway_shape(raw_shape: object) -> str:

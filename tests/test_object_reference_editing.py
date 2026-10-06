@@ -249,6 +249,27 @@ class ObjectReferenceEditingPipelineTests(unittest.TestCase):
                 self.assertEqual(result.shape, (1024, 1024, 4))
                 self.assertTrue(np.all(result == (205, 155, 105, 77)))
 
+    def test_responses_models_request_a_plain_neutral_opaque_background(
+        self,
+    ) -> None:
+        for model in ("gpt-5.6-terra", "gpt-5.6-luna"):
+            with self.subTest(model=model):
+                editor = RecordingEditor((205, 155, 105, 255))
+
+                edit_object_reference(
+                    _source_bgra(),
+                    "Remove the floral cover.",
+                    model=model,
+                    api_key="test-key",
+                    image_editor=editor,
+                )
+
+                prompt = " ".join(
+                    str(editor.calls[0]["prompt"]).lower().split()
+                )
+                self.assertIn("plain neutral opaque background", prompt)
+                self.assertNotIn("transparent background", prompt)
+
     def test_rejects_an_unsupported_model_before_calling_the_editor(self) -> None:
         editor = RecordingEditor((205, 155, 105, 77))
 
@@ -519,7 +540,8 @@ class AlternateObjectReferenceEditingAdapterTests(unittest.TestCase):
                 self.assertEqual(arguments["prompt"], "Remove the cover")
                 self.assertEqual(arguments["output_size"], (1024, 1024))
                 self.assertIsNone(arguments["cancellation_check"])
-                self.assertEqual(arguments["background"], "transparent")
+                self.assertEqual(arguments["background"], "opaque")
+                self.assertEqual(arguments["action"], "generate")
 
     def test_qwen_adapter_uses_local_factory_without_api_key(self) -> None:
         calls: list[tuple[bytes, dict[str, object]]] = []

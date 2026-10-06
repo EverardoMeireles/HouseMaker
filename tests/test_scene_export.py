@@ -11,6 +11,15 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+from housemaker.door_geometry import (
+    DoorBodyMirrorConfiguration,
+    assemble_door_model,
+    build_default_door_slot_models,
+)
+from housemaker.door_state import (
+    DOOR_SLOT_KNOB,
+    create_door_definition_for_doorway,
+)
 from housemaker.glb import (
     GeneratedModel,
     PlacedGeneratedModel,
@@ -19,10 +28,12 @@ from housemaker.glb import (
     compose_placed_generated_models,
     export_glb_file,
 )
+from housemaker.models import DoorwayData
 from housemaker.scene_export import (
     INSTANCE_SOURCE_SCENE_NAME,
     RUNTIME_SCENE_FORMAT,
     RUNTIME_SCENE_VERSION,
+    DoorBodyReconstruction,
     build_runtime_scene_manifest,
     write_runtime_scene_manifest,
 )
@@ -72,6 +83,17 @@ def _read_glb_document(payload: bytes) -> dict[str, object]:
     return json.loads(payload[20 : 20 + json_byte_count].rstrip(b" \0"))
 
 
+def _doorway() -> DoorwayData:
+    return DoorwayData(
+        doorway_id="doorway-a",
+        center_x=0.0,
+        center_y=0.0,
+        width_meters=1.0,
+        height_meters=2.2,
+        depth_meters=0.2,
+    )
+
+
 # ### Runtime manifest tests ###
 class RuntimeSceneManifestTests(unittest.TestCase):
     def test_manifest_treats_the_source_placement_as_an_instance(self) -> None:
@@ -100,7 +122,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
 
         self.assertEqual(payload["format"], RUNTIME_SCENE_FORMAT)
         self.assertEqual(payload["version"], RUNTIME_SCENE_VERSION)
-        self.assertEqual(payload["version"], 7)
+        self.assertEqual(payload["version"], 8)
         self.assertEqual(payload["coordinateSystem"], "gltf-y-up")
         self.assertEqual(payload["matrixLayout"], "column-major")
         self.assertEqual(payload["asset"]["glb"], "house.glb")
@@ -114,6 +136,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             {"sourceNodeName", "instances"},
         )
         self.assertEqual(group["sourceNodeName"], "chair")
+        self.assertEqual(payload["doorBodyReconstructions"], [])
         self.assertEqual(
             [serialized["id"] for serialized in group["instances"]],
             ["chair", "instance-chair-1"],
@@ -216,6 +239,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             {"sourceNodeName", "halfMesh", "instances"},
         )
         self.assertIs(group["halfMesh"], True)
+        self.assertEqual(group["sourceNodeName"], "half-chair")
 
     def test_manifest_marks_an_unplaced_half_mesh_instance_group(self) -> None:
         source_model = _source_model()
@@ -239,6 +263,115 @@ class RuntimeSceneManifestTests(unittest.TestCase):
         group = payload["instanceGroups"][0]
         self.assertIs(group["halfMesh"], True)
         self.assertEqual(group["sourceNodeName"], "half-table")
+
+    def test_manifest_exports_door_side_duplication_after_half_mesh(self) -> None:
+        reconstruction = DoorBodyReconstruction(
+            placement_object_id="door-placement:placement-a",
+            body_object_id="door:door-a:slot:body",
+            kept_side="front",
+            mirror_point=(2.0, 1.0, -3.0),
+            mirror_normal=(0.0, 0.0, -1.0),
+        )
+
+        payload = build_runtime_scene_manifest(
+            glb_name="house.glb",
+            glb_bytes=b"glb",
+            source_placements={},
+            instance_placements=(),
+            door_body_reconstructions=(reconstruction,),
+        )
+
+        self.assertEqual(
+            payload["doorBodyReconstructions"],
+            [
+                {
+                    "placementObjectId": "door-placement:placement-a",
+                    "bodyObjectId": "door:door-a:slot:body",
+                    "sideDuplication": {
+                        "keptSide": "front",
+                        "mirrorPlane": {
+                            "point": [2.0, 1.0, -3.0],
+                            "normal": [0.0, 0.0, -1.0],
+                        },
+                        "uvMode": "reuse",
+                        "applyAfter": "halfMesh",
+                    },
+                }
+            ],
+        )
+
+    def test_export_preserves_body_only_locator_on_nested_half_door(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        knob = door.get_slot(DOOR_SLOT_KNOB)
+        assert knob is not None
+        door = door.replace_slot(
+            knob.with_transform(
+                position_meters=(0.4, -0.04, 1.0),
+                joined=True,
+            )
+        )
+        body = door.get_slot("body")
+        assert body is not None
+        assembled = assemble_door_model(
+            door,
+            build_default_door_slot_models(door),
+            body_mirror=DoorBodyMirrorConfiguration(
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.0,
+                side_duplication_plane_coordinate=0.0,
+            ),
+        )
+        placed = PlacedGeneratedModel(
+            object_id="door-placement:placement-a",
+            object_name="Placed door",
+            model=assembled,
+            world_position=(2.0, 3.0, 0.0),
+        )
+        complete_scene = compose_placed_generated_models(
+            _empty_model(),
+            (placed,),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            glb_path = export_glb_file(
+                complete_scene,
+                Path(temporary_directory) / "scene.glb",
+            )
+            document = _read_glb_document(glb_path.read_bytes())
+
+        mesh_nodes = [
+            node
+            for node in document["nodes"]
+            if isinstance(node, dict) and "mesh" in node
+        ]
+        marked_nodes = [
+            node
+            for node in mesh_nodes
+            if "housemakerDoorBody" in node.get("extras", {})
+        ]
+        self.assertEqual(len(marked_nodes), 1)
+        self.assertEqual(
+            marked_nodes[0]["extras"]["housemakerDoorBody"],
+            {
+                "placementObjectId": "door-placement:placement-a",
+                "bodyObjectId": body.source_object_id,
+            },
+        )
+        self.assertIn("halfMesh", marked_nodes[0]["extras"])
+        self.assertTrue(
+            any("door_knob" in str(node.get("name", "")) for node in mesh_nodes)
+        )
+        self.assertTrue(
+            all(
+                "housemakerDoorBody" not in node.get("extras", {})
+                for node in mesh_nodes
+                if "door_knob" in str(node.get("name", ""))
+            )
+        )
 
     def test_manifest_rejects_mixed_half_mesh_instance_metadata(self) -> None:
         source_model = _source_model()
@@ -408,7 +541,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             ],
             ["chair_prototype", "table_prototype"],
         )
-        self.assertEqual(manifest["version"], 7)
+        self.assertEqual(manifest["version"], 8)
         self.assertEqual(
             manifest["asset"]["sha256"],
             hashlib.sha256(final_glb).hexdigest(),

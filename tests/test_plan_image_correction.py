@@ -6,8 +6,10 @@ import json
 import tempfile
 import threading
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import cv2
 import numpy as np
@@ -649,6 +651,131 @@ class OpenAIImageEditTests(unittest.TestCase):
                 output_size=(1024, 768),
                 cancellation_check=None,
             )
+
+    def test_responses_edit_reports_safe_http_error_detail(self) -> None:
+        api_key = "sk-private-reference-edit-key"
+        private_prompt = "Remove the confidential floral cover."
+        safe_detail = "Image generation is unavailable for this project."
+        response = json.dumps(
+            {
+                "error": {
+                    "message": safe_detail,
+                    "private_debug": f"{api_key}: {private_prompt}",
+                }
+            }
+        ).encode()
+        error = HTTPError(
+            correction.OPENAI_RESPONSES_URL,
+            403,
+            "Forbidden",
+            hdrs=None,
+            fp=BytesIO(response),
+        )
+
+        with (
+            patch.object(correction, "urlopen", side_effect=error),
+            self.assertRaises(PlanImageCorrectionInferenceError) as raised,
+        ):
+            openai_responses_image_edit(
+                b"input-png",
+                model=PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+                api_key=api_key,
+                prompt=private_prompt,
+                output_size=(1024, 768),
+                cancellation_check=None,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("403", message)
+        self.assertIn(safe_detail, message)
+        self.assertNotIn(api_key, message)
+        self.assertNotIn(private_prompt, message)
+        self.assertNotIn("private_debug", message)
+
+    def test_responses_edit_reports_completed_image_tool_failure(self) -> None:
+        safe_detail = "The image edit was rejected by the safety system."
+        private_prompt = "Remove a confidential object."
+        response = json.dumps(
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "status": "failed",
+                        "error": {
+                            "message": safe_detail,
+                            "private_debug": private_prompt,
+                        },
+                    }
+                ],
+            }
+        ).encode()
+
+        with (
+            patch.object(
+                correction,
+                "urlopen",
+                return_value=FakeResponse(response),
+            ),
+            self.assertRaises(PlanImageCorrectionInferenceError) as raised,
+        ):
+            openai_responses_image_edit(
+                b"input-png",
+                model=PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+                api_key="sk-test",
+                prompt=private_prompt,
+                output_size=(1024, 768),
+                cancellation_check=None,
+            )
+
+        message = str(raised.exception)
+        self.assertIn(safe_detail, message)
+        self.assertNotIn(private_prompt, message)
+        self.assertNotIn("private_debug", message)
+
+    def test_responses_edit_reports_completed_refusal_without_prompt_leak(
+        self,
+    ) -> None:
+        safe_detail = "I cannot complete this image edit."
+        private_prompt = "Remove a confidential object."
+        response = json.dumps(
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "refusal",
+                                "refusal": safe_detail,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ).encode()
+
+        with (
+            patch.object(
+                correction,
+                "urlopen",
+                return_value=FakeResponse(response),
+            ),
+            self.assertRaises(PlanImageCorrectionInferenceError) as raised,
+        ):
+            openai_responses_image_edit(
+                b"input-png",
+                model=PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+                api_key="sk-test",
+                prompt=private_prompt,
+                output_size=(1024, 768),
+                cancellation_check=None,
+            )
+
+        message = str(raised.exception)
+        self.assertIn(safe_detail, message)
+        self.assertNotIn(private_prompt, message)
 
     def test_responses_edit_can_request_a_transparent_background(self) -> None:
         returned = _png_bytes(_plan_array((320, 240)))

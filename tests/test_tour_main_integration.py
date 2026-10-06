@@ -108,7 +108,15 @@ class TourMainIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             tab_names,
-            ["Canvas", "3D scene", "Atlas", "Generation", "Tour", "Settings"],
+            [
+                "Canvas",
+                "3D scene",
+                "Atlas",
+                "Generation",
+                "Doors",
+                "Tour",
+                "Settings",
+            ],
         )
         self.assertEqual(
             self.workspace.tour_workspace_tab_index,
@@ -1479,6 +1487,7 @@ class TourMainIntegrationTests(unittest.TestCase):
             source_placements={},
             instance_placements=(),
             tours=(tour,),
+            door_body_reconstructions=(),
         )
 
 

@@ -18,20 +18,15 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker import object_symmetry
 from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM
-from housemaker.object_texture_variants import (
-    PBR_MAP_METALLIC,
-    PBR_MAP_NORMAL,
-    PBR_MAP_ROUGHNESS,
-    TEXTURE_RESOLUTIONS,
-)
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+    AXIS_HALF_SIDE_NEGATIVE,
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
     SYMMETRIC_QUARTER_METADATA_VERSION,
-    SYMMETRIC_SQUARE_PAIR_ATLAS_RESOLUTION_BY_CONTENT_RESOLUTION,
     SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
-    SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT,
+    SYMMETRIC_SQUARE_PAIR_ATLAS_RESOLUTION_BY_CONTENT_RESOLUTION,
     SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+    SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT,
     SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
     SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER,
     SymmetricDivisionMetadata,
@@ -41,11 +36,19 @@ from housemaker.object_symmetry import (
     SymmetricSquarePairTextureVariants,
     build_automatic_symmetric_geometry,
     build_automatic_symmetric_object_variants,
+    build_axis_mirror_retexture_proxy_glb,
     build_symmetric_half_texture_variants,
     build_symmetric_pair_texture_variants,
     build_symmetric_quarter_texture_variants,
     build_symmetric_retexture_proxy_glb,
     build_symmetric_square_pair_texture_variants,
+    clip_glb_to_axis_half,
+)
+from housemaker.object_texture_variants import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    TEXTURE_RESOLUTIONS,
 )
 from housemaker.object_uv_scan_projection import (
     LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
@@ -778,6 +781,67 @@ class SymmetricRetextureProxyTests(unittest.TestCase):
             atol=1e-7,
         )
         self.assertEqual(object_symmetry._collect_material_textures(scene), [])
+
+
+# ### Arbitrary-axis half tests ###
+class AxisHalfTests(unittest.TestCase):
+    def test_depth_clip_preserves_texture_and_uvs(self) -> None:
+        source_bounds = _z_up_world_mesh(_box_glb()).bounds
+        result = clip_glb_to_axis_half(
+            _box_glb(),
+            axis=1,
+            kept_side=AXIS_HALF_SIDE_NEGATIVE,
+            plane_coordinate=0.0,
+        )
+        scene = _load_scene(result.glb_bytes)
+        retained = _z_up_world_mesh(result.glb_bytes)
+
+        self.assertEqual(result.axis, 1)
+        self.assertEqual(result.kept_side, AXIS_HALF_SIDE_NEGATIVE)
+        np.testing.assert_allclose(
+            retained.bounds[:, 1],
+            (source_bounds[0, 1], 0.0),
+            atol=1e-7,
+        )
+        self.assertTrue(object_symmetry._collect_material_textures(scene))
+        self.assertTrue(
+            all(
+                getattr(mesh.visual, "uv", None) is not None
+                for mesh in scene.geometry.values()
+            )
+        )
+
+    def test_depth_proxy_reconstructs_both_sides_with_uv_reuse(self) -> None:
+        source_bounds = _z_up_world_mesh(_box_glb()).bounds
+        retained = clip_glb_to_axis_half(
+            _box_glb(),
+            axis=1,
+            kept_side=AXIS_HALF_SIDE_NEGATIVE,
+            plane_coordinate=0.0,
+        )
+        proxy = build_axis_mirror_retexture_proxy_glb(
+            retained.glb_bytes,
+            axis=1,
+            plane_coordinate=retained.plane_coordinate,
+        )
+        scene = _load_scene(proxy)
+        reconstructed = _z_up_world_mesh(proxy)
+
+        np.testing.assert_allclose(
+            reconstructed.bounds[:, 1],
+            source_bounds[:, 1],
+            atol=1e-7,
+        )
+        self.assertEqual(len(scene.geometry), 2)
+        uv_sets = [
+            np.asarray(mesh.visual.uv, dtype=float)
+            for mesh in scene.geometry.values()
+        ]
+        np.testing.assert_allclose(
+            SymmetricRetextureProxyTests._sorted_rows(uv_sets[0]),
+            SymmetricRetextureProxyTests._sorted_rows(uv_sets[1]),
+            atol=1e-7,
+        )
 
 
 # ### Automatic textured symmetry tests ###

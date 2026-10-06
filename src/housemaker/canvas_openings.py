@@ -402,6 +402,7 @@ def _build_doorway_target(
             kind=CANVAS_OPENING_DOORWAY,
             level_index=level.index,
             item_index=doorway_index,
+            stable_id=doorway.doorway_id,
         ),
         wall_surface_id=surface.surface_id,
         plane_start_world=tuple(float(value) for value in plane_start),

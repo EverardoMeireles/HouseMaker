@@ -86,6 +86,16 @@ reconstruct any object surface hidden by the removed or changed item. Transparen
 source pixels are background, not an edit boundary. Center the complete object and
 keep it fully inside the square. Return one isolated object on a transparent
 background, with no text, border, scenery, or additional object."""
+OPENAI_RESPONSES_OBJECT_REFERENCE_GENERATION_INSTRUCTION = """The supplied image contains one foreground object isolated with the user's mask.
+Use that object as the visual reference and generate a complete new 1024x1024 image
+that applies this requested semantic change: {request}
+
+Keep the same object, viewpoint, perspective, pose, proportions, scale, lighting,
+and every source detail not explicitly affected by the request. Plausibly
+reconstruct any object surface hidden by the removed or changed item. Transparent
+source pixels are background, not an edit boundary. Center the complete object and
+keep it fully inside the square. Return one isolated object on a plain neutral
+opaque background, with no text, border, scenery, or additional object."""
 QWEN_OBJECT_REFERENCE_GENERATION_INSTRUCTION = """This is an RGBA image with transparency.
 The non-transparent pixels are a user selection and may show only one visible
 surface or part of an object. Treat that selection as visual evidence, not as the
@@ -166,7 +176,12 @@ def edit_object_reference(
     _raise_if_cancelled(cancellation_check)
 
     editor = image_editor or _default_image_editor(normalized_model)
-    provider_prompt = OBJECT_REFERENCE_GENERATION_INSTRUCTION.format(
+    prompt_template = (
+        OPENAI_RESPONSES_OBJECT_REFERENCE_GENERATION_INSTRUCTION
+        if normalized_model in OPENAI_RESPONSES_REFERENCE_EDIT_MODELS
+        else OBJECT_REFERENCE_GENERATION_INSTRUCTION
+    )
+    provider_prompt = prompt_template.format(
         request=normalized_prompt,
     )
     try:
@@ -307,7 +322,8 @@ def openai_responses_object_reference_edit(
             prompt=_normalize_prompt(prompt),
             output_size=size,
             cancellation_check=cancellation_check,
-            background="transparent",
+            background="opaque",
+            action="generate",
         )
     except PlanImageCorrectionCancelled:
         raise ObjectReferenceEditingCancelled(

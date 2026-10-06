@@ -26,11 +26,11 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.uv_integrity import (
-    UV_FINGERPRINT_VERSION,
-    UvFingerprint,
-    UvIntegrityError,
-    build_uv_fingerprint,
+from housemaker.door_state import (
+    DOOR_SIDE_DUPLICATION_BACK,
+    DOOR_SIDE_DUPLICATION_FRONT,
+    DoorSideDuplication,
+    DoorSideDuplicationMetadata,
 )
 from housemaker.generation_state import (
     MASK_MODE_PAINT,
@@ -40,28 +40,32 @@ from housemaker.generation_state import (
     MaskStroke,
 )
 from housemaker.generation_workspace import (
+    DOOR_COMPONENT_PIPELINE_KEY,
+    DOOR_SIDE_DUPLICATION_PIPELINE_KEY,
     GLASS_CONVERSION_PIPELINE_KEY,
     GLASS_MATERIAL_SOURCE_PREFAB,
     LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
-    ObjectSymmetricDivisionMetadata,
     SCAN_PROJECTION_PIPELINE_KEY,
     TEXTURE_INPAINT_STROKES_PIPELINE_KEY,
     VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
-    TextureRegenerationOutcome,
-    TextureRegenerationRequest,
-    TextureRegenerationWorker,
     GenerationWorkspace,
     MeshyModelExecutor,
     MeshyTextureRegenerator,
-    _TextureRegenerationPreflight,
-    _GenerationCancelled,
+    ObjectSymmetricDivisionMetadata,
+    TextureRegenerationOutcome,
+    TextureRegenerationRequest,
+    TextureRegenerationWorker,
     _build_regenerated_texture_pipeline,
+    _GenerationCancelled,
     _materialize_texture_regeneration_preflight,
     _persist_generated_named_asset,
+    _prepare_and_persist_texture_regeneration,
     _remap_faces_by_world_geometry,
+    _texture_regeneration_scan_target,
+    _TextureRegenerationPreflight,
     _validate_symmetric_texture_regeneration_uvs,
     _with_persisted_canonical_uv_fingerprint,
-    _texture_regeneration_scan_target,
+    get_door_side_duplication_metadata,
 )
 from housemaker.glass_material import (
     HOUSEMAKER_GLASS_MATERIAL_PROFILE,
@@ -76,19 +80,30 @@ from housemaker.glb import (
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+    AXIS_HALF_SIDE_POSITIVE,
     SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
     SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
     SYMMETRIC_DIVISION_SIDE_LEFT,
     SYMMETRIC_DIVISION_SIDE_RIGHT,
-    SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
     SYMMETRIC_QUARTER_METADATA_VERSION,
-    SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT,
+    SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
     SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+    SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT,
     SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
     SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER,
+    AxisHalfClipResult,
     SymmetricDivisionMetadata,
+    SymmetricDivisionResult,
     SymmetricSquarePairTextureVariants,
     build_symmetric_retexture_proxy_glb,
+)
+from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    TEXTURE_RESOLUTIONS,
+    ObjectTextureVariants,
 )
 from housemaker.object_uv_scan_projection import (
     DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
@@ -99,27 +114,24 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionResult,
     ScanProjectionStats,
 )
-from housemaker.object_texture_variants import (
-    ATLAS_MAP_BASE_COLOR,
-    PBR_MAP_METALLIC,
-    PBR_MAP_NORMAL,
-    PBR_MAP_ROUGHNESS,
-    TEXTURE_RESOLUTIONS,
-    ObjectTextureVariants,
+from housemaker.safe_duplicate_face_removal import (
+    remove_safe_duplicate_faces_from_glb,
 )
 from housemaker.settings_widget import GenerationServiceSettings
 from housemaker.texture_color_balance import (
     ColorBalanceAdjustment,
     TextureColorBalanceSettings,
 )
-from housemaker.safe_duplicate_face_removal import (
-    remove_safe_duplicate_faces_from_glb,
-)
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     UnusedFaceRemovalResult,
 )
-
+from housemaker.uv_integrity import (
+    UV_FINGERPRINT_VERSION,
+    UvFingerprint,
+    UvIntegrityError,
+    build_uv_fingerprint,
+)
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -220,6 +232,36 @@ def _uv_glb(
             )
     material = PBRMaterial(baseColorTexture=texture_image)
     mesh.visual = TextureVisuals(uv=uv, material=material)
+    return bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+
+def _textured_box_glb() -> bytes:
+    """Build a shallow textured Z-up box for door-depth tests."""
+
+    mesh = trimesh.creation.box(extents=(1.0, 0.2, 2.0))
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    uv = np.column_stack(
+        (
+            (vertices[:, 0] - np.min(vertices[:, 0]))
+            / np.ptp(vertices[:, 0])
+            * 0.8
+            + 0.1,
+            (vertices[:, 2] - np.min(vertices[:, 2]))
+            / np.ptp(vertices[:, 2])
+            * 0.8
+            + 0.1,
+        )
+    )
+    mesh.visual = TextureVisuals(
+        uv=uv,
+        material=PBRMaterial(
+            baseColorTexture=Image.new(
+                "RGBA",
+                (8, 8),
+                (35, 95, 155, 255),
+            )
+        ),
+    )
     return bytes(trimesh.Scene(mesh).export(file_type="glb"))
 
 
@@ -363,10 +405,61 @@ def _texture_variants(
     )
 
 
+def _door_texture_variants() -> ObjectTextureVariants:
+    """Build lightweight textured variants with measurable authored UVs."""
+
+    glb = _textured_box_glb()
+    texture_pngs = {
+        resolution: _png_bytes((35, 95, 155, 255))
+        for resolution in TEXTURE_RESOLUTIONS
+    }
+    previews = {
+        resolution: np.full(
+            (8, 8, 4),
+            (35, 95, 155, 255),
+            dtype=np.uint8,
+        )
+        for resolution in TEXTURE_RESOLUTIONS
+    }
+    return ObjectTextureVariants(
+        glb_by_resolution={
+            resolution: glb for resolution in TEXTURE_RESOLUTIONS
+        },
+        texture_png_by_resolution=texture_pngs,
+        preview_rgba_by_resolution=previews,
+    )
+
+
 def _model_with_variants(variants: ObjectTextureVariants) -> GeneratedModel:
     model = import_generated_glb(variants.glb_by_resolution[1024])
     model.object_texture_variants = variants
     return model
+
+
+def _symmetric_square_pair_variants() -> SymmetricSquarePairTextureVariants:
+    """Build compact deterministic outputs for a mocked symmetric transform."""
+
+    resolutions = (512, 1024)
+    return SymmetricSquarePairTextureVariants(
+        glb_by_resolution={
+            resolution: _uv_glb(
+                left_packed=True,
+                texture_resolution=resolution,
+            )
+            for resolution in resolutions
+        },
+        texture_png_by_resolution={
+            resolution: _png_bytes((40, 80, 120, 255))
+            for resolution in resolutions
+        },
+        preview_rgba_by_resolution={
+            resolution: np.broadcast_to(
+                np.asarray((40, 80, 120, 255), dtype=np.uint8),
+                (resolution, resolution, 4),
+            )
+            for resolution in resolutions
+        },
+    )
 
 
 def _scan_projection_result(
@@ -466,6 +559,23 @@ class _SequenceExecutor:
         return self.models.pop(0)
 
 
+class _EchoTextureRegenerator:
+    """Return the exact provider proxy while recording request order."""
+
+    def __init__(self) -> None:
+        self.requests: list[TextureRegenerationRequest] = []
+
+    def regenerate(
+        self,
+        request: TextureRegenerationRequest,
+    ) -> MeshyGenerationResult:
+        self.requests.append(request)
+        return MeshyGenerationResult(
+            "echo-door-texture-task",
+            request.model_glb,
+        )
+
+
 class _BlockingTextureRegenerator:
     def __init__(self, result: MeshyGenerationResult) -> None:
         self.result = result
@@ -549,6 +659,386 @@ class TextureRegenerationRequestTests(unittest.TestCase):
         )
         self.assertTrue(locally_unwrapped_request.enable_original_uv)
         self.assertFalse(locally_unwrapped_request.preserve_symmetric_uvs)
+
+    def test_new_symmetric_division_is_normalized_and_cannot_repeat(self) -> None:
+        fingerprint = UvFingerprint(UV_FINGERPRINT_VERSION, "a" * 64, 2)
+        common = {
+            "object_id": "door-body",
+            "reference_frame_index": 0,
+            "reference_image_bgra": np.zeros((2, 2, 4), dtype=np.uint8),
+            "model_glb": b"model",
+            "settings": GenerationServiceSettings(),
+            "enable_original_uv": True,
+            "submitted_uv_fingerprint": fingerprint,
+        }
+
+        request = TextureRegenerationRequest(
+            **common,
+            new_symmetric_division_orientation=" VERTICAL ",
+        )
+
+        self.assertEqual(
+            request.new_symmetric_division_orientation,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+        )
+        with self.assertRaisesRegex(ValueError, "cannot preserve and newly apply"):
+            TextureRegenerationRequest(
+                **common,
+                preserve_symmetric_uvs=True,
+                new_symmetric_division_orientation=(
+                    SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "orientation"):
+            TextureRegenerationRequest(
+                **common,
+                new_symmetric_division_orientation="depth",
+            )
+
+    def test_door_side_duplication_request_is_authored_uv_only(self) -> None:
+        fingerprint = UvFingerprint(UV_FINGERPRINT_VERSION, "a" * 64, 2)
+        common = {
+            "object_id": "door-body",
+            "reference_frame_index": 0,
+            "reference_image_bgra": np.zeros((2, 2, 4), dtype=np.uint8),
+            "model_glb": b"model",
+            "settings": GenerationServiceSettings(),
+        }
+        duplication = DoorSideDuplication(
+            kept_side=DOOR_SIDE_DUPLICATION_FRONT
+        )
+
+        request = TextureRegenerationRequest(
+            **common,
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+            new_door_side_duplication=duplication,
+        )
+
+        self.assertEqual(request.new_door_side_duplication, duplication)
+        with self.assertRaisesRegex(ValueError, "authored UV"):
+            TextureRegenerationRequest(
+                **common,
+                new_door_side_duplication=duplication,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot preserve and newly"):
+            TextureRegenerationRequest(
+                **common,
+                enable_original_uv=True,
+                submitted_uv_fingerprint=fingerprint,
+                preserve_door_side_duplication=True,
+                new_door_side_duplication=duplication,
+            )
+
+    def test_door_body_division_runs_after_retexture_before_persistence(
+        self,
+    ) -> None:
+        source_variants = _texture_variants(1)
+        divided_variants = _symmetric_square_pair_variants()
+        symmetry = SymmetricDivisionMetadata(
+            version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+            texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 4)),
+            tie_broken_randomly=False,
+        )
+        division_result = SymmetricDivisionResult(
+            variants=divided_variants,
+            orientation=symmetry.orientation,
+            kept_side=symmetry.kept_side,
+            plane_coordinate=symmetry.plane_coordinate,
+            metadata=symmetry,
+        )
+        request = TextureRegenerationRequest(
+            object_id="door-body",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_variants.glb_by_resolution[1024],
+            settings=GenerationServiceSettings(),
+            new_symmetric_division_orientation=(
+                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
+            ),
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult(
+                "door-texture-task",
+                source_variants.glb_by_resolution[2048],
+            ),
+        )
+        record = replace(
+            _record("door-body", "door-body.glb"),
+            pipeline={
+                "mode": "door_component",
+                DOOR_COMPONENT_PIPELINE_KEY: {
+                    "door_id": "door-1",
+                    "slot_id": "body",
+                },
+                LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory)
+            with patch(
+                "housemaker.generation_workspace."
+                "build_automatic_symmetric_object_variants",
+                return_value=division_result,
+            ) as divide:
+                saved = _prepare_and_persist_texture_regeneration(
+                    asset_directory,
+                    outcome,
+                    _model_with_variants(source_variants),
+                    None,
+                    1024,
+                    record,
+                )
+
+            divide.assert_called_once_with(
+                source_variants.glb_by_resolution[2048],
+                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            )
+            self.assertEqual(
+                saved.next_pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+                record.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+            )
+            self.assertEqual(
+                saved.next_pipeline["symmetric_division"],
+                symmetry.to_pipeline_dict(),
+            )
+            self.assertEqual(
+                set(saved.next_pipeline["texture_variants"]),
+                {"512", "1024"},
+            )
+            self.assertEqual(
+                saved.next_pipeline["selected_texture_resolution"],
+                1024,
+            )
+            self.assertEqual(
+                saved.next_pipeline["postprocessed_asset_path"],
+                saved.next_pipeline["texture_variants"]["1024"][
+                    "glb_asset_path"
+                ],
+            )
+            self.assertEqual(
+                saved.outcome.final_uv_fingerprint,
+                build_uv_fingerprint(
+                    divided_variants.glb_by_resolution[1024]
+                ),
+            )
+            self.assertTrue(
+                all(
+                    asset_directory.joinpath(path).is_file()
+                    for path in saved.persisted_asset_paths
+                )
+            )
+
+    def test_door_side_duplication_cuts_geometry_without_repacking_texture(
+        self,
+    ) -> None:
+        variants = _door_texture_variants()
+        fingerprint = build_uv_fingerprint(
+            variants.glb_by_resolution[2048]
+        )
+        duplication = DoorSideDuplication(
+            kept_side=DOOR_SIDE_DUPLICATION_FRONT
+        )
+        request = TextureRegenerationRequest(
+            object_id="door-body",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=variants.glb_by_resolution[2048],
+            settings=GenerationServiceSettings(),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+            new_door_side_duplication=duplication,
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult(
+                "door-side-task",
+                variants.glb_by_resolution[2048],
+            ),
+            preserved_uv_fingerprint=fingerprint,
+            final_uv_fingerprint=fingerprint,
+        )
+        record = replace(
+            _record("door-body", "door-body.glb"),
+            pipeline={
+                "mode": "door_component",
+                DOOR_COMPONENT_PIPELINE_KEY: {
+                    "door_id": "door-1",
+                    "slot_id": "body",
+                },
+                LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory)
+            saved = _prepare_and_persist_texture_regeneration(
+                asset_directory,
+                outcome,
+                _model_with_variants(variants),
+                None,
+                1024,
+                record,
+            )
+
+            metadata = get_door_side_duplication_metadata(
+                replace(record, pipeline=saved.next_pipeline)
+            )
+            self.assertIsNotNone(metadata)
+            assert metadata is not None
+            self.assertEqual(
+                metadata.kept_side,
+                DOOR_SIDE_DUPLICATION_FRONT,
+            )
+            self.assertEqual(
+                set(saved.next_pipeline["texture_variants"]),
+                {"512", "1024", "2048"},
+            )
+            for resolution, variant in saved.next_pipeline[
+                "texture_variants"
+            ].items():
+                persisted_texture = asset_directory.joinpath(
+                    variant["texture_asset_path"]
+                ).read_bytes()
+                self.assertEqual(
+                    persisted_texture,
+                    variants.texture_png_by_resolution[int(resolution)],
+                )
+                self.assertNotEqual(
+                    asset_directory.joinpath(
+                        variant["glb_asset_path"]
+                    ).read_bytes(),
+                    variants.glb_by_resolution[int(resolution)],
+                )
+
+    def test_symmetric_division_precedes_door_side_duplication(self) -> None:
+        source_variants = _door_texture_variants()
+        divided_variants = _symmetric_square_pair_variants()
+        fingerprint = build_uv_fingerprint(
+            source_variants.glb_by_resolution[2048]
+        )
+        symmetry = SymmetricDivisionMetadata(
+            version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+            texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 4)),
+            tie_broken_randomly=False,
+        )
+        division_result = SymmetricDivisionResult(
+            variants=divided_variants,
+            orientation=symmetry.orientation,
+            kept_side=symmetry.kept_side,
+            plane_coordinate=symmetry.plane_coordinate,
+            metadata=symmetry,
+        )
+        request = TextureRegenerationRequest(
+            object_id="door-body",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_variants.glb_by_resolution[2048],
+            settings=GenerationServiceSettings(),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+            new_symmetric_division_orientation=(
+                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
+            ),
+            new_door_side_duplication=DoorSideDuplication(
+                kept_side=DOOR_SIDE_DUPLICATION_BACK
+            ),
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult(
+                "door-quarter-task",
+                source_variants.glb_by_resolution[2048],
+            ),
+            preserved_uv_fingerprint=fingerprint,
+            final_uv_fingerprint=fingerprint,
+        )
+        record = replace(
+            _record("door-body", "door-body.glb"),
+            pipeline={
+                DOOR_COMPONENT_PIPELINE_KEY: {
+                    "door_id": "door-1",
+                    "slot_id": "body",
+                },
+                LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+            },
+        )
+        operation_order: list[str] = []
+
+        def divide(*_args: object, **_kwargs: object) -> SymmetricDivisionResult:
+            operation_order.append("symmetric")
+            return division_result
+
+        def clip(
+            source_glb: bytes,
+            *,
+            axis: int,
+            kept_side: str,
+            plane_coordinate: float | None = None,
+        ) -> AxisHalfClipResult:
+            operation_order.append("side")
+            self.assertEqual(axis, 1)
+            self.assertEqual(kept_side, AXIS_HALF_SIDE_POSITIVE)
+            return AxisHalfClipResult(
+                glb_bytes=source_glb,
+                axis=axis,
+                kept_side=kept_side,
+                plane_coordinate=(
+                    0.25 if plane_coordinate is None else plane_coordinate
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch(
+            "housemaker.generation_workspace."
+            "build_automatic_symmetric_object_variants",
+            side_effect=divide,
+        ), patch(
+            "housemaker.generation_workspace.clip_glb_to_axis_half",
+            side_effect=clip,
+        ):
+            saved = _prepare_and_persist_texture_regeneration(
+                Path(temporary_directory),
+                outcome,
+                _model_with_variants(source_variants),
+                None,
+                1024,
+                record,
+            )
+
+        self.assertEqual(operation_order, ["symmetric", "side", "side"])
+        self.assertEqual(
+            saved.next_pipeline["symmetric_division"],
+            symmetry.to_pipeline_dict(),
+        )
+        self.assertEqual(
+            saved.next_pipeline[DOOR_SIDE_DUPLICATION_PIPELINE_KEY],
+            DoorSideDuplicationMetadata(
+                kept_side=DOOR_SIDE_DUPLICATION_BACK,
+                plane_coordinate=0.25,
+            ).to_pipeline_dict(),
+        )
+        self.assertEqual(
+            set(saved.next_pipeline["texture_variants"]),
+            {"512", "1024"},
+        )
 
     def test_request_snapshots_and_validates_camera_percentages(self) -> None:
         percentages = [35, 25, 15, 10, 10, 5]
@@ -1139,6 +1629,87 @@ class SymmetricRetextureProxyTests(unittest.TestCase):
             sum(len(mesh.faces) for mesh in proxy_scene.geometry.values()),
             28,
         )
+
+    def test_door_retexture_builds_x_then_y_proxy_and_preserves_uvs(
+        self,
+    ) -> None:
+        retained_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=2048,
+        )
+        fingerprint = build_uv_fingerprint(retained_glb)
+        symmetry = SymmetricDivisionMetadata(
+            version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+            texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 4)),
+            tie_broken_randomly=False,
+        )
+        side_duplication = DoorSideDuplicationMetadata(
+            kept_side=DOOR_SIDE_DUPLICATION_FRONT,
+            plane_coordinate=0.0,
+        )
+        request = TextureRegenerationRequest(
+            object_id="door-body",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=retained_glb,
+            settings=GenerationServiceSettings(),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+            preserve_symmetric_uvs=True,
+            preserve_door_side_duplication=True,
+        )
+        regenerator = _EchoTextureRegenerator()
+        worker = TextureRegenerationWorker(
+            regenerator,
+            _SequenceExecutor([_model_with_variants(_door_texture_variants())]),
+            request,
+            symmetry=symmetry,
+            door_side_duplication=side_duplication,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+        operation_order: list[str] = []
+
+        def symmetric_proxy(
+            source_glb: bytes,
+            *_args: object,
+        ) -> bytes:
+            operation_order.append("x")
+            return source_glb
+
+        def side_proxy(
+            source_glb: bytes,
+            **_kwargs: object,
+        ) -> bytes:
+            operation_order.append("y")
+            return source_glb
+
+        with patch(
+            "housemaker.generation_workspace."
+            "build_symmetric_retexture_proxy_glb",
+            side_effect=symmetric_proxy,
+        ), patch(
+            "housemaker.generation_workspace."
+            "build_axis_mirror_retexture_proxy_glb",
+            side_effect=side_proxy,
+        ):
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        self.assertEqual(operation_order, ["x", "y"])
+        self.assertEqual(len(regenerator.requests), 1)
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(outcome.preserved_uv_fingerprint, fingerprint)
+        self.assertEqual(outcome.final_uv_fingerprint, fingerprint)
 
 
 class MeshyTextureRegeneratorTests(unittest.TestCase):
@@ -2194,6 +2765,241 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             _qt_application.processEvents()
             QTest.qWait(10)
         self.assertTrue(event.is_set(), "Blocking provider did not start.")
+
+    def test_door_body_can_request_symmetry_without_leaking_to_hardware(
+        self,
+    ) -> None:
+        component_glb = _uv_glb(texture_resolution=8)
+        component_model = import_generated_glb(component_glb)
+        self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="Door - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                preview_model=component_model,
+                editable_transform=False,
+                side_duplication=DoorSideDuplication(
+                    kept_side=DOOR_SIDE_DUPLICATION_FRONT
+                ),
+            )
+        )
+        self._load_reference()
+
+        self.assertTrue(self.workspace.symmetric_division_checkbox.isEnabled())
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+        body_preflight = self.workspace._build_texture_regeneration_request()
+        self.assertIsNotNone(body_preflight)
+        assert body_preflight is not None
+        self.assertEqual(
+            body_preflight.new_symmetric_division_orientation,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+        )
+        self.assertFalse(body_preflight.preserve_symmetric_uvs)
+        self.assertEqual(
+            body_preflight.new_door_side_duplication,
+            DoorSideDuplication(
+                kept_side=DOOR_SIDE_DUPLICATION_FRONT
+            ),
+        )
+        self.assertFalse(body_preflight.preserve_door_side_duplication)
+        body_request = _materialize_texture_regeneration_preflight(
+            body_preflight,
+            self.asset_directory,
+        ).request
+        self.assertEqual(
+            body_request.new_symmetric_division_orientation,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+        )
+        self.assertEqual(
+            body_request.new_door_side_duplication,
+            DoorSideDuplication(
+                kept_side=DOOR_SIDE_DUPLICATION_FRONT
+            ),
+        )
+        body_record = next(
+            record
+            for record in self.workspace._data.generated_objects
+            if record.object_id == "door-body"
+        )
+        body_record_index = self.workspace._data.generated_objects.index(
+            body_record
+        )
+        self.workspace._data.generated_objects[body_record_index] = replace(
+            body_record,
+            pipeline={
+                **body_record.pipeline,
+                "symmetric_division": {
+                    "version": 1,
+                    "orientation": "vertical",
+                    "kept_side": "left",
+                    "plane_coordinate": 0.0,
+                    "texture_content_half": "left",
+                },
+                DOOR_SIDE_DUPLICATION_PIPELINE_KEY: (
+                    DoorSideDuplicationMetadata(
+                        kept_side=DOOR_SIDE_DUPLICATION_FRONT,
+                        plane_coordinate=0.0,
+                    ).to_pipeline_dict()
+                ),
+            },
+        )
+        repeated_preflight = self.workspace._build_texture_regeneration_request()
+        self.assertIsNotNone(repeated_preflight)
+        assert repeated_preflight is not None
+        self.assertTrue(repeated_preflight.preserve_symmetric_uvs)
+        self.assertIsNone(
+            repeated_preflight.new_symmetric_division_orientation
+        )
+        self.assertTrue(
+            repeated_preflight.preserve_door_side_duplication
+        )
+        self.assertIsNone(repeated_preflight.new_door_side_duplication)
+
+        self.workspace.register_door_component_model(
+            object_id="door-knob",
+            object_name="Door - Knob",
+            door_id="door-1",
+            slot_id="door_knob",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                preview_model=component_model,
+                editable_transform=True,
+            )
+        )
+
+        self.assertTrue(self.workspace.symmetric_division_checkbox.isChecked())
+        self.assertFalse(self.workspace.symmetric_division_checkbox.isEnabled())
+        knob_preflight = self.workspace._build_texture_regeneration_request()
+        self.assertIsNotNone(knob_preflight)
+        assert knob_preflight is not None
+        self.assertIsNone(knob_preflight.new_symmetric_division_orientation)
+        self.assertFalse(knob_preflight.preserve_door_side_duplication)
+        self.assertIsNone(knob_preflight.new_door_side_duplication)
+        with self.assertRaisesRegex(ValueError, "only be applied to a door body"):
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                preview_model=component_model,
+                editable_transform=True,
+                side_duplication=DoorSideDuplication(),
+            )
+
+    def test_door_body_symmetric_texture_commit_preserves_undo(self) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="Door - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                preview_model=component_model,
+                editable_transform=False,
+            )
+        )
+        self._load_reference()
+        source_variants = _texture_variants(5)
+        divided_variants = _symmetric_square_pair_variants()
+        symmetry = SymmetricDivisionMetadata(
+            version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+            texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 4)),
+            tie_broken_randomly=False,
+        )
+        division_result = SymmetricDivisionResult(
+            variants=divided_variants,
+            orientation=symmetry.orientation,
+            kept_side=symmetry.kept_side,
+            plane_coordinate=symmetry.plane_coordinate,
+            metadata=symmetry,
+        )
+        self.workspace.set_texture_regenerator(
+            _SequenceTextureRegenerator(
+                [
+                    MeshyGenerationResult(
+                        "door-texture-task",
+                        _uv_glb(texture_resolution=2048),
+                    )
+                ]
+            )
+        )
+        self.workspace.set_meshy_executor(
+            _SequenceExecutor([_model_with_variants(source_variants)])
+        )
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+
+        with patch(
+            "housemaker.generation_workspace."
+            "build_automatic_symmetric_object_variants",
+            return_value=division_result,
+        ) as divide, patch.object(QMessageBox, "warning") as warning:
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+            self._wait_until_idle()
+
+        warning.assert_not_called()
+        self.assertEqual(divide.call_count, 1)
+        self.assertEqual(
+            divide.call_args.args,
+            (
+                source_variants.glb_by_resolution[2048],
+                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            ),
+        )
+        replacement = next(
+            record
+            for record in self.workspace._data.generated_objects
+            if record.object_id == original.object_id
+        )
+        self.assertEqual(
+            replacement.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+            original.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+        )
+        self.assertEqual(
+            replacement.pipeline["symmetric_division"],
+            symmetry.to_pipeline_dict(),
+        )
+        self.assertEqual(replacement.provider_task_id, None)
+        undo_stack = replacement.pipeline["object_operation_undo_stack"]
+        self.assertEqual(len(undo_stack), 1)
+        self.assertEqual(
+            undo_stack[0]["pipeline"][DOOR_COMPONENT_PIPELINE_KEY],
+            original.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+        )
+
+        self.assertTrue(self.workspace.undo_selected_object_change())
+        restored = next(
+            record
+            for record in self.workspace._data.generated_objects
+            if record.object_id == original.object_id
+        )
+        self.assertEqual(restored, original)
 
     def test_texture_request_snapshots_current_camera_allocations(self) -> None:
         self._seed_object(0, name="Chair", task_id="geometry-task")

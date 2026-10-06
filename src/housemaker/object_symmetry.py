@@ -55,7 +55,6 @@ from housemaker.scan_projection_layout import (
     remap_scan_projection_scene_uvs,
 )
 
-
 # ### Constants ###
 SYMMETRIC_DIVISION_METADATA_VERSION = 1
 SYMMETRIC_QUARTER_METADATA_VERSION = 2
@@ -67,6 +66,11 @@ SYMMETRIC_DIVISION_SIDE_LEFT = "left"
 SYMMETRIC_DIVISION_SIDE_RIGHT = "right"
 SYMMETRIC_DIVISION_SIDE_BOTTOM = "bottom"
 SYMMETRIC_DIVISION_SIDE_TOP = "top"
+AXIS_HALF_SIDE_NEGATIVE = "negative"
+AXIS_HALF_SIDE_POSITIVE = "positive"
+AXIS_HALF_SIDES = frozenset(
+    {AXIS_HALF_SIDE_NEGATIVE, AXIS_HALF_SIDE_POSITIVE}
+)
 SYMMETRIC_DIVISION_ORIENTATIONS = frozenset(
     {
         SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
@@ -567,6 +571,23 @@ class SymmetricGeometryDivisionResult:
             )
 
 
+@dataclass(frozen=True)
+class AxisHalfClipResult:
+    """One material-preserving half clipped along an arbitrary Z-up axis."""
+
+    glb_bytes: bytes
+    axis: int
+    kept_side: str
+    plane_coordinate: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.glb_bytes, bytes) or not self.glb_bytes:
+            raise ValueError("The axis-half GLB is empty.")
+        _validate_axis_half_request(self.axis, self.kept_side)
+        if not math.isfinite(float(self.plane_coordinate)):
+            raise ValueError("The axis-half clipping plane must be finite.")
+
+
 # ### Internal data models ###
 @dataclass(frozen=True)
 class _MeshInstance:
@@ -768,6 +789,106 @@ def build_symmetric_retexture_proxy_glb(
         raise ValueError(
             "The full symmetric Retexture proxy could not be exported."
         ) from error
+
+
+def clip_glb_to_axis_half(
+    source_glb: bytes,
+    *,
+    axis: int,
+    kept_side: str,
+    plane_coordinate: float | None = None,
+) -> AxisHalfClipResult:
+    """Clip a textured GLB without changing its UV or material pixels."""
+
+    _validate_axis_half_request(axis, kept_side)
+    payload = bytes(source_glb)
+    if not payload:
+        raise ValueError("The axis-half source GLB is empty.")
+    scene = _load_glb_scene(payload)
+    _prepare_auxiliary_material_textures(scene)
+    instances = _collect_mesh_instances(scene)
+    resolved_plane = (
+        _get_world_midpoint(instances, axis)
+        if plane_coordinate is None
+        else float(plane_coordinate)
+    )
+    if not math.isfinite(resolved_plane):
+        raise ValueError("The axis-half clipping plane must be finite.")
+    clipped_scene = _build_clipped_scene(
+        instances,
+        axis=axis,
+        plane_coordinate=resolved_plane,
+        kept_side=(
+            SYMMETRIC_DIVISION_SIDE_LEFT
+            if kept_side == AXIS_HALF_SIDE_NEGATIVE
+            else SYMMETRIC_DIVISION_SIDE_RIGHT
+        ),
+        metadata=scene.metadata,
+    )
+    return AxisHalfClipResult(
+        glb_bytes=_export_symmetric_geometry_scene(clipped_scene),
+        axis=axis,
+        kept_side=kept_side,
+        plane_coordinate=resolved_plane,
+    )
+
+
+def build_axis_mirror_retexture_proxy_glb(
+    retained_glb: bytes,
+    *,
+    axis: int,
+    plane_coordinate: float,
+) -> bytes:
+    """Mirror an arbitrary retained half for provider context with UV reuse."""
+
+    _validate_axis_half_request(axis, AXIS_HALF_SIDE_NEGATIVE)
+    normalized_plane = float(plane_coordinate)
+    if not math.isfinite(normalized_plane):
+        raise ValueError("The axis-mirror Retexture plane must be finite.")
+    payload = bytes(retained_glb)
+    if not payload:
+        raise ValueError("The axis-mirror Retexture source GLB is empty.")
+
+    source_scene = _load_glb_scene(payload)
+    _prepare_auxiliary_material_textures(source_scene)
+    instances = _collect_mesh_instances(source_scene)
+    proxy_scene = copy.deepcopy(source_scene)
+    occupied_geometry_names = {str(name) for name in proxy_scene.geometry}
+    occupied_node_names = {str(name) for name in proxy_scene.graph.nodes}
+    reflection = np.eye(4, dtype=float)
+    reflection[axis, axis] = -1.0
+    reflection[axis, 3] = 2.0 * normalized_plane
+    for instance in instances:
+        mirrored_mesh = copy.deepcopy(instance.mesh)
+        mirror_transform = (
+            Z_UP_TO_GLTF_Y_UP_TRANSFORM
+            @ reflection
+            @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+            @ instance.transform
+        )
+        mirrored_mesh.apply_transform(mirror_transform)
+        geometry_name = _reserve_unique_proxy_name(
+            f"{instance.geometry_name}-axis-mirror",
+            occupied_geometry_names,
+        )
+        node_name = _reserve_unique_proxy_name(
+            f"{instance.node_name}-axis-mirror",
+            occupied_node_names,
+        )
+        proxy_scene.add_geometry(
+            mirrored_mesh,
+            geom_name=geometry_name,
+            node_name=node_name,
+        )
+    try:
+        payload = proxy_scene.export(file_type="glb")
+    except Exception as error:
+        raise ValueError(
+            "The full axis-mirror Retexture proxy could not be exported."
+        ) from error
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("The full axis-mirror Retexture proxy was empty.")
+    return payload
 
 
 def build_automatic_symmetric_geometry(
@@ -4896,6 +5017,13 @@ def _validate_orientation_and_side(
     _validate_orientation(orientation)
     if kept_side not in SYMMETRIC_DIVISION_SIDES_BY_ORIENTATION[orientation]:
         raise ValueError("The kept side does not match the orientation.")
+
+
+def _validate_axis_half_request(axis: int, kept_side: str) -> None:
+    if isinstance(axis, bool) or not isinstance(axis, int) or axis not in {0, 1, 2}:
+        raise ValueError("Axis-half clipping requires axis 0, 1, or 2.")
+    if kept_side not in AXIS_HALF_SIDES:
+        raise ValueError("Axis-half clipping requires a negative or positive side.")
 
 
 def _validate_orientation(orientation: str) -> None:

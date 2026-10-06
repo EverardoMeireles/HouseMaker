@@ -130,12 +130,15 @@ STAIR_ROUTE_CACHE_MAX_ENTRIES = 64
 TEXTURE_PREVIEW_PLANE_SIZE_METERS = 2.0
 SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
     "vertical": 0,
+    "depth": 1,
     "horizontal": 2,
 }
 HALF_NODE_NAME_PREFIX = "[HALF] "
 HALF_MESH_EXTRAS_KEY = "halfMesh"
 HALF_MESH_UV_MODE = "reuse"
 OBJECT_ID_METADATA_KEY = "housemaker_object_id"
+DOOR_BODY_MARKER_METADATA_KEY = "housemaker_door_body"
+DOOR_BODY_MARKER_EXTRAS_KEY = "housemakerDoorBody"
 INSTANCE_SOURCE_ID_METADATA_KEY = "housemaker_instance_source_id"
 INSTANCE_SOURCE_NAME_METADATA_KEY = "housemaker_instance_source_name"
 PACKED_ORM_AO_UV_ATTRIBUTE = "_HOUSEMAKER_AO_UV"
@@ -1256,6 +1259,28 @@ def build_placed_generated_model_gltf_transform(
     ).copy()
 
 
+def build_placed_generated_model_gltf_mirror_plane(
+    placement: PlacedGeneratedModel,
+    *,
+    axis: int,
+    plane_coordinate: float,
+) -> dict[str, list[float]]:
+    """Return a local Z-up mirror plane in exported glTF world coordinates."""
+
+    if not isinstance(placement, PlacedGeneratedModel):
+        raise TypeError("Placed mirror planes require a placed model.")
+    if isinstance(axis, bool) or not isinstance(axis, int) or axis not in {0, 1, 2}:
+        raise ValueError("Placed mirror planes require axis 0, 1, or 2.")
+    normalized_plane = float(plane_coordinate)
+    if not math.isfinite(normalized_plane):
+        raise ValueError("Placed mirror planes must be finite.")
+    return _build_gltf_mirror_plane(
+        _build_placed_model_transform(placement),
+        axis=axis,
+        plane_coordinate=normalized_plane,
+    )
+
+
 def _compose_placed_generated_models(
     base_model: GeneratedModel,
     placements: Sequence[PlacedGeneratedModel],
@@ -1325,6 +1350,12 @@ def _compose_placed_generated_models(
         )
         preview_textured_surfaces.extend(textured_surfaces)
         placed_untextured_meshes.extend(untextured_meshes)
+        preview_symmetric_objects.extend(
+            _build_nested_symmetric_previews(
+                placement,
+                placement_transform,
+            )
+        )
         preview_placed_objects.append(
             PreviewPlacedObject(
                 object_id=placement.object_id,
@@ -1600,8 +1631,27 @@ def _build_half_mesh_node_metadata(
     assert plane_coordinate is not None
     axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[orientation]
 
+    mirror_plane = _build_gltf_mirror_plane(
+        placement_transform,
+        axis=axis,
+        plane_coordinate=plane_coordinate,
+    )
+    return {
+        HALF_MESH_EXTRAS_KEY: {
+            "mirrorPlane": mirror_plane,
+            "uvMode": HALF_MESH_UV_MODE,
+        }
+    }
+
+
+def _build_gltf_mirror_plane(
+    placement_transform: np.ndarray,
+    *,
+    axis: int,
+    plane_coordinate: float,
+) -> dict[str, list[float]]:
     local_point = np.zeros(4, dtype=float)
-    local_point[axis] = plane_coordinate
+    local_point[axis] = float(plane_coordinate)
     local_point[3] = 1.0
     local_normal = np.zeros(3, dtype=float)
     local_normal[axis] = 1.0
@@ -1623,13 +1673,73 @@ def _build_half_mesh_node_metadata(
         raise ValueError("A symmetric half-model has an invalid mirror normal.")
     world_normal_gltf /= normal_length
     return {
-        HALF_MESH_EXTRAS_KEY: {
-            "mirrorPlane": {
-                "point": _clean_export_vector(world_point_gltf),
-                "normal": _clean_export_vector(world_normal_gltf),
-            },
-            "uvMode": HALF_MESH_UV_MODE,
-        }
+        "point": _clean_export_vector(world_point_gltf),
+        "normal": _clean_export_vector(world_normal_gltf),
+    }
+
+
+def _prepare_nested_housemaker_metadata(
+    metadata: dict[str, object],
+    placement_object_id: str,
+    placement_transform: np.ndarray,
+) -> None:
+    """Retarget nested door markers and mirror planes to this placement."""
+
+    _retarget_door_body_marker(metadata, placement_object_id)
+    raw_half_mesh = metadata.get(HALF_MESH_EXTRAS_KEY)
+    if raw_half_mesh is None:
+        return
+    normalized = _normalize_half_mesh_extras(raw_half_mesh)
+    mirror_plane = normalized["mirrorPlane"]
+    assert isinstance(mirror_plane, Mapping)
+    point_gltf = np.asarray((*mirror_plane["point"], 1.0), dtype=float)
+    normal_gltf = np.asarray(mirror_plane["normal"], dtype=float)
+    point_z_up = GLTF_Y_UP_TO_Z_UP_TRANSFORM @ point_gltf
+    normal_z_up = GLTF_Y_UP_TO_Z_UP_TRANSFORM[:3, :3] @ normal_gltf
+    transform = _get_valid_source_transform(placement_transform)
+    try:
+        normal_transform = np.linalg.inv(transform[:3, :3]).T
+    except np.linalg.LinAlgError as error:
+        raise ValueError(
+            "A nested symmetric half-model has a singular placement transform."
+        ) from error
+    world_point_gltf = (
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM @ (transform @ point_z_up)
+    )[:3]
+    world_normal_gltf = (
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM[:3, :3]
+        @ (normal_transform @ normal_z_up)
+    )
+    normal_length = float(np.linalg.norm(world_normal_gltf))
+    if not math.isfinite(normal_length) or normal_length <= 0.0:
+        raise ValueError("A nested half-model has an invalid mirror normal.")
+    metadata[HALF_MESH_EXTRAS_KEY] = {
+        "mirrorPlane": {
+            "point": _clean_export_vector(world_point_gltf),
+            "normal": _clean_export_vector(
+                world_normal_gltf / normal_length
+            ),
+        },
+        "uvMode": HALF_MESH_UV_MODE,
+    }
+
+
+def _retarget_door_body_marker(
+    metadata: dict[str, object],
+    placement_object_id: str,
+) -> None:
+    """Bind an embedded door-body marker to its outer scene placement."""
+
+    raw_marker = metadata.get(DOOR_BODY_MARKER_METADATA_KEY)
+    if not isinstance(raw_marker, Mapping):
+        return
+    body_object_id = str(raw_marker.get("bodyObjectId", "")).strip()
+    if not body_object_id:
+        metadata.pop(DOOR_BODY_MARKER_METADATA_KEY, None)
+        return
+    metadata[DOOR_BODY_MARKER_METADATA_KEY] = {
+        "placementObjectId": str(placement_object_id).strip(),
+        "bodyObjectId": body_object_id,
     }
 
 
@@ -1844,6 +1954,10 @@ def _append_placed_half_model_meshes(
             dict(getattr(copied_geometry, "metadata", {}) or {})
         )
         copied_geometry.metadata["housemaker_object_id"] = placement.object_id
+        _retarget_door_body_marker(
+            copied_geometry.metadata,
+            placement.object_id,
+        )
         output_scene.geometry[geometry_name] = copied_geometry
         geometry_names[source_name] = geometry_name
 
@@ -1881,6 +1995,7 @@ def _append_placed_half_model_meshes(
         node_metadata.update(_get_scene_node_metadata(source_scene, source_node_name))
         node_metadata.pop(OBJECT_ID_METADATA_KEY, None)
         node_metadata[OBJECT_ID_METADATA_KEY] = placement.object_id
+        _retarget_door_body_marker(node_metadata, placement.object_id)
         node_metadata.update(half_metadata)
         output_scene.graph.update(
             frame_to=node_name,
@@ -1936,6 +2051,10 @@ def _append_placed_model_scene(
             dict(getattr(copied_geometry, "metadata", {}) or {})
         )
         copied_geometry.metadata["housemaker_object_id"] = placement.object_id
+        _retarget_door_body_marker(
+            copied_geometry.metadata,
+            placement.object_id,
+        )
         output_scene.geometry[geometry_names[source_name]] = copied_geometry
 
     source_base_frame = source_scene.graph.base_frame
@@ -1955,6 +2074,11 @@ def _append_placed_model_scene(
     root_metadata = copy.deepcopy(source_base_data.get("metadata") or {})
     root_metadata.pop(OBJECT_ID_METADATA_KEY, None)
     root_metadata[OBJECT_ID_METADATA_KEY] = placement.object_id
+    _prepare_nested_housemaker_metadata(
+        root_metadata,
+        placement.object_id,
+        placement_transform,
+    )
     root_kwargs: dict[str, object] = {
         "matrix": _source_to_gltf_y_up_transform(placement_transform),
         "metadata": root_metadata,
@@ -1985,6 +2109,11 @@ def _append_placed_model_scene(
             if isinstance(child_metadata, Mapping):
                 child_metadata = dict(child_metadata)
                 child_metadata.pop(OBJECT_ID_METADATA_KEY, None)
+                _prepare_nested_housemaker_metadata(
+                    child_metadata,
+                    placement.object_id,
+                    placement_transform,
+                )
             edge_kwargs["metadata"] = child_metadata
         output_scene.graph.update(
             frame_to=node_names[source_to],
@@ -2068,6 +2197,74 @@ def _build_symmetric_preview_world_meshes(
         mirrored_mesh.apply_transform(placement_transform)
         mirrored_meshes.append(mirrored_mesh)
     return tuple(mirrored_meshes)
+
+
+def _build_nested_symmetric_previews(
+    placement: PlacedGeneratedModel,
+    placement_transform: np.ndarray,
+) -> tuple[PreviewSymmetricObject, ...]:
+    """Move mirrors already carried by an assembled model into world space.
+
+    Composite assets such as doors can contain a symmetric body alongside
+    ordinary hardware.  Their mirrors are already restricted to the body, so
+    rebuilding a mirror from the complete outer placement would duplicate the
+    hardware.  Preserve those nested mesh groups and apply only the outer
+    placement transform.
+    """
+
+    nested_previews: list[PreviewSymmetricObject] = []
+    for nested_index, nested in enumerate(
+        placement.model.preview_symmetric_objects,
+        start=1,
+    ):
+        retained_meshes = _transform_preview_mesh_group(
+            nested.meshes,
+            placement_transform,
+        )
+        if nested.mirrored_meshes:
+            mirrored_meshes = _transform_preview_mesh_group(
+                nested.mirrored_meshes,
+                placement_transform,
+            )
+        else:
+            mirrored_meshes = _build_symmetric_preview_world_meshes(
+                nested.meshes,
+                nested.orientation,
+                nested.plane_coordinate,
+                placement_transform,
+            )
+        axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[nested.orientation]
+        local_plane_point = np.zeros(4, dtype=float)
+        local_plane_point[axis] = nested.plane_coordinate
+        local_plane_point[3] = 1.0
+        world_plane_point = placement_transform @ local_plane_point
+        nested_previews.append(
+            PreviewSymmetricObject(
+                object_id=(
+                    f"{placement.object_id}:nested:{nested_index}:"
+                    f"{nested.object_id}"
+                ),
+                meshes=retained_meshes,
+                orientation=nested.orientation,
+                plane_coordinate=float(world_plane_point[axis]),
+                mirrored_meshes=mirrored_meshes,
+            )
+        )
+    return tuple(nested_previews)
+
+
+def _transform_preview_mesh_group(
+    meshes: Sequence[trimesh.Trimesh],
+    transform: np.ndarray,
+) -> tuple[trimesh.Trimesh, ...]:
+    """Return independent preview meshes transformed without losing materials."""
+
+    transformed_meshes: list[trimesh.Trimesh] = []
+    for mesh in meshes:
+        transformed_mesh = copy.deepcopy(mesh)
+        transformed_mesh.apply_transform(transform)
+        transformed_meshes.append(transformed_mesh)
+    return tuple(transformed_meshes)
 
 
 def _mesh_supports_embedded_texture_preview(mesh: trimesh.Trimesh) -> bool:
@@ -5317,6 +5514,9 @@ def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
     payload = _rewrite_serialized_glb_half_mesh_extras(
         model.glb_bytes,
         _collect_half_mesh_extras_by_node_name(model.scene),
+        door_body_markers_by_node_name=(
+            _collect_door_body_markers_by_node_name(model.scene)
+        ),
         failure_message="The final house GLB is invalid.",
     )
     export_path.write_bytes(payload)
@@ -5420,12 +5620,16 @@ def _serialize_scene_glb_with_half_mesh_extras(
     if not isinstance(scene, trimesh.Scene):
         raise TypeError("GLB serialization requires a triangle-mesh scene.")
     half_mesh_by_node_name = _collect_half_mesh_extras_by_node_name(scene)
+    door_body_markers_by_node_name = (
+        _collect_door_body_markers_by_node_name(scene)
+    )
     payload = scene.export(file_type="glb")
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise ValueError(failure_message)
     return _rewrite_serialized_glb_half_mesh_extras(
         bytes(payload),
         half_mesh_by_node_name,
+        door_body_markers_by_node_name=door_body_markers_by_node_name,
         failure_message=failure_message,
         packed_orm_material_names=packed_orm_material_names,
         atlas_texture_material_names=atlas_texture_material_names,
@@ -5436,6 +5640,11 @@ def _rewrite_serialized_glb_half_mesh_extras(
     payload: bytes,
     half_mesh_by_node_name: Mapping[str, Mapping[str, object]],
     *,
+    door_body_markers_by_node_name: Mapping[
+        str,
+        Mapping[str, object],
+    ]
+    | None = None,
     failure_message: str,
     packed_orm_material_names: Mapping[
         str,
@@ -5479,6 +5688,10 @@ def _rewrite_serialized_glb_half_mesh_extras(
     _inject_half_mesh_extras_into_gltf_tree(
         document,
         half_mesh_by_node_name,
+    )
+    _inject_door_body_markers_into_gltf_tree(
+        document,
+        door_body_markers_by_node_name or {},
     )
     try:
         encoded_document = json.dumps(
@@ -5823,6 +6036,40 @@ def _collect_half_mesh_extras_by_node_name(
     return result
 
 
+def _collect_door_body_markers_by_node_name(
+    scene: trimesh.Scene,
+) -> dict[str, dict[str, str]]:
+    """Collect stable body locators for runtime door reconstruction."""
+
+    result: dict[str, dict[str, str]] = {}
+    for node_name in scene.graph.nodes_geometry:
+        metadata = _get_scene_node_metadata(scene, node_name)
+        raw_marker = metadata.get(DOOR_BODY_MARKER_METADATA_KEY)
+        if raw_marker is None:
+            continue
+        marker = _normalize_door_body_marker(raw_marker)
+        normalized_name = str(node_name)
+        if normalized_name in result:
+            raise ValueError("Door-body GLB node names must be unique.")
+        result[normalized_name] = marker
+    return result
+
+
+def _normalize_door_body_marker(raw_marker: object) -> dict[str, str]:
+    if not isinstance(raw_marker, Mapping):
+        raise ValueError("Door-body metadata has an invalid schema.")
+    placement_object_id = str(
+        raw_marker.get("placementObjectId", "")
+    ).strip()
+    body_object_id = str(raw_marker.get("bodyObjectId", "")).strip()
+    if not placement_object_id or not body_object_id:
+        raise ValueError("Door-body metadata requires stable object IDs.")
+    return {
+        "placementObjectId": placement_object_id,
+        "bodyObjectId": body_object_id,
+    }
+
+
 def _normalize_half_mesh_extras(raw_half_mesh: object) -> dict[str, object]:
     """Validate and copy the public ``extras.halfMesh`` schema."""
 
@@ -5961,6 +6208,39 @@ def _inject_half_mesh_extras_into_gltf_tree(
     if missing_names:
         raise ValueError(
             "The exported glTF omitted half-mesh node extras for: "
+            + ", ".join(sorted(missing_names))
+        )
+
+
+def _inject_door_body_markers_into_gltf_tree(
+    tree: dict[str, object],
+    markers_by_node_name: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Expose stable body locators without turning hardware into mirrors."""
+
+    if not markers_by_node_name:
+        return
+    raw_nodes = tree.get("nodes")
+    if not isinstance(raw_nodes, list):
+        raise ValueError("The exported glTF has no node list.")
+    injected_names: set[str] = set()
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, dict) or "mesh" not in raw_node:
+            continue
+        node_name = str(raw_node.get("name", ""))
+        raw_marker = markers_by_node_name.get(node_name)
+        if raw_marker is None:
+            continue
+        marker = _normalize_door_body_marker(raw_marker)
+        raw_extras = raw_node.get("extras")
+        extras = dict(raw_extras) if isinstance(raw_extras, Mapping) else {}
+        extras[DOOR_BODY_MARKER_EXTRAS_KEY] = marker
+        raw_node["extras"] = extras
+        injected_names.add(node_name)
+    missing_names = set(markers_by_node_name) - injected_names
+    if missing_names:
+        raise ValueError(
+            "The exported glTF omitted door-body node metadata for: "
             + ", ".join(sorted(missing_names))
         )
 
