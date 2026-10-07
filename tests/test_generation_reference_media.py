@@ -148,7 +148,7 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         expected_buttons = (
             ("load_video_button", "Load video"),
             ("copy_inpaint_button", "Copy inpaint"),
-            ("paste_inpaint_button", "Paste inpaint"),
+            ("paste_inpaint_button", "Paste"),
             ("load_reference_image_button", "Load image"),
         )
         buttons = []

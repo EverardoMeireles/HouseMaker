@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from housemaker.door_state import (
@@ -40,9 +41,11 @@ class DoorProjectPersistenceTests(unittest.TestCase):
             knob.with_transform(
                 position_meters=(0.32, 0.01, 0.94),
                 rotation_degrees=(0.0, 15.0, 0.0),
+                axis_scales=(1.2, 0.8, 1.1),
                 joined=True,
             )
         )
+        door = replace(door, generate_displacement=True)
         doors = DoorLibraryData(
             doors=[door],
             placements=[
@@ -70,6 +73,7 @@ class DoorProjectPersistenceTests(unittest.TestCase):
 
         self.assertEqual(payload["doors"], doors.to_dict())
         self.assertEqual(restored.doors, doors)
+        self.assertTrue(restored.doors.doors[0].generate_displacement)
 
     def test_project_without_doors_loads_an_empty_library(self) -> None:
         levels = create_default_levels()

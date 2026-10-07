@@ -21,9 +21,13 @@ from housemaker.door_state import (
     create_door_definition_for_doorway,
 )
 from housemaker.glb import (
+    DOOR_COMPONENT_MARKER_METADATA_KEY,
     GeneratedModel,
     PlacedGeneratedModel,
+    build_gltf_mirror_plane_from_z_up_transform,
+    build_placed_generated_model_gltf_mirror_plane,
     build_placed_generated_model_gltf_transform,
+    build_placed_generated_model_transform,
     compose_generated_model_instance_sources,
     compose_placed_generated_models,
     export_glb_file,
@@ -92,6 +96,81 @@ def _doorway() -> DoorwayData:
         height_meters=2.2,
         depth_meters=0.2,
     )
+
+
+# ### GLB mirror-plane tests ###
+class GltfMirrorPlaneTests(unittest.TestCase):
+    def test_arbitrary_z_up_transform_maps_point_and_normal_to_gltf_world(
+        self,
+    ) -> None:
+        translation = np.eye(4, dtype=float)
+        translation[:3, 3] = (4.0, -3.0, 2.0)
+        rotation = trimesh.transformations.rotation_matrix(
+            np.pi / 2.0,
+            (0.0, 0.0, 1.0),
+        )
+        scale = np.diag((2.0, 3.0, 4.0, 1.0))
+
+        mirror_plane = build_gltf_mirror_plane_from_z_up_transform(
+            translation @ rotation @ scale,
+            axis=0,
+            plane_coordinate=0.5,
+        )
+
+        np.testing.assert_allclose(
+            mirror_plane["point"],
+            (4.0, 2.0, 2.0),
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            mirror_plane["normal"],
+            (0.0, 0.0, -1.0),
+            atol=1e-9,
+        )
+
+    def test_placed_model_wrapper_uses_the_general_transform_helper(self) -> None:
+        placement = PlacedGeneratedModel(
+            object_id="nested-door-body",
+            model=_source_model(),
+            world_position=(3.0, -2.0, 1.5),
+            rotation_degrees=(10.0, 20.0, 30.0),
+            scale=1.25,
+            axis_scales=(0.5, 2.0, 1.5),
+        )
+        transform = build_placed_generated_model_transform(placement)
+
+        self.assertEqual(
+            build_placed_generated_model_gltf_mirror_plane(
+                placement,
+                axis=1,
+                plane_coordinate=0.2,
+            ),
+            build_gltf_mirror_plane_from_z_up_transform(
+                transform,
+                axis=1,
+                plane_coordinate=0.2,
+            ),
+        )
+
+    def test_transform_helper_rejects_invalid_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "axis 0, 1, or 2"):
+            build_gltf_mirror_plane_from_z_up_transform(
+                np.eye(4, dtype=float),
+                axis=3,
+                plane_coordinate=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "coordinates must be finite"):
+            build_gltf_mirror_plane_from_z_up_transform(
+                np.eye(4, dtype=float),
+                axis=0,
+                plane_coordinate=float("nan"),
+            )
+        with self.assertRaisesRegex(ValueError, "finite 4 by 4 matrix"):
+            build_gltf_mirror_plane_from_z_up_transform(
+                np.eye(3, dtype=float),
+                axis=0,
+                plane_coordinate=0.0,
+            )
 
 
 # ### Runtime manifest tests ###
@@ -271,6 +350,9 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             kept_side="front",
             mirror_point=(2.0, 1.0, -3.0),
             mirror_normal=(0.0, 0.0, -1.0),
+            mirrored_component_object_ids=(
+                "door:door-a:slot:door_knob",
+            ),
         )
 
         payload = build_runtime_scene_manifest(
@@ -295,12 +377,77 @@ class RuntimeSceneManifestTests(unittest.TestCase):
                         },
                         "uvMode": "reuse",
                         "applyAfter": "halfMesh",
+                        "mirroredComponentObjectIds": [
+                            "door:door-a:slot:door_knob"
+                        ],
                     },
                 }
             ],
         )
 
-    def test_export_preserves_body_only_locator_on_nested_half_door(self) -> None:
+    def test_manifest_omits_empty_mirrored_component_ids(self) -> None:
+        reconstruction = DoorBodyReconstruction(
+            placement_object_id="door-placement:placement-a",
+            body_object_id="door:door-a:slot:body",
+            kept_side="front",
+            mirror_point=(0.0, 0.0, 0.0),
+            mirror_normal=(0.0, 0.0, 1.0),
+        )
+
+        side_duplication = reconstruction.to_runtime_dict()["sideDuplication"]
+
+        self.assertNotIn("mirroredComponentObjectIds", side_duplication)
+
+    def test_export_preserves_nested_door_component_locator(self) -> None:
+        component_model = _source_model_with_node_name("door_knob")
+        component_node = next(iter(component_model.scene.graph.nodes_geometry))
+        component_parent = component_model.scene.graph.transforms.parents[
+            component_node
+        ]
+        component_edge = component_model.scene.graph.transforms.edge_data[
+            (component_parent, component_node)
+        ]
+        component_edge["metadata"] = {
+            DOOR_COMPONENT_MARKER_METADATA_KEY: {
+                "componentObjectId": "door:door-a:slot:door_knob",
+                "kind": "door_knob",
+            }
+        }
+        placed = PlacedGeneratedModel(
+            object_id="door-placement:placement-a",
+            object_name="Placed door",
+            model=component_model,
+            world_position=(2.0, 3.0, 0.0),
+        )
+        complete_scene = compose_placed_generated_models(
+            _empty_model(),
+            (placed,),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            glb_path = export_glb_file(
+                complete_scene,
+                Path(temporary_directory) / "scene.glb",
+            )
+            document = _read_glb_document(glb_path.read_bytes())
+
+        marked_nodes = [
+            node
+            for node in document["nodes"]
+            if isinstance(node, dict)
+            and "housemakerDoorComponent" in node.get("extras", {})
+        ]
+        self.assertEqual(len(marked_nodes), 1)
+        self.assertEqual(
+            marked_nodes[0]["extras"]["housemakerDoorComponent"],
+            {
+                "placementObjectId": "door-placement:placement-a",
+                "componentObjectId": "door:door-a:slot:door_knob",
+                "kind": "door_knob",
+            },
+        )
+
+    def test_export_preserves_door_body_and_component_locators(self) -> None:
         door = create_door_definition_for_doorway(
             _doorway(),
             door_id="door-a",
@@ -316,9 +463,13 @@ class RuntimeSceneManifestTests(unittest.TestCase):
         )
         body = door.get_slot("body")
         assert body is not None
+        slot_models = build_default_door_slot_models(door)
+        slot_models[knob.source_object_id] = _source_model_with_node_name(
+            "door_knob"
+        )
         assembled = assemble_door_model(
             door,
-            build_default_door_slot_models(door),
+            slot_models,
             body_mirror=DoorBodyMirrorConfiguration(
                 symmetric_orientation="vertical",
                 symmetric_plane_coordinate=0.0,
@@ -362,8 +513,19 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             },
         )
         self.assertIn("halfMesh", marked_nodes[0]["extras"])
-        self.assertTrue(
-            any("door_knob" in str(node.get("name", "")) for node in mesh_nodes)
+        component_nodes = [
+            node
+            for node in mesh_nodes
+            if "housemakerDoorComponent" in node.get("extras", {})
+        ]
+        self.assertEqual(len(component_nodes), 1)
+        self.assertEqual(
+            component_nodes[0]["extras"]["housemakerDoorComponent"],
+            {
+                "placementObjectId": "door-placement:placement-a",
+                "componentObjectId": knob.source_object_id,
+                "kind": DOOR_SLOT_KNOB,
+            },
         )
         self.assertTrue(
             all(

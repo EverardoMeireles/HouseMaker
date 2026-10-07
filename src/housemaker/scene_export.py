@@ -47,6 +47,7 @@ class DoorBodyReconstruction:
     kept_side: str
     mirror_point: tuple[float, float, float]
     mirror_normal: tuple[float, float, float]
+    mirrored_component_object_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         placement_object_id = str(self.placement_object_id).strip()
@@ -60,25 +61,39 @@ class DoorBodyReconstruction:
         normal = _normalize_runtime_vector(self.mirror_normal, "normal")
         if float(np.linalg.norm(normal)) <= 0.0:
             raise ValueError("Door reconstruction mirror normals cannot be zero.")
+        component_ids = _normalize_mirrored_component_object_ids(
+            self.mirrored_component_object_ids,
+            body_object_id=body_object_id,
+        )
         object.__setattr__(self, "placement_object_id", placement_object_id)
         object.__setattr__(self, "body_object_id", body_object_id)
         object.__setattr__(self, "kept_side", kept_side)
         object.__setattr__(self, "mirror_point", point)
         object.__setattr__(self, "mirror_normal", normal)
+        object.__setattr__(
+            self,
+            "mirrored_component_object_ids",
+            component_ids,
+        )
 
     def to_runtime_dict(self) -> dict[str, object]:
+        side_duplication: dict[str, object] = {
+            "keptSide": self.kept_side,
+            "mirrorPlane": {
+                "point": list(self.mirror_point),
+                "normal": list(self.mirror_normal),
+            },
+            "uvMode": DOOR_SIDE_DUPLICATION_UV_MODE,
+            "applyAfter": HALF_MESH_EXTRAS_KEY,
+        }
+        if self.mirrored_component_object_ids:
+            side_duplication["mirroredComponentObjectIds"] = list(
+                self.mirrored_component_object_ids
+            )
         return {
             "placementObjectId": self.placement_object_id,
             "bodyObjectId": self.body_object_id,
-            "sideDuplication": {
-                "keptSide": self.kept_side,
-                "mirrorPlane": {
-                    "point": list(self.mirror_point),
-                    "normal": list(self.mirror_normal),
-                },
-                "uvMode": DOOR_SIDE_DUPLICATION_UV_MODE,
-                "applyAfter": HALF_MESH_EXTRAS_KEY,
-            },
+            "sideDuplication": side_duplication,
         }
 
 
@@ -217,6 +232,32 @@ def _normalize_runtime_vector(
     return tuple(0.0 if abs(value) <= 1e-12 else value for value in values)
 
 
+def _normalize_mirrored_component_object_ids(
+    raw_values: object,
+    *,
+    body_object_id: str,
+) -> tuple[str, ...]:
+    """Normalize optional non-body targets sharing the body mirror plane."""
+
+    if isinstance(raw_values, (str, bytes, bytearray)) or not isinstance(
+        raw_values,
+        Sequence,
+    ):
+        raise TypeError(
+            "Door mirrored component object IDs must contain a sequence."
+        )
+    component_ids = tuple(str(value).strip() for value in raw_values)
+    if any(not value for value in component_ids):
+        raise ValueError("Door mirrored component object IDs cannot be empty.")
+    if body_object_id in component_ids:
+        raise ValueError(
+            "Door mirrored component object IDs cannot repeat the body object ID."
+        )
+    if len(component_ids) != len(set(component_ids)):
+        raise ValueError("Door mirrored component object IDs must be unique.")
+    return tuple(sorted(component_ids))
+
+
 def _normalize_door_body_reconstructions(
     values: Sequence[DoorBodyReconstruction],
 ) -> tuple[DoorBodyReconstruction, ...]:
@@ -262,7 +303,9 @@ def _normalize_source_placements(
         if placement.object_id != source_id:
             raise ValueError("Instance source keys must match their placed object IDs.")
         if placement.source_object_id != source_id:
-            raise ValueError("Instance sources must identify themselves as their source.")
+            raise ValueError(
+                "Instance sources must identify themselves as their source."
+            )
         normalized[source_id] = placement
     return normalized
 

@@ -10,14 +10,23 @@ from pathlib import Path
 from housemaker.door_state import (
     DOOR_LIBRARY_SCHEMA_VERSION,
     DOOR_SIDE_DUPLICATION_BACK,
+    DOOR_SIDE_DUPLICATION_FRONT,
+    DOOR_SLOT_BACK_BODY,
+    DOOR_SLOT_BACK_KNOB,
     DOOR_SLOT_BODY,
     DOOR_SLOT_KNOB,
     DoorLibraryData,
     DoorPlacement,
     DoorSideDuplication,
+    DoorSlotData,
     create_door_definition_for_doorway,
     door_fits_doorway,
+    door_slot_component,
+    door_slot_side,
+    is_door_body_slot,
+    is_door_knob_slot,
     next_door_name,
+    set_door_double_sided,
 )
 from housemaker.models import DOORWAY_SHAPE_ARCH, DoorwayData, create_default_levels
 from housemaker.project_io import load_project, save_project
@@ -54,6 +63,7 @@ class DoorStateTests(unittest.TestCase):
                 knob.with_transform(
                     position_meters=(0.31, 0.0, 0.88),
                     rotation_degrees=(0.0, 0.0, 15.0),
+                    axis_scales=(1.2, 0.8, 1.4),
                     joined=True,
                 )
             ),
@@ -81,6 +91,7 @@ class DoorStateTests(unittest.TestCase):
         assert restored_knob is not None
         self.assertTrue(restored_knob.joined)
         self.assertEqual(restored_knob.position_meters, (0.31, 0.0, 0.88))
+        self.assertEqual(restored_knob.axis_scales, (1.2, 0.8, 1.4))
         self.assertEqual(restored.placements[0].doorway_id, "doorway-destination")
         self.assertEqual(
             restored.doors[0].side_duplication,
@@ -90,6 +101,32 @@ class DoorStateTests(unittest.TestCase):
             library.to_dict()["schema_version"],
             DOOR_LIBRARY_SCHEMA_VERSION,
         )
+
+    def test_displacement_generation_round_trip_and_legacy_default(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        displaced = replace(door, generate_displacement=True)
+
+        restored = type(door).from_dict(displaced.to_dict())
+        legacy_payload = door.to_dict()
+        legacy_payload.pop("generate_displacement")
+        restored_legacy = type(door).from_dict(legacy_payload)
+
+        self.assertTrue(restored.generate_displacement)
+        self.assertFalse(restored_legacy.generate_displacement)
+
+    def test_displacement_generation_state_must_be_boolean(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+
+        with self.assertRaisesRegex(TypeError, "displacement-generation"):
+            replace(door, generate_displacement=1)
 
     def test_legacy_door_defaults_to_no_side_duplication(self) -> None:
         door = create_door_definition_for_doorway(
@@ -103,6 +140,66 @@ class DoorStateTests(unittest.TestCase):
         restored = type(door).from_dict(payload)
 
         self.assertIsNone(restored.side_duplication)
+        self.assertFalse(restored.make_double_sided)
+
+    def test_legacy_hinge_slot_is_removed_during_migration(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="legacy-door",
+            name="New door 1",
+        )
+        payload = door.to_dict()
+        payload.pop("make_double_sided")
+        payload["slots"].insert(
+            1,
+            {
+                "slot_id": "hinges",
+                "source_object_id": "door:legacy-door:slot:hinges",
+                "position_meters": [-0.4, 0.0, 0.4],
+                "rotation_degrees": [0.0, 0.0, 0.0],
+                "joined": True,
+            },
+        )
+
+        restored = type(door).from_dict(payload)
+
+        self.assertEqual(
+            tuple(slot.slot_id for slot in restored.slots),
+            (DOOR_SLOT_BODY, DOOR_SLOT_KNOB),
+        )
+        self.assertFalse(restored.make_double_sided)
+        with self.assertRaises(ValueError):
+            DoorSlotData(
+                slot_id="hinges",
+                source_object_id="new-hinge",
+            )
+
+    def test_legacy_slot_defaults_to_unit_axis_scales(self) -> None:
+        slot = DoorSlotData(
+            slot_id=DOOR_SLOT_KNOB,
+            source_object_id="legacy-knob",
+        )
+        payload = slot.to_dict()
+        payload.pop("axis_scales")
+
+        restored = DoorSlotData.from_dict(payload)
+
+        self.assertEqual(restored.axis_scales, (1.0, 1.0, 1.0))
+
+    def test_slot_axis_scales_must_be_finite_and_positive(self) -> None:
+        for invalid_scales in (
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+            (float("inf"), 1.0, 1.0),
+        ):
+            with self.subTest(axis_scales=invalid_scales), self.assertRaises(
+                ValueError
+            ):
+                DoorSlotData(
+                    slot_id=DOOR_SLOT_KNOB,
+                    source_object_id="invalid-knob",
+                    axis_scales=invalid_scales,
+                )
 
     def test_factory_creates_required_slots_and_incremental_names(self) -> None:
         first = create_door_definition_for_doorway(
@@ -114,19 +211,122 @@ class DoorStateTests(unittest.TestCase):
 
         self.assertEqual(
             {slot.slot_id for slot in first.slots},
-            {"body", "hinges", "door_knob"},
+            {DOOR_SLOT_BODY, DOOR_SLOT_KNOB},
         )
         body = first.get_slot(DOOR_SLOT_BODY)
         assert body is not None
         self.assertTrue(body.joined)
         self.assertEqual(next_door_name((first, third)), "New door 4")
         self.assertTrue(door_fits_doorway(first, _doorway()))
+        self.assertTrue(
+            door_fits_doorway(
+                first,
+                replace(
+                    _doorway(),
+                    width_meters=1.2,
+                    height_meters=2.8,
+                ),
+            )
+        )
         self.assertFalse(
             door_fits_doorway(
                 first,
-                replace(_doorway(), width_meters=1.2),
+                replace(_doorway(), shape="arch", arch_amount=0.5),
             )
         )
+
+    def test_double_sided_toggle_preserves_front_slot_identities(self) -> None:
+        original = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+
+        doubled = set_door_double_sided(original, True)
+
+        self.assertTrue(doubled.make_double_sided)
+        self.assertEqual(
+            tuple(slot.slot_id for slot in doubled.slots),
+            (
+                DOOR_SLOT_BODY,
+                DOOR_SLOT_KNOB,
+                DOOR_SLOT_BACK_BODY,
+                DOOR_SLOT_BACK_KNOB,
+            ),
+        )
+        for slot_id in (DOOR_SLOT_BODY, DOOR_SLOT_KNOB):
+            self.assertEqual(
+                doubled.get_slot(slot_id),
+                original.get_slot(slot_id),
+            )
+        back_body = doubled.get_slot(DOOR_SLOT_BACK_BODY)
+        back_knob = doubled.get_slot(DOOR_SLOT_BACK_KNOB)
+        assert back_body is not None
+        assert back_knob is not None
+        self.assertEqual(
+            back_body.source_object_id,
+            "door:door-a:slot:back_body",
+        )
+        self.assertEqual(
+            back_knob.source_object_id,
+            "door:door-a:slot:back_door_knob",
+        )
+        self.assertTrue(back_body.joined)
+        self.assertFalse(back_knob.joined)
+        self.assertEqual(doubled.with_double_sided(False), original)
+
+    def test_double_sided_door_round_trip_and_slot_helpers(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        ).with_double_sided(True)
+
+        restored = type(door).from_dict(door.to_dict())
+
+        self.assertEqual(restored, door)
+        self.assertTrue(restored.make_double_sided)
+        self.assertTrue(is_door_body_slot(DOOR_SLOT_BODY))
+        self.assertTrue(is_door_body_slot(DOOR_SLOT_BACK_BODY))
+        self.assertTrue(is_door_knob_slot(DOOR_SLOT_KNOB))
+        self.assertTrue(is_door_knob_slot(DOOR_SLOT_BACK_KNOB))
+        self.assertEqual(
+            door_slot_side(DOOR_SLOT_BODY),
+            DOOR_SIDE_DUPLICATION_FRONT,
+        )
+        self.assertEqual(
+            door_slot_side(DOOR_SLOT_BACK_KNOB),
+            DOOR_SIDE_DUPLICATION_BACK,
+        )
+        self.assertEqual(
+            door_slot_component(DOOR_SLOT_BACK_BODY),
+            DOOR_SLOT_BODY,
+        )
+        self.assertEqual(
+            door_slot_component(DOOR_SLOT_BACK_KNOB),
+            DOOR_SLOT_KNOB,
+        )
+
+    def test_double_sided_and_side_duplication_are_mutually_exclusive(
+        self,
+    ) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        duplicated = replace(
+            door,
+            side_duplication=DoorSideDuplication(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be regenerated"):
+            set_door_double_sided(duplicated, True)
+        with self.assertRaisesRegex(ValueError, "cannot use side door"):
+            replace(
+                door.with_double_sided(True),
+                side_duplication=DoorSideDuplication(),
+            )
 
     def test_malformed_library_entries_are_skipped_without_dangling_placements(
         self,

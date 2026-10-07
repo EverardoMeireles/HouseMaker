@@ -18,17 +18,22 @@ from housemaker.models import (
 
 # ### Constants ###
 DOOR_SLOT_BODY = "body"
-DOOR_SLOT_HINGES = "hinges"
 DOOR_SLOT_KNOB = "door_knob"
+DOOR_SLOT_BACK_BODY = "back_body"
+DOOR_SLOT_BACK_KNOB = "back_door_knob"
 DOOR_SLOT_KINDS = (
     DOOR_SLOT_BODY,
-    DOOR_SLOT_HINGES,
     DOOR_SLOT_KNOB,
+    DOOR_SLOT_BACK_BODY,
+    DOOR_SLOT_BACK_KNOB,
 )
+DOOR_BODY_SLOT_IDS = frozenset({DOOR_SLOT_BODY, DOOR_SLOT_BACK_BODY})
+DOOR_KNOB_SLOT_IDS = frozenset({DOOR_SLOT_KNOB, DOOR_SLOT_BACK_KNOB})
 DOOR_SLOT_DISPLAY_NAMES = {
     DOOR_SLOT_BODY: "Body",
-    DOOR_SLOT_HINGES: "Hinges",
-    DOOR_SLOT_KNOB: "Door knob",
+    DOOR_SLOT_KNOB: "Door knob/handle",
+    DOOR_SLOT_BACK_BODY: "Body",
+    DOOR_SLOT_BACK_KNOB: "Door knob/handle",
 }
 DEFAULT_DOOR_BODY_THICKNESS_METERS = 0.04
 MIN_DOOR_DIMENSION_METERS = 0.001
@@ -43,8 +48,9 @@ DOOR_SIDE_DUPLICATION_SIDES = frozenset(
 )
 DOOR_SIDE_DUPLICATION_METADATA_VERSION = 1
 DOOR_SIDE_DUPLICATION_UV_MODE = "reuse"
-DOOR_LIBRARY_SCHEMA_VERSION = 2
+DOOR_LIBRARY_SCHEMA_VERSION = 3
 _DOOR_NAME_PATTERN = re.compile(r"^New door\s+([1-9]\d*)$", re.IGNORECASE)
+_LEGACY_DOOR_SLOT_HINGES = "hinges"
 
 
 # ### Type aliases ###
@@ -65,6 +71,7 @@ class DoorSlotData:
     source_object_id: str
     position_meters: Vector3 = (0.0, 0.0, 0.0)
     rotation_degrees: Vector3 = (0.0, 0.0, 0.0)
+    axis_scales: Vector3 = (1.0, 1.0, 1.0)
     joined: bool = False
 
     def __post_init__(self) -> None:
@@ -77,7 +84,7 @@ class DoorSlotData:
         )
         if not isinstance(self.joined, bool):
             raise TypeError("Door slot joined state must be boolean.")
-        if slot_id == DOOR_SLOT_BODY and not self.joined:
+        if is_door_body_slot(slot_id) and not self.joined:
             raise ValueError("The door body slot must always be joined.")
 
         object.__setattr__(self, "slot_id", slot_id)
@@ -92,6 +99,14 @@ class DoorSlotData:
             "rotation_degrees",
             _normalize_vector3(self.rotation_degrees, "Door slot rotation"),
         )
+        object.__setattr__(
+            self,
+            "axis_scales",
+            _normalize_positive_vector3(
+                self.axis_scales,
+                "Door slot axis scales",
+            ),
+        )
 
     @property
     def display_name(self) -> str:
@@ -102,6 +117,7 @@ class DoorSlotData:
         *,
         position_meters: Sequence[float] | None = None,
         rotation_degrees: Sequence[float] | None = None,
+        axis_scales: Sequence[float] | None = None,
         joined: bool | None = None,
     ) -> DoorSlotData:
         """Return this slot with a validated edited transform."""
@@ -118,6 +134,9 @@ class DoorSlotData:
                 if rotation_degrees is None
                 else tuple(rotation_degrees)
             ),
+            axis_scales=(
+                self.axis_scales if axis_scales is None else tuple(axis_scales)
+            ),
             joined=self.joined if joined is None else joined,
         )
 
@@ -127,6 +146,7 @@ class DoorSlotData:
             "source_object_id": self.source_object_id,
             "position_meters": list(self.position_meters),
             "rotation_degrees": list(self.rotation_degrees),
+            "axis_scales": list(self.axis_scales),
             "joined": self.joined,
         }
 
@@ -138,6 +158,7 @@ class DoorSlotData:
             source_object_id=str(raw["source_object_id"]),
             position_meters=raw.get("position_meters", (0.0, 0.0, 0.0)),
             rotation_degrees=raw.get("rotation_degrees", (0.0, 0.0, 0.0)),
+            axis_scales=raw.get("axis_scales", (1.0, 1.0, 1.0)),
             joined=raw.get("joined", False),
         )
 
@@ -219,6 +240,8 @@ class DoorDefinition:
     thickness_meters: float = DEFAULT_DOOR_BODY_THICKNESS_METERS
     shape: str = DEFAULT_DOORWAY_SHAPE
     arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT
+    make_double_sided: bool = False
+    generate_displacement: bool = False
     side_duplication: DoorSideDuplication | None = None
     slots: tuple[DoorSlotData, ...] = ()
 
@@ -239,14 +262,35 @@ class DoorDefinition:
         slot_ids = tuple(slot.slot_id for slot in slots)
         if len(slot_ids) != len(set(slot_ids)):
             raise ValueError("A door cannot contain duplicate component slots.")
-        if DOOR_SLOT_BODY not in slot_ids:
-            raise ValueError("A door definition requires a body slot.")
+        if not isinstance(self.make_double_sided, bool):
+            raise TypeError("Door double-sided state must be boolean.")
+        if not isinstance(self.generate_displacement, bool):
+            raise TypeError("Door displacement-generation state must be boolean.")
+        required_slot_ids = {DOOR_SLOT_BODY, DOOR_SLOT_KNOB}
+        back_slot_ids = {DOOR_SLOT_BACK_BODY, DOOR_SLOT_BACK_KNOB}
+        if self.make_double_sided:
+            required_slot_ids.update(back_slot_ids)
+        elif back_slot_ids.intersection(slot_ids):
+            raise ValueError(
+                "A single-sided door cannot contain back-side slots."
+            )
+        missing_slot_ids = required_slot_ids.difference(slot_ids)
+        if missing_slot_ids:
+            raise ValueError(
+                "A door definition is missing required component slots: "
+                + ", ".join(sorted(missing_slot_ids))
+                + "."
+            )
         if self.side_duplication is not None and not isinstance(
             self.side_duplication,
             DoorSideDuplication,
         ):
             raise TypeError(
                 "Door side duplication must be DoorSideDuplication or None."
+            )
+        if self.make_double_sided and self.side_duplication is not None:
+            raise ValueError(
+                "A double-sided door cannot use side door duplication."
             )
 
         object.__setattr__(self, "door_id", door_id)
@@ -297,6 +341,11 @@ class DoorDefinition:
             ),
         )
 
+    def with_double_sided(self, enabled: bool) -> DoorDefinition:
+        """Return this door with deterministic front/back component slots."""
+
+        return set_door_double_sided(self, enabled)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "door_id": self.door_id,
@@ -307,6 +356,8 @@ class DoorDefinition:
             "thickness_meters": self.thickness_meters,
             "shape": self.shape,
             "arch_amount": self.arch_amount,
+            "make_double_sided": self.make_double_sided,
+            "generate_displacement": self.generate_displacement,
             "side_duplication": (
                 None
                 if self.side_duplication is None
@@ -339,12 +390,18 @@ class DoorDefinition:
                 "arch_amount",
                 DEFAULT_DOORWAY_ARCH_AMOUNT,
             ),
+            make_double_sided=raw.get("make_double_sided", False),
+            generate_displacement=raw.get("generate_displacement", False),
             side_duplication=(
                 None
                 if raw.get("side_duplication") is None
                 else DoorSideDuplication.from_dict(raw["side_duplication"])
             ),
-            slots=tuple(DoorSlotData.from_dict(slot) for slot in raw_slots),
+            slots=tuple(
+                DoorSlotData.from_dict(slot)
+                for slot in raw_slots
+                if not _is_legacy_hinge_slot_payload(slot)
+            ),
         )
 
 
@@ -522,7 +579,7 @@ def create_door_definition_for_doorway(
     door_id: str | None = None,
     thickness_meters: float | None = None,
 ) -> DoorDefinition:
-    """Create canonical body, hinge, and knob slots for one doorway."""
+    """Create canonical body and knob/handle slots for one doorway."""
 
     if not isinstance(doorway, DoorwayData):
         raise TypeError("Doors can only be created from DoorwayData.")
@@ -532,7 +589,6 @@ def create_door_definition_for_doorway(
         if thickness_meters is None
         else thickness_meters
     )
-    hinge_radius = min(0.012, doorway.width_meters * 0.025)
     knob_radius = min(0.035, doorway.width_meters * 0.075)
     slots = (
         DoorSlotData(
@@ -542,18 +598,6 @@ def create_door_definition_for_doorway(
                 DOOR_SLOT_BODY,
             ),
             joined=True,
-        ),
-        DoorSlotData(
-            slot_id=DOOR_SLOT_HINGES,
-            source_object_id=_slot_source_object_id(
-                normalized_door_id,
-                DOOR_SLOT_HINGES,
-            ),
-            position_meters=(
-                -doorway.width_meters / 2.0 + hinge_radius,
-                0.0,
-                doorway.height_meters * 0.18,
-            ),
         ),
         DoorSlotData(
             slot_id=DOOR_SLOT_KNOB,
@@ -581,6 +625,73 @@ def create_door_definition_for_doorway(
     )
 
 
+def set_door_double_sided(
+    door: DoorDefinition,
+    enabled: bool,
+) -> DoorDefinition:
+    """Add or remove deterministic back-side slots without changing the front."""
+
+    if not isinstance(door, DoorDefinition):
+        raise TypeError("Only DoorDefinition values can be made double-sided.")
+    if not isinstance(enabled, bool):
+        raise TypeError("Door double-sided state must be boolean.")
+    if enabled == door.make_double_sided:
+        return door
+    if enabled and door.side_duplication is not None:
+        raise ValueError(
+            "A side-duplicated door must be regenerated before it can be "
+            "made double-sided."
+        )
+    if not enabled:
+        return replace(
+            door,
+            make_double_sided=False,
+            slots=tuple(
+                slot
+                for slot in door.slots
+                if slot.slot_id
+                not in {DOOR_SLOT_BACK_BODY, DOOR_SLOT_BACK_KNOB}
+            ),
+        )
+
+    front_body = door.get_slot(DOOR_SLOT_BODY)
+    front_knob = door.get_slot(DOOR_SLOT_KNOB)
+    assert front_body is not None
+    assert front_knob is not None
+    back_body = replace(
+        front_body,
+        slot_id=DOOR_SLOT_BACK_BODY,
+        source_object_id=_slot_source_object_id(
+            door.door_id,
+            DOOR_SLOT_BACK_BODY,
+        ),
+    )
+    back_knob = replace(
+        front_knob,
+        slot_id=DOOR_SLOT_BACK_KNOB,
+        source_object_id=_slot_source_object_id(
+            door.door_id,
+            DOOR_SLOT_BACK_KNOB,
+        ),
+        position_meters=(
+            front_knob.position_meters[0],
+            (
+                -front_knob.position_meters[1]
+                if abs(front_knob.position_meters[1])
+                > MIN_DOOR_DIMENSION_METERS
+                else door.thickness_meters * 0.5
+            ),
+            front_knob.position_meters[2],
+        ),
+        joined=False,
+    )
+    return replace(
+        door,
+        make_double_sided=True,
+        slots=(*door.slots, back_body, back_knob),
+    )
+
+
 def next_door_name(doors: Iterable[DoorDefinition]) -> str:
     """Return the next monotonic ``New door n`` library name."""
 
@@ -597,19 +708,11 @@ def next_door_name(doors: Iterable[DoorDefinition]) -> str:
 def door_fits_doorway(
     door: DoorDefinition,
     doorway: DoorwayData,
-    *,
-    tolerance_meters: float = 0.01,
 ) -> bool:
-    """Return whether a reusable door matches a destination doorway profile."""
+    """Return whether scaling can preserve the destination silhouette."""
 
-    tolerance = _normalize_non_negative_float(
-        tolerance_meters,
-        "Door fit tolerance",
-    )
     return (
-        abs(door.width_meters - doorway.width_meters) <= tolerance
-        and abs(door.height_meters - doorway.height_meters) <= tolerance
-        and door.shape == doorway.shape
+        door.shape == doorway.shape
         and (
             door.shape == DEFAULT_DOORWAY_SHAPE
             or math.isclose(
@@ -621,7 +724,53 @@ def door_fits_doorway(
     )
 
 
+# ### Door slot helpers ###
+def is_door_body_slot(slot_id: object) -> bool:
+    """Return whether a slot identifies a front or back door body."""
+
+    return str(slot_id).strip().lower() in DOOR_BODY_SLOT_IDS
+
+
+def is_door_knob_slot(slot_id: object) -> bool:
+    """Return whether a slot identifies a front or back knob/handle."""
+
+    return str(slot_id).strip().lower() in DOOR_KNOB_SLOT_IDS
+
+
+def door_slot_side(slot_id: object) -> str:
+    """Return the stable front/back hierarchy side for an active slot."""
+
+    normalized_slot_id = str(slot_id).strip().lower()
+    if normalized_slot_id not in DOOR_SLOT_KINDS:
+        raise ValueError(f"Unknown door slot: {slot_id!r}.")
+    if normalized_slot_id in {DOOR_SLOT_BACK_BODY, DOOR_SLOT_BACK_KNOB}:
+        return DOOR_SIDE_DUPLICATION_BACK
+    return DOOR_SIDE_DUPLICATION_FRONT
+
+
+def door_slot_component(slot_id: object) -> str:
+    """Return the body or knob component represented by an active slot."""
+
+    normalized_slot_id = str(slot_id).strip().lower()
+    if normalized_slot_id in DOOR_BODY_SLOT_IDS:
+        return DOOR_SLOT_BODY
+    if normalized_slot_id in DOOR_KNOB_SLOT_IDS:
+        return DOOR_SLOT_KNOB
+    raise ValueError(f"Unknown door slot: {slot_id!r}.")
+
+
 # ### Validation helpers ###
+def _is_legacy_hinge_slot_payload(payload: object) -> bool:
+    """Return whether a serialized v1/v2 slot is the removed hinge slot."""
+
+    if not isinstance(payload, Mapping):
+        return False
+    return (
+        str(payload.get("slot_id", "")).strip().lower()
+        == _LEGACY_DOOR_SLOT_HINGES
+    )
+
+
 def _normalize_identifier(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} ID must be a string.")
@@ -641,13 +790,6 @@ def _normalize_dimension(value: object, label: str) -> float:
             f"{MAX_DOOR_DIMENSION_METERS:g} meters."
         )
     return dimension
-
-
-def _normalize_non_negative_float(value: object, label: str) -> float:
-    number = _normalize_finite_float(value, label)
-    if number < 0.0:
-        raise ValueError(f"{label} cannot be negative.")
-    return number
 
 
 def _normalize_finite_float(value: object, label: str) -> float:
@@ -674,6 +816,15 @@ def _normalize_vector3(value: object, label: str) -> Vector3:
         _normalize_finite_float(coordinate, label) for coordinate in value
     )
     return coordinates[0], coordinates[1], coordinates[2]
+
+
+def _normalize_positive_vector3(value: object, label: str) -> Vector3:
+    """Return three finite values that are all strictly positive."""
+
+    coordinates = _normalize_vector3(value, label)
+    if any(coordinate <= 0.0 for coordinate in coordinates):
+        raise ValueError(f"{label} must be greater than zero on every axis.")
+    return coordinates
 
 
 def _require_mapping(payload: object, label: str) -> Mapping[object, object]:

@@ -18,6 +18,7 @@ from housemaker.door_geometry import (
     mirror_door_model_horizontally,
 )
 from housemaker.door_state import (
+    DOOR_SLOT_BACK_BODY,
     DOOR_SLOT_BODY,
     DOOR_SLOT_KNOB,
     create_door_definition_for_doorway,
@@ -73,6 +74,19 @@ def _with_solid_texture(
         node_name="textured_door_body",
     )
     return import_generated_glb(bytes(scene.export(file_type="glb")))
+
+
+def _generated_hardware_fixture() -> GeneratedModel:
+    """Build a small stand-in for hardware that Generation would supply."""
+
+    return build_door_body_model(
+        0.08,
+        0.12,
+        0.04,
+        shape=DOORWAY_SHAPE_RECTANGULAR,
+        arch_amount=0.0,
+        geometry_name="generated_hardware_fixture",
+    )
 
 
 # ### UV assertions ###
@@ -140,7 +154,7 @@ class DoorBodyGeometryTests(unittest.TestCase):
         self.assertTrue(np.allclose(top_vertices[:, 0], 0.0, atol=1e-7))
         _assert_complete_uvs(self, model.mesh)
 
-    def test_every_default_slot_model_has_complete_finite_uvs(self) -> None:
+    def test_only_default_body_model_has_complete_finite_uvs(self) -> None:
         door = create_door_definition_for_doorway(
             _doorway(shape=DOORWAY_SHAPE_ARCH, arch_amount=0.7),
             door_id="door-with-uvs",
@@ -149,7 +163,7 @@ class DoorBodyGeometryTests(unittest.TestCase):
 
         slot_models = build_default_door_slot_models(door)
 
-        self.assertEqual(set(slot_models), {"body", "hinges", "door_knob"})
+        self.assertEqual(set(slot_models), {"body"})
         for model in slot_models.values():
             with self.subTest(model_bounds=model.mesh.bounds.tolist()):
                 _assert_complete_uvs(self, model.mesh)
@@ -159,6 +173,74 @@ class DoorBodyGeometryTests(unittest.TestCase):
 
 # ### Door assembly and mirror tests ###
 class DoorAssemblyGeometryTests(unittest.TestCase):
+    def test_double_sided_bodies_share_depth_without_overlapping(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
+            door_id="double-sided-door",
+            name="New door 1",
+        ).with_double_sided(True)
+        slot_models = build_default_door_slot_models(door)
+
+        assembled = assemble_door_model(
+            door,
+            slot_models,
+            include_unjoined=True,
+        )
+
+        self.assertEqual(
+            set(slot_models),
+            {DOOR_SLOT_BODY, DOOR_SLOT_BACK_BODY},
+        )
+        transformed_bounds: dict[str, np.ndarray] = {}
+        for preview in assembled.preview_placed_objects:
+            if preview.object_id not in {
+                door.get_slot(DOOR_SLOT_BODY).source_object_id,
+                door.get_slot(DOOR_SLOT_BACK_BODY).source_object_id,
+            }:
+                continue
+            mesh = preview.meshes[0].copy()
+            mesh.apply_transform(preview.placement_transform)
+            transformed_bounds[preview.object_id] = mesh.bounds
+        front = door.get_slot(DOOR_SLOT_BODY)
+        back = door.get_slot(DOOR_SLOT_BACK_BODY)
+        assert front is not None and back is not None
+        self.assertAlmostEqual(
+            transformed_bounds[front.source_object_id][1, 1],
+            transformed_bounds[back.source_object_id][0, 1],
+        )
+        self.assertAlmostEqual(
+            assembled.mesh.extents[1],
+            door.thickness_meters,
+        )
+
+    def test_slot_axis_scales_are_applied_to_assembled_geometry(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
+            door_id="scaled-door",
+            name="New door 1",
+        )
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        door = door.replace_slot(body.with_transform(axis_scales=(1.5, 2.0, 0.5)))
+        body_model = build_default_door_slot_models(door)[DOOR_SLOT_BODY]
+
+        assembled = assemble_door_model(
+            door,
+            {body.source_object_id: body_model},
+        )
+
+        body_preview = next(
+            preview
+            for preview in assembled.preview_placed_objects
+            if preview.object_id == body.source_object_id
+        )
+        self.assertEqual(body_preview.axis_scales, (1.5, 2.0, 0.5))
+        np.testing.assert_allclose(
+            assembled.mesh.extents,
+            body_model.mesh.extents * np.asarray((1.5, 2.0, 0.5)),
+            atol=1e-8,
+        )
+
     def test_textured_body_remains_textured_in_complete_preview(self) -> None:
         door = create_door_definition_for_doorway(
             _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
@@ -193,14 +275,10 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
         )
         self.assertIsNotNone(assembled.preview_untextured_mesh)
         assert assembled.preview_untextured_mesh is not None
-        self.assertEqual(
-            len(assembled.preview_untextured_mesh.faces),
-            len(slot_models["hinges"].mesh.faces)
-            + len(slot_models["door_knob"].mesh.faces),
-        )
+        self.assertEqual(len(assembled.preview_untextured_mesh.faces), 0)
         self.assertEqual(
             len(assembled.mesh.faces),
-            sum(len(model.mesh.faces) for model in slot_models.values()),
+            len(slot_models[DOOR_SLOT_BODY].mesh.faces),
         )
 
     def test_body_only_assembly_keeps_its_embedded_texture(self) -> None:
@@ -248,6 +326,7 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
             )
         )
         slot_models = build_default_door_slot_models(door)
+        slot_models[knob.source_object_id] = _generated_hardware_fixture()
 
         assembled = assemble_door_model(door, slot_models)
 
@@ -275,7 +354,10 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
         )
         assembled = assemble_door_model(
             door,
-            build_default_door_slot_models(door),
+            {
+                **build_default_door_slot_models(door),
+                knob.source_object_id: _generated_hardware_fixture(),
+            },
         )
 
         mirrored = mirror_door_model_horizontally(assembled)
@@ -291,7 +373,7 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
         self.assertEqual(len(mirrored.mesh.faces), len(assembled.mesh.faces))
         self.assertGreater(len(mirrored.glb_bytes), 0)
 
-    def test_nested_door_body_mirrors_follow_the_complete_door_placement(
+    def test_nested_body_and_knob_mirrors_follow_complete_door_placement(
         self,
     ) -> None:
         door = create_door_definition_for_doorway(
@@ -300,13 +382,24 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
             name="New door 1",
         )
         body = door.get_slot(DOOR_SLOT_BODY)
-        assert body is not None
+        knob = door.get_slot(DOOR_SLOT_KNOB)
+        assert body is not None and knob is not None
+        door = door.replace_slot(
+            knob.with_transform(
+                position_meters=(0.3, -0.06, 0.9),
+                axis_scales=(1.0, 1.5, 1.0),
+                joined=True,
+            )
+        )
+        knob = door.get_slot(DOOR_SLOT_KNOB)
+        assert knob is not None
         slot_models = build_default_door_slot_models(door)
         slot_models[DOOR_SLOT_BODY] = _with_solid_texture(
             slot_models[DOOR_SLOT_BODY],
             (45, 130, 220, 255),
         )
         body_face_count = len(slot_models[DOOR_SLOT_BODY].mesh.faces)
+        slot_models[knob.source_object_id] = _generated_hardware_fixture()
         hardware_face_count = sum(
             len(model.mesh.faces)
             for slot_id, model in slot_models.items()
@@ -323,13 +416,30 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(len(assembled.preview_symmetric_objects), 3)
+        previews = {
+            preview.object_id: preview
+            for preview in assembled.preview_symmetric_objects
+        }
+        body_preview_ids = {
+            body.source_object_id,
+            f"{body.source_object_id}:side",
+            f"{body.source_object_id}:symmetric-side",
+        }
+        knob_preview_id = f"{knob.source_object_id}:side"
+        self.assertEqual(set(previews), {*body_preview_ids, knob_preview_id})
+        self.assertTrue(
+            all(
+                not preview.fade_enabled
+                for preview in assembled.preview_symmetric_objects
+            )
+        )
         self.assertGreater(hardware_face_count, 0)
         self.assertEqual(
             len(assembled.mesh.faces),
             body_face_count + hardware_face_count,
         )
-        for preview in assembled.preview_symmetric_objects:
+        for preview_id in body_preview_ids:
+            preview = previews[preview_id]
             self.assertEqual(
                 sum(len(mesh.faces) for mesh in preview.meshes),
                 body_face_count,
@@ -338,8 +448,44 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
                 sum(len(mesh.faces) for mesh in preview.mirrored_meshes),
                 body_face_count,
             )
+        knob_preview = previews[knob_preview_id]
+        self.assertEqual(
+            sum(len(mesh.faces) for mesh in knob_preview.meshes),
+            hardware_face_count,
+        )
+        self.assertEqual(
+            sum(len(mesh.faces) for mesh in knob_preview.mirrored_meshes),
+            hardware_face_count,
+        )
+        retained_knob_vertices = np.asarray(
+            knob_preview.meshes[0].vertices,
+            dtype=float,
+        )
+        mirrored_knob_vertices = np.asarray(
+            knob_preview.mirrored_meshes[0].vertices,
+            dtype=float,
+        )
+        np.testing.assert_allclose(
+            np.sort(mirrored_knob_vertices[:, 0]),
+            np.sort(retained_knob_vertices[:, 0]),
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            np.sort(mirrored_knob_vertices[:, 1]),
+            np.sort(
+                knob_preview.plane_coordinate * 2.0
+                - retained_knob_vertices[:, 1]
+            ),
+            atol=1e-9,
+        )
         mirrored_assembly = mirror_door_model_horizontally(assembled)
-        self.assertEqual(len(mirrored_assembly.preview_symmetric_objects), 3)
+        self.assertEqual(len(mirrored_assembly.preview_symmetric_objects), 4)
+        self.assertTrue(
+            all(
+                not preview.fade_enabled
+                for preview in mirrored_assembly.preview_symmetric_objects
+            )
+        )
         for original, reflected in zip(
             assembled.preview_symmetric_objects,
             mirrored_assembly.preview_symmetric_objects,
@@ -371,9 +517,17 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(len(composed.preview_symmetric_objects), 3)
+        self.assertEqual(len(composed.preview_symmetric_objects), 4)
         for preview in composed.preview_symmetric_objects:
             self.assertTrue(preview.object_id.startswith("placed-door:nested:"))
+            self.assertFalse(preview.fade_enabled)
+        composed_body_previews = tuple(
+            preview
+            for preview in composed.preview_symmetric_objects
+            if not preview.object_id.endswith(knob_preview_id)
+        )
+        self.assertEqual(len(composed_body_previews), 3)
+        for preview in composed_body_previews:
             self.assertEqual(
                 sum(len(mesh.faces) for mesh in preview.mirrored_meshes),
                 body_face_count,
@@ -384,6 +538,69 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
                 np.asarray(texture.convert("RGBA"), dtype=np.uint8)[0, 0],
                 (45, 130, 220, 255),
             )
+        composed_knob_preview = next(
+            preview
+            for preview in composed.preview_symmetric_objects
+            if preview.object_id.endswith(knob_preview_id)
+        )
+        self.assertEqual(
+            sum(
+                len(mesh.faces)
+                for mesh in composed_knob_preview.mirrored_meshes
+            ),
+            hardware_face_count,
+        )
+
+    def test_nested_body_mirror_planes_follow_body_axis_scales(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
+            door_id="scaled-mirror-door",
+            name="New door 1",
+        )
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        door = door.replace_slot(
+            body.with_transform(axis_scales=(1.5, 2.0, 0.75))
+        )
+        body_model = build_default_door_slot_models(door)[DOOR_SLOT_BODY]
+
+        assembled = assemble_door_model(
+            door,
+            {body.source_object_id: body_model},
+            body_mirror=DoorBodyMirrorConfiguration(
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.1,
+                side_duplication_plane_coordinate=0.01,
+            ),
+        )
+
+        previews = {
+            preview.object_id: preview
+            for preview in assembled.preview_symmetric_objects
+        }
+        symmetric = previews[body.source_object_id]
+        side = previews[f"{body.source_object_id}:side"]
+        symmetric_side = previews[f"{body.source_object_id}:symmetric-side"]
+        self.assertAlmostEqual(symmetric.plane_coordinate, 0.15)
+        self.assertAlmostEqual(side.plane_coordinate, 0.02)
+        self.assertAlmostEqual(symmetric_side.plane_coordinate, 0.02)
+
+        retained_vertices = np.asarray(side.meshes[0].vertices, dtype=float)
+        side_vertices = np.asarray(side.mirrored_meshes[0].vertices, dtype=float)
+        np.testing.assert_allclose(
+            np.sort(side_vertices[:, 1]),
+            np.sort(0.04 - retained_vertices[:, 1]),
+            atol=1e-9,
+        )
+        symmetric_vertices = np.asarray(
+            symmetric_side.meshes[0].vertices,
+            dtype=float,
+        )
+        np.testing.assert_allclose(
+            np.sort(symmetric_vertices[:, 0]),
+            np.sort(0.3 - retained_vertices[:, 0]),
+            atol=1e-9,
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import (
     QObject,
+    QSignalBlocker,
     QStandardPaths,
     Qt,
     QThread,
@@ -47,9 +48,9 @@ from shiboken6 import isValid as is_valid_qt_object
 from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_BACK,
     DOOR_SIDE_DUPLICATION_FRONT,
-    DOOR_SLOT_BODY,
     DoorSideDuplication,
     DoorSideDuplicationMetadata,
+    is_door_body_slot,
 )
 from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_shared_controls import GenerationSharedControls
@@ -78,7 +79,9 @@ from housemaker.glb import (
     GLB_JSON_CHUNK_TYPE,
     GLB_MAGIC,
     GLB_VERSION,
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     MAX_IMPORTED_GENERATED_MODEL_FACES,
+    Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     GeneratedModel,
     import_generated_glb,
 )
@@ -231,17 +234,21 @@ SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY = "safe_duplicate_face_removal"
 EXTERNAL_GLB_IMPORT_PIPELINE_KEY = "external_glb_import"
 DOOR_COMPONENT_PIPELINE_KEY = "door_component"
 DOOR_SIDE_DUPLICATION_PIPELINE_KEY = "door_side_duplication"
+DOOR_BODY_DISPLACEMENT_PIPELINE_KEY = "door_body_displacement"
 DOOR_SIDE_DUPLICATION_AXIS = 1
 DOOR_SIDE_DUPLICATION_AXIS_SIDE_BY_NAME = {
     DOOR_SIDE_DUPLICATION_FRONT: AXIS_HALF_SIDE_NEGATIVE,
     DOOR_SIDE_DUPLICATION_BACK: AXIS_HALF_SIDE_POSITIVE,
 }
+DOOR_SIDE_DUPLICATION_FRONT_PROJECTION_PERCENTAGES = (1, 1, 1, 95, 1, 1)
+DOOR_SIDE_DUPLICATION_BACK_PROJECTION_PERCENTAGES = (1, 1, 95, 1, 1, 1)
 # Legacy-only key retained so later geometry operations can discard obsolete
 # masks from projects saved before Object Generation inpainting was removed.
 TEXTURE_INPAINT_STROKES_PIPELINE_KEY = "texture_inpaint_strokes"
 OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
+OBJECT_OPERATION_REPLACE_MODEL = "replace_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_CREATE_FACE = "create_face"
 OBJECT_OPERATION_DELETE_FACES = "delete_faces"
@@ -384,6 +391,16 @@ def _normalize_editable_projection_camera_percentages(
     return normalized
 
 
+def _door_side_duplication_projection_percentages(
+    duplication: DoorSideDuplication | DoorSideDuplicationMetadata,
+) -> tuple[int, ...]:
+    """Give the retained broad face 95% and every other direction 1%."""
+
+    if duplication.kept_side == DOOR_SIDE_DUPLICATION_BACK:
+        return DOOR_SIDE_DUPLICATION_BACK_PROJECTION_PERCENTAGES
+    return DOOR_SIDE_DUPLICATION_FRONT_PROJECTION_PERCENTAGES
+
+
 def _apportion_integer_percentage(
     amount: int,
     weights: Sequence[int],
@@ -430,6 +447,8 @@ class _ActiveObjectOperation:
     cancel_requested: bool = False
     committed_object_id: str | None = None
     pending_placement: GeneratedObjectPlacement | None = None
+    door_slot_target: _DoorSlotEditingTarget | None = None
+    replaced_object_record: GeneratedObjectRecord | None = None
     _operation_id: str = field(
         default_factory=lambda: uuid.uuid4().hex,
         init=False,
@@ -540,6 +559,31 @@ def _apply_generation_batch_pipeline_metadata(
         "blob_index": operation.blob_index,
         "blob_count": operation.blob_count,
     }
+
+
+def _apply_door_slot_pipeline_metadata(
+    pipeline: dict[str, object],
+    target: _DoorSlotEditingTarget | None,
+) -> None:
+    """Keep generated door hardware hidden from ordinary object workflows."""
+
+    if target is None:
+        return
+    pipeline["mode"] = "door_component"
+    pipeline[DOOR_COMPONENT_PIPELINE_KEY] = {
+        "door_id": target.door_id,
+        "slot_id": target.slot_id,
+    }
+    if (
+        target.generate_displacement
+        and target.door_body_fit_dimensions is not None
+    ):
+        pipeline[DOOR_BODY_DISPLACEMENT_PIPELINE_KEY] = {
+            "fit_dimensions_meters": list(
+                target.door_body_fit_dimensions
+            ),
+            "geometry_generation": True,
+        }
 
 
 # ### Symmetric-division metadata ###
@@ -719,6 +763,41 @@ def _normalize_new_door_side_duplication(
     return raw_duplication
 
 
+def _normalize_door_body_fit_dimensions(
+    raw_dimensions: object,
+) -> tuple[float, float, float] | None:
+    """Validate one generated body's width, thickness, and height target."""
+
+    if raw_dimensions is None:
+        return None
+    if isinstance(raw_dimensions, (str, bytes, bytearray)):
+        raise TypeError("Door body fit dimensions must be a numeric sequence.")
+    try:
+        values = tuple(raw_dimensions)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "Door body fit dimensions must be a numeric sequence."
+        ) from error
+    if len(values) != 3:
+        raise ValueError(
+            "Door body fit dimensions require width, thickness, and height."
+        )
+    normalized: list[float] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise TypeError("Door body fit dimensions must be numbers.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as error:
+            raise TypeError("Door body fit dimensions must be numbers.") from error
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(
+                "Door body fit dimensions must be finite and greater than zero."
+            )
+        normalized.append(number)
+    return normalized[0], normalized[1], normalized[2]
+
+
 class GenerationRequest:
     """Owned selected-object input passed to Meshy Image-to-3D."""
 
@@ -738,6 +817,8 @@ class GenerationRequest:
         ),
         enabled_pbr_maps: Sequence[str] = (),
         ai_prompt: str = "",
+        door_body_fit_dimensions: Sequence[float] | None = None,
+        door_side_duplication: DoorSideDuplication | None = None,
     ) -> None:
         self.frame_index = int(frame_index)
         self.selected_object_bgra = np.ascontiguousarray(
@@ -765,6 +846,24 @@ class GenerationRequest:
             enabled_pbr_maps
         )
         self.ai_prompt = normalize_image_to_3d_texture_prompt(ai_prompt)
+        self.door_body_fit_dimensions = _normalize_door_body_fit_dimensions(
+            door_body_fit_dimensions
+        )
+        self.door_side_duplication = _normalize_new_door_side_duplication(
+            door_side_duplication,
+            preserve_existing=False,
+        )
+        if (
+            self.door_side_duplication is not None
+            and self.door_body_fit_dimensions is None
+        ):
+            raise ValueError(
+                "Door side duplication requires a fitted generated door body."
+            )
+        if self.geometry_only and self.door_body_fit_dimensions is not None:
+            raise ValueError(
+                "Door displacement generation requires a textured model."
+            )
 
 
 @dataclass(frozen=True)
@@ -1218,8 +1317,13 @@ class _DoorSlotEditingTarget:
     door_id: str
     slot_id: str
     object_id: str
-    editable_transform: bool
+    object_name: str
+    slot_display_name: str
     side_duplication: DoorSideDuplication | None = None
+    side_duplication_allowed: bool = True
+    generate_displacement: bool = False
+    door_body_fit_dimensions: tuple[float, float, float] | None = None
+    generation_ready: bool = False
 
     def __post_init__(self) -> None:
         if self.side_duplication is not None and not isinstance(
@@ -1229,10 +1333,39 @@ class _DoorSlotEditingTarget:
             raise TypeError(
                 "Door side duplication must use DoorSideDuplication settings."
             )
-        if self.slot_id != DOOR_SLOT_BODY and self.side_duplication is not None:
+        body_slot = is_door_body_slot(self.slot_id)
+        if not isinstance(self.generate_displacement, bool):
+            raise TypeError("Door displacement-generation state must be boolean.")
+        normalized_fit_dimensions = _normalize_door_body_fit_dimensions(
+            self.door_body_fit_dimensions
+        )
+        object.__setattr__(
+            self,
+            "door_body_fit_dimensions",
+            normalized_fit_dimensions,
+        )
+        if not isinstance(self.side_duplication_allowed, bool):
+            raise TypeError("Door side-duplication availability must be boolean.")
+        if not body_slot and self.side_duplication is not None:
             raise ValueError(
                 "Side duplication can only be applied to a door body."
             )
+        if self.side_duplication is not None and not self.side_duplication_allowed:
+            raise ValueError(
+                "Side duplication is unavailable for this door body."
+            )
+        if not body_slot and self.generate_displacement:
+            raise ValueError(
+                "Displacement generation can only be enabled for a door body."
+            )
+        if not body_slot and normalized_fit_dimensions is not None:
+            raise ValueError("Only a door body can have fit dimensions.")
+        if self.generate_displacement and normalized_fit_dimensions is None:
+            raise ValueError(
+                "Door displacement generation requires body fit dimensions."
+            )
+        if not isinstance(self.generation_ready, bool):
+            raise TypeError("Door slot generation readiness must be boolean.")
 
 
 @dataclass(frozen=True)
@@ -1574,6 +1707,8 @@ def _texture_regeneration_scan_target(
         and not request.glass_face_indices
         and not request.preserve_existing_glass
     ):
+        return None
+    if request.new_symmetric_division_orientation is not None:
         return None
     if symmetry is None:
         return SCAN_PROJECTION_TARGET_FULL
@@ -3500,7 +3635,8 @@ class GenerationWorkspace(QWidget):
     external_glb_import_completed = Signal(object, object)
     external_glb_import_failed = Signal(str)
     door_slot_editing_changed = Signal(bool)
-    door_slot_transform_changed = Signal(str, str, object, object)
+    door_slot_generation_status_changed = Signal(str)
+    door_side_duplication_changed = Signal(str, object)
 
     def __init__(
         self,
@@ -3585,10 +3721,8 @@ class GenerationWorkspace(QWidget):
         self._is_emitting_texture_repair = False
         self._selected_object_id: str | None = None
         self._door_slot_editing_target: _DoorSlotEditingTarget | None = None
+        self._door_slot_generation_prompt_visible = False
         self._build_ui()
-        self.result_view.placed_object_transform_changed.connect(
-            self._handle_door_slot_transform_changed
-        )
         self._sync_video_controls()
         self._sync_controls()
 
@@ -3894,42 +4028,101 @@ class GenerationWorkspace(QWidget):
         door_id: str,
         slot_id: str,
         object_id: str,
-        preview_model: GeneratedModel,
-        editable_transform: bool,
+        object_name: str,
+        slot_display_name: str,
         side_duplication: DoorSideDuplication | None = None,
+        side_duplication_allowed: bool = True,
+        generate_displacement: bool = False,
+        door_body_fit_dimensions: Sequence[float] | None = None,
+        generation_ready: bool = True,
+        announce_generation: bool | None = None,
     ) -> bool:
-        """Display a door assembly while routing generation to one exact slot."""
+        """Route Generation to one slot without owning its transform gizmo."""
 
-        record = self._find_generated_object_record(str(object_id).strip())
-        if record is None or not is_door_component_record(record):
+        normalized_door_id = str(door_id).strip()
+        normalized_slot_id = str(slot_id).strip()
+        normalized_object_id = str(object_id).strip()
+        normalized_object_name = str(object_name).strip()
+        normalized_slot_display_name = str(slot_display_name).strip()
+        if not all(
+            (
+                normalized_door_id,
+                normalized_slot_id,
+                normalized_object_id,
+                normalized_object_name,
+                normalized_slot_display_name,
+            )
+        ):
             return False
-        if not isinstance(preview_model, GeneratedModel):
-            raise TypeError("Door slot previews require a GeneratedModel.")
-        self._door_slot_editing_target = _DoorSlotEditingTarget(
-            door_id=str(door_id).strip(),
-            slot_id=str(slot_id).strip(),
-            object_id=record.object_id,
-            editable_transform=bool(editable_transform),
+        record = self._find_generated_object_record(normalized_object_id)
+        if record is not None and not is_door_component_record(record):
+            return False
+        previous_target = self._door_slot_editing_target
+        next_target = _DoorSlotEditingTarget(
+            door_id=normalized_door_id,
+            slot_id=normalized_slot_id,
+            object_id=normalized_object_id,
+            object_name=normalized_object_name,
+            slot_display_name=normalized_slot_display_name,
             side_duplication=side_duplication,
+            side_duplication_allowed=bool(
+                side_duplication_allowed
+                and is_door_body_slot(normalized_slot_id)
+            ),
+            generate_displacement=bool(
+                generate_displacement
+                and is_door_body_slot(normalized_slot_id)
+            ),
+            door_body_fit_dimensions=(
+                door_body_fit_dimensions
+                if is_door_body_slot(normalized_slot_id)
+                else None
+            ),
+            generation_ready=bool(generation_ready),
         )
-        self._selected_object_id = record.object_id
-        self._generated_model = self._load_generated_object_model(record)
-        self._displayed_object_snapshot = _build_generated_object_display_snapshot(
-            record,
-            self._asset_directory,
+        same_target = bool(
+            previous_target is not None
+            and previous_target.door_id == next_target.door_id
+            and previous_target.slot_id == next_target.slot_id
         )
+        if announce_generation is not None:
+            self._door_slot_generation_prompt_visible = bool(
+                announce_generation and next_target.generation_ready
+            )
+        elif not next_target.generation_ready:
+            self._door_slot_generation_prompt_visible = False
+        elif not same_target or not previous_target.generation_ready:
+            self._door_slot_generation_prompt_visible = True
+        self._door_slot_editing_target = next_target
         self.result_view.cancel_transient_pointer_interactions()
-        self.result_view.set_model(preview_model)
         self.result_view.set_face_editing_enabled(False)
-        self.result_view.set_selected_placed_object_ids(
-            (record.object_id,) if editable_transform else (),
-            active_object_id=record.object_id if editable_transform else None,
-        )
-        self._sync_model_statistics(self._generated_model, record)
+        self.result_view.set_selected_placed_object_ids(())
+        if record is None:
+            self._selected_object_id = None
+            self._clear_generated_object_display()
+        else:
+            self._selected_object_id = record.object_id
+            self._display_generated_object(record)
         self._sync_face_selection_outputs()
         self._sync_controls()
         self.door_slot_editing_changed.emit(True)
+        self._emit_active_door_slot_generation_status()
         return True
+
+    def is_door_slot_generation_ready(
+        self,
+        door_id: str,
+        slot_id: str,
+    ) -> bool:
+        """Return whether this exact slot was explicitly opened for generation."""
+
+        target = self._door_slot_editing_target
+        return bool(
+            target is not None
+            and target.door_id == str(door_id).strip()
+            and target.slot_id == str(slot_id).strip()
+            and target.generation_ready
+        )
 
     def clear_door_slot_editing_target(self) -> None:
         """Return Generation to its ordinary generated-object context."""
@@ -3937,32 +4130,11 @@ class GenerationWorkspace(QWidget):
         if self._door_slot_editing_target is None:
             return
         self._door_slot_editing_target = None
+        self._door_slot_generation_prompt_visible = False
         self.result_view.set_selected_placed_object_ids(())
         self._select_generated_object(None)
         self.door_slot_editing_changed.emit(False)
-
-    @Slot(str, object, object)
-    def _handle_door_slot_transform_changed(
-        self,
-        object_id: str,
-        world_position: object,
-        rotation_degrees: object,
-    ) -> None:
-        """Forward only the active non-body door slot's gizmo transform."""
-
-        target = self._door_slot_editing_target
-        if (
-            target is None
-            or not target.editable_transform
-            or str(object_id) != target.object_id
-        ):
-            return
-        self.door_slot_transform_changed.emit(
-            target.door_id,
-            target.slot_id,
-            world_position,
-            rotation_degrees,
-        )
+        self._emit_active_door_slot_generation_status()
 
     def import_external_glb(
         self,
@@ -4274,7 +4446,9 @@ class GenerationWorkspace(QWidget):
             return ()
         placeable_ids_by_index: dict[int, str] = {}
         completed_object_ids = {
-            record.object_id for record in self._data.generated_objects
+            record.object_id
+            for record in self._data.generated_objects
+            if not is_door_component_record(record)
         }
         for blob_index, placeable_id in (
             self._latest_generation_batch_member_ids.items()
@@ -4287,6 +4461,8 @@ class GenerationWorkspace(QWidget):
             if is_active or placeable_id in completed_object_ids:
                 placeable_ids_by_index[blob_index] = placeable_id
         for record in self._data.generated_objects:
+            if is_door_component_record(record):
+                continue
             raw_metadata = record.pipeline.get(GENERATION_BATCH_PIPELINE_KEY)
             if not isinstance(raw_metadata, Mapping):
                 continue
@@ -4299,7 +4475,10 @@ class GenerationWorkspace(QWidget):
             placeable_ids_by_index[blob_index] = record.object_id
         for runtime in self._object_job_runtimes.values():
             operation = runtime.operation
-            if operation.batch_id != batch_id:
+            if (
+                operation.batch_id != batch_id
+                or operation.door_slot_target is not None
+            ):
                 continue
             if operation.committed_object_id is not None:
                 placeable_ids_by_index[operation.blob_index] = (
@@ -4366,10 +4545,11 @@ class GenerationWorkspace(QWidget):
     def get_scene_bound_placeable_object_ids(self) -> tuple[str, ...]:
         """Return sources represented by an authored placement or an instance."""
 
+        placeable_ids = set(self.get_placeable_object_names_by_id())
         bound_ids = [
             record.object_id
             for record in self._data.generated_objects
-            if record.placement is not None
+            if record.object_id in placeable_ids and record.placement is not None
         ]
         bound_ids.extend(
             runtime.operation_id
@@ -4378,7 +4558,9 @@ class GenerationWorkspace(QWidget):
             and runtime.operation.pending_placement is not None
         )
         bound_ids.extend(
-            instance.source_object_id for instance in self._data.object_instances
+            instance.source_object_id
+            for instance in self._data.object_instances
+            if instance.source_object_id in placeable_ids
         )
         return tuple(dict.fromkeys(bound_ids))
 
@@ -4658,6 +4840,7 @@ class GenerationWorkspace(QWidget):
             raise RuntimeError("Cannot replace Generation data while generating.")
         self._finish_existing_object_placement_request()
         self._door_slot_editing_target = None
+        self._door_slot_generation_prompt_visible = False
         self._latest_generation_batch_id = None
         self._latest_generation_batch_member_ids.clear()
         self._latest_generation_batch_mask_signature = None
@@ -4697,6 +4880,8 @@ class GenerationWorkspace(QWidget):
         finally:
             self._is_rebuilding_generation_data = False
         self._sync_controls()
+        self.door_slot_editing_changed.emit(False)
+        self._emit_active_door_slot_generation_status()
         self._emit_placeable_objects_changed()
 
     def set_runtime_settings(self, settings: GenerationServiceSettings) -> None:
@@ -5716,10 +5901,77 @@ class GenerationWorkspace(QWidget):
     def generate_selected_object_texture(self) -> bool:
         """Generate the selected object's texture from the current mask."""
 
+        target = self._door_slot_editing_target
+        if (
+            target is not None
+            and self._find_generated_object_record(target.object_id) is None
+        ):
+            return self._start_empty_door_slot_generation(target)
         request = self._build_texture_regeneration_request()
         if request is None:
             return False
         return self._start_texture_regeneration(request)
+
+    def _start_empty_door_slot_generation(
+        self,
+        target: _DoorSlotEditingTarget,
+    ) -> bool:
+        """Create the first real model for one non-body door hardware slot."""
+
+        if self._find_generated_object_record(target.object_id) is not None:
+            return False
+        if is_door_body_slot(target.slot_id):
+            self.status_label.setText(
+                "The fitted door body is missing. Use Generate with Generate "
+                "displacement enabled to recreate its geometry."
+            )
+            return False
+        return self._start_door_slot_model_generation(target)
+
+    def _start_door_slot_model_generation(
+        self,
+        target: _DoorSlotEditingTarget,
+    ) -> bool:
+        """Generate or replace one eligible door component model."""
+
+        side_duplication_rebuild = (
+            self._door_body_side_duplication_requires_rebuild(target)
+        )
+        if (
+            is_door_body_slot(target.slot_id)
+            and not target.generate_displacement
+            and not side_duplication_rebuild
+        ):
+            self.status_label.setText(
+                "Enable Generate displacement to replace the fitted door "
+                "body geometry."
+            )
+            return False
+        if (
+            is_door_body_slot(target.slot_id)
+            and target.door_body_fit_dimensions is None
+        ):
+            self.status_label.setText(
+                "The door body dimensions are unavailable, so its geometry "
+                "cannot be rebuilt."
+            )
+            return False
+        if self._object_has_active_mutation_job(target.object_id):
+            self.status_label.setText(
+                f"Wait for {target.slot_display_name} generation to finish."
+            )
+            return False
+        request = self._build_generation_request()
+        if request is None:
+            return False
+        replaced_record = self._find_generated_object_record(target.object_id)
+        self._start_generation(
+            request,
+            requested_name=target.object_name,
+            door_slot_target=target,
+            replaced_object_record=replaced_record,
+        )
+        return True
 
     def convert_selected_faces_to_glass(self) -> bool:
         """Run a PBR texture job for the authoritative selected faces."""
@@ -5856,6 +6108,7 @@ class GenerationWorkspace(QWidget):
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         operation = str(snapshot.get("operation", "object change"))
         operation_label = {
+            OBJECT_OPERATION_REPLACE_MODEL: "model replacement",
             OBJECT_OPERATION_GENERATE_TEXTURE: "texture generation",
             OBJECT_OPERATION_CREATE_FACE: "face creation",
             OBJECT_OPERATION_DELETE_FACES: "face deletion",
@@ -6037,8 +6290,18 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
 
     def generate(self) -> None:
-        if self._door_slot_editing_target is not None:
-            self.generate_selected_object_texture()
+        target = self._door_slot_editing_target
+        if target is not None and is_door_body_slot(target.slot_id):
+            if (
+                target.generate_displacement
+                or self._door_body_side_duplication_requires_rebuild(target)
+            ):
+                self._start_door_slot_model_generation(target)
+            else:
+                self.generate_selected_object_texture()
+            return
+        if target is not None:
+            self._start_door_slot_model_generation(target)
             return
         requests = self._build_generation_requests()
         if not requests:
@@ -6050,8 +6313,8 @@ class GenerationWorkspace(QWidget):
 
         if self._door_slot_editing_target is not None:
             self.status_label.setText(
-                "Door slots keep their exact doorway-fitting geometry. Use "
-                "Generate or Generate texture to texture the selected slot."
+                "Door components use Generate for model creation or Generate "
+                "texture for texture-only updates."
             )
             return
         if self.symmetric_division_checkbox.isChecked():
@@ -6160,18 +6423,46 @@ class GenerationWorkspace(QWidget):
         batch_id: str | None = None,
         blob_index: int = 1,
         blob_count: int = 1,
+        door_slot_target: _DoorSlotEditingTarget | None = None,
+        replaced_object_record: GeneratedObjectRecord | None = None,
     ) -> str:
         """Start one independently owned model-generation request."""
 
-        resolved_name = str(requested_name or "").strip()
+        if replaced_object_record is not None and (
+            door_slot_target is None
+            or replaced_object_record.object_id != door_slot_target.object_id
+        ):
+            raise ValueError(
+                "A model replacement must target the same door slot object."
+            )
+
+        resolved_name = (
+            door_slot_target.object_name
+            if door_slot_target is not None
+            else str(requested_name or "").strip()
+        )
         if not resolved_name:
             resolved_name = self._build_next_generated_object_name()
-        object_id = uuid.uuid4().hex
+        staging_object_id = uuid.uuid4().hex
         operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_MODEL,
+            target_object_id=(
+                None
+                if door_slot_target is None
+                else door_slot_target.object_id
+            ),
             batch_id=None if batch_id is None else str(batch_id),
             blob_index=int(blob_index),
             blob_count=int(blob_count),
+            door_slot_target=door_slot_target,
+            replaced_object_record=(
+                None
+                if replaced_object_record is None
+                else replace(
+                    replaced_object_record,
+                    pipeline=copy.deepcopy(replaced_object_record.pipeline),
+                )
+            ),
         )
         thread = QThread(self)
         worker = GenerationWorker(
@@ -6179,7 +6470,7 @@ class GenerationWorkspace(QWidget):
             self._meshy_executor,
             request,
             asset_directory=self._asset_directory,
-            object_id=object_id,
+            object_id=staging_object_id,
         )
         relay = _ObjectJobSignalRelay(operation.operation_id, self)
         managed_job_id = self._create_managed_job(
@@ -6199,6 +6490,7 @@ class GenerationWorkspace(QWidget):
             managed_job_id=managed_job_id,
         )
         self._register_object_job_runtime(runtime)
+        self._emit_active_door_slot_generation_status()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(relay.forward_pair_succeeded)
@@ -6245,6 +6537,15 @@ class GenerationWorkspace(QWidget):
         operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_TEXTURE,
             target_object_id=request.object_id,
+            door_slot_target=(
+                self._door_slot_editing_target
+                if (
+                    self._door_slot_editing_target is not None
+                    and self._door_slot_editing_target.object_id
+                    == request.object_id
+                )
+                else None
+            ),
         )
         thread = QThread(self)
         worker = TextureRegenerationWorker(
@@ -6280,6 +6581,7 @@ class GenerationWorkspace(QWidget):
             managed_job_id=managed_job_id,
         )
         self._register_object_job_runtime(runtime)
+        self._emit_active_door_slot_generation_status()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(relay.forward_pair_succeeded)
@@ -6472,6 +6774,25 @@ class GenerationWorkspace(QWidget):
             )
         if self._can_place_active_operation(runtime.operation):
             self._emit_placeable_objects_changed()
+
+    def _emit_active_door_slot_generation_status(self) -> None:
+        """Publish the newest door job or explicitly opened slot header."""
+
+        slot_name = ""
+        for runtime in reversed(tuple(self._object_job_runtimes.values())):
+            target = runtime.operation.door_slot_target
+            if target is not None:
+                slot_name = target.slot_display_name
+                break
+        target = self._door_slot_editing_target
+        if (
+            not slot_name
+            and target is not None
+            and target.generation_ready
+            and self._door_slot_generation_prompt_visible
+        ):
+            slot_name = target.slot_display_name
+        self.door_slot_generation_status_changed.emit(slot_name)
 
     def _active_placeable_object_name(
         self,
@@ -6893,6 +7214,26 @@ class GenerationWorkspace(QWidget):
         self.symmetric_division_checkbox.toggled.connect(self._sync_controls)
         buttons_layout.addWidget(self.symmetric_division_checkbox)
 
+        self.side_door_duplication_checkbox = QCheckBox(
+            "Side door duplication"
+        )
+        self.side_door_duplication_checkbox.setObjectName(
+            "side_door_duplication_checkbox"
+        )
+        self.side_door_duplication_checkbox.setToolTip(
+            "Choose whether the next generated door body keeps its front "
+            "depth-half, allocate "
+            "95% of its texture detail to the visible face and 1% to each "
+            "other direction, then mirror the omitted half in R3F. Clearing "
+            "an already-applied cut makes Generate rebuild the full body."
+        )
+        self.side_door_duplication_checkbox.hide()
+        self.side_door_duplication_checkbox.setEnabled(False)
+        self.side_door_duplication_checkbox.toggled.connect(
+            self._handle_side_door_duplication_changed
+        )
+        buttons_layout.addWidget(self.side_door_duplication_checkbox)
+
         self.generate_button = QPushButton("Generate")
         self.generate_button.setMinimumHeight(38)
         self.generate_button.setToolTip(
@@ -7076,6 +7417,7 @@ class GenerationWorkspace(QWidget):
         return bool(
             operation is not None
             and operation.kind == OBJECT_OPERATION_GENERATE_MODEL
+            and operation.door_slot_target is None
             and not operation.cancel_requested
             and operation.committed_object_id is None
             and runtime is not None
@@ -7156,6 +7498,69 @@ class GenerationWorkspace(QWidget):
         if was_placeable:
             self._emit_placeable_objects_changed()
         self._sync_controls()
+
+    def _resolve_generated_model_replacement_source(
+        self,
+        operation: _ActiveObjectOperation | None,
+        object_id: str,
+    ) -> GeneratedObjectRecord | None:
+        """Validate the stable door-slot record captured when a job started."""
+
+        if operation is None or operation.door_slot_target is None:
+            return None
+        current_record = self._find_generated_object_record(object_id)
+        snapshot = operation.replaced_object_record
+        if snapshot is None:
+            if current_record is not None:
+                raise RuntimeError(
+                    "The target door slot received another model before this "
+                    "generation completed."
+                )
+            return None
+        if current_record is None or current_record != snapshot:
+            raise RuntimeError(
+                "The target door slot changed before its replacement model "
+                "could be applied."
+            )
+        return current_record
+
+    def _commit_generated_model_record(
+        self,
+        record: GeneratedObjectRecord,
+        preview_model: GeneratedModel,
+        replacement_source: GeneratedObjectRecord | None,
+        *,
+        operation_id: str | None,
+        preview_asset_revision: tuple[object, ...] | None = None,
+    ) -> bool:
+        """Append a new model or atomically replace one stable door slot."""
+
+        if replacement_source is None:
+            self._data.generated_objects.append(record)
+            self._cache_generated_model(
+                record,
+                preview_model,
+                asset_revision=preview_asset_revision,
+            )
+        elif not self._request_object_packing_change(
+            replacement_source,
+            record,
+            preview_model,
+            preview_asset_revision=preview_asset_revision,
+        ):
+            return False
+
+        self._selected_object_id = record.object_id
+        self._generated_model = preview_model
+        self._select_generated_object(record.object_id)
+        self._record_operation_commit(
+            OBJECT_OPERATION_GENERATE_MODEL,
+            record.object_id,
+            operation_id,
+        )
+        if replacement_source is not None:
+            self._delete_unreferenced_object_assets(replacement_source)
+        return True
 
     @Slot(str, object, object)
     def _handle_job_generation_succeeded(
@@ -7617,6 +8022,16 @@ class GenerationWorkspace(QWidget):
         )
         if operation_id is None:
             self._active_generation_request = None
+        active_operation = (
+            self._active_object_operation
+            if runtime is None
+            else runtime.operation
+        )
+        door_slot_target = (
+            None
+            if active_operation is None
+            else active_operation.door_slot_target
+        )
         if isinstance(result, _SavedObjectGeneration):
             self._commit_saved_object_generation(
                 result,
@@ -7631,17 +8046,44 @@ class GenerationWorkspace(QWidget):
                 operation_id=operation_id,
             )
             return
-        object_id = uuid.uuid4().hex
+        object_id = (
+            uuid.uuid4().hex
+            if door_slot_target is None
+            else door_slot_target.object_id
+        )
         object_name = (
-            runtime.requested_name
-            if runtime is not None and runtime.requested_name
-            else self._build_next_generated_object_name()
+            door_slot_target.object_name
+            if door_slot_target is not None
+            else (
+                runtime.requested_name
+                if runtime is not None and runtime.requested_name
+                else self._build_next_generated_object_name()
+            )
+        )
+        try:
+            replacement_source = (
+                self._resolve_generated_model_replacement_source(
+                    active_operation,
+                    object_id,
+                )
+            )
+        except RuntimeError as error:
+            self._handle_generation_failed(
+                str(error),
+                operation_id=operation_id,
+            )
+            return
+        storage_object_id = (
+            uuid.uuid4().hex
+            if replacement_source is not None
+            else object_id
         )
         pipeline: dict[str, object] = (
             _build_safe_duplicate_removal_pipeline_metadata(result)
         )
         persisted_asset_paths: list[str] = []
         symmetry: ObjectSymmetricDivisionMetadata | None = None
+        applied_side_duplication: DoorSideDuplicationMetadata | None = None
         scan_projection_stats: ScanProjectionStats | None = None
         variant_metadata: dict[str, dict[str, object]] | None = None
         try:
@@ -7662,6 +8104,27 @@ class GenerationWorkspace(QWidget):
                 if geometry_only
                 else generated_model.object_texture_variants
             )
+            if (
+                generation_request is not None
+                and generation_request.door_body_fit_dimensions is not None
+            ):
+                if not isinstance(
+                    texture_variants,
+                    (
+                        ObjectTextureVariants,
+                        SymmetricQuarterTextureVariants,
+                        SymmetricPairTextureVariants,
+                        SymmetricSquarePairTextureVariants,
+                    ),
+                ):
+                    raise ValueError(
+                        "Door displacement generation requires a newly "
+                        "generated textured model."
+                    )
+                texture_variants = _fit_generated_door_body_texture_variants(
+                    texture_variants,
+                    generation_request.door_body_fit_dimensions,
+                )
             symmetric_division_was_requested = bool(
                 generation_request is not None
                 and generation_request.symmetric_division_enabled
@@ -7702,9 +8165,25 @@ class GenerationWorkspace(QWidget):
                 scan_projection_stats = (
                     division_result.scan_projection_stats
                 )
+            if (
+                generation_request is not None
+                and generation_request.door_side_duplication is not None
+            ):
+                if texture_variants is None:
+                    raise ValueError(
+                        "Door side duplication requires a newly generated "
+                        "textured model."
+                    )
+                (
+                    texture_variants,
+                    applied_side_duplication,
+                ) = _clip_door_side_duplication_texture_variants(
+                    texture_variants,
+                    generation_request.door_side_duplication,
+                )
             if texture_variants is None:
                 asset_path = self._persist_meshy_asset(
-                    object_id,
+                    storage_object_id,
                     result.glb_bytes,
                 )
                 persisted_asset_paths.append(asset_path)
@@ -7712,7 +8191,7 @@ class GenerationWorkspace(QWidget):
                     generated_model = import_generated_glb(result.glb_bytes)
             else:
                 variant_metadata = self._persist_object_texture_variants(
-                    object_id,
+                    storage_object_id,
                     texture_variants,
                 )
                 pipeline.update(
@@ -7744,7 +8223,7 @@ class GenerationWorkspace(QWidget):
                 )
             if isinstance(result, StagedMeshyGenerationResult):
                 source_asset_path = self._persist_meshy_revision_asset(
-                    object_id,
+                    storage_object_id,
                     MESHY_REVISION_GEOMETRY,
                     result.source_glb_bytes,
                 )
@@ -7754,22 +8233,34 @@ class GenerationWorkspace(QWidget):
                     source_asset_path,
                 )
                 if symmetry is None:
-                    postprocessed_asset_path = (
-                        _resolve_staged_postprocessed_asset_path(
-                            result,
-                            asset_path,
-                            variant_metadata,
-                        )
-                    )
-                    if postprocessed_asset_path is None:
+                    if (
+                        generation_request is not None
+                        and generation_request.door_body_fit_dimensions
+                        is not None
+                        and variant_metadata is not None
+                    ):
+                        postprocessed_asset_path = variant_metadata[
+                            str(TEXTURE_RESOLUTION_2048)
+                        ][TEXTURE_VARIANT_GLB_PATH_KEY]
+                    else:
                         postprocessed_asset_path = (
-                            self._persist_meshy_revision_asset(
-                                object_id,
-                                MESHY_REVISION_POSTPROCESSED,
-                                result.postprocessed_glb_bytes,
+                            _resolve_staged_postprocessed_asset_path(
+                                result,
+                                asset_path,
+                                variant_metadata,
                             )
                         )
-                        persisted_asset_paths.append(postprocessed_asset_path)
+                        if postprocessed_asset_path is None:
+                            postprocessed_asset_path = (
+                                self._persist_meshy_revision_asset(
+                                    storage_object_id,
+                                    MESHY_REVISION_POSTPROCESSED,
+                                    result.postprocessed_glb_bytes,
+                                )
+                            )
+                            persisted_asset_paths.append(
+                                postprocessed_asset_path
+                            )
                     staged_pipeline["postprocessed_asset_path"] = (
                         postprocessed_asset_path
                     )
@@ -7785,6 +8276,11 @@ class GenerationWorkspace(QWidget):
                     variant_metadata,
                     scan_projection_stats=scan_projection_stats,
                 )
+            if applied_side_duplication is not None:
+                pipeline = _build_door_side_duplication_pipeline(
+                    pipeline,
+                    applied_side_duplication,
+                )
         except Exception as error:
             self._remove_newly_persisted_assets(persisted_asset_paths)
             self._handle_generation_failed(
@@ -7792,18 +8288,24 @@ class GenerationWorkspace(QWidget):
                 operation_id=operation_id,
             )
             return
-        active_operation = (
-            self._active_object_operation
-            if runtime is None
-            else runtime.operation
-        )
-        placement = (
-            active_operation.pending_placement
-            if active_operation is not None
-            and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
-            else None
-        )
         _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
+        _apply_door_slot_pipeline_metadata(pipeline, door_slot_target)
+        if replacement_source is not None:
+            pipeline = _push_object_operation_undo_snapshot(
+                replacement_source,
+                pipeline,
+                operation=OBJECT_OPERATION_REPLACE_MODEL,
+            )
+        placement = (
+            replacement_source.placement
+            if replacement_source is not None
+            else (
+                active_operation.pending_placement
+                if active_operation is not None
+                and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
+                else None
+            )
+        )
         record = GeneratedObjectRecord(
             object_id=object_id,
             frame_index=(
@@ -7818,16 +8320,18 @@ class GenerationWorkspace(QWidget):
             asset_path=asset_path,
             placement=placement,
         )
-        self._data.generated_objects.append(record)
-        self._cache_generated_model(record, generated_model)
-        self._selected_object_id = object_id
-        self._generated_model = generated_model
-        self._select_generated_object(object_id)
-        self._record_operation_commit(
-            OBJECT_OPERATION_GENERATE_MODEL,
-            object_id,
-            operation_id,
-        )
+        if not self._commit_generated_model_record(
+            record,
+            generated_model,
+            replacement_source,
+            operation_id=operation_id,
+        ):
+            self._remove_newly_persisted_assets(persisted_asset_paths)
+            self._handle_generation_failed(
+                "The target door slot could not accept its replacement model.",
+                operation_id=operation_id,
+            )
+            return
         if isinstance(result, StagedMeshyGenerationResult):
             if result.geometry_only:
                 self.status_label.setText(
@@ -7862,7 +8366,10 @@ class GenerationWorkspace(QWidget):
                 f"kept the {symmetry.kept_side} half."
             )
         self._emit_data_changed()
-        self.generation_completed.emit(record, generated_model)
+        if replacement_source is None:
+            self.generation_completed.emit(record, generated_model)
+        else:
+            self.generated_object_changed.emit(record, generated_model)
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(
                 runtime,
@@ -7885,26 +8392,64 @@ class GenerationWorkspace(QWidget):
                 operation_id=operation_id,
             )
             return
-        object_name = (
-            runtime.requested_name
-            if runtime is not None and runtime.requested_name
-            else self._build_next_generated_object_name()
-        )
         active_operation = (
             self._active_object_operation
             if runtime is None
             else runtime.operation
         )
-        placement = (
-            active_operation.pending_placement
-            if active_operation is not None
-            and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
-            else None
+        door_slot_target = (
+            None
+            if active_operation is None
+            else active_operation.door_slot_target
         )
+        object_id = (
+            saved.object_id
+            if door_slot_target is None
+            else door_slot_target.object_id
+        )
+        object_name = (
+            door_slot_target.object_name
+            if door_slot_target is not None
+            else (
+                runtime.requested_name
+                if runtime is not None and runtime.requested_name
+                else self._build_next_generated_object_name()
+            )
+        )
+        try:
+            replacement_source = (
+                self._resolve_generated_model_replacement_source(
+                    active_operation,
+                    object_id,
+                )
+            )
+        except RuntimeError as error:
+            self._handle_generation_failed(
+                str(error),
+                operation_id=operation_id,
+            )
+            return
         pipeline = copy.deepcopy(saved.pipeline)
         _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
+        _apply_door_slot_pipeline_metadata(pipeline, door_slot_target)
+        if replacement_source is not None:
+            pipeline = _push_object_operation_undo_snapshot(
+                replacement_source,
+                pipeline,
+                operation=OBJECT_OPERATION_REPLACE_MODEL,
+            )
+        placement = (
+            replacement_source.placement
+            if replacement_source is not None
+            else (
+                active_operation.pending_placement
+                if active_operation is not None
+                and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
+                else None
+            )
+        )
         record = GeneratedObjectRecord(
-            object_id=saved.object_id,
+            object_id=object_id,
             frame_index=(
                 self._data.current_frame_index
                 if generation_request is None
@@ -7929,20 +8474,18 @@ class GenerationWorkspace(QWidget):
                 operation_id=operation_id,
             )
             return
-        self._data.generated_objects.append(record)
-        self._cache_generated_model(
+        if not self._commit_generated_model_record(
             record,
             saved.preview_model,
-            asset_revision=saved.preview_asset_revision,
-        )
-        self._selected_object_id = saved.object_id
-        self._generated_model = saved.preview_model
-        self._select_generated_object(saved.object_id)
-        self._record_operation_commit(
-            OBJECT_OPERATION_GENERATE_MODEL,
-            saved.object_id,
-            operation_id,
-        )
+            replacement_source,
+            operation_id=operation_id,
+            preview_asset_revision=saved.preview_asset_revision,
+        ):
+            self._handle_generation_failed(
+                "The target door slot could not accept its replacement model.",
+                operation_id=operation_id,
+            )
+            return
         if isinstance(result, StagedMeshyGenerationResult):
             status = _format_staged_generation_status(
                 object_name,
@@ -7971,7 +8514,10 @@ class GenerationWorkspace(QWidget):
             )
         self.status_label.setText(status)
         self._emit_data_changed()
-        self.generation_completed.emit(record, saved.preview_model)
+        if replacement_source is None:
+            self.generation_completed.emit(record, saved.preview_model)
+        else:
+            self.generated_object_changed.emit(record, saved.preview_model)
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(
                 runtime,
@@ -8045,12 +8591,24 @@ class GenerationWorkspace(QWidget):
                 division_result = build_automatic_symmetric_object_variants(
                     texture_variants.glb_by_resolution[TEXTURE_RESOLUTION_2048],
                     request.new_symmetric_division_orientation,
+                    projection_camera_percentages=(
+                        request.projection_camera_percentages
+                        if request.settings.use_uv_raycast_for_object_generation
+                        else None
+                    ),
                 )
                 new_symmetry = _validate_automatic_symmetric_division_result(
                     division_result,
                     request.new_symmetric_division_orientation,
                 )
                 texture_variants = division_result.variants
+                if division_result.scan_projection_stats is not None:
+                    outcome = replace(
+                        outcome,
+                        scan_projection_stats=(
+                            division_result.scan_projection_stats
+                        ),
+                    )
             _validate_door_side_duplication_retexture_uvs(outcome)
             applied_side_duplication = side_duplication
             side_duplication_request = (
@@ -8449,6 +9007,12 @@ class GenerationWorkspace(QWidget):
         if operation.kind == OBJECT_OPERATION_GENERATE_MODEL:
             if self._find_generated_object_record(object_id) is None:
                 return True
+            if operation.replaced_object_record is not None:
+                return self._undo_object_change(
+                    object_id,
+                    expected_operation=OBJECT_OPERATION_REPLACE_MODEL,
+                    allow_operation_id=operation_id,
+                )
             return self.delete_generated_object(
                 object_id,
                 allow_operation_id=operation_id,
@@ -8480,11 +9044,18 @@ class GenerationWorkspace(QWidget):
             )
             return
         if operation.kind == OBJECT_OPERATION_GENERATE_MODEL:
-            suffix = (
-                " The generated model was deleted."
-                if had_commit
-                else ""
-            )
+            if operation.replaced_object_record is not None:
+                suffix = (
+                    " The previous model was restored."
+                    if had_commit
+                    else " The existing model was kept."
+                )
+            else:
+                suffix = (
+                    " The generated model was deleted."
+                    if had_commit
+                    else ""
+                )
             self.status_label.setText("Model generation cancelled." + suffix)
             return
         if operation.kind == OBJECT_OPERATION_GENERATE_TEXTURE:
@@ -8544,6 +9115,9 @@ class GenerationWorkspace(QWidget):
             operation.pending_placement = None
         was_placeable = self._can_place_active_operation(operation)
         self._object_job_runtimes.pop(runtime.operation_id, None)
+        if operation is not None and operation.door_slot_target is not None:
+            self._door_slot_generation_prompt_visible = False
+        self._emit_active_door_slot_generation_status()
         if operation is not None:
             self.operation_finished.emit(operation.operation_id)
         manager = self._job_manager
@@ -8595,12 +9169,29 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText("The selected object mask is empty.")
             return None
         self._store_current_frame_strokes()
+        door_slot_target = self._door_slot_editing_target
+        rebuild_door_body = bool(
+            door_slot_target is not None
+            and is_door_body_slot(door_slot_target.slot_id)
+            and (
+                door_slot_target.generate_displacement
+                or self._door_body_side_duplication_requires_rebuild(
+                    door_slot_target
+                )
+            )
+        )
         symmetric_division_enabled = (
             not geometry_only
             and self.symmetric_division_checkbox.isChecked()
+            and (
+                door_slot_target is None
+                or is_door_body_slot(door_slot_target.slot_id)
+            )
         )
         projection_camera_percentages = (
-            self.object_3d_panel.get_projection_camera_percentages()
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+            if door_slot_target is not None
+            else self.object_3d_panel.get_projection_camera_percentages()
         )
         projection_camera_percentages_are_valid = (
             sum(projection_camera_percentages) == 100
@@ -8608,6 +9199,7 @@ class GenerationWorkspace(QWidget):
         if (
             not geometry_only
             and self._settings.use_uv_raycast_for_object_generation
+            and door_slot_target is None
             and not projection_camera_percentages_are_valid
         ):
             self.status_label.setText(
@@ -8621,7 +9213,14 @@ class GenerationWorkspace(QWidget):
         return GenerationRequest(
             frame_index=self._data.current_frame_index,
             selected_object_bgra=selected_crop,
-            settings=self._settings,
+            settings=(
+                replace(
+                    self._settings,
+                    use_uv_raycast_for_object_generation=False,
+                )
+                if door_slot_target is not None
+                else self._settings
+            ),
             geometry_only=geometry_only,
             symmetric_division_enabled=symmetric_division_enabled,
             symmetric_division_orientation=(
@@ -8632,6 +9231,16 @@ class GenerationWorkspace(QWidget):
             ),
             enabled_pbr_maps=self._get_enabled_pbr_maps(),
             ai_prompt=self.ai_prompt_edit.text(),
+            door_body_fit_dimensions=(
+                door_slot_target.door_body_fit_dimensions
+                if door_slot_target is not None and rebuild_door_body
+                else None
+            ),
+            door_side_duplication=(
+                door_slot_target.side_duplication
+                if door_slot_target is not None and rebuild_door_body
+                else None
+            ),
         )
 
     def _build_generation_requests(
@@ -8671,6 +9280,10 @@ class GenerationWorkspace(QWidget):
                 ),
                 enabled_pbr_maps=template.enabled_pbr_maps,
                 ai_prompt=template.ai_prompt,
+                door_body_fit_dimensions=(
+                    template.door_body_fit_dimensions
+                ),
+                door_side_duplication=template.door_side_duplication,
             )
             for selected_crop in selected_crops
         )
@@ -8747,9 +9360,10 @@ class GenerationWorkspace(QWidget):
                 self._door_slot_editing_target.side_duplication
                 if (
                     self._door_slot_editing_target is not None
+                    and self._door_slot_editing_target.generation_ready
                     and self._door_slot_editing_target.object_id
                     == record.object_id
-                    and door_component_slot_id == DOOR_SLOT_BODY
+                    and is_door_body_slot(door_component_slot_id)
                 )
                 else None
             )
@@ -8758,11 +9372,17 @@ class GenerationWorkspace(QWidget):
                 if not preserve_side_duplication
                 else None
             )
+            if new_side_duplication is not None:
+                projection_camera_percentages = (
+                    _door_side_duplication_projection_percentages(
+                        new_side_duplication
+                    )
+                )
             new_symmetric_division_orientation = (
                 SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
                 if (
                     is_door_component
-                    and door_component_slot_id == DOOR_SLOT_BODY
+                    and is_door_body_slot(door_component_slot_id)
                     and self.symmetric_division_checkbox.isChecked()
                     and not preserve_symmetric_uvs
                 )
@@ -8796,7 +9416,9 @@ class GenerationWorkspace(QWidget):
                 settings=(
                     replace(
                         self._settings,
-                        use_uv_raycast_for_object_generation=False,
+                        use_uv_raycast_for_object_generation=(
+                            new_side_duplication is not None
+                        ),
                     )
                     if is_door_component
                     else self._settings
@@ -8851,11 +9473,60 @@ class GenerationWorkspace(QWidget):
         self.seekbar.setValue(int(frame_index))
         self._is_syncing_seekbar = False
 
+    # ### Door generation controls ###
+    def _door_body_side_duplication_requires_rebuild(
+        self,
+        target: _DoorSlotEditingTarget | None = None,
+    ) -> bool:
+        """Return whether the desired option cannot reuse the authored half."""
+
+        resolved_target = target or self._door_slot_editing_target
+        if (
+            resolved_target is None
+            or not is_door_body_slot(resolved_target.slot_id)
+        ):
+            return False
+        record = self._find_generated_object_record(resolved_target.object_id)
+        applied = get_door_side_duplication_metadata(record)
+        if applied is None:
+            return False
+        desired = resolved_target.side_duplication
+        return bool(
+            desired is None or desired.kept_side != applied.kept_side
+        )
+
+    @Slot(bool)
+    def _handle_side_door_duplication_changed(self, checked: bool) -> None:
+        """Store the next front-depth option for one active door body."""
+
+        target = self._door_slot_editing_target
+        if (
+            target is None
+            or not is_door_body_slot(target.slot_id)
+            or not target.side_duplication_allowed
+            or not target.generation_ready
+        ):
+            self._sync_controls()
+            return
+        side_duplication = DoorSideDuplication() if checked else None
+        if target.side_duplication == side_duplication:
+            return
+        self._door_slot_editing_target = replace(
+            target,
+            side_duplication=side_duplication,
+        )
+        self.door_side_duplication_changed.emit(
+            target.door_id,
+            side_duplication,
+        )
+        self._sync_controls()
+
+    # ### Control synchronization ###
     def _sync_controls(self) -> None:
         door_slot_mode = self._door_slot_editing_target is not None
         door_body_slot_mode = bool(
             self._door_slot_editing_target is not None
-            and self._door_slot_editing_target.slot_id == DOOR_SLOT_BODY
+            and is_door_body_slot(self._door_slot_editing_target.slot_id)
         )
         has_video = self._video_source is not None
         has_temporary_reference = self.has_temporary_object_reference()
@@ -8871,12 +9542,57 @@ class GenerationWorkspace(QWidget):
         selected_record = self._find_generated_object_record(
             self._selected_object_id
         )
+        door_slot_can_generate_model = bool(
+            self._door_slot_editing_target is not None
+            and (
+                not is_door_body_slot(
+                    self._door_slot_editing_target.slot_id
+                )
+                or self._door_slot_editing_target.generate_displacement
+                or self._door_body_side_duplication_requires_rebuild()
+            )
+            and not self._object_has_active_mutation_job(
+                self._door_slot_editing_target.object_id
+            )
+            and not has_untracked_legacy_job
+            and has_reference_source
+            and has_generation_reference
+            and self._settings.meshy_api_key
+        )
+        missing_door_slot_can_generate = bool(
+            door_slot_can_generate_model
+            and not door_body_slot_mode
+            and selected_record is None
+        )
         selected_object_is_busy = bool(
             selected_record is not None
             and self._object_has_active_mutation_job(
                 selected_record.object_id
             )
         )
+        side_duplication_visible = bool(
+            door_body_slot_mode
+            and self._door_slot_editing_target is not None
+            and self._door_slot_editing_target.side_duplication_allowed
+            and self._door_slot_editing_target.generation_ready
+        )
+        side_duplication_checked = bool(
+            self._door_slot_editing_target is not None
+            and self._door_slot_editing_target.side_duplication is not None
+        )
+        side_duplication_blocker = QSignalBlocker(
+            self.side_door_duplication_checkbox
+        )
+        self.side_door_duplication_checkbox.setVisible(
+            side_duplication_visible
+        )
+        self.side_door_duplication_checkbox.setChecked(
+            side_duplication_checked
+        )
+        self.side_door_duplication_checkbox.setEnabled(
+            side_duplication_visible
+        )
+        del side_duplication_blocker
         mask_tool_is_available = (
             has_video
             and not has_temporary_reference
@@ -8933,8 +9649,11 @@ class GenerationWorkspace(QWidget):
             face_selection_is_available
         )
         self.regenerate_texture_button.setEnabled(
-            self._can_regenerate_object_texture(selected_record)
-            and projection_camera_percentages_are_valid
+            missing_door_slot_can_generate
+            or (
+                self._can_regenerate_object_texture(selected_record)
+                and projection_camera_percentages_are_valid
+            )
         )
 
         if not self._shared_control_state_managed_externally:
@@ -8950,7 +9669,16 @@ class GenerationWorkspace(QWidget):
         if not self._shared_control_state_managed_externally:
             self.ai_prompt_edit.setEnabled(not has_untracked_legacy_job)
         self.generate_button.setEnabled(
-            self._can_regenerate_object_texture(selected_record)
+            (
+                self._can_regenerate_object_texture(selected_record)
+                if (
+                    door_body_slot_mode
+                    and self._door_slot_editing_target is not None
+                    and not self._door_slot_editing_target.generate_displacement
+                    and not self._door_body_side_duplication_requires_rebuild()
+                )
+                else door_slot_can_generate_model
+            )
             if door_slot_mode
             else (
                 has_reference_source
@@ -10000,7 +10728,36 @@ def _validate_door_side_duplication_retexture_uvs(
             "The existing texture was kept."
         )
     _validate_preserved_uv_retexture_integrity(submitted, preserved)
-    _validate_preserved_uv_retexture_integrity(submitted, final)
+    scan_stats = outcome.scan_projection_stats
+    if scan_stats is None:
+        _validate_preserved_uv_retexture_integrity(submitted, final)
+        return
+    duplication = (
+        request.new_door_side_duplication
+        if request.new_door_side_duplication is not None
+        else DoorSideDuplication()
+    )
+    expected_percentages = (
+        _door_side_duplication_projection_percentages(duplication)
+    )
+    if tuple(scan_stats.camera_percentages) != expected_percentages:
+        raise UvIntegrityError(
+            "Door side duplication used an invalid projection texture "
+            "allocation. The existing texture was kept."
+        )
+    expected_target = (
+        SCAN_PROJECTION_TARGET_LEFT_HALF
+        if (
+            request.preserve_symmetric_uvs
+            or request.new_symmetric_division_orientation is not None
+        )
+        else SCAN_PROJECTION_TARGET_FULL
+    )
+    if scan_stats.target_domain != expected_target:
+        raise UvIntegrityError(
+            "Door side duplication rebuilt UVs in an invalid texture region. "
+            "The existing texture was kept."
+        )
 
 
 def _validate_preserved_uv_retexture_integrity(
@@ -10115,7 +10872,7 @@ def get_door_side_duplication_metadata(
 
     if (
         record is None
-        or _get_door_component_slot_id(record) != DOOR_SLOT_BODY
+        or not is_door_body_slot(_get_door_component_slot_id(record))
     ):
         return None
     raw_metadata = record.pipeline.get(
@@ -10127,6 +10884,91 @@ def get_door_side_duplication_metadata(
         return DoorSideDuplicationMetadata.from_pipeline_dict(raw_metadata)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _fit_generated_door_body_texture_variants(
+    variants: PersistableObjectTextureVariants,
+    fit_dimensions: Sequence[float],
+    *,
+    cancel_event: threading.Event | None = None,
+) -> PersistableObjectTextureVariants:
+    """Fit full generated geometry before any authored-half processing.
+
+    The transform changes only vertex positions. UV coordinates and every
+    embedded texture remain untouched, so Meshy's geometric relief survives
+    while the body keeps the doorway's exact width, thickness, and height.
+    """
+
+    dimensions = _normalize_door_body_fit_dimensions(fit_dimensions)
+    if dimensions is None:
+        raise ValueError("Door body fit dimensions are unavailable.")
+    source_glbs = variants.glb_by_resolution
+    if not source_glbs:
+        raise ValueError("Door displacement generation has no texture variants.")
+    canonical_resolution = max(source_glbs)
+    canonical_model = import_generated_glb(
+        source_glbs[canonical_resolution]
+    )
+    bounds = np.asarray(canonical_model.mesh.bounds, dtype=float)
+    if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+        raise ValueError("The generated door body has invalid bounds.")
+    extents = bounds[1] - bounds[0]
+    if np.any(extents <= 1e-9):
+        raise ValueError(
+            "The generated door body has no measurable size on every axis."
+        )
+    bottom_center = np.asarray(
+        (
+            (bounds[0, 0] + bounds[1, 0]) * 0.5,
+            (bounds[0, 1] + bounds[1, 1]) * 0.5,
+            bounds[0, 2],
+        ),
+        dtype=float,
+    )
+    scales = np.asarray(dimensions, dtype=float) / extents
+    z_up_transform = np.eye(4, dtype=float)
+    z_up_transform[:3, :3] = np.diag(scales)
+    z_up_transform[:3, 3] = -(scales * bottom_center)
+    gltf_transform = (
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM
+        @ z_up_transform
+        @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+    )
+
+    fitted_glbs: dict[int, bytes] = {}
+    for resolution, source_glb in source_glbs.items():
+        _raise_if_generation_cancelled(cancel_event)
+        source_model = import_generated_glb(source_glb)
+        fitted_scene = copy.deepcopy(source_model.scene)
+        fitted_scene.apply_transform(gltf_transform)
+        exported = fitted_scene.export(file_type="glb")
+        if not isinstance(exported, bytes) or not exported:
+            raise ValueError("The fitted door body could not be serialized.")
+        fitted_glbs[resolution] = exported
+
+    fitted_canonical = import_generated_glb(
+        fitted_glbs[canonical_resolution]
+    )
+    fitted_bounds = np.asarray(fitted_canonical.mesh.bounds, dtype=float)
+    fitted_extents = fitted_bounds[1] - fitted_bounds[0]
+    if not np.allclose(
+        fitted_extents,
+        np.asarray(dimensions, dtype=float),
+        rtol=1e-5,
+        atol=1e-7,
+    ):
+        raise ValueError("The generated door body could not be fitted reliably.")
+    fitted_bottom_center = np.asarray(
+        (
+            (fitted_bounds[0, 0] + fitted_bounds[1, 0]) * 0.5,
+            (fitted_bounds[0, 1] + fitted_bounds[1, 1]) * 0.5,
+            fitted_bounds[0, 2],
+        )
+    )
+    if not np.allclose(fitted_bottom_center, 0.0, atol=1e-7):
+        raise ValueError("The fitted door body anchor is invalid.")
+    _raise_if_generation_cancelled(cancel_event)
+    return replace(variants, glb_by_resolution=fitted_glbs)
 
 
 def _clip_door_side_duplication_texture_variants(
@@ -10400,10 +11242,12 @@ def _get_object_operation_undo_stack(
         if not isinstance(raw_snapshot, dict):
             continue
         operation = raw_snapshot.get("operation")
+        raw_provider = raw_snapshot.get("provider", record.provider)
         asset_path = raw_snapshot.get("asset_path")
         provider_task_id = raw_snapshot.get("provider_task_id")
         pipeline = raw_snapshot.get("pipeline")
         if operation not in {
+            OBJECT_OPERATION_REPLACE_MODEL,
             OBJECT_OPERATION_GENERATE_TEXTURE,
             OBJECT_OPERATION_CREATE_FACE,
             OBJECT_OPERATION_DELETE_FACES,
@@ -10412,7 +11256,13 @@ def _get_object_operation_undo_stack(
             continue
         if not isinstance(asset_path, str) or not asset_path.strip():
             continue
-        if record.provider == GENERATION_BACKEND_MESHY:
+        if raw_provider not in {
+            GENERATION_BACKEND_MESHY,
+            GENERATION_BACKEND_EXTERNAL_GLB,
+        }:
+            continue
+        snapshot_provider = str(raw_provider)
+        if snapshot_provider == GENERATION_BACKEND_MESHY:
             if (
                 not isinstance(provider_task_id, str)
                 or not provider_task_id.strip()
@@ -10427,6 +11277,7 @@ def _get_object_operation_undo_stack(
         snapshots.append(
             {
                 "operation": operation,
+                "provider": snapshot_provider,
                 "asset_path": asset_path,
                 "provider_task_id": provider_task_id,
                 "pipeline": snapshot_pipeline,
@@ -10444,6 +11295,7 @@ def _push_object_operation_undo_snapshot(
     """Attach one bounded pre-operation snapshot to a replacement pipeline."""
 
     if operation not in {
+        OBJECT_OPERATION_REPLACE_MODEL,
         OBJECT_OPERATION_GENERATE_TEXTURE,
         OBJECT_OPERATION_CREATE_FACE,
         OBJECT_OPERATION_DELETE_FACES,
@@ -10454,6 +11306,7 @@ def _push_object_operation_undo_snapshot(
     snapshot_pipeline.pop(OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY, None)
     snapshot: dict[str, object] = {
         "operation": operation,
+        "provider": record.provider,
         "asset_path": record.asset_path,
         "provider_task_id": record.provider_task_id,
         "pipeline": snapshot_pipeline,
@@ -10474,12 +11327,19 @@ def _restore_object_operation_snapshot(
 ) -> GeneratedObjectRecord:
     """Build an immutable restored record before any workspace state changes."""
 
+    raw_provider = snapshot.get("provider", record.provider)
     asset_path = snapshot.get("asset_path")
     provider_task_id = snapshot.get("provider_task_id")
     raw_pipeline = snapshot.get("pipeline")
     if not isinstance(asset_path, str) or not asset_path.strip():
         raise ValueError("The saved undo model path is invalid.")
-    if record.provider == GENERATION_BACKEND_MESHY:
+    if raw_provider not in {
+        GENERATION_BACKEND_MESHY,
+        GENERATION_BACKEND_EXTERNAL_GLB,
+    }:
+        raise ValueError("The saved undo provider is invalid.")
+    provider = str(raw_provider)
+    if provider == GENERATION_BACKEND_MESHY:
         if not isinstance(provider_task_id, str) or not provider_task_id.strip():
             raise ValueError("The saved undo provider task is invalid.")
     elif provider_task_id is not None:
@@ -10495,6 +11355,7 @@ def _restore_object_operation_snapshot(
     return replace(
         record,
         pipeline=pipeline,
+        provider=provider,
         provider_task_id=provider_task_id,
         asset_path=asset_path,
     )
@@ -11496,6 +12357,7 @@ def _prepare_and_persist_object_generation(
     )
     persisted_asset_paths: list[str] = []
     symmetry: ObjectSymmetricDivisionMetadata | None = None
+    applied_side_duplication: DoorSideDuplicationMetadata | None = None
     scan_projection_stats: ScanProjectionStats | None = None
     variant_metadata: dict[str, dict[str, object]] | None = None
     try:
@@ -11517,6 +12379,26 @@ def _prepare_and_persist_object_generation(
             if geometry_only
             else generated_model.object_texture_variants
         )
+        if request.door_body_fit_dimensions is not None:
+            if not isinstance(
+                texture_variants,
+                (
+                    ObjectTextureVariants,
+                    SymmetricQuarterTextureVariants,
+                    SymmetricPairTextureVariants,
+                    SymmetricSquarePairTextureVariants,
+                ),
+            ):
+                raise ValueError(
+                    "Door displacement generation requires a newly generated "
+                    "textured model."
+                )
+            texture_variants = _fit_generated_door_body_texture_variants(
+                texture_variants,
+                request.door_body_fit_dimensions,
+                cancel_event=cancel_event,
+            )
+            _raise_if_generation_cancelled(cancel_event)
         if request.symmetric_division_enabled:
             if geometry_only:
                 raise ValueError(
@@ -11553,6 +12435,22 @@ def _prepare_and_persist_object_generation(
             )
             texture_variants = division_result.variants
             scan_projection_stats = division_result.scan_projection_stats
+            _raise_if_generation_cancelled(cancel_event)
+
+        if request.door_side_duplication is not None:
+            if texture_variants is None:
+                raise ValueError(
+                    "Door side duplication requires a newly generated "
+                    "textured model."
+                )
+            (
+                texture_variants,
+                applied_side_duplication,
+            ) = _clip_door_side_duplication_texture_variants(
+                texture_variants,
+                request.door_side_duplication,
+                cancel_event=cancel_event,
+            )
             _raise_if_generation_cancelled(cancel_event)
 
         if texture_variants is None:
@@ -11613,20 +12511,33 @@ def _prepare_and_persist_object_generation(
                 source_asset_path,
             )
             if symmetry is None:
-                postprocessed_asset_path = (
-                    _resolve_staged_postprocessed_asset_path(
-                        result,
-                        asset_path,
-                        variant_metadata,
+                if (
+                    request.door_body_fit_dimensions is not None
+                    and variant_metadata is not None
+                ):
+                    postprocessed_asset_path = variant_metadata[
+                        str(TEXTURE_RESOLUTION_2048)
+                    ][TEXTURE_VARIANT_GLB_PATH_KEY]
+                else:
+                    postprocessed_asset_path = (
+                        _resolve_staged_postprocessed_asset_path(
+                            result,
+                            asset_path,
+                            variant_metadata,
+                        )
                     )
-                )
-                if postprocessed_asset_path is None:
-                    postprocessed_asset_path = _persist_generated_named_asset(
-                        asset_directory,
-                        f"{object_id}.{MESHY_REVISION_POSTPROCESSED}.glb",
-                        result.postprocessed_glb_bytes,
-                    )
-                    persisted_asset_paths.append(postprocessed_asset_path)
+                    if postprocessed_asset_path is None:
+                        postprocessed_asset_path = (
+                            _persist_generated_named_asset(
+                                asset_directory,
+                                f"{object_id}."
+                                f"{MESHY_REVISION_POSTPROCESSED}.glb",
+                                result.postprocessed_glb_bytes,
+                            )
+                        )
+                        persisted_asset_paths.append(
+                            postprocessed_asset_path
+                        )
                 staged_pipeline["postprocessed_asset_path"] = (
                     postprocessed_asset_path
                 )
@@ -11640,6 +12551,11 @@ def _prepare_and_persist_object_generation(
                 symmetry,
                 variant_metadata,
                 scan_projection_stats=scan_projection_stats,
+            )
+        if applied_side_duplication is not None:
+            pipeline = _build_door_side_duplication_pipeline(
+                pipeline,
+                applied_side_duplication,
             )
         _raise_if_generation_cancelled(cancel_event)
         preview_asset_revision = _build_generation_asset_revision(
@@ -11704,6 +12620,10 @@ def _prepare_and_persist_texture_regeneration(
                     "texture variants."
                 )
             symmetric_builder_kwargs: dict[str, object] = {}
+            if outcome.request.settings.use_uv_raycast_for_object_generation:
+                symmetric_builder_kwargs[
+                    "projection_camera_percentages"
+                ] = outcome.request.projection_camera_percentages
             if cancel_event is not None:
                 symmetric_builder_kwargs["cancellation_check"] = (
                     cancel_event.is_set
@@ -11718,6 +12638,11 @@ def _prepare_and_persist_texture_regeneration(
                 outcome.request.new_symmetric_division_orientation,
             )
             texture_variants = division_result.variants
+            if division_result.scan_projection_stats is not None:
+                outcome = replace(
+                    outcome,
+                    scan_projection_stats=division_result.scan_projection_stats,
+                )
             _raise_if_generation_cancelled(cancel_event)
         _validate_door_side_duplication_retexture_uvs(outcome)
         applied_side_duplication = door_side_duplication

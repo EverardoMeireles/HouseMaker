@@ -22,17 +22,18 @@ from PySide6.QtCore import QThread
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
 
-from housemaker.generation_state import (
-    GeneratedObjectPlacement,
-    GeneratedObjectRecord,
-    GenerationData,
-)
 from housemaker.generation_jobs import (
     JOB_STATUS_CANCELLED,
     JOB_STATUS_COMPLETED,
     GenerationJobManager,
 )
+from housemaker.generation_state import (
+    GeneratedObjectPlacement,
+    GeneratedObjectRecord,
+    GenerationData,
+)
 from housemaker.generation_workspace import (
+    DOOR_COMPONENT_PIPELINE_KEY,
     OBJECT_OPERATION_GENERATE_MODEL,
     GenerationRequest,
     GenerationWorker,
@@ -47,7 +48,6 @@ from housemaker.object_texture_variants import (
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
-
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -315,6 +315,30 @@ class GenerationCancellationTests(unittest.TestCase):
         self.workspace.set_data(GenerationData(generated_objects=[record]))
         return record, variants
 
+    def _seed_door_hardware(
+        self,
+    ) -> tuple[GeneratedObjectRecord, GeneratedModel]:
+        """Persist one existing knob under its stable hidden slot identity."""
+
+        model = _plain_model(0.4)
+        record = self.workspace.register_door_component_model(
+            object_id="door-knob",
+            object_name="New door 1 - Door knob/handle",
+            door_id="door-1",
+            slot_id="door_knob",
+            model=model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id=record.object_id,
+                object_name=record.object_name,
+                slot_display_name="Door knob/handle",
+            )
+        )
+        return record, model
+
     def _wait_for_event(self, event: threading.Event) -> None:
         deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS
         while not event.is_set() and time.monotonic() < deadline:
@@ -384,6 +408,184 @@ class GenerationCancellationTests(unittest.TestCase):
         self.assertEqual(self.workspace.get_data().generated_objects, [])
         self.assertFalse(self.asset_directory.exists())
         self.assertIn("cancelled", self.workspace.status_label.text().lower())
+
+    def test_empty_door_slot_commits_under_its_stable_hidden_identity(self) -> None:
+        result = MeshyGenerationResult("knob-task", _box_glb(), "Knob")
+        planner = _BlockingPlanner(result)
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(_ImmediateExecutor(_plain_model()))
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                object_name="New door 1 - Door knob/handle",
+                slot_display_name="Door knob/handle",
+            )
+        )
+        target = self.workspace._door_slot_editing_target
+        assert target is not None
+        statuses = QSignalSpy(
+            self.workspace.door_slot_generation_status_changed
+        )
+
+        self.workspace._start_generation(
+            self._generation_request(),
+            door_slot_target=target,
+        )
+        self._wait_for_event(planner.started)
+        self.assertEqual(self.workspace.get_placeable_object_names_by_id(), {})
+        planner.release.set()
+        self._wait_for_record_count(1)
+        self._wait_until_idle()
+
+        record = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(record.object_id, "door-knob")
+        self.assertEqual(
+            record.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+            {"door_id": "door-1", "slot_id": "door_knob"},
+        )
+        self.assertEqual(self.workspace.get_generated_object_ids(), ())
+        self.assertEqual(self.workspace.get_placeable_object_names_by_id(), {})
+        hidden_pipeline = dict(record.pipeline)
+        hidden_pipeline["generation_batch"] = {
+            "batch_id": "hidden-door-batch",
+            "blob_index": 1,
+            "blob_count": 1,
+        }
+        self.workspace._data.generated_objects[0] = replace(
+            record,
+            pipeline=hidden_pipeline,
+            placement=GeneratedObjectPlacement(1, 10.0, 20.0),
+        )
+        self.workspace._latest_generation_batch_id = "hidden-door-batch"
+        self.workspace._latest_generation_batch_member_ids = {1: record.object_id}
+        self.assertEqual(
+            self.workspace.get_scene_bound_placeable_object_ids(),
+            (),
+        )
+        self.assertEqual(
+            self.workspace.get_latest_generation_batch_placeable_ids(),
+            (),
+        )
+        self.assertGreaterEqual(statuses.count(), 2)
+        self.assertEqual(statuses.at(0)[0], "Door knob/handle")
+        self.assertEqual(statuses.at(statuses.count() - 1)[0], "")
+
+    def test_existing_door_hardware_generation_replaces_the_stable_record(
+        self,
+    ) -> None:
+        original, original_model = self._seed_door_hardware()
+        target = self.workspace._door_slot_editing_target
+        assert target is not None
+        replacement_model = _plain_model(1.8)
+        result = MeshyGenerationResult(
+            "replacement-knob-task",
+            replacement_model.glb_bytes,
+            "Replacement knob",
+        )
+        self.workspace.set_meshy_planner(_ImmediatePlanner(result))
+        self.workspace.set_meshy_executor(
+            _ImmediateExecutor(replacement_model)
+        )
+
+        self.workspace._start_generation(
+            self._generation_request(),
+            door_slot_target=target,
+            replaced_object_record=original,
+        )
+        self._wait_until_idle()
+
+        records = self.workspace.get_data().generated_objects
+        self.assertEqual(len(records), 1)
+        replacement = records[0]
+        self.assertEqual(replacement.object_id, original.object_id)
+        self.assertEqual(replacement.object_name, original.object_name)
+        self.assertEqual(
+            replacement.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+            original.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
+        )
+        self.assertEqual(
+            replacement.provider_task_id,
+            "replacement-knob-task",
+        )
+        self.assertNotEqual(replacement.asset_path, original.asset_path)
+        self.assertTrue(
+            self.asset_directory.joinpath(original.asset_path).exists()
+        )
+        stored_model = self.workspace.get_generated_object_model(
+            original.object_id
+        )
+        self.assertIsNotNone(stored_model)
+        assert stored_model is not None
+        self.assertNotEqual(
+            stored_model.glb_bytes,
+            original_model.glb_bytes,
+        )
+        np.testing.assert_allclose(
+            stored_model.mesh.bounds,
+            replacement_model.mesh.bounds,
+        )
+        self.assertEqual(self.workspace.get_generated_object_ids(), ())
+
+    def test_post_commit_hardware_replacement_cancel_restores_original(
+        self,
+    ) -> None:
+        original, original_model = self._seed_door_hardware()
+        original_path = self.asset_directory.joinpath(original.asset_path)
+        original_bytes = original_path.read_bytes()
+        target = self.workspace._door_slot_editing_target
+        assert target is not None
+        replacement_model = _plain_model(1.8)
+        result = MeshyGenerationResult(
+            "cancelled-replacement-knob-task",
+            replacement_model.glb_bytes,
+            "Replacement knob",
+        )
+        self.workspace.set_meshy_planner(_ImmediatePlanner(result))
+        self.workspace.set_meshy_executor(
+            _ImmediateExecutor(replacement_model)
+        )
+        cancel_results: list[bool] = []
+
+        def cancel_after_replacement(
+            _record: object,
+            _model: object,
+        ) -> None:
+            if cancel_results:
+                return
+            cancel_results.append(self.workspace.cancel_current_operation())
+
+        self.workspace.generated_object_changed.connect(
+            cancel_after_replacement
+        )
+
+        self.workspace._start_generation(
+            self._generation_request(),
+            door_slot_target=target,
+            replaced_object_record=original,
+        )
+        self._wait_until_idle()
+
+        records = self.workspace.get_data().generated_objects
+        self.assertEqual(cancel_results, [True])
+        self.assertEqual(records, [original])
+        self.assertTrue(original_path.exists())
+        self.assertEqual(original_path.read_bytes(), original_bytes)
+        self.assertEqual(
+            {path.name for path in self.asset_directory.iterdir()},
+            {original.asset_path},
+        )
+        restored_model = self.workspace.get_generated_object_model(
+            original.object_id
+        )
+        self.assertIsNotNone(restored_model)
+        assert restored_model is not None
+        self.assertEqual(restored_model.glb_bytes, original_model.glb_bytes)
+        self.assertIn(
+            "previous model was restored",
+            self.workspace.status_label.text().lower(),
+        )
 
     def test_post_commit_generation_cancel_deletes_exact_generated_model(
         self,
@@ -643,7 +845,7 @@ class GenerationCancellationTests(unittest.TestCase):
             self.workspace.get_placeable_object_names_by_id()[
                 active_operation_id
             ],
-            "Object from frame 1",
+            "object_1",
         )
         planner.release.set()
         self._wait_until_idle()
@@ -652,7 +854,7 @@ class GenerationCancellationTests(unittest.TestCase):
         self.assertNotEqual(active_operation_id, record.object_id)
         self.assertEqual(
             self.workspace.get_placeable_object_names_by_id(),
-            {record.object_id: "Bookcase"},
+            {record.object_id: "object_1"},
         )
         self.assertGreaterEqual(catalog_changes.count(), 2)
         self.assertIn(
@@ -661,7 +863,7 @@ class GenerationCancellationTests(unittest.TestCase):
         )
         self.assertEqual(
             dict(catalog_changes.at(catalog_changes.count() - 1)[0]),
-            {record.object_id: "Bookcase"},
+            {record.object_id: "object_1"},
         )
         placement_requests = QSignalSpy(self.workspace.placement_requested)
         self.assertTrue(
@@ -712,8 +914,8 @@ class GenerationCancellationTests(unittest.TestCase):
                 for operation_id in ordered_ids
             ),
             (
-                "Object from frame 1 - Blob 1",
-                "Object from frame 1 - Blob 2",
+                "object_1",
+                "object_2",
             ),
         )
 
@@ -724,8 +926,8 @@ class GenerationCancellationTests(unittest.TestCase):
         self.assertEqual(
             {record.object_name for record in records},
             {
-                "Object from frame 1 - Blob 1",
-                "Object from frame 1 - Blob 2",
+                "object_1",
+                "object_2",
             },
         )
         records_by_blob_index = {
@@ -1078,7 +1280,7 @@ class GenerationCancellationTests(unittest.TestCase):
         self._wait_for_record_count(1)
         self.assertEqual(
             self.workspace.get_data().generated_objects[0].object_name,
-            "Provider object 1",
+            "object_1",
         )
         self.assertTrue(self.workspace.is_generating)
 
@@ -1092,7 +1294,7 @@ class GenerationCancellationTests(unittest.TestCase):
         )
         self.assertEqual(
             [record.object_name for record in records],
-            ["Provider object 1", "Custom chair"],
+            ["object_1", "Custom chair"],
         )
         self.assertTrue(
             all(
@@ -1102,7 +1304,7 @@ class GenerationCancellationTests(unittest.TestCase):
         )
         self.assertEqual(
             {job.name for job in self.job_manager.jobs()},
-            {"Custom chair", "Provider object 1"},
+            {"Custom chair", "object_1"},
         )
 
     def test_cancelling_one_model_job_leaves_its_sibling_running(self) -> None:

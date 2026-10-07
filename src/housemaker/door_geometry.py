@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import trimesh
@@ -13,15 +13,19 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.door_state import (
+    DOOR_SIDE_DUPLICATION_FRONT,
     DOOR_SLOT_BODY,
-    DOOR_SLOT_HINGES,
     DOOR_SLOT_KNOB,
     DoorDefinition,
     DoorSlotData,
+    door_slot_side,
+    is_door_body_slot,
+    is_door_knob_slot,
 )
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.glb import (
     DOOR_BODY_MARKER_METADATA_KEY,
+    DOOR_COMPONENT_MARKER_METADATA_KEY,
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     GeneratedModel,
@@ -32,12 +36,7 @@ from housemaker.glb import (
 
 # ### Constants ###
 DOOR_BODY_COLOR = (164, 109, 68, 255)
-DOOR_HARDWARE_COLOR = (132, 138, 145, 255)
 DOOR_BODY_GEOMETRY_NAME = "door_body"
-DOOR_HINGES_GEOMETRY_NAME = "door_hinges"
-DOOR_KNOB_GEOMETRY_NAME = "door_knob"
-DOOR_HINGE_CYLINDER_SECTIONS = 20
-DOOR_KNOB_SPHERE_SUBDIVISIONS = 2
 DOOR_GEOMETRY_EPSILON = 1e-9
 DOOR_UV_ATLAS_RESOLUTION = 1024
 DOOR_UV_PADDING_PIXELS = 2
@@ -114,100 +113,27 @@ def build_door_body_model(
     return _build_generated_model(mesh, geometry_name)
 
 
-# ### Public hardware construction ###
-def build_door_hinges_model(
-    door_height_meters: float,
-    *,
-    radius_meters: float = 0.012,
-    geometry_name: str = DOOR_HINGES_GEOMETRY_NAME,
-) -> GeneratedModel:
-    """Build two simple hinge barrels in one movable component slot."""
-
-    door_height = _normalize_positive_measurement(
-        door_height_meters,
-        "Door height",
-    )
-    radius = _normalize_positive_measurement(radius_meters, "Hinge radius")
-    barrel_height = min(max(door_height * 0.06, 0.06), 0.14)
-    barrel_separation = min(
-        max(door_height * 0.45, barrel_height * 1.5),
-        max(door_height - barrel_height, barrel_height * 1.5),
-    )
-    barrels: list[trimesh.Trimesh] = []
-    for base_z in (0.0, barrel_separation):
-        barrel = trimesh.creation.cylinder(
-            radius=radius,
-            height=barrel_height,
-            sections=DOOR_HINGE_CYLINDER_SECTIONS,
-        )
-        barrel.apply_translation((0.0, 0.0, base_z + barrel_height / 2.0))
-        barrels.append(barrel)
-    mesh = _concatenate_meshes(barrels)
-    mesh = _unwrap_mesh(mesh, DOOR_HARDWARE_COLOR, geometry_name)
-    return _build_generated_model(mesh, geometry_name)
-
-
-def build_door_knob_model(
-    door_thickness_meters: float,
-    *,
-    radius_meters: float = 0.035,
-    projection_meters: float = 0.035,
-    geometry_name: str = DOOR_KNOB_GEOMETRY_NAME,
-) -> GeneratedModel:
-    """Build paired knobs and their spindle as one movable component slot."""
-
-    thickness = _normalize_positive_measurement(
-        door_thickness_meters,
-        "Door thickness",
-    )
-    radius = _normalize_positive_measurement(radius_meters, "Door-knob radius")
-    projection = _normalize_positive_measurement(
-        projection_meters,
-        "Door-knob projection",
-    )
-    center_z = radius
-    center_y = thickness / 2.0 + projection
-    front = trimesh.creation.icosphere(
-        subdivisions=DOOR_KNOB_SPHERE_SUBDIVISIONS,
-        radius=radius,
-    )
-    front.apply_translation((0.0, -center_y, center_z))
-    back = trimesh.creation.icosphere(
-        subdivisions=DOOR_KNOB_SPHERE_SUBDIVISIONS,
-        radius=radius,
-    )
-    back.apply_translation((0.0, center_y, center_z))
-
-    spindle = trimesh.creation.cylinder(
-        radius=max(radius * 0.22, 0.003),
-        height=center_y * 2.0,
-        sections=DOOR_HINGE_CYLINDER_SECTIONS,
-    )
-    spindle.apply_transform(
-        trimesh.transformations.rotation_matrix(math.pi / 2.0, (1.0, 0.0, 0.0))
-    )
-    spindle.apply_translation((0.0, 0.0, center_z))
-    mesh = _concatenate_meshes((front, back, spindle))
-    mesh = _unwrap_mesh(mesh, DOOR_HARDWARE_COLOR, geometry_name)
-    return _build_generated_model(mesh, geometry_name)
-
-
 def build_default_door_slot_models(
     door: DoorDefinition,
 ) -> dict[str, GeneratedModel]:
-    """Build all canonical procedural source models for a new door."""
+    """Build the doorway-fitting body supplied for each configured side."""
 
     _require_door_definition(door)
     return {
-        DOOR_SLOT_BODY: build_door_body_model(
+        slot.slot_id: build_door_body_model(
             door.width_meters,
             door.height_meters,
             door.thickness_meters,
             shape=door.shape,
             arch_amount=door.arch_amount,
-        ),
-        DOOR_SLOT_HINGES: build_door_hinges_model(door.height_meters),
-        DOOR_SLOT_KNOB: build_door_knob_model(door.thickness_meters),
+            geometry_name=(
+                DOOR_BODY_GEOMETRY_NAME
+                if slot.slot_id == DOOR_SLOT_BODY
+                else f"{DOOR_BODY_GEOMETRY_NAME}_{slot.slot_id}"
+            ),
+        )
+        for slot in door.slots
+        if is_door_body_slot(slot.slot_id)
     }
 
 
@@ -218,6 +144,7 @@ def assemble_door_model(
     *,
     include_unjoined: bool = False,
     body_mirror: DoorBodyMirrorConfiguration | None = None,
+    body_mirrors: Mapping[str, DoorBodyMirrorConfiguration] | None = None,
 ) -> GeneratedModel:
     """Join a door's confirmed slots while retaining each slot material.
 
@@ -234,6 +161,15 @@ def assemble_door_model(
         DoorBodyMirrorConfiguration,
     ):
         raise TypeError("Door body mirror configuration is invalid.")
+    normalized_body_mirrors = dict(body_mirrors or {})
+    if body_mirror is not None:
+        normalized_body_mirrors.setdefault(DOOR_SLOT_BODY, body_mirror)
+    if any(
+        not is_door_body_slot(slot_id)
+        or not isinstance(configuration, DoorBodyMirrorConfiguration)
+        for slot_id, configuration in normalized_body_mirrors.items()
+    ):
+        raise TypeError("Door body mirror configurations are invalid.")
     models = (
         build_default_door_slot_models(door)
         if slot_models is None
@@ -242,24 +178,58 @@ def assemble_door_model(
     placements: list[PlacedGeneratedModel] = []
     for slot in door.slots:
         if (
-            slot.slot_id != DOOR_SLOT_BODY
+            not is_door_body_slot(slot.slot_id)
             and not include_unjoined
             and not slot.joined
         ):
             continue
         component_model = _resolve_slot_model(models, slot)
-        if slot.slot_id == DOOR_SLOT_BODY:
+        if component_model is None:
+            if is_door_body_slot(slot.slot_id):
+                raise ValueError("The door body has no generated source model.")
+            continue
+        if is_door_body_slot(slot.slot_id):
             component_model = _with_door_body_marker(
                 component_model,
                 slot.source_object_id,
             )
+        elif is_door_knob_slot(slot.slot_id):
+            component_model = _with_door_component_marker(
+                component_model,
+                slot.source_object_id,
+                DOOR_SLOT_KNOB,
+            )
+        slot_body_mirror = normalized_body_mirrors.get(slot.slot_id)
         world_position = slot.position_meters
-        if slot.slot_id == DOOR_SLOT_BODY:
+        axis_scales = slot.axis_scales
+        if is_door_body_slot(slot.slot_id):
             bottom_center = _mesh_bottom_center(component_model.mesh)
             world_position = tuple(
                 float(slot.position_meters[index] + bottom_center[index])
                 for index in range(3)
             )
+            if door.make_double_sided:
+                body_depth = _mesh_axis_extent(component_model.mesh, 1)
+                side_depth = (
+                    door.thickness_meters * axis_scales[1] * 0.5
+                )
+                side_sign = (
+                    -1.0
+                    if door_slot_side(slot.slot_id)
+                    == DOOR_SIDE_DUPLICATION_FRONT
+                    else 1.0
+                )
+                world_position = (
+                    world_position[0],
+                    world_position[1]
+                    + side_sign * side_depth * 0.5,
+                    world_position[2],
+                )
+                axis_scales = (
+                    axis_scales[0],
+                    side_depth / body_depth,
+                    axis_scales[2],
+                )
         placements.append(
             PlacedGeneratedModel(
                 object_id=slot.source_object_id,
@@ -269,15 +239,16 @@ def assemble_door_model(
                 world_position=world_position,
                 symmetric_preview_orientation=(
                     None
-                    if slot.slot_id != DOOR_SLOT_BODY or body_mirror is None
-                    else body_mirror.symmetric_orientation
+                    if slot_body_mirror is None
+                    else slot_body_mirror.symmetric_orientation
                 ),
                 symmetric_preview_plane_coordinate=(
                     None
-                    if slot.slot_id != DOOR_SLOT_BODY or body_mirror is None
-                    else body_mirror.symmetric_plane_coordinate
+                    if slot_body_mirror is None
+                    else slot_body_mirror.symmetric_plane_coordinate
                 ),
                 rotation_degrees=slot.rotation_degrees,
+                axis_scales=axis_scales,
             )
         )
     # Every slot must pass through the placed-model preview splitter so the
@@ -288,14 +259,22 @@ def assemble_door_model(
         glb_bytes=b"",
     )
     assembled = compose_placed_generated_models(empty_base, placements)
+    assembled.preview_symmetric_objects = [
+        replace(preview, fade_enabled=False)
+        for preview in assembled.preview_symmetric_objects
+    ]
     if (
-        body_mirror is not None
-        and body_mirror.side_duplication_plane_coordinate is not None
+        normalized_body_mirrors.get(DOOR_SLOT_BODY) is not None
+        and normalized_body_mirrors[
+            DOOR_SLOT_BODY
+        ].side_duplication_plane_coordinate
+        is not None
     ):
         _append_side_duplication_previews(
             assembled,
             door.get_slot(DOOR_SLOT_BODY),
-            body_mirror,
+            door.get_slot(DOOR_SLOT_KNOB),
+            normalized_body_mirrors[DOOR_SLOT_BODY],
         )
     return assembled
 
@@ -330,12 +309,49 @@ def _with_door_body_marker(
     return tagged
 
 
+def _with_door_component_marker(
+    model: GeneratedModel,
+    component_object_id: str,
+    component_kind: str,
+) -> GeneratedModel:
+    """Tag one authored component so runtime reconstruction can locate it."""
+
+    tagged = copy.deepcopy(model)
+    marker = {
+        "componentObjectId": str(component_object_id).strip(),
+        "kind": str(component_kind).strip(),
+    }
+    for geometry in tagged.scene.geometry.values():
+        if not isinstance(geometry, trimesh.Trimesh):
+            continue
+        geometry.metadata = copy.deepcopy(
+            dict(getattr(geometry, "metadata", {}) or {})
+        )
+        geometry.metadata[DOOR_COMPONENT_MARKER_METADATA_KEY] = copy.deepcopy(
+            marker
+        )
+    for node_name in tagged.scene.graph.nodes_geometry:
+        parent_name = tagged.scene.graph.transforms.parents.get(node_name)
+        if parent_name is None:
+            continue
+        edge_data = tagged.scene.graph.transforms.edge_data.get(
+            (parent_name, node_name)
+        )
+        if not isinstance(edge_data, dict):
+            continue
+        metadata = copy.deepcopy(dict(edge_data.get("metadata") or {}))
+        metadata[DOOR_COMPONENT_MARKER_METADATA_KEY] = copy.deepcopy(marker)
+        edge_data["metadata"] = metadata
+    return tagged
+
+
 def _append_side_duplication_previews(
     assembled: GeneratedModel,
     body_slot: DoorSlotData | None,
+    knob_slot: DoorSlotData | None,
     body_mirror: DoorBodyMirrorConfiguration,
 ) -> None:
-    """Show Y and optional X+Y mirrors while keeping hardware single."""
+    """Show body reconstruction mirrors and duplicate its knob by depth."""
 
     if body_slot is None:
         raise ValueError("A side-duplicated door requires a body slot.")
@@ -353,8 +369,13 @@ def _append_side_duplication_previews(
         preview.meshes,
         preview.placement_transform,
     )
-    side_plane = body_mirror.side_duplication_plane_coordinate
-    assert side_plane is not None
+    local_side_plane = body_mirror.side_duplication_plane_coordinate
+    assert local_side_plane is not None
+    side_plane = _transform_axis_plane_coordinate(
+        preview.placement_transform,
+        axis=1,
+        plane_coordinate=local_side_plane,
+    )
     side_mirrors = _reflect_preview_meshes(world_meshes, 1, side_plane)
     assembled.preview_symmetric_objects.append(
         PreviewSymmetricObject(
@@ -363,32 +384,69 @@ def _append_side_duplication_previews(
             orientation="depth",
             plane_coordinate=side_plane,
             mirrored_meshes=side_mirrors,
+            fade_enabled=False,
         )
     )
-    if body_mirror.symmetric_orientation is None:
+    if body_mirror.symmetric_orientation is not None:
+        symmetric_axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[
+            body_mirror.symmetric_orientation
+        ]
+        local_symmetric_plane = body_mirror.symmetric_plane_coordinate
+        assert local_symmetric_plane is not None
+        symmetric_plane = _transform_axis_plane_coordinate(
+            preview.placement_transform,
+            axis=symmetric_axis,
+            plane_coordinate=local_symmetric_plane,
+        )
+        symmetric_mirrors = _reflect_preview_meshes(
+            world_meshes,
+            symmetric_axis,
+            symmetric_plane,
+        )
+        combined_mirrors = _reflect_preview_meshes(
+            symmetric_mirrors,
+            1,
+            side_plane,
+        )
+        assembled.preview_symmetric_objects.append(
+            PreviewSymmetricObject(
+                object_id=f"{body_slot.source_object_id}:symmetric-side",
+                meshes=symmetric_mirrors,
+                orientation="depth",
+                plane_coordinate=side_plane,
+                mirrored_meshes=combined_mirrors,
+                fade_enabled=False,
+            )
+        )
+
+    if knob_slot is None:
         return
-    symmetric_axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[
-        body_mirror.symmetric_orientation
-    ]
-    symmetric_plane = body_mirror.symmetric_plane_coordinate
-    assert symmetric_plane is not None
-    symmetric_mirrors = _reflect_preview_meshes(
-        world_meshes,
-        symmetric_axis,
-        symmetric_plane,
+    knob_preview = next(
+        (
+            item
+            for item in assembled.preview_placed_objects
+            if item.object_id == knob_slot.source_object_id
+        ),
+        None,
     )
-    combined_mirrors = _reflect_preview_meshes(
-        symmetric_mirrors,
-        1,
-        side_plane,
+    if knob_preview is None:
+        return
+    knob_meshes = _transform_preview_meshes(
+        knob_preview.meshes,
+        knob_preview.placement_transform,
     )
     assembled.preview_symmetric_objects.append(
         PreviewSymmetricObject(
-            object_id=f"{body_slot.source_object_id}:symmetric-side",
-            meshes=symmetric_mirrors,
+            object_id=f"{knob_slot.source_object_id}:side",
+            meshes=knob_meshes,
             orientation="depth",
             plane_coordinate=side_plane,
-            mirrored_meshes=combined_mirrors,
+            mirrored_meshes=_reflect_preview_meshes(
+                knob_meshes,
+                1,
+                side_plane,
+            ),
+            fade_enabled=False,
         )
     )
 
@@ -403,6 +461,21 @@ def _transform_preview_meshes(
         copied.apply_transform(np.asarray(transform, dtype=float))
         transformed.append(copied)
     return tuple(transformed)
+
+
+def _transform_axis_plane_coordinate(
+    transform: np.ndarray,
+    *,
+    axis: int,
+    plane_coordinate: float,
+) -> float:
+    """Move one local axis-aligned mirror plane into assembled coordinates."""
+
+    point = np.zeros(4, dtype=float)
+    point[axis] = float(plane_coordinate)
+    point[3] = 1.0
+    transformed = np.asarray(transform, dtype=float) @ point
+    return float(transformed[axis])
 
 
 def _reflect_preview_meshes(
@@ -431,6 +504,16 @@ def _mesh_bottom_center(mesh: trimesh.Trimesh) -> np.ndarray:
         ),
         dtype=float,
     )
+
+
+def _mesh_axis_extent(mesh: trimesh.Trimesh, axis: int) -> float:
+    """Return one finite positive local mesh extent."""
+
+    minimum, maximum = np.asarray(mesh.bounds, dtype=float)
+    extent = float(maximum[axis] - minimum[axis])
+    if not math.isfinite(extent) or extent <= DOOR_GEOMETRY_EPSILON:
+        raise ValueError("A door body has no measurable depth.")
+    return extent
 
 
 def mirror_door_model_horizontally(model: GeneratedModel) -> GeneratedModel:
@@ -498,6 +581,7 @@ def _reflect_symmetric_previews_x(
                 orientation=preview.orientation,
                 plane_coordinate=plane_coordinate,
                 mirrored_meshes=mirrored_meshes,
+                fade_enabled=preview.fade_enabled,
             )
         )
     return reflected_previews
@@ -595,29 +679,17 @@ def _build_generated_model(
 def _resolve_slot_model(
     models: Mapping[str, GeneratedModel],
     slot: DoorSlotData,
-) -> GeneratedModel:
+) -> GeneratedModel | None:
     model = models.get(slot.slot_id)
     if model is None:
         model = models.get(slot.source_object_id)
     if model is None:
-        raise ValueError(
-            f"Door slot {slot.display_name!r} has no generated source model."
-        )
+        return None
     if not isinstance(model, GeneratedModel):
         raise TypeError(
             f"Door slot {slot.display_name!r} source must be a GeneratedModel."
         )
     return model
-
-
-def _concatenate_meshes(meshes: Sequence[trimesh.Trimesh]) -> trimesh.Trimesh:
-    normalized = tuple(mesh for mesh in meshes if not mesh.is_empty)
-    if not normalized:
-        raise ValueError("Door component geometry cannot be empty.")
-    combined = trimesh.util.concatenate(normalized)
-    if not isinstance(combined, trimesh.Trimesh):
-        raise TypeError("Door component geometry could not be combined.")
-    return combined
 
 
 def _unwrap_mesh(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -23,6 +24,10 @@ from housemaker.canvas_openings import (
     CanvasOpeningReference,
     CanvasOpeningTarget,
 )
+from housemaker.door_state import (
+    DOOR_SLOT_BODY,
+    DOOR_SLOT_KNOB,
+)
 from housemaker.glb import GeneratedModel
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
@@ -39,6 +44,9 @@ from housemaker.viewer import (
     CANVAS_OPENING_SIDE_SIZE_PIXELS,
     CANVAS_OPENING_SIDE_TOP,
     CANVAS_SURFACE_SELECTION_COLOR,
+    DOOR_PLACEMENT_PREVIEW_COLORS,
+    DoorPlacementPreviewCandidate,
+    DoorPlacementPreviewPart,
     GlbViewerWidget,
     _CanvasOpeningGizmoHandle,
     _get_canvas_door_creation_local_position,
@@ -132,6 +140,36 @@ def _bounds_values(bounds: CanvasOpeningBounds) -> tuple[float, ...]:
         bounds.end_ratio,
         bounds.bottom_ratio,
         bounds.top_ratio,
+    )
+
+
+def _build_door_preview_candidate(
+    target: CanvasOpeningTarget,
+) -> DoorPlacementPreviewCandidate:
+    """Build visibly distinct normal and wheel-mirrored preview profiles."""
+
+    roles = (DOOR_SLOT_BODY, DOOR_SLOT_KNOB)
+    normal_parts: list[DoorPlacementPreviewPart] = []
+    mirrored_parts: list[DoorPlacementPreviewPart] = []
+    for index, role in enumerate(roles):
+        normal_mesh = trimesh.creation.box(
+            extents=(0.25 + index * 0.05, 0.1, 0.5),
+        )
+        normal_mesh.apply_translation((float(index), 0.0, 0.25))
+        mirrored_mesh = normal_mesh.copy()
+        mirrored_mesh.apply_translation((10.0, 0.0, 0.0))
+        normal_parts.append(DoorPlacementPreviewPart(role, (normal_mesh,)))
+        mirrored_parts.append(DoorPlacementPreviewPart(role, (mirrored_mesh,)))
+    normal_transform = np.eye(4, dtype=float)
+    normal_transform[:3, 3] = (2.0, 3.0, 4.0)
+    mirrored_transform = np.eye(4, dtype=float)
+    mirrored_transform[:3, 3] = (5.0, 6.0, 7.0)
+    return DoorPlacementPreviewCandidate(
+        opening_key=target.key,
+        normal_parts=tuple(normal_parts),
+        normal_transform=normal_transform,
+        mirrored_parts=tuple(mirrored_parts),
+        mirrored_transform=mirrored_transform,
     )
 
 
@@ -407,6 +445,209 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         self.assertFalse(viewer.is_door_placement_active)
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
         self.assertFalse(viewer.view._primary_pointer_tool_active)
+
+    def test_door_placement_hover_shows_colored_component_profile(self) -> None:
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        candidate = _build_door_preview_candidate(target)
+
+        self.assertNotIn("hinges", DOOR_PLACEMENT_PREVIEW_COLORS)
+
+        self.assertTrue(
+            viewer.begin_door_placement(
+                "door-a",
+                (target.key,),
+                preview_candidates=(candidate,),
+            )
+        )
+        self.assertIsNone(viewer._door_placement_preview_root)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            self.assertTrue(
+                viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            )
+
+        self.assertEqual(
+            viewer._door_placement_hover_opening_key,
+            target.key,
+        )
+        self.assertIsNotNone(viewer._door_placement_preview_root)
+        self.assertEqual(len(viewer._door_placement_preview_items), 2)
+        rendered_colors = tuple(
+            tuple(float(component) for component in item.opts["color"])
+            for item in viewer._door_placement_preview_items
+        )
+        expected_colors = tuple(
+            DOOR_PLACEMENT_PREVIEW_COLORS[role]
+            for role in (
+                DOOR_SLOT_BODY,
+                DOOR_SLOT_KNOB,
+            )
+        )
+        self.assertEqual(rendered_colors, expected_colors)
+
+    def test_door_placement_preview_clears_on_pointer_leave_and_cancel(
+        self,
+    ) -> None:
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        candidate = _build_door_preview_candidate(target)
+        self.assertTrue(
+            viewer.begin_door_placement(
+                "door-a",
+                (target.key,),
+                preview_candidates=(candidate,),
+            )
+        )
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+        self.assertIsNotNone(viewer._door_placement_preview_root)
+
+        viewer._handle_surface_vertex_pointer_left()
+
+        self.assertIsNone(viewer._door_placement_hover_opening_key)
+        self.assertIsNone(viewer._door_placement_preview_root)
+        self.assertEqual(viewer._door_placement_preview_items, [])
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+        self.assertIsNotNone(viewer._door_placement_preview_root)
+
+        self.assertTrue(viewer.cancel_door_placement())
+        self.assertIsNone(viewer._door_placement_preview_root)
+        self.assertEqual(viewer._door_placement_preview_items, [])
+        self.assertEqual(viewer._door_placement_preview_candidates, {})
+
+    def test_nearer_scene_geometry_occludes_door_placement_hover_and_click(
+        self,
+    ) -> None:
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        viewer.set_model(_build_model(), preserve_camera=True)
+        placements: list[tuple[str, object, bool]] = []
+        viewer.door_placement_requested.connect(
+            lambda door_id, reference, mirrored: placements.append(
+                (door_id, reference, mirrored)
+            )
+        )
+        self.assertTrue(
+            viewer.begin_door_placement(
+                "door-a",
+                (target.key,),
+                preview_candidates=(_build_door_preview_candidate(target),),
+            )
+        )
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            self.assertFalse(
+                viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            )
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+            viewer._handle_canvas_gizmo_pointer_released(QPointF())
+
+        self.assertIsNone(viewer._door_placement_hover_opening_key)
+        self.assertIsNone(viewer._door_placement_preview_root)
+        self.assertEqual(placements, [])
+        self.assertTrue(viewer.is_door_placement_active)
+
+    def test_changing_compatible_opening_cancels_stale_door_preview(
+        self,
+    ) -> None:
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        cancellations: list[str] = []
+        viewer.door_placement_cancelled.connect(cancellations.append)
+        self.assertTrue(
+            viewer.begin_door_placement(
+                "door-a",
+                (target.key,),
+                preview_candidates=(_build_door_preview_candidate(target),),
+            )
+        )
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+        self.assertIsNotNone(viewer._door_placement_preview_root)
+
+        changed_target = replace(
+            target,
+            bounds=CanvasOpeningBounds(
+                start_ratio=0.2,
+                end_ratio=0.8,
+                bottom_ratio=0.1,
+                top_ratio=0.9,
+            ),
+        )
+        self.assertEqual(changed_target.key, target.key)
+        viewer.set_canvas_opening_targets((changed_target,))
+
+        self.assertFalse(viewer.is_door_placement_active)
+        self.assertEqual(cancellations, ["door-a"])
+        self.assertIsNone(viewer._door_placement_hover_opening_key)
+        self.assertIsNone(viewer._door_placement_preview_root)
+        self.assertEqual(viewer._door_placement_preview_candidates, {})
+
+    def test_door_placement_wheel_switches_hover_to_mirrored_profile(
+        self,
+    ) -> None:
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        candidate = _build_door_preview_candidate(target)
+        placements: list[tuple[str, object, bool]] = []
+        viewer.door_placement_requested.connect(
+            lambda door_id, reference, mirrored: placements.append(
+                (door_id, reference, mirrored)
+            )
+        )
+        self.assertTrue(
+            viewer.begin_door_placement(
+                "door-a",
+                (target.key,),
+                preview_candidates=(candidate,),
+            )
+        )
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            normal_minimum_x = min(
+                float(item.opts["meshdata"].vertexes()[:, 0].min())
+                for item in viewer._door_placement_preview_items
+            )
+
+            viewer._handle_projection_camera_wheel_steps_requested(1)
+
+            mirrored_minimum_x = min(
+                float(item.opts["meshdata"].vertexes()[:, 0].min())
+                for item in viewer._door_placement_preview_items
+            )
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+            viewer._handle_canvas_gizmo_pointer_released(QPointF())
+
+        self.assertGreater(mirrored_minimum_x, normal_minimum_x + 5.0)
+        self.assertEqual(placements, [("door-a", target.reference, True)])
+        self.assertFalse(viewer.is_door_placement_active)
 
     def test_door_placement_rejects_incompatible_openings_and_stays_armed(
         self,

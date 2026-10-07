@@ -56,6 +56,7 @@ from housemaker.generation_workspace import (
     TextureRegenerationRequest,
     TextureRegenerationWorker,
     _build_regenerated_texture_pipeline,
+    _fit_generated_door_body_texture_variants,
     _GenerationCancelled,
     _materialize_texture_regeneration_preflight,
     _persist_generated_named_asset,
@@ -265,6 +266,47 @@ def _textured_box_glb() -> bytes:
     return bytes(trimesh.Scene(mesh).export(file_type="glb"))
 
 
+def _textured_relief_door_glb() -> bytes:
+    """Build a textured door-like box with one protruding front vertex."""
+
+    # Raw trimesh GLB coordinates are glTF Y-up. HouseMaker imports them as
+    # Z-up, so raw Y is height and raw Z is door depth.
+    source = trimesh.creation.box(extents=(2.0, 3.0, 0.4))
+    vertices = np.asarray(source.vertices, dtype=float).copy()
+    front_indices = np.flatnonzero(
+        np.isclose(vertices[:, 2], np.max(vertices[:, 2]))
+    )
+    raised_index = max(
+        front_indices,
+        key=lambda index: vertices[index, 0] + vertices[index, 1],
+    )
+    vertices[raised_index, 2] += 0.25
+    mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=np.asarray(source.faces, dtype=np.int64),
+        process=False,
+    )
+    uv = np.column_stack(
+        (
+            (vertices[:, 0] - np.min(vertices[:, 0]))
+            / np.ptp(vertices[:, 0]),
+            (vertices[:, 1] - np.min(vertices[:, 1]))
+            / np.ptp(vertices[:, 1]),
+        )
+    )
+    mesh.visual = TextureVisuals(
+        uv=uv,
+        material=PBRMaterial(
+            baseColorTexture=Image.new(
+                "RGBA",
+                (8, 8),
+                (85, 115, 145, 255),
+            )
+        ),
+    )
+    return bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+
 def _png_bytes(color: tuple[int, int, int, int]) -> bytes:
     pixels = np.full((8, 8, 4), color, dtype=np.uint8)
     encoded, payload = cv2.imencode(".png", pixels)
@@ -430,6 +472,31 @@ def _door_texture_variants() -> ObjectTextureVariants:
     )
 
 
+def _relief_door_texture_variants() -> ObjectTextureVariants:
+    """Build consistent texture variants around one non-planar door mesh."""
+
+    glb = _textured_relief_door_glb()
+    texture_pngs = {
+        resolution: _png_bytes((85, 115, 145, 255))
+        for resolution in TEXTURE_RESOLUTIONS
+    }
+    previews = {
+        resolution: np.full(
+            (8, 8, 4),
+            (85, 115, 145, 255),
+            dtype=np.uint8,
+        )
+        for resolution in TEXTURE_RESOLUTIONS
+    }
+    return ObjectTextureVariants(
+        glb_by_resolution={
+            resolution: glb for resolution in TEXTURE_RESOLUTIONS
+        },
+        texture_png_by_resolution=texture_pngs,
+        preview_rgba_by_resolution=previews,
+    )
+
+
 def _model_with_variants(variants: ObjectTextureVariants) -> GeneratedModel:
     model = import_generated_glb(variants.glb_by_resolution[1024])
     model.object_texture_variants = variants
@@ -529,6 +596,54 @@ def _asset_bytes(
         raw_path: asset_directory.joinpath(raw_path).read_bytes()
         for raw_path in raw_paths
     }
+
+
+# ### Door displacement geometry tests ###
+class DoorDisplacementGeometryTests(unittest.TestCase):
+    def test_fitting_preserves_relief_uvs_and_texture_payloads(self) -> None:
+        source = _relief_door_texture_variants()
+        target_dimensions = np.asarray((0.9, 0.06, 2.1), dtype=float)
+
+        fitted = _fit_generated_door_body_texture_variants(
+            source,
+            target_dimensions,
+        )
+
+        self.assertEqual(
+            fitted.texture_png_by_resolution,
+            source.texture_png_by_resolution,
+        )
+        for resolution in TEXTURE_RESOLUTIONS:
+            source_glb = source.glb_by_resolution[resolution]
+            fitted_glb = fitted.glb_by_resolution[resolution]
+            self.assertEqual(
+                build_uv_fingerprint(fitted_glb),
+                build_uv_fingerprint(source_glb),
+            )
+            fitted_model = import_generated_glb(fitted_glb)
+            fitted_bounds = np.asarray(fitted_model.mesh.bounds, dtype=float)
+            np.testing.assert_allclose(
+                fitted_bounds[1] - fitted_bounds[0],
+                target_dimensions,
+                rtol=1e-5,
+                atol=1e-7,
+            )
+            np.testing.assert_allclose(
+                (
+                    (fitted_bounds[0, 0] + fitted_bounds[1, 0]) * 0.5,
+                    (fitted_bounds[0, 1] + fitted_bounds[1, 1]) * 0.5,
+                    fitted_bounds[0, 2],
+                ),
+                (0.0, 0.0, 0.0),
+                atol=1e-7,
+            )
+            distinct_depths = np.unique(
+                np.round(
+                    np.asarray(fitted_model.mesh.vertices)[:, 1],
+                    decimals=7,
+                )
+            )
+            self.assertGreaterEqual(len(distinct_depths), 3)
 
 
 # ### Provider fixtures ###
@@ -921,9 +1036,12 @@ class TextureRegenerationRequestTests(unittest.TestCase):
                     variants.glb_by_resolution[int(resolution)],
                 )
 
-    def test_symmetric_division_precedes_door_side_duplication(self) -> None:
+    def test_symmetric_division_reprojects_before_door_side_duplication(
+        self,
+    ) -> None:
         source_variants = _door_texture_variants()
         divided_variants = _symmetric_square_pair_variants()
+        percentages = (1, 1, 95, 1, 1, 1)
         fingerprint = build_uv_fingerprint(
             source_variants.glb_by_resolution[2048]
         )
@@ -946,13 +1064,20 @@ class TextureRegenerationRequestTests(unittest.TestCase):
             kept_side=symmetry.kept_side,
             plane_coordinate=symmetry.plane_coordinate,
             metadata=symmetry,
+            scan_projection_stats=_scan_projection_result(
+                divided_variants.glb_by_resolution[1024],
+                percentages,
+                SCAN_PROJECTION_TARGET_LEFT_HALF,
+            ).stats,
         )
         request = TextureRegenerationRequest(
             object_id="door-body",
             reference_frame_index=0,
             reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
             model_glb=source_variants.glb_by_resolution[2048],
-            settings=GenerationServiceSettings(),
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=True,
+            ),
             enable_original_uv=True,
             submitted_uv_fingerprint=fingerprint,
             new_symmetric_division_orientation=(
@@ -961,6 +1086,7 @@ class TextureRegenerationRequestTests(unittest.TestCase):
             new_door_side_duplication=DoorSideDuplication(
                 kept_side=DOOR_SIDE_DUPLICATION_BACK
             ),
+            projection_camera_percentages=percentages,
         )
         outcome = TextureRegenerationOutcome(
             request=request,
@@ -983,8 +1109,12 @@ class TextureRegenerationRequestTests(unittest.TestCase):
         )
         operation_order: list[str] = []
 
-        def divide(*_args: object, **_kwargs: object) -> SymmetricDivisionResult:
+        def divide(*_args: object, **kwargs: object) -> SymmetricDivisionResult:
             operation_order.append("symmetric")
+            self.assertEqual(
+                kwargs["projection_camera_percentages"],
+                percentages,
+            )
             return division_result
 
         def clip(
@@ -1038,6 +1168,14 @@ class TextureRegenerationRequestTests(unittest.TestCase):
         self.assertEqual(
             set(saved.next_pipeline["texture_variants"]),
             {"512", "1024"},
+        )
+        self.assertEqual(
+            tuple(
+                saved.next_pipeline[SCAN_PROJECTION_PIPELINE_KEY][
+                    "camera_percentages"
+                ].values()
+            ),
+            percentages,
         )
 
     def test_request_snapshots_and_validates_camera_percentages(self) -> None:
@@ -2766,7 +2904,345 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             QTest.qWait(10)
         self.assertTrue(event.is_set(), "Blocking provider did not start.")
 
-    def test_door_body_can_request_symmetry_without_leaking_to_hardware(
+    def test_empty_knob_slot_starts_one_model_generation(self) -> None:
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                object_name="New door 1 - Door knob/handle",
+                slot_display_name="Door knob/handle",
+            )
+        )
+        self.assertIsNone(self.workspace.result_view.model)
+        self._load_reference()
+
+        with patch.object(
+            self.workspace,
+            "_start_generation",
+            return_value="door-operation",
+        ) as start_generation:
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        target = start_generation.call_args.kwargs["door_slot_target"]
+        self.assertFalse(request.symmetric_division_enabled)
+        self.assertFalse(
+            request.settings.use_uv_raycast_for_object_generation
+        )
+        self.assertEqual(target.object_id, "door-knob")
+        self.assertEqual(target.slot_display_name, "Door knob/handle")
+
+    def test_generate_replaces_existing_knob_with_model_generation(
+        self,
+    ) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-knob",
+            object_name="New door 1 - Door knob/handle",
+            door_id="door-1",
+            slot_id="door_knob",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                object_name="New door 1 - Door knob/handle",
+                slot_display_name="Door knob/handle",
+            )
+        )
+        target = self.workspace._door_slot_editing_target
+        assert target is not None
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="door-replacement-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.workspace.generate()
+
+        start_texture_regeneration.assert_not_called()
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        self.assertFalse(request.geometry_only)
+        self.assertEqual(
+            start_generation.call_args.kwargs["requested_name"],
+            target.object_name,
+        )
+        self.assertEqual(
+            start_generation.call_args.kwargs["door_slot_target"],
+            target,
+        )
+        self.assertEqual(
+            start_generation.call_args.kwargs["replaced_object_record"],
+            original,
+        )
+
+    def test_generate_texture_keeps_existing_knob_texture_only(
+        self,
+    ) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        self.workspace.register_door_component_model(
+            object_id="door-knob",
+            object_name="New door 1 - Door knob/handle",
+            door_id="door-1",
+            slot_id="door_knob",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                object_name="New door 1 - Door knob/handle",
+                slot_display_name="Door knob/handle",
+            )
+        )
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="unexpected-model-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+
+        start_generation.assert_not_called()
+        start_texture_regeneration.assert_called_once()
+        request = start_texture_regeneration.call_args.args[0]
+        self.assertEqual(request.object_id, "door-knob")
+
+    # ### Door body displacement routing ###
+    def test_body_generate_without_displacement_keeps_texture_only_route(
+        self,
+    ) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                generate_displacement=False,
+            )
+        )
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="unexpected-model-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.workspace.generate()
+
+        start_generation.assert_not_called()
+        start_texture_regeneration.assert_called_once()
+        request = start_texture_regeneration.call_args.args[0]
+        self.assertEqual(request.object_id, "door-body")
+
+    def test_clearing_applied_side_duplication_rebuilds_full_body(self) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        applied = replace(
+            original,
+            pipeline={
+                **original.pipeline,
+                DOOR_SIDE_DUPLICATION_PIPELINE_KEY: (
+                    DoorSideDuplicationMetadata(
+                        kept_side=DOOR_SIDE_DUPLICATION_FRONT,
+                        plane_coordinate=0.0,
+                    ).to_pipeline_dict()
+                ),
+            },
+        )
+        original_index = self.workspace._data.generated_objects.index(original)
+        self.workspace._data.generated_objects[original_index] = applied
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                side_duplication=None,
+                generate_displacement=False,
+                door_body_fit_dimensions=(1.0, 0.04, 2.0),
+            )
+        )
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="door-side-rebuild-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.workspace.generate()
+
+        start_texture_regeneration.assert_not_called()
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        self.assertEqual(
+            request.door_body_fit_dimensions,
+            (1.0, 0.04, 2.0),
+        )
+        self.assertIsNone(request.door_side_duplication)
+        self.assertEqual(
+            start_generation.call_args.kwargs["replaced_object_record"],
+            applied,
+        )
+
+    def test_body_generate_with_displacement_replaces_the_existing_model(
+        self,
+    ) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        side_duplication = DoorSideDuplication(
+            kept_side=DOOR_SIDE_DUPLICATION_FRONT
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                side_duplication=side_duplication,
+                generate_displacement=True,
+                door_body_fit_dimensions=(1.0, 0.04, 2.0),
+            )
+        )
+        self._load_reference()
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="door-displacement-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.workspace.generate()
+
+        start_texture_regeneration.assert_not_called()
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        target = start_generation.call_args.kwargs["door_slot_target"]
+        self.assertTrue(request.symmetric_division_enabled)
+        self.assertEqual(request.door_side_duplication, side_duplication)
+        self.assertTrue(target.generate_displacement)
+        self.assertEqual(target.object_id, original.object_id)
+        self.assertEqual(
+            start_generation.call_args.kwargs["replaced_object_record"],
+            original,
+        )
+
+    def test_generate_texture_stays_texture_only_in_displacement_mode(
+        self,
+    ) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                generate_displacement=True,
+                door_body_fit_dimensions=(1.0, 0.04, 2.0),
+            )
+        )
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="unexpected-model-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+
+        start_generation.assert_not_called()
+        start_texture_regeneration.assert_called_once()
+        request = start_texture_regeneration.call_args.args[0]
+        self.assertEqual(request.object_id, "door-body")
+
+    def test_door_body_can_request_symmetry_without_leaking_to_knob(
         self,
     ) -> None:
         component_glb = _uv_glb(texture_resolution=8)
@@ -2783,16 +3259,20 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
                 door_id="door-1",
                 slot_id="body",
                 object_id="door-body",
-                preview_model=component_model,
-                editable_transform=False,
-                side_duplication=DoorSideDuplication(
-                    kept_side=DOOR_SIDE_DUPLICATION_FRONT
-                ),
+                object_name="Door - Body",
+                slot_display_name="Body",
             )
         )
         self._load_reference()
 
         self.assertTrue(self.workspace.symmetric_division_checkbox.isEnabled())
+        self.assertFalse(
+            self.workspace.side_door_duplication_checkbox.isHidden()
+        )
+        self.assertTrue(
+            self.workspace.side_door_duplication_checkbox.isEnabled()
+        )
+        self.workspace.side_door_duplication_checkbox.setChecked(True)
         self.workspace.symmetric_division_checkbox.setChecked(True)
         body_preflight = self.workspace._build_texture_regeneration_request()
         self.assertIsNotNone(body_preflight)
@@ -2809,6 +3289,13 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             ),
         )
         self.assertFalse(body_preflight.preserve_door_side_duplication)
+        self.assertTrue(
+            body_preflight.settings.use_uv_raycast_for_object_generation
+        )
+        self.assertEqual(
+            body_preflight.projection_camera_percentages,
+            (1, 1, 1, 95, 1, 1),
+        )
         body_request = _materialize_texture_regeneration_preflight(
             body_preflight,
             self.asset_directory,
@@ -2822,6 +3309,13 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             DoorSideDuplication(
                 kept_side=DOOR_SIDE_DUPLICATION_FRONT
             ),
+        )
+        self.assertTrue(
+            body_request.settings.use_uv_raycast_for_object_generation
+        )
+        self.assertEqual(
+            body_request.projection_camera_percentages,
+            (1, 1, 1, 95, 1, 1),
         )
         body_record = next(
             record
@@ -2874,13 +3368,19 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
                 door_id="door-1",
                 slot_id="door_knob",
                 object_id="door-knob",
-                preview_model=component_model,
-                editable_transform=True,
+                object_name="Door - Door knob/handle",
+                slot_display_name="Door knob/handle",
             )
         )
 
         self.assertTrue(self.workspace.symmetric_division_checkbox.isChecked())
         self.assertFalse(self.workspace.symmetric_division_checkbox.isEnabled())
+        self.assertTrue(
+            self.workspace.side_door_duplication_checkbox.isHidden()
+        )
+        self.assertFalse(
+            self.workspace.side_door_duplication_checkbox.isEnabled()
+        )
         knob_preflight = self.workspace._build_texture_regeneration_request()
         self.assertIsNotNone(knob_preflight)
         assert knob_preflight is not None
@@ -2892,8 +3392,8 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
                 door_id="door-1",
                 slot_id="door_knob",
                 object_id="door-knob",
-                preview_model=component_model,
-                editable_transform=True,
+                object_name="Door - Door knob/handle",
+                slot_display_name="Door knob/handle",
                 side_duplication=DoorSideDuplication(),
             )
 
@@ -2911,8 +3411,8 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
                 door_id="door-1",
                 slot_id="body",
                 object_id="door-body",
-                preview_model=component_model,
-                editable_transform=False,
+                object_name="Door - Body",
+                slot_display_name="Body",
             )
         )
         self._load_reference()

@@ -220,6 +220,11 @@ OBJECT_PLACEMENT_PREVIEW_CUBE_SIZE_METERS = 0.75
 OBJECT_PLACEMENT_PREVIEW_SPACING_METERS = 1.25
 OBJECT_PLACEMENT_PREVIEW_COLOR = (0.20, 0.85, 0.45, 0.42)
 OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR = (0.12, 1.0, 0.55, 0.95)
+DOOR_PLACEMENT_PREVIEW_COLORS = {
+    "body": (1.0, 0.78, 0.08, 0.38),
+    "door_knob": (0.10, 0.46, 1.0, 0.42),
+}
+DOOR_PLACEMENT_PREVIEW_EDGE_ALPHA = 0.96
 TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
 TRANSFORM_GIZMO_RING_RADIUS_RATIO = 0.72
 TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
@@ -921,6 +926,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     items_clicked = Signal(object)
     viewport_clicked = Signal(object)
+    viewport_double_clicked = Signal(object)
     first_person_pointer_capture_changed = Signal(bool)
     rectangle_pointer_pressed = Signal(object)
     rectangle_pointer_moved = Signal(object)
@@ -1679,13 +1685,22 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
-        """Let open-ended viewport tools use a double-click as completion."""
+        """Finish an open tool or report one CPU-picked viewport double-click."""
 
         if (
             self._primary_pointer_finish_enabled
             and event.button() == Qt.MouseButton.LeftButton
         ):
             self.primary_pointer_finish_requested.emit()
+            event.accept()
+            return
+        if (
+            self._viewport_click_selection_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+            and not self.is_first_person_pointer_captured
+        ):
+            self._primary_pointer_release_suppressed = True
+            self.viewport_double_clicked.emit(event.position())
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -3042,6 +3057,16 @@ class _SymmetricPreviewRenderGroup:
     vertices: np.ndarray
     faces: np.ndarray
     face_colors: np.ndarray
+    fade_enabled: bool
+
+
+@dataclass
+class _LiveSymmetricPreviewBinding:
+    """A frozen reflected mesh kept synchronized with its editable source."""
+
+    root_item: GLGraphicsItem
+    source_baseline_transform: np.ndarray
+    reflection_transform: np.ndarray
 
 
 @dataclass
@@ -3480,6 +3505,68 @@ class SceneObjectPlacementCandidate:
         object.__setattr__(self, "world_positions", positions)
 
 
+# ### Door-placement preview models ###
+@dataclass(frozen=True)
+class DoorPlacementPreviewPart:
+    """Door-local meshes sharing one semantic placement-preview color."""
+
+    component_kind: str
+    meshes: tuple[trimesh.Trimesh, ...]
+
+    def __post_init__(self) -> None:
+        normalized_kind = str(self.component_kind).strip()
+        if normalized_kind not in DOOR_PLACEMENT_PREVIEW_COLORS:
+            raise ValueError("Unknown door placement preview component.")
+        if not isinstance(self.meshes, tuple) or not self.meshes:
+            raise ValueError("Door placement preview parts require meshes.")
+        if not all(isinstance(mesh, trimesh.Trimesh) for mesh in self.meshes):
+            raise TypeError("Door placement preview parts require triangle meshes.")
+        object.__setattr__(self, "component_kind", normalized_kind)
+
+
+@dataclass(frozen=True)
+class DoorPlacementPreviewCandidate:
+    """Normal and wheel-mirrored profiles for one compatible doorway."""
+
+    opening_key: str
+    normal_parts: tuple[DoorPlacementPreviewPart, ...]
+    normal_transform: np.ndarray
+    mirrored_parts: tuple[DoorPlacementPreviewPart, ...]
+    mirrored_transform: np.ndarray
+
+    def __post_init__(self) -> None:
+        normalized_key = str(self.opening_key).strip()
+        if not normalized_key:
+            raise ValueError("Door placement previews require an opening key.")
+        for parts in (self.normal_parts, self.mirrored_parts):
+            if not isinstance(parts, tuple) or not parts:
+                raise ValueError("Door placement previews require profile parts.")
+            if not all(isinstance(part, DoorPlacementPreviewPart) for part in parts):
+                raise TypeError("Door placement previews contain invalid parts.")
+        normal_transform = _normalize_door_placement_preview_transform(
+            self.normal_transform
+        )
+        mirrored_transform = _normalize_door_placement_preview_transform(
+            self.mirrored_transform
+        )
+        object.__setattr__(self, "opening_key", normalized_key)
+        object.__setattr__(self, "normal_transform", normal_transform)
+        object.__setattr__(self, "mirrored_transform", mirrored_transform)
+
+
+def _normalize_door_placement_preview_transform(raw_transform: object) -> np.ndarray:
+    """Return one immutable finite 4x4 placement transform."""
+
+    transform = np.asarray(raw_transform, dtype=float)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError(
+            "Door placement preview transforms must be finite 4x4 matrices."
+        )
+    normalized = np.ascontiguousarray(transform, dtype=float)
+    normalized.setflags(write=False)
+    return normalized
+
+
 def build_scene_object_placement_group_candidate(
     level_index: int,
     anchor_world_position: Sequence[float],
@@ -3525,6 +3612,7 @@ class GlbViewerWidget(QWidget):
     placed_object_axis_scales_changed = Signal(str, object)
     placed_object_selection_changed = Signal(object)
     placed_object_selection_set_changed = Signal(object)
+    placed_object_double_clicked = Signal(str)
     object_placement_selected = Signal(str, object)
     object_placement_cancelled = Signal(str)
     door_placement_requested = Signal(str, object, bool)
@@ -3571,10 +3659,14 @@ class GlbViewerWidget(QWidget):
         wireframe_only: bool = DEFAULT_WIREFRAME_ONLY,
         window_editing_enabled: bool = False,
         placed_object_editing_enabled: bool | None = None,
+        placed_object_click_selection_enabled: bool = False,
         placed_object_auxiliary_controls_enabled: bool = True,
+        placed_object_axis_scale_gizmos_enabled: bool | None = None,
+        placed_object_transform_gizmos_enabled: bool = True,
         face_editing_enabled: bool = False,
         tour_direction_arrow_enabled: bool = True,
         tour_html_tooltips_enabled: bool = False,
+        symmetric_preview_fade_enabled: bool = True,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3623,6 +3715,9 @@ class GlbViewerWidget(QWidget):
         self._face_editing_enabled = bool(face_editing_enabled)
         self._tour_direction_arrow_enabled = bool(tour_direction_arrow_enabled)
         self._tour_html_tooltips_enabled = bool(tour_html_tooltips_enabled)
+        self._symmetric_preview_fade_enabled = bool(
+            symmetric_preview_fade_enabled
+        )
         self._face_edit_vertices: np.ndarray | None = None
         self._face_edit_faces: np.ndarray | None = None
         self._face_edit_vertex_representatives: np.ndarray | None = None
@@ -3643,8 +3738,20 @@ class GlbViewerWidget(QWidget):
             if placed_object_editing_enabled is None
             else bool(placed_object_editing_enabled)
         )
+        self._placed_object_click_selection_enabled = bool(
+            placed_object_click_selection_enabled
+            and self._placed_object_editing_enabled
+        )
         self._placed_object_auxiliary_controls_enabled = bool(
             placed_object_auxiliary_controls_enabled
+        )
+        self._placed_object_axis_scale_gizmos_enabled = (
+            self._placed_object_auxiliary_controls_enabled
+            if placed_object_axis_scale_gizmos_enabled is None
+            else bool(placed_object_axis_scale_gizmos_enabled)
+        )
+        self._placed_object_transform_gizmos_enabled = bool(
+            placed_object_transform_gizmos_enabled
         )
         self._placed_object_render_groups: dict[
             str,
@@ -3654,7 +3761,11 @@ class GlbViewerWidget(QWidget):
         self._selected_placed_object_id: str | None = None
         self._placed_object_transform_drag: _PlacedObjectTransformDrag | None = None
         self._placed_object_instance_drag: _PlacedObjectInstanceDrag | None = None
-        self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
+        self._placed_object_gizmo_mode = (
+            PLACED_OBJECT_GIZMO_TRANSFORM
+            if self._placed_object_transform_gizmos_enabled
+            else PLACED_OBJECT_GIZMO_SCALE
+        )
         self._transform_gizmo_items: list[GLGraphicsItem] = []
         self._placed_object_instance_gizmo_items: list[GLGraphicsItem] = []
         self._placed_object_instance_gizmo_center: np.ndarray | None = None
@@ -3670,6 +3781,13 @@ class GlbViewerWidget(QWidget):
         self._door_placement_compatible_opening_keys: frozenset[str] = frozenset()
         self._door_placement_mirrored_horizontally = False
         self._door_placement_press_position: QPointF | None = None
+        self._door_placement_preview_candidates: dict[
+            str,
+            DoorPlacementPreviewCandidate,
+        ] = {}
+        self._door_placement_hover_opening_key: str | None = None
+        self._door_placement_preview_root: GLGraphicsItem | None = None
+        self._door_placement_preview_items: list[gl.GLMeshItem] = []
         self._tour_point_placement_kind: str | None = None
         self._tour_point_placement_repeat = False
         self._tour_point_vertical_offset_meters = 0.0
@@ -3874,6 +3992,10 @@ class GlbViewerWidget(QWidget):
         )
         self._explicit_symmetric_preview_groups: list[_SymmetricPreviewRenderGroup] = []
         self._embedded_symmetric_preview_groups: list[_SymmetricPreviewRenderGroup] = []
+        self._live_symmetric_preview_bindings: dict[
+            str,
+            list[_LiveSymmetricPreviewBinding],
+        ] = {}
         self._last_set_model_preserved_camera = False
         self._symmetric_preview_timer = QTimer(self)
         self._symmetric_preview_timer.setInterval(
@@ -4619,7 +4741,10 @@ class GlbViewerWidget(QWidget):
         self.view = SelectableGLViewWidget()
         self.view.setBackgroundColor((24, 24, 28))
         self.view.set_item_click_selection_enabled(False)
-        self.view.set_viewport_click_selection_enabled(self._window_editing_enabled)
+        self.view.set_viewport_click_selection_enabled(
+            self._window_editing_enabled
+            or self._placed_object_click_selection_enabled
+        )
         self.view.set_first_person_ctrl_interaction_enabled(
             self._window_editing_enabled
         )
@@ -4714,7 +4839,10 @@ class GlbViewerWidget(QWidget):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
-        if self._get_symmetric_preview_groups():
+        if (
+            self._symmetric_preview_fade_enabled
+            and self._get_fading_symmetric_preview_groups()
+        ):
             self._symmetric_preview_timer.start()
         if self._canvas_stair_preview_groups:
             self._canvas_stair_preview_timer.start()
@@ -6639,17 +6767,32 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_door_creation_press()
         self._cancel_canvas_opening_edit_drag()
         selected_key = self._selected_canvas_opening_key
+        previous_targets = self._canvas_opening_targets
         self._canvas_opening_targets = normalized_targets
         if self._door_placement_door_id is not None:
             retained_keys = self._door_placement_compatible_opening_keys.intersection(
                 normalized_targets
             )
-            if not retained_keys:
+            preview_target_changed = any(
+                previous_targets.get(key) != normalized_targets.get(key)
+                for key in retained_keys
+            )
+            if not retained_keys or preview_target_changed:
                 self.cancel_door_placement()
             else:
                 self._door_placement_compatible_opening_keys = frozenset(
                     retained_keys
                 )
+                self._door_placement_preview_candidates = {
+                    key: candidate
+                    for key, candidate in (
+                        self._door_placement_preview_candidates.items()
+                    )
+                    if key in retained_keys
+                }
+                if self._door_placement_hover_opening_key not in retained_keys:
+                    self._door_placement_hover_opening_key = None
+                self._refresh_door_placement_preview_items()
         if selected_key not in normalized_targets:
             self._set_selected_canvas_opening_key(None)
             return
@@ -6667,6 +6810,12 @@ class GlbViewerWidget(QWidget):
         if self._canvas_opening_edit_drag is not None:
             raise RuntimeError("A Canvas opening target cannot change during a drag.")
         self._cancel_canvas_door_creation_press()
+        if (
+            self.is_door_placement_active
+            and target.key in self._door_placement_compatible_opening_keys
+            and self._canvas_opening_targets[target.key] != target
+        ):
+            self.cancel_door_placement()
         self._canvas_opening_targets[target.key] = target
         if target.key == self._selected_canvas_opening_key:
             self._set_canvas_opening_edit_instruction(target)
@@ -6770,6 +6919,8 @@ class GlbViewerWidget(QWidget):
         self,
         door_id: str,
         compatible_opening_keys: Sequence[str],
+        *,
+        preview_candidates: Sequence[DoorPlacementPreviewCandidate] = (),
     ) -> bool:
         """Arm one doorway-snapped placement with wheel-controlled mirroring."""
 
@@ -6787,6 +6938,20 @@ class GlbViewerWidget(QWidget):
         )
         if not normalized_door_id or not normalized_keys:
             return False
+        if isinstance(preview_candidates, (str, bytes, bytearray)) or not isinstance(
+            preview_candidates,
+            Sequence,
+        ):
+            return False
+        normalized_candidates: dict[str, DoorPlacementPreviewCandidate] = {}
+        for candidate in preview_candidates:
+            if (
+                not isinstance(candidate, DoorPlacementPreviewCandidate)
+                or candidate.opening_key not in normalized_keys
+                or candidate.opening_key in normalized_candidates
+            ):
+                return False
+            normalized_candidates[candidate.opening_key] = candidate
         self.cancel_tour_point_placement()
         self._clear_door_placement(notify=False)
         if self.is_object_placement_active:
@@ -6803,9 +6968,12 @@ class GlbViewerWidget(QWidget):
         self._door_placement_compatible_opening_keys = normalized_keys
         self._door_placement_mirrored_horizontally = False
         self._door_placement_press_position = None
+        self._door_placement_preview_candidates = normalized_candidates
+        self._door_placement_hover_opening_key = None
         self.view.set_primary_pointer_tool_active(True)
         self.view.set_overlay_wheel_steps_enabled(True)
         self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self._refresh_door_placement_preview_items()
         self._set_door_placement_status()
         return True
 
@@ -6824,10 +6992,13 @@ class GlbViewerWidget(QWidget):
         self._door_placement_compatible_opening_keys = frozenset()
         self._door_placement_mirrored_horizontally = False
         self._door_placement_press_position = None
+        self._door_placement_preview_candidates = {}
+        self._door_placement_hover_opening_key = None
         if self.view.is_primary_pointer_drag_reserved:
             self.view.cancel_primary_pointer_drag()
         self.view.set_primary_pointer_tool_active(False)
         self.view.unsetCursor()
+        self._remove_door_placement_preview_items()
         self._sync_projection_camera_input_state()
         self._sync_window_tools_controls()
         if notify:
@@ -6850,6 +7021,130 @@ class GlbViewerWidget(QWidget):
             "Use the mouse wheel to mirror it horizontally; right-click or "
             "Escape cancels."
         )
+
+    def _get_door_placement_opening_at(
+        self,
+        position: QPointF,
+    ) -> CanvasOpeningTarget | None:
+        """Return the nearest visible opening rectangle under the pointer."""
+
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return None
+        opening_hit = _get_nearest_canvas_opening_ray_hit(
+            tuple(
+                target
+                for target in self._canvas_opening_targets.values()
+                if target.wall_surface_id in self.get_visible_canvas_surface_ids()
+            ),
+            *camera_ray,
+        )
+        if opening_hit is None:
+            return None
+        display_mesh = self._get_display_mesh()
+        scene_hit = (
+            None
+            if display_mesh is None
+            else _get_nearest_triangle_ray_hit(
+                display_mesh,
+                np.asarray(camera_ray[0], dtype=float),
+                np.asarray(camera_ray[1], dtype=float),
+            )
+        )
+        if scene_hit is not None and scene_hit[1] < opening_hit[2] - 1e-9:
+            return None
+        return opening_hit[0]
+
+    def _update_door_placement_hover(self, position: QPointF) -> bool:
+        """Snap the colored door profile to one compatible hovered doorway."""
+
+        if not self.is_door_placement_active:
+            return False
+        target = self._get_door_placement_opening_at(position)
+        opening_key = (
+            target.key
+            if (
+                target is not None
+                and target.reference.kind == CANVAS_OPENING_DOORWAY
+                and target.key in self._door_placement_compatible_opening_keys
+                and target.key in self._door_placement_preview_candidates
+            )
+            else None
+        )
+        if opening_key == self._door_placement_hover_opening_key:
+            return False
+        self._door_placement_hover_opening_key = opening_key
+        self._refresh_door_placement_preview_items()
+        return True
+
+    def _refresh_door_placement_preview_items(self) -> None:
+        """Render the active normal or wheel-mirrored colored door profile."""
+
+        self._remove_door_placement_preview_items()
+        if not self.is_door_placement_active or not hasattr(self, "view"):
+            return
+        opening_key = self._door_placement_hover_opening_key
+        candidate = self._door_placement_preview_candidates.get(opening_key or "")
+        if candidate is None:
+            return
+        parts = (
+            candidate.mirrored_parts
+            if self._door_placement_mirrored_horizontally
+            else candidate.normal_parts
+        )
+        transform = (
+            candidate.mirrored_transform
+            if self._door_placement_mirrored_horizontally
+            else candidate.normal_transform
+        )
+        root = GLGraphicsItem()
+        root.setTransform(_numpy_transform_to_qt(transform))
+        self.view.addItem(root)
+        self._door_placement_preview_root = root
+        for part in parts:
+            color = DOOR_PLACEMENT_PREVIEW_COLORS[part.component_kind]
+            for mesh in part.meshes:
+                vertices = np.asarray(mesh.vertices, dtype=np.float32)
+                faces = np.asarray(mesh.faces, dtype=np.int32)
+                if (
+                    vertices.ndim != 2
+                    or vertices.shape[1:] != (3,)
+                    or faces.ndim != 2
+                    or faces.shape[1:] != (3,)
+                    or not len(vertices)
+                    or not len(faces)
+                    or not np.all(np.isfinite(vertices))
+                ):
+                    continue
+                item = gl.GLMeshItem(
+                    vertexes=vertices,
+                    faces=faces,
+                    color=color,
+                    smooth=False,
+                    drawFaces=True,
+                    drawEdges=True,
+                    edgeColor=(
+                        *color[:3],
+                        DOOR_PLACEMENT_PREVIEW_EDGE_ALPHA,
+                    ),
+                    shader=self._ambient_shader,
+                )
+                item.setGLOptions("translucent")
+                item.setParentItem(root)
+                self._door_placement_preview_items.append(item)
+        if not self._door_placement_preview_items:
+            self.view.removeItem(root)
+            self._door_placement_preview_root = None
+        self.view.update()
+
+    def _remove_door_placement_preview_items(self) -> None:
+        """Remove transient door profile items without disarming placement."""
+
+        root = self._door_placement_preview_root
+        if root is not None and hasattr(self, "view") and root in self.view.items:
+            self.view.removeItem(root)
+        self._door_placement_preview_root = None
+        self._door_placement_preview_items = []
 
     def _commit_door_placement(self, target: CanvasOpeningTarget) -> bool:
         """Emit one compatible doorway placement without a cancellation event."""
@@ -6925,6 +7220,10 @@ class GlbViewerWidget(QWidget):
 
         group.current_transform = np.asarray(transform, dtype=float)
         group.root_item.setTransform(_numpy_transform_to_qt(transform))
+        self._sync_live_symmetric_preview_bindings(
+            normalized_object_id,
+            group.current_transform,
+        )
         self._remember_placed_object_preview_transform(
             group,
             normalized_position,
@@ -6940,12 +7239,60 @@ class GlbViewerWidget(QWidget):
 
         return self._placed_object_gizmo_mode
 
+    def set_placed_object_gizmo_capabilities(
+        self,
+        *,
+        transform_enabled: bool,
+        axis_scale_enabled: bool,
+        prefer_axis_scale: bool = False,
+    ) -> None:
+        """Choose which placed-object handle sets this viewer may expose.
+
+        Axis-scale handles are independent of auxiliary Canvas controls so a
+        focused editor can offer cube handles without also reserving the mouse
+        wheel or showing the instance-creation handle.
+        """
+
+        self._placed_object_transform_gizmos_enabled = bool(transform_enabled)
+        self._placed_object_axis_scale_gizmos_enabled = bool(axis_scale_enabled)
+        preferred_mode = (
+            PLACED_OBJECT_GIZMO_SCALE
+            if prefer_axis_scale
+            else PLACED_OBJECT_GIZMO_TRANSFORM
+        )
+        self._placed_object_gizmo_mode = self._resolve_placed_object_gizmo_mode(
+            preferred_mode
+        )
+        if self._placed_object_transform_drag is not None:
+            self._cancel_placed_object_gizmo_drag()
+        self._sync_placed_object_selection_rendering()
+
+    def _resolve_placed_object_gizmo_mode(self, requested_mode: str) -> str:
+        """Return an enabled handle mode, preferring the caller's request."""
+
+        if (
+            requested_mode == PLACED_OBJECT_GIZMO_SCALE
+            and self._placed_object_axis_scale_gizmos_enabled
+        ):
+            return PLACED_OBJECT_GIZMO_SCALE
+        if (
+            requested_mode == PLACED_OBJECT_GIZMO_TRANSFORM
+            and self._placed_object_transform_gizmos_enabled
+        ):
+            return PLACED_OBJECT_GIZMO_TRANSFORM
+        if self._placed_object_transform_gizmos_enabled:
+            return PLACED_OBJECT_GIZMO_TRANSFORM
+        if self._placed_object_axis_scale_gizmos_enabled:
+            return PLACED_OBJECT_GIZMO_SCALE
+        return PLACED_OBJECT_GIZMO_TRANSFORM
+
     def _toggle_placed_object_gizmo_mode(self) -> bool:
         """Switch the selected object's handle set after a repeated click."""
 
         if (
             self._selected_placed_object_id is None
-            or not self._placed_object_auxiliary_controls_enabled
+            or not self._placed_object_transform_gizmos_enabled
+            or not self._placed_object_axis_scale_gizmos_enabled
         ):
             return False
         if self._placed_object_instance_drag is not None:
@@ -7089,7 +7436,9 @@ class GlbViewerWidget(QWidget):
         self._selected_placed_object_id = normalized_active_id
         self._clear_placed_object_color_balance_preview_if_unselected(normalized_ids)
         if active_changed:
-            self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
+            self._placed_object_gizmo_mode = self._resolve_placed_object_gizmo_mode(
+                PLACED_OBJECT_GIZMO_TRANSFORM
+            )
         self._sync_placed_object_selection_rendering()
         if selection_changed:
             self.placed_object_selection_set_changed.emit(normalized_ids)
@@ -9895,9 +10244,19 @@ class GlbViewerWidget(QWidget):
         )
 
     def _connect_placed_object_editor_input(self) -> None:
-        """Connect Canvas-only pointer events used by 3D editing gizmos."""
+        """Connect pointer events used by editable placed-model previews."""
 
         self.view.set_primary_pointer_interaction_enabled(True)
+        if (
+            self._placed_object_click_selection_enabled
+            and not self._window_editing_enabled
+        ):
+            self.view.viewport_clicked.connect(
+                self._handle_placed_object_click_selection_requested
+            )
+            self.view.viewport_double_clicked.connect(
+                self._handle_placed_object_double_click_requested
+            )
         self.view.primary_pointer_pressed.connect(
             self._handle_placed_object_pointer_pressed
         )
@@ -10118,30 +10477,13 @@ class GlbViewerWidget(QWidget):
     def _handle_door_placement_pick(self, position: QPointF) -> None:
         """Commit only when the click intersects a compatible doorway."""
 
-        camera_ray = self.view.build_camera_ray(position)
-        if camera_ray is None:
+        target = self._get_door_placement_opening_at(position)
+        if target is None:
             self._set_door_placement_status(
                 "No doorway was found there. Click a compatible doorway, or "
                 "right-click to cancel."
             )
             return
-        ray_origin, ray_direction = camera_ray
-        opening_hit = _get_nearest_canvas_opening_ray_hit(
-            tuple(
-                target
-                for target in self._canvas_opening_targets.values()
-                if target.wall_surface_id in self.get_visible_canvas_surface_ids()
-            ),
-            ray_origin,
-            ray_direction,
-        )
-        if opening_hit is None:
-            self._set_door_placement_status(
-                "No doorway was found there. Click a compatible doorway, or "
-                "right-click to cancel."
-            )
-            return
-        target = opening_hit[0]
         if (
             target.reference.kind != CANVAS_OPENING_DOORWAY
             or target.key not in self._door_placement_compatible_opening_keys
@@ -10227,6 +10569,73 @@ class GlbViewerWidget(QWidget):
         self.canvas_surface_orientation_flip_requested.emit(surface_id)
 
     # ### Placed-object gizmo input ###
+    def _handle_placed_object_click_selection_requested(
+        self,
+        position: QPointF,
+    ) -> None:
+        """Select or retoggle one object in a non-Canvas model preview."""
+
+        if (
+            not self._placed_object_click_selection_enabled
+            or self._window_editing_enabled
+        ):
+            return
+        object_id = self._pick_preview_placed_object_id(position)
+        if object_id is None:
+            self.set_selected_placed_object_ids(())
+            return
+        if (
+            self._selected_placed_object_ids == (object_id,)
+            and self._selected_placed_object_id == object_id
+        ):
+            self._toggle_placed_object_gizmo_mode()
+            return
+        self.set_selected_placed_object_ids(
+            (object_id,),
+            active_object_id=object_id,
+        )
+
+    def _handle_placed_object_double_click_requested(
+        self,
+        position: QPointF,
+    ) -> None:
+        """Select and activate one object in a non-Canvas model preview."""
+
+        if (
+            not self._placed_object_click_selection_enabled
+            or self._window_editing_enabled
+        ):
+            return
+        object_id = self._pick_preview_placed_object_id(position)
+        if object_id is None:
+            return
+        self.set_selected_placed_object_ids(
+            (object_id,),
+            active_object_id=object_id,
+        )
+        self.placed_object_double_clicked.emit(object_id)
+
+    def _pick_preview_placed_object_id(
+        self,
+        position: QPointF,
+    ) -> str | None:
+        """Return the nearest placed preview object under one screen point."""
+
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return None
+        hit = _get_nearest_preview_placed_object_ray_hit(
+            tuple(
+                replace(
+                    group.preview,
+                    placement_transform=group.current_transform,
+                )
+                for group in self._placed_object_render_groups.values()
+            ),
+            *camera_ray,
+        )
+        return None if hit is None else hit[0].object_id
+
     def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
         if (
             self.is_tour_point_placement_active
@@ -10303,7 +10712,10 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
 
-        if self.is_tour_point_placement_active or self.is_door_placement_active:
+        if self.is_tour_point_placement_active:
+            return
+        if self.is_door_placement_active:
+            self._update_door_placement_hover(position)
             return
         if self._object_placement_pointer_pressed:
             self._update_object_placement_hover(position)
@@ -10918,6 +11330,8 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Show contextual insertion or the currently armed pointer preview."""
 
+        if self.is_door_placement_active:
+            return self._update_door_placement_hover(position)
         if self.is_object_placement_active:
             self._update_object_placement_hover(position)
             return True
@@ -10941,6 +11355,9 @@ class GlbViewerWidget(QWidget):
     def _handle_surface_vertex_pointer_left(self) -> None:
         """Hide only the transient hover candidate outside the viewport."""
 
+        if self.is_door_placement_active:
+            self._door_placement_hover_opening_key = None
+            self._remove_door_placement_preview_items()
         if self.is_object_placement_active:
             self._object_placement_candidate = None
             if self._object_placement_preview_root is not None:
@@ -13510,6 +13927,8 @@ class GlbViewerWidget(QWidget):
                 continue
             parent_item = None
             world_to_local = None
+            live_source_id = None
+            live_root_item = None
             if self._placed_object_editing_enabled:
                 owner_id = next(
                     (
@@ -13526,11 +13945,29 @@ class GlbViewerWidget(QWidget):
                         continue
                     parent_item = owner_group.root_item
                     world_to_local = np.linalg.inv(owner_group.current_transform)
+                else:
+                    live_source_id = next(
+                        (
+                            object_id
+                            for object_id in placed_previews_by_id
+                            if preview_object.object_id
+                            in {
+                                f"{object_id}:side",
+                                f"{object_id}:symmetric-side",
+                            }
+                        ),
+                        None,
+                    )
+                    if live_source_id is not None:
+                        live_root_item = GLGraphicsItem()
+                        self.view.addItem(live_root_item)
+                        parent_item = live_root_item
             source_meshes = (
                 preview_object.mirrored_meshes
                 if preview_object.mirrored_meshes
                 else preview_object.meshes
             )
+            group_was_built = False
             for source_mesh in source_meshes:
                 render_mesh = source_mesh
                 if world_to_local is not None:
@@ -13540,6 +13977,7 @@ class GlbViewerWidget(QWidget):
                     group = self._create_symmetric_preview_mesh_group(
                         render_mesh,
                         parent_item,
+                        fade_enabled=preview_object.fade_enabled,
                     )
                 else:
                     group = self._create_symmetric_preview_group(
@@ -13547,11 +13985,56 @@ class GlbViewerWidget(QWidget):
                         preview_object.orientation,
                         preview_object.plane_coordinate,
                         parent_item,
+                        fade_enabled=preview_object.fade_enabled,
                     )
                 if group is not None:
                     self._embedded_symmetric_preview_groups.append(group)
+                    group_was_built = True
+            if live_source_id is not None and live_root_item is not None:
+                source_group = self._placed_object_render_groups.get(live_source_id)
+                if source_group is None or not group_was_built:
+                    self.view.removeItem(live_root_item)
+                    continue
+                binding = _LiveSymmetricPreviewBinding(
+                    root_item=live_root_item,
+                    source_baseline_transform=np.asarray(
+                        source_group.current_transform,
+                        dtype=float,
+                    ).copy(),
+                    reflection_transform=_build_symmetric_reflection_transform(
+                        preview_object.orientation,
+                        preview_object.plane_coordinate,
+                    ),
+                )
+                self._live_symmetric_preview_bindings.setdefault(
+                    live_source_id,
+                    [],
+                ).append(binding)
         if self._embedded_symmetric_preview_groups:
             self._start_symmetric_preview_animation()
+
+    def _sync_live_symmetric_preview_bindings(
+        self,
+        object_id: str,
+        source_transform: object,
+    ) -> None:
+        """Move direct component mirrors during a source gizmo preview."""
+
+        current_transform = np.asarray(source_transform, dtype=float)
+        if current_transform.shape != (4, 4):
+            return
+        for binding in self._live_symmetric_preview_bindings.get(object_id, ()):
+            reflection = binding.reflection_transform
+            try:
+                mirror_delta = (
+                    reflection
+                    @ current_transform
+                    @ np.linalg.inv(binding.source_baseline_transform)
+                    @ reflection
+                )
+            except np.linalg.LinAlgError:
+                continue
+            binding.root_item.setTransform(_numpy_transform_to_qt(mirror_delta))
 
     def _create_symmetric_preview_group(
         self,
@@ -13559,6 +14042,8 @@ class GlbViewerWidget(QWidget):
         orientation: str,
         plane_coordinate: float,
         parent_item: GLGraphicsItem | None = None,
+        *,
+        fade_enabled: bool = True,
     ) -> _SymmetricPreviewRenderGroup | None:
         """Reflect one retained mesh using the shared symmetric-preview rules."""
 
@@ -13579,7 +14064,8 @@ class GlbViewerWidget(QWidget):
             plane_coordinate,
         )
         mirrored_faces = np.ascontiguousarray(faces[:, (0, 2, 1)])
-        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY
+        actually_fades = bool(self._symmetric_preview_fade_enabled and fade_enabled)
+        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY if actually_fades else 1.0
         texture_mesh_data = _build_texture_mesh_data(retained_mesh)
         textured_item = None
         if texture_mesh_data is not None:
@@ -13593,7 +14079,7 @@ class GlbViewerWidget(QWidget):
                 self._ambient_light_intensity,
                 double_sided=mirrored_texture_data.double_sided,
                 opacity=opacity,
-                translucent=True,
+                translucent=actually_fades,
                 pbr_maps_enabled=self._pbr_maps_enabled,
             )
             if not mirrored_texture_data.is_prefab_glass:
@@ -13619,7 +14105,7 @@ class GlbViewerWidget(QWidget):
             edgeColor=(*EDGE_COLOR[:3], opacity),
             shader=self._ambient_shader,
         )
-        mesh_item.setGLOptions("translucent")
+        mesh_item.setGLOptions("translucent" if actually_fades else "opaque")
         self._attach_preview_item(mesh_item, parent_item)
         return _SymmetricPreviewRenderGroup(
             textured_item=textured_item,
@@ -13627,12 +14113,15 @@ class GlbViewerWidget(QWidget):
             vertices=mirrored_vertices,
             faces=mirrored_faces,
             face_colors=face_colors,
+            fade_enabled=actually_fades,
         )
 
     def _create_symmetric_preview_mesh_group(
         self,
         mirrored_mesh,
         parent_item: GLGraphicsItem | None = None,
+        *,
+        fade_enabled: bool = True,
     ) -> _SymmetricPreviewRenderGroup | None:
         """Render geometry that was already mirrored in object-local space."""
 
@@ -13647,7 +14136,8 @@ class GlbViewerWidget(QWidget):
             or not len(faces)
         ):
             return None
-        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY
+        actually_fades = bool(self._symmetric_preview_fade_enabled and fade_enabled)
+        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY if actually_fades else 1.0
         texture_mesh_data = _build_texture_mesh_data(mirrored_mesh)
         textured_item = None
         if texture_mesh_data is not None:
@@ -13656,7 +14146,7 @@ class GlbViewerWidget(QWidget):
                 self._ambient_light_intensity,
                 double_sided=texture_mesh_data.double_sided,
                 opacity=opacity,
-                translucent=True,
+                translucent=actually_fades,
                 pbr_maps_enabled=self._pbr_maps_enabled,
             )
             if not texture_mesh_data.is_prefab_glass:
@@ -13682,7 +14172,7 @@ class GlbViewerWidget(QWidget):
             edgeColor=(*EDGE_COLOR[:3], opacity),
             shader=self._ambient_shader,
         )
-        mesh_item.setGLOptions("translucent")
+        mesh_item.setGLOptions("translucent" if actually_fades else "opaque")
         self._attach_preview_item(mesh_item, parent_item)
         return _SymmetricPreviewRenderGroup(
             textured_item=textured_item,
@@ -13690,6 +14180,7 @@ class GlbViewerWidget(QWidget):
             vertices=np.ascontiguousarray(vertices),
             faces=np.ascontiguousarray(faces),
             face_colors=face_colors,
+            fade_enabled=actually_fades,
         )
 
     def _attach_preview_item(
@@ -13706,6 +14197,9 @@ class GlbViewerWidget(QWidget):
         """Synchronize all current mirror groups to one fade phase."""
 
         self._symmetric_preview_phase = -math.pi / 2.0
+        if not self._get_fading_symmetric_preview_groups():
+            self._symmetric_preview_timer.stop()
+            return
         if self.isVisible():
             self._symmetric_preview_timer.start()
 
@@ -13718,10 +14212,21 @@ class GlbViewerWidget(QWidget):
         groups.extend(self._explicit_symmetric_preview_groups)
         return tuple(groups)
 
+    def _get_fading_symmetric_preview_groups(
+        self,
+    ) -> tuple[_SymmetricPreviewRenderGroup, ...]:
+        """Return only mirror groups that participate in the fade timer."""
+
+        return tuple(
+            group
+            for group in self._get_symmetric_preview_groups()
+            if group.fade_enabled
+        )
+
     def _advance_symmetric_preview_fade(self) -> None:
         """Advance the translucent mirror through one smooth pulse sample."""
 
-        groups = self._get_symmetric_preview_groups()
+        groups = self._get_fading_symmetric_preview_groups()
         if not groups:
             self._symmetric_preview_timer.stop()
             return
@@ -13784,7 +14289,7 @@ class GlbViewerWidget(QWidget):
                 if item is not None and item in self.view.items:
                     self.view.removeItem(item)
         self._reset_symmetric_preview_item_state()
-        if not self._get_symmetric_preview_groups():
+        if not self._get_fading_symmetric_preview_groups():
             self._symmetric_preview_timer.stop()
 
     def _reset_symmetric_preview_item_state(self) -> None:
@@ -14169,6 +14674,7 @@ class GlbViewerWidget(QWidget):
                 self._door_placement_mirrored_horizontally = (
                     not self._door_placement_mirrored_horizontally
                 )
+                self._refresh_door_placement_preview_items()
                 self._set_door_placement_status()
             return
         selected_id = self._selected_projection_camera_id
@@ -14362,6 +14868,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_level_transform_preview_outline_item()
             self._refresh_doorway_preview_outline_item()
             self._refresh_object_placement_preview_items()
+            self._refresh_door_placement_preview_items()
             self._refresh_architectural_trim_hover_preview_items()
             self._refresh_architectural_trim_edit_preview_items()
             self._refresh_canvas_stair_preview_items()
@@ -14478,6 +14985,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_level_transform_preview_outline_item()
         self._refresh_doorway_preview_outline_item()
         self._refresh_object_placement_preview_items()
+        self._refresh_door_placement_preview_items()
         self._refresh_architectural_trim_hover_preview_items()
         self._refresh_architectural_trim_edit_preview_items()
         self._refresh_canvas_stair_preview_items()
@@ -16159,7 +16667,9 @@ class GlbViewerWidget(QWidget):
         active_changed = selected_id != self._selected_placed_object_id
         self._selected_placed_object_id = selected_id
         if active_changed:
-            self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
+            self._placed_object_gizmo_mode = self._resolve_placed_object_gizmo_mode(
+                PLACED_OBJECT_GIZMO_TRANSFORM
+            )
         if selection_changed:
             self.placed_object_selection_set_changed.emit(selected_ids)
         if active_changed:
@@ -16193,15 +16703,23 @@ class GlbViewerWidget(QWidget):
             self._placed_object_render_groups[selected_id]
         )
         if self.object_transform_status_label is not None:
-            if not self._placed_object_auxiliary_controls_enabled:
-                self.object_transform_status_label.setText(
-                    "Drag an RGB arrow to move or an RGB ring to rotate."
+            if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
+                suffix = (
+                    " Select the object again to switch gizmos."
+                    if self._placed_object_transform_gizmos_enabled
+                    else ""
                 )
-            elif self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
                 self.object_transform_status_label.setText(
-                    "Drag an RGB cube to scale one local axis. Use the wheel "
-                    "to scale uniformly, or drag the purple handle to create "
-                    "an instance; select the object again to switch gizmos."
+                    "Drag an RGB cube to scale one local axis." + suffix
+                )
+            elif not self._placed_object_auxiliary_controls_enabled:
+                suffix = (
+                    " Select the object again to switch gizmos."
+                    if self._placed_object_axis_scale_gizmos_enabled
+                    else ""
+                )
+                self.object_transform_status_label.setText(
+                    "Drag an RGB arrow to move or an RGB ring to rotate." + suffix
                 )
             else:
                 self.object_transform_status_label.setText(
@@ -16277,6 +16795,10 @@ class GlbViewerWidget(QWidget):
             group.root_item.setTransform(
                 _numpy_transform_to_qt(group.current_transform)
             )
+            self._sync_live_symmetric_preview_bindings(
+                object_id,
+                group.current_transform,
+            )
             updated_scales.append((object_id, next_scale))
             updated_previews[object_id] = next_preview
 
@@ -16298,13 +16820,16 @@ class GlbViewerWidget(QWidget):
 
         self._remove_placed_object_instance_gizmo_items()
         if (
-            self._placed_object_auxiliary_controls_enabled
+            self._placed_object_axis_scale_gizmos_enabled
             and self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE
         ):
             self._build_scale_gizmo_items(group)
-        else:
+        elif self._placed_object_transform_gizmos_enabled:
             self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
             self._build_transform_gizmo_items(group)
+        elif self._placed_object_axis_scale_gizmos_enabled:
+            self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_SCALE
+            self._build_scale_gizmo_items(group)
         if self._placed_object_auxiliary_controls_enabled:
             self._build_placed_object_instance_gizmo_items(group)
 
@@ -16520,12 +17045,20 @@ class GlbViewerWidget(QWidget):
         group = self._placed_object_render_groups.get(selected_id or "")
         if group is None:
             return None
+        scale_mode = self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE
+        if (
+            scale_mode
+            and not self._placed_object_axis_scale_gizmos_enabled
+        ) or (
+            not scale_mode
+            and not self._placed_object_transform_gizmos_enabled
+        ):
+            return None
         origin, direction = _normalize_ray(ray_origin, ray_direction)
         if origin is None or direction is None:
             return None
         pivot = _get_render_group_world_pivot(group)
         candidates: list[tuple[float, _TransformGizmoHandle]] = []
-        scale_mode = self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE
         axes = (
             tuple(
                 _get_placed_object_scale_world_axis(group, axis_index)
@@ -16922,6 +17455,10 @@ class GlbViewerWidget(QWidget):
 
         group.current_transform = np.asarray(transform, dtype=float)
         group.root_item.setTransform(_numpy_transform_to_qt(transform))
+        self._sync_live_symmetric_preview_bindings(
+            drag.object_id,
+            group.current_transform,
+        )
         drag.preview_world_position = tuple(float(value) for value in world_position)
         drag.preview_rotation_degrees = tuple(
             float(value) for value in rotation_degrees
@@ -17000,6 +17537,8 @@ class GlbViewerWidget(QWidget):
                 drag.object_id,
                 axis_scales,
             )
+        if not changed and self._placed_object_click_selection_enabled:
+            return self._toggle_placed_object_gizmo_mode()
         self._sync_placed_object_selection_rendering()
         return committed
 
@@ -17041,6 +17580,10 @@ class GlbViewerWidget(QWidget):
                 group.current_transform = drag.start_transform.copy()
                 group.root_item.setTransform(
                     _numpy_transform_to_qt(drag.start_transform)
+                )
+                self._sync_live_symmetric_preview_bindings(
+                    drag.object_id,
+                    group.current_transform,
                 )
         self._sync_placed_object_selection_rendering()
 
@@ -17193,6 +17736,7 @@ class GlbViewerWidget(QWidget):
         self._mirrored_vertex_selection_item = None
         self._reset_symmetric_preview_item_state()
         self._embedded_symmetric_preview_groups = []
+        self._live_symmetric_preview_bindings = {}
         self._placed_object_render_groups = {}
         self._remove_transform_gizmo_items()
         self._remove_placed_object_instance_gizmo_items()
@@ -17225,6 +17769,8 @@ class GlbViewerWidget(QWidget):
         self._atlas_stair_part_highlight_items = []
         self._canvas_stair_preview_groups = []
         self._window_preview_item = None
+        self._door_placement_preview_root = None
+        self._door_placement_preview_items = []
         self._level_transform_preview_outline_item = None
         self._doorway_preview_outline_item = None
         self._object_placement_preview_root = None
@@ -21961,6 +22507,19 @@ def _offset_points_toward_camera(
 
 
 # ### Transform helpers ###
+def _build_symmetric_reflection_transform(
+    orientation: str,
+    plane_coordinate: float,
+) -> np.ndarray:
+    """Return the world transform that reflects around one symmetric plane."""
+
+    axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[orientation]
+    transform = np.eye(4, dtype=float)
+    transform[axis, axis] = -1.0
+    transform[axis, 3] = float(plane_coordinate) * 2.0
+    return transform
+
+
 def _numpy_transform_to_qt(transform: object) -> Transform3D:
     matrix = np.asarray(transform, dtype=float)
     if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):

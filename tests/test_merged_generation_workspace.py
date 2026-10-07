@@ -180,6 +180,31 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         assert primary_actions is not None
         self.assertEqual(primary_actions.layout().spacing(), 0)
 
+    def test_door_slot_generation_indicator_blinks_beside_heading(self) -> None:
+        self.objects.door_slot_generation_status_changed.emit(
+            "Door knob/handle"
+        )
+
+        self.assertEqual(
+            self.workspace.door_slot_generation_indicator.text(),
+            "- Generating the door's Door knob/handle",
+        )
+        self.assertFalse(
+            self.workspace.door_slot_generation_indicator.isHidden()
+        )
+        self.assertTrue(
+            self.workspace._door_slot_generation_blink_timer.isActive()
+        )
+
+        self.objects.door_slot_generation_status_changed.emit("")
+
+        self.assertTrue(
+            self.workspace.door_slot_generation_indicator.isHidden()
+        )
+        self.assertFalse(
+            self.workspace._door_slot_generation_blink_timer.isActive()
+        )
+
     def test_current_video_frame_api_tracks_shared_video_view(self) -> None:
         changed = QSignalSpy(self.workspace.current_video_frame_changed)
         frame_bgr = np.zeros((4, 6, 3), dtype=np.uint8)
@@ -460,7 +485,11 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             self.objects.symmetric_division_checkbox,
         )
         self.assertIs(
-            settings_layout.itemAt(2).widget(),
+            settings_layout.itemAt(1).widget(),
+            self.objects.side_door_duplication_checkbox,
+        )
+        self.assertIs(
+            settings_layout.itemAt(3).widget(),
             self.objects.meshy_target_polycount_control,
         )
         generation_actions_layout = generation_actions.layout()
@@ -500,6 +529,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         for generation_control in (
             self.objects.symmetric_division_checkbox,
+            self.objects.side_door_duplication_checkbox,
             self.objects.meshy_target_polycount_control,
             self.objects.generate_geometry_button,
             self.objects.generate_texture_button,
@@ -518,9 +548,22 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertLess(creation_index, statistics_index)
 
         creation_layout = creation_section.layout()
-        self.assertIs(creation_layout.itemAt(0).widget(), generation_settings)
-        self.assertIs(creation_layout.itemAt(1).widget(), primary_actions)
-        self.assertIs(creation_layout.itemAt(2).widget(), generation_actions)
+        generation_header = creation_layout.itemAt(0).widget()
+        self.assertIsNotNone(generation_header)
+        assert generation_header is not None
+        self.assertTrue(
+            generation_header.isAncestorOf(
+                self.workspace.object_generation_heading_label
+            )
+        )
+        self.assertTrue(
+            generation_header.isAncestorOf(
+                self.workspace.door_slot_generation_indicator
+            )
+        )
+        self.assertIs(creation_layout.itemAt(1).widget(), generation_settings)
+        self.assertIs(creation_layout.itemAt(2).widget(), primary_actions)
+        self.assertIs(creation_layout.itemAt(3).widget(), generation_actions)
 
     def test_material_controls_are_boxed_in_requested_order(self) -> None:
         material_section = self.workspace.findChild(

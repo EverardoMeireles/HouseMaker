@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QRect,
     Qt,
     QThread,
+    QTimer,
     Signal,
     Slot,
 )
@@ -100,6 +101,11 @@ WORKFLOW_SECTION_SPACING = 10
 CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS = 100
 CEILING_HEIGHT_NOT_ESTIMATED_TEXT = "Ceiling height: Not estimated"
 OBJECT_REFERENCE_EDIT_JOB_KIND = "object_reference_edit"
+DOOR_SLOT_GENERATION_BLINK_INTERVAL_MILLISECONDS = 500
+DOOR_SLOT_GENERATION_ACTIVE_STYLE = "color: #ff3030; font-weight: 700;"
+DOOR_SLOT_GENERATION_HIDDEN_STYLE = (
+    "color: rgba(255, 48, 48, 0); font-weight: 700;"
+)
 OBJECT_REFERENCE_EDIT_STATUS_EMPTY = (
     "Select one object, describe the change, then click Edit reference."
 )
@@ -366,6 +372,8 @@ class MergedGenerationWorkspace(QWidget):
             _ObjectReferenceEditRuntime | None
         ) = None
         self._door_slot_editing_active = False
+        self._door_slot_generation_name = ""
+        self._door_slot_generation_blink_visible = True
         self._is_shutdown = False
 
         self.surface_workspace.setParent(self)
@@ -375,6 +383,13 @@ class MergedGenerationWorkspace(QWidget):
         self.object_workspace.set_shared_control_state_managed_externally(True)
         self._adopt_shared_controls()
         self._build_ui()
+        self._door_slot_generation_blink_timer = QTimer(self)
+        self._door_slot_generation_blink_timer.setInterval(
+            DOOR_SLOT_GENERATION_BLINK_INTERVAL_MILLISECONDS
+        )
+        self._door_slot_generation_blink_timer.timeout.connect(
+            self._toggle_door_slot_generation_blink
+        )
         self._connect_shared_controls()
         self.clear_mask_shortcut = QShortcut(self)
         self.clear_mask_shortcut.setContext(
@@ -390,6 +405,7 @@ class MergedGenerationWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._door_slot_generation_blink_timer.stop()
         try:
             QApplication.clipboard().dataChanged.disconnect(
                 self.sync_shared_controls
@@ -635,7 +651,7 @@ class MergedGenerationWorkspace(QWidget):
             "Copy the masked object or active temporary reference with "
             "transparency."
         )
-        self.paste_inpaint_button = QPushButton("Paste inpaint")
+        self.paste_inpaint_button = QPushButton("Paste")
         self.paste_inpaint_button.setObjectName("paste_inpaint_button")
         self.paste_inpaint_button.setToolTip(
             "Use a clipboard image as the next Object generation reference."
@@ -852,9 +868,29 @@ class MergedGenerationWorkspace(QWidget):
         primary_layout.addWidget(self.reference_editing_section)
 
         self.object_creation_section, creation_layout = _build_boxed_section(
-            "Generation",
+            "",
             "merged_generation_object_creation_section",
         )
+        generation_header = QWidget(self.object_creation_section)
+        generation_header_layout = QHBoxLayout(generation_header)
+        generation_header_layout.setContentsMargins(0, 0, 0, 0)
+        generation_header_layout.setSpacing(5)
+        self.object_generation_heading_label = QLabel("Generation")
+        self.object_generation_heading_label.setObjectName(
+            "object_generation_heading_label"
+        )
+        self.door_slot_generation_indicator = QLabel()
+        self.door_slot_generation_indicator.setObjectName(
+            "door_slot_generation_indicator"
+        )
+        self.door_slot_generation_indicator.setStyleSheet(
+            DOOR_SLOT_GENERATION_ACTIVE_STYLE
+        )
+        self.door_slot_generation_indicator.hide()
+        generation_header_layout.addWidget(self.object_generation_heading_label)
+        generation_header_layout.addWidget(self.door_slot_generation_indicator)
+        generation_header_layout.addStretch(1)
+        creation_layout.addWidget(generation_header)
 
         generation_settings = QWidget()
         generation_settings.setObjectName(
@@ -864,6 +900,9 @@ class MergedGenerationWorkspace(QWidget):
         generation_settings_layout.setContentsMargins(0, 0, 0, 0)
         generation_settings_layout.setSpacing(6)
         generation_settings_layout.addWidget(objects.symmetric_division_checkbox)
+        generation_settings_layout.addWidget(
+            objects.side_door_duplication_checkbox
+        )
         generation_settings_layout.addStretch(1)
         generation_settings_layout.addWidget(objects.meshy_target_polycount_control)
         creation_layout.addWidget(generation_settings)
@@ -951,6 +990,9 @@ class MergedGenerationWorkspace(QWidget):
         objects.door_slot_editing_changed.connect(
             self._handle_door_slot_editing_changed
         )
+        objects.door_slot_generation_status_changed.connect(
+            self._handle_door_slot_generation_status_changed
+        )
         try:
             self.seekbar.valueChanged.disconnect()
         except (RuntimeError, TypeError):
@@ -977,6 +1019,43 @@ class MergedGenerationWorkspace(QWidget):
 
         self._door_slot_editing_active = bool(active)
         self.sync_shared_controls()
+
+    @Slot(str)
+    def _handle_door_slot_generation_status_changed(
+        self,
+        slot_name: str,
+    ) -> None:
+        """Blink the exact in-flight door slot beside the Generation heading."""
+
+        self._door_slot_generation_name = str(slot_name).strip()
+        if not self._door_slot_generation_name:
+            self._door_slot_generation_blink_timer.stop()
+            self.door_slot_generation_indicator.hide()
+            return
+        self.door_slot_generation_indicator.setText(
+            f"- Generating the door's {self._door_slot_generation_name}"
+        )
+        self._door_slot_generation_blink_visible = True
+        self.door_slot_generation_indicator.setStyleSheet(
+            DOOR_SLOT_GENERATION_ACTIVE_STYLE
+        )
+        self.door_slot_generation_indicator.show()
+        self._door_slot_generation_blink_timer.start()
+
+    @Slot()
+    def _toggle_door_slot_generation_blink(self) -> None:
+        """Alternate red and transparent text without shifting the layout."""
+
+        if not self._door_slot_generation_name:
+            return
+        self._door_slot_generation_blink_visible = (
+            not self._door_slot_generation_blink_visible
+        )
+        self.door_slot_generation_indicator.setStyleSheet(
+            DOOR_SLOT_GENERATION_ACTIVE_STYLE
+            if self._door_slot_generation_blink_visible
+            else DOOR_SLOT_GENERATION_HIDDEN_STYLE
+        )
 
     @Slot()
     def _handle_video_frame_changed(self) -> None:
@@ -1391,7 +1470,7 @@ class MergedGenerationWorkspace(QWidget):
         if image is None:
             QMessageBox.warning(
                 self,
-                "Paste inpaint",
+                "Paste",
                 "The clipboard does not contain a usable image.",
             )
             return
@@ -1692,7 +1771,7 @@ def _read_clipboard_image() -> QImage | None:
 
 
 def _clipboard_has_usable_image() -> bool:
-    """Return whether Paste inpaint can resolve an image right now."""
+    """Return whether Paste can resolve an image right now."""
 
     clipboard = QApplication.clipboard()
     mime_data = clipboard.mimeData()

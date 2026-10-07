@@ -153,6 +153,96 @@ class SymmetricViewerPreviewTests(unittest.TestCase):
         self.assertEqual(self.viewer._embedded_symmetric_preview_groups, [])
         self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
 
+    def test_fade_can_be_disabled_for_a_static_opaque_mirror(self) -> None:
+        self.viewer.close()
+        self.viewer.deleteLater()
+        self.viewer = GlbViewerWidget(symmetric_preview_fade_enabled=False)
+        self.viewer.resize(640, 480)
+        self.viewer.show()
+        _qt_application.processEvents()
+        model = _textured_half_model()
+        model.preview_symmetric_objects = [
+            PreviewSymmetricObject(
+                object_id="door-body",
+                meshes=(model.mesh,),
+                orientation="vertical",
+                plane_coordinate=0.0,
+            )
+        ]
+
+        self.viewer.set_model(model)
+
+        self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
+        self.assertEqual(len(self.viewer._embedded_symmetric_preview_groups), 1)
+        ghost = self.viewer._embedded_symmetric_preview_groups[0]
+        assert ghost.textured_item is not None
+        self.assertEqual(ghost.textured_item._opacity, 1.0)
+        opacity_before = ghost.textured_item._opacity
+        self.viewer._advance_symmetric_preview_fade()
+        self.assertEqual(ghost.textured_item._opacity, opacity_before)
+
+    def test_static_door_mirror_does_not_start_the_shared_fade_timer(self) -> None:
+        model = _textured_half_model()
+        model.preview_symmetric_objects = [
+            PreviewSymmetricObject(
+                object_id="door-body",
+                meshes=(model.mesh,),
+                orientation="vertical",
+                plane_coordinate=0.0,
+                fade_enabled=False,
+            )
+        ]
+
+        self.viewer.set_model(model)
+
+        self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
+        self.assertEqual(len(self.viewer._embedded_symmetric_preview_groups), 1)
+        door_group = self.viewer._embedded_symmetric_preview_groups[0]
+        self.assertFalse(door_group.fade_enabled)
+        assert door_group.textured_item is not None
+        self.assertEqual(door_group.textured_item._opacity, 1.0)
+
+    def test_static_door_and_fading_half_object_keep_independent_opacity(
+        self,
+    ) -> None:
+        model = _textured_half_model()
+        model.preview_symmetric_objects = [
+            PreviewSymmetricObject(
+                object_id="ordinary-half-object",
+                meshes=(model.mesh,),
+                orientation="vertical",
+                plane_coordinate=0.0,
+            ),
+            PreviewSymmetricObject(
+                object_id="door-body",
+                meshes=(model.mesh.copy(),),
+                orientation="vertical",
+                plane_coordinate=0.0,
+                fade_enabled=False,
+            ),
+        ]
+
+        self.viewer.set_model(model)
+
+        self.assertTrue(self.viewer._symmetric_preview_timer.isActive())
+        self.assertEqual(len(self.viewer._embedded_symmetric_preview_groups), 2)
+        ordinary_group, door_group = self.viewer._embedded_symmetric_preview_groups
+        self.assertTrue(ordinary_group.fade_enabled)
+        self.assertFalse(door_group.fade_enabled)
+        assert ordinary_group.textured_item is not None
+        assert door_group.textured_item is not None
+        ordinary_opacity = ordinary_group.textured_item._opacity
+        door_opacity = door_group.textured_item._opacity
+
+        self.viewer._advance_symmetric_preview_fade()
+
+        self.assertNotEqual(
+            ordinary_group.textured_item._opacity,
+            ordinary_opacity,
+        )
+        self.assertEqual(door_group.textured_item._opacity, door_opacity)
+        self.assertEqual(door_group.textured_item._opacity, 1.0)
+
     def test_editable_placed_object_keeps_nested_mirrors_without_duplicates(
         self,
     ) -> None:
