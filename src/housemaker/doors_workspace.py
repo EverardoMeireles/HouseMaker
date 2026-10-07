@@ -399,6 +399,7 @@ class DoorsWorkspace(QWidget):
             placed_object_axis_scale_gizmos_enabled=True,
             face_editing_enabled=False,
             symmetric_preview_fade_enabled=False,
+            orbiting_point_light_with_pbr=True,
         )
         self.preview_viewer.setObjectName("door_complete_preview_viewer")
         preview_layout.addWidget(self.wireframe_checkbox)

@@ -62,6 +62,7 @@ from housemaker.generation_workspace import (
     _collect_scene_glass_face_indices,
     _ExternalGlbImportRuntime,
     _ExternalGlbImportSignalRelay,
+    _format_external_glb_cleanup_progress,
     _format_model_statistics,
     _GenerationCancelled,
     _ObjectGenerationProgressMapper,
@@ -106,7 +107,9 @@ from housemaker.settings_widget import (
 )
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
+    FACE_REMOVAL_CAMERA_IDS,
     UnusedFaceRemovalCancelled,
+    UnusedFaceRemovalProgress,
     UnusedFaceRemovalResult,
 )
 from housemaker.video_source import VideoMetadata
@@ -1454,7 +1457,7 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         removal_options = removal_calls[0][1]["options"]
         self.assertEqual(
             removal_options.enabled_camera_ids,  # type: ignore[union-attr]
-            ALL_CAMERA_IDS,
+            FACE_REMOVAL_CAMERA_IDS,
         )
         self.assertEqual(
             removal_options.minimum_visible_fraction,  # type: ignore[union-attr]
@@ -1700,6 +1703,23 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.workspace.shutdown()
         self.workspace.close()
         _qt_application.processEvents()
+
+    def test_external_cleanup_progress_covers_all_fourteen_views(self) -> None:
+        percentages: list[int] = []
+        for camera_id in FACE_REMOVAL_CAMERA_IDS:
+            message = _format_external_glb_cleanup_progress(
+                UnusedFaceRemovalProgress(
+                    stage="capturing",
+                    completed_face_count=1,
+                    total_face_count=1,
+                    camera_id=camera_id,
+                )
+            )
+            percentages.append(int(message.rsplit("(", 1)[1].split("%", 1)[0]))
+
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertEqual(len(set(percentages)), 14)
+        self.assertEqual(percentages[-1], 58)
 
     def test_external_glb_resource_validation_rejects_sidecar_files(self) -> None:
         for collection_name, uri in (
@@ -2727,6 +2747,12 @@ class GenerationWorkspaceTests(unittest.TestCase):
                 PBR_MAP_METALLIC: True,
             },
         )
+        self.assertTrue(viewer.is_orbiting_point_light_enabled())
+
+        self.workspace.pbr_map_checkboxes[PBR_MAP_NORMAL].setChecked(False)
+        self.assertTrue(viewer.is_orbiting_point_light_enabled())
+        self.workspace.pbr_map_checkboxes[PBR_MAP_METALLIC].setChecked(False)
+        self.assertFalse(viewer.is_orbiting_point_light_enabled())
 
     def test_enabled_pbr_map_is_snapshotted_and_requests_meshy_pbr(self) -> None:
         self.workspace.set_runtime_settings(

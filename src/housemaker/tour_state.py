@@ -30,7 +30,8 @@ DEFAULT_TOOLTIP_HTML_BODY = (
 )
 DEFAULT_TOOLTIP_STYLE = """\
 box-sizing: border-box;
-max-width: 360px;
+width: 25vw;
+height: 80vh;
 padding: 14px 16px;
 color: #f5f7fb;
 background: rgba(24, 27, 34, 0.94);

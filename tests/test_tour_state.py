@@ -374,7 +374,8 @@ class TourModelTests(unittest.TestCase):
         self.assertEqual(len(visible_body.split()), 20)
         for declaration in (
             "box-sizing: border-box;",
-            "max-width: 360px;",
+            "width: 25vw;",
+            "height: 80vh;",
             "background: rgba(24, 27, 34, 0.94);",
             "border-radius: 8px;",
             "font-family: sans-serif;",

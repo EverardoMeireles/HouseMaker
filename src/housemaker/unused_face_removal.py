@@ -34,7 +34,21 @@ CAMERA_OPTIONS: tuple[tuple[str, str], ...] = (
     (CAMERA_ID_TOP, "Top (+Z)"),
     (CAMERA_ID_BOTTOM, "Bottom (-Z)"),
 )
+# These six cameras remain the only visible projection-allocation cameras.
 ALL_CAMERA_IDS = tuple(camera_id for camera_id, _label in CAMERA_OPTIONS)
+
+_DIAGONAL_CAMERA_SIGNS_BY_ID = {
+    "diag_pos_x_pos_y_pos_z": (1, 1, 1),
+    "diag_pos_x_pos_y_neg_z": (1, 1, -1),
+    "diag_pos_x_neg_y_pos_z": (1, -1, 1),
+    "diag_pos_x_neg_y_neg_z": (1, -1, -1),
+    "diag_neg_x_pos_y_pos_z": (-1, 1, 1),
+    "diag_neg_x_pos_y_neg_z": (-1, 1, -1),
+    "diag_neg_x_neg_y_pos_z": (-1, -1, 1),
+    "diag_neg_x_neg_y_neg_z": (-1, -1, -1),
+}
+DIAGONAL_FACE_REMOVAL_CAMERA_IDS = tuple(_DIAGONAL_CAMERA_SIGNS_BY_ID)
+FACE_REMOVAL_CAMERA_IDS = ALL_CAMERA_IDS + DIAGONAL_FACE_REMOVAL_CAMERA_IDS
 
 
 # ### Processing constants ###
@@ -67,7 +81,7 @@ ProgressCallback = Callable[["UnusedFaceRemovalProgress"], None]
 class UnusedFaceRemovalOptions:
     """Bounds and selected views for one removal operation."""
 
-    enabled_camera_ids: tuple[str, ...] = ALL_CAMERA_IDS
+    enabled_camera_ids: tuple[str, ...] = FACE_REMOVAL_CAMERA_IDS
     image_size: int = DEFAULT_CAPTURE_IMAGE_SIZE
     max_face_count: int = DEFAULT_MAX_FACE_COUNT
     progress_interval_faces: int = DEFAULT_PROGRESS_INTERVAL_FACES
@@ -181,6 +195,36 @@ class _CameraCapture:
 
 
 # ### Camera definitions ###
+def _build_diagonal_camera_definition(
+    camera_id: str,
+    signs: tuple[int, int, int],
+) -> _CameraDefinition:
+    """Build one normalized corner view with a stable world-up basis."""
+
+    sign_x, sign_y, sign_z = signs
+    inverse_sqrt_two = 1.0 / math.sqrt(2.0)
+    inverse_sqrt_three = 1.0 / math.sqrt(3.0)
+    inverse_sqrt_six = 1.0 / math.sqrt(6.0)
+    return _CameraDefinition(
+        camera_id=camera_id,
+        depth_axis=(
+            sign_x * inverse_sqrt_three,
+            sign_y * inverse_sqrt_three,
+            sign_z * inverse_sqrt_three,
+        ),
+        horizontal_axis=(
+            -sign_y * inverse_sqrt_two,
+            sign_x * inverse_sqrt_two,
+            0.0,
+        ),
+        vertical_axis=(
+            -sign_x * sign_z * inverse_sqrt_six,
+            -sign_y * sign_z * inverse_sqrt_six,
+            2.0 * inverse_sqrt_six,
+        ),
+    )
+
+
 _CAMERA_DEFINITIONS = {
     CAMERA_ID_POS_X: _CameraDefinition(
         camera_id=CAMERA_ID_POS_X,
@@ -219,6 +263,12 @@ _CAMERA_DEFINITIONS = {
         vertical_axis=(0.0, -1.0, 0.0),
     ),
 }
+_CAMERA_DEFINITIONS.update(
+    {
+        camera_id: _build_diagonal_camera_definition(camera_id, signs)
+        for camera_id, signs in _DIAGONAL_CAMERA_SIGNS_BY_ID.items()
+    }
+)
 
 
 # ### Public camera helpers ###
@@ -317,7 +367,7 @@ def remove_unused_faces_from_glb(
     cancel_requested: CancelCallback | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> UnusedFaceRemovalResult:
-    """Return a self-contained GLB after conservative six-view face removal.
+    """Return a self-contained GLB after conservative fourteen-view removal.
 
     Each capture measures exact projected pixel-center coverage and top-depth
     ownership rather than material color. A face must have meaningful coverage
@@ -760,7 +810,7 @@ def _find_stacked_faces(
     camera_directions = np.asarray(
         [
             _CAMERA_DEFINITIONS[camera_id].depth_axis
-            for camera_id in ALL_CAMERA_IDS
+            for camera_id in FACE_REMOVAL_CAMERA_IDS
         ],
         dtype=float,
     )
@@ -778,7 +828,7 @@ def _find_stacked_faces(
         depth_epsilon,
     )
     checked_face_count = 0
-    for camera_index, camera_id in enumerate(ALL_CAMERA_IDS):
+    for camera_index, camera_id in enumerate(FACE_REMOVAL_CAMERA_IDS):
         capture = capture_by_id.get(camera_id)
         if capture is None:
             continue
@@ -935,12 +985,14 @@ def _make_unique_name(
 # ### Validation and callback helpers ###
 def _normalize_camera_ids(camera_ids: Iterable[str]) -> tuple[str, ...]:
     requested_camera_ids = tuple(str(camera_id) for camera_id in camera_ids)
-    unknown_camera_ids = set(requested_camera_ids).difference(ALL_CAMERA_IDS)
+    unknown_camera_ids = set(requested_camera_ids).difference(FACE_REMOVAL_CAMERA_IDS)
     if unknown_camera_ids:
         unknown_labels = ", ".join(sorted(unknown_camera_ids))
         raise ValueError(f"Unknown unused-face camera IDs: {unknown_labels}.")
     normalized_camera_ids = tuple(
-        camera_id for camera_id in ALL_CAMERA_IDS if camera_id in requested_camera_ids
+        camera_id
+        for camera_id in FACE_REMOVAL_CAMERA_IDS
+        if camera_id in requested_camera_ids
     )
     if not normalized_camera_ids:
         raise ValueError("Select at least one unused-face camera.")

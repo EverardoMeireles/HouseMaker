@@ -155,6 +155,16 @@ MOUSE_WHEEL_DELTA_PER_STEP = 120
 DEFAULT_AMBIENT_LIGHT_INTENSITY = 0.5
 MIN_AMBIENT_LIGHT_INTENSITY = 0.0
 MAX_AMBIENT_LIGHT_INTENSITY = 1.0
+ORBITING_POINT_LIGHT_UPDATE_INTERVAL_MILLISECONDS = 33
+ORBITING_POINT_LIGHT_PERIOD_MILLISECONDS = 8_000
+ORBITING_POINT_LIGHT_RADIUS_SCALE = 1.6
+ORBITING_POINT_LIGHT_MINIMUM_RADIUS_METERS = 0.75
+ORBITING_POINT_LIGHT_HEIGHT_SCALE = 0.55
+ORBITING_POINT_LIGHT_MARKER_RADIUS_SCALE = 0.045
+ORBITING_POINT_LIGHT_MARKER_MINIMUM_RADIUS_METERS = 0.04
+ORBITING_POINT_LIGHT_MARKER_ROWS = 12
+ORBITING_POINT_LIGHT_MARKER_COLUMNS = 24
+ORBITING_POINT_LIGHT_MARKER_COLOR = (1.0, 1.0, 1.0, 1.0)
 MAX_TEXTURE_PREVIEW_DIMENSION = 4096
 DEFAULT_TEXTURES_ENABLED = True
 DEFAULT_WIREFRAME_ENABLED = True
@@ -471,6 +481,7 @@ AMBIENT_LIT_FRAGMENT_SHADER = """
 """
 TEXTURED_AMBIENT_VERTEX_SHADER = """
     uniform mat4 u_mvp;
+    uniform mat4 u_model_view;
     uniform mat3 u_normal;
     attribute vec3 a_position;
     attribute vec3 a_normal;
@@ -480,11 +491,13 @@ TEXTURED_AMBIENT_VERTEX_SHADER = """
     varying vec3 v_normal;
     varying vec3 v_tangent;
     varying vec3 v_bitangent;
+    varying vec3 v_view_position;
     varying vec2 v_texcoord;
     void main() {
         v_normal = normalize(u_normal * a_normal);
         v_tangent = normalize(u_normal * a_tangent);
         v_bitangent = normalize(u_normal * a_bitangent);
+        v_view_position = (u_model_view * vec4(a_position, 1.0)).xyz;
         v_texcoord = a_texcoord;
         gl_Position = u_mvp * vec4(a_position, 1.0);
     }
@@ -504,6 +517,8 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     uniform float u_metallic_map_enabled;
     uniform float u_alpha_pass;
     uniform float u_ambient_light;
+    uniform float u_point_light_enabled;
+    uniform vec3 u_point_light_position_view;
     uniform float u_opacity;
     uniform float u_color_balance_enabled;
     uniform vec3 u_color_balance_shadows;
@@ -513,6 +528,7 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     varying vec3 v_normal;
     varying vec3 v_tangent;
     varying vec3 v_bitangent;
+    varying vec3 v_view_position;
     varying vec2 v_texcoord;
 
     float color_balance_gamut_limit(float source, float delta) {
@@ -594,9 +610,23 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
             surface_normal = normalize(tangent_basis * tangent_normal);
         }
         vec3 light_direction = normalize(vec3(1.0, -1.0, -1.0));
+        vec3 point_light_delta = u_point_light_position_view - v_view_position;
+        vec3 point_light_direction = point_light_delta
+            / max(length(point_light_delta), 0.0001);
         float diffuse = max(dot(surface_normal, light_direction), 0.0);
-        float illumination = min(1.0, u_ambient_light + diffuse * 0.65);
-        float normal_detail_illumination = mix(0.72, 1.0, diffuse);
+        float point_diffuse = max(
+            dot(surface_normal, point_light_direction),
+            0.0
+        ) * u_point_light_enabled;
+        float illumination = min(
+            1.0,
+            u_ambient_light + diffuse * 0.65 + point_diffuse * 0.45
+        );
+        float normal_detail_illumination = mix(
+            0.72,
+            1.0,
+            max(diffuse, point_diffuse)
+        );
         illumination = mix(
             illumination,
             normal_detail_illumination,
@@ -616,12 +646,13 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
                 v_texcoord
             ).r;
         }
+        vec3 view_direction = -v_view_position
+            / max(length(v_view_position), 0.0001);
         vec3 lit_color = base_color.rgb * illumination;
         if (
             u_roughness_map_enabled > 0.5
             || u_metallic_map_enabled > 0.5
         ) {
-            vec3 view_direction = vec3(0.0, 0.0, 1.0);
             vec3 half_direction = normalize(light_direction + view_direction);
             float shininess = mix(96.0, 4.0, roughness);
             float specular_amount = pow(
@@ -637,6 +668,24 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
             lit_color = diffuse_color * illumination
                 + reflection_color * specular_amount * 0.8;
         }
+        vec3 point_half_delta = point_light_direction + view_direction;
+        vec3 point_half_direction = point_half_delta
+            / max(length(point_half_delta), 0.0001);
+        float point_shininess = mix(64.0, 8.0, roughness);
+        float point_specular = pow(
+            max(dot(surface_normal, point_half_direction), 0.0),
+            point_shininess
+        ) * (1.0 - roughness * 0.72) * u_point_light_enabled;
+        vec3 point_reflection_color = mix(
+            vec3(0.08),
+            base_color.rgb,
+            metallic
+        );
+        lit_color += base_color.rgb
+            * (1.0 - metallic * 0.65)
+            * point_diffuse
+            * 0.22;
+        lit_color += point_reflection_color * point_specular * 0.9;
         gl_FragColor = vec4(
             lit_color,
             output_alpha
@@ -2330,6 +2379,7 @@ class TexturedMeshItem(GLGraphicsItem):
         opacity: float = 1.0,
         translucent: bool = False,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
+        point_light_world_position: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
         self._vertices = np.ascontiguousarray(
@@ -2377,6 +2427,9 @@ class TexturedMeshItem(GLGraphicsItem):
             NEUTRAL_METALLIC_TEXTURE_RGBA,
         )
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
+        self._point_light_world_position = _normalize_optional_world_position(
+            point_light_world_position
+        )
         self._color_balance_preview_settings = TextureColorBalanceSettings()
         self._tangents: np.ndarray | None = None
         self._bitangents: np.ndarray | None = None
@@ -2480,6 +2533,23 @@ class TexturedMeshItem(GLGraphicsItem):
         """Return an isolated copy of the active material-map toggles."""
 
         return dict(self._pbr_maps_enabled)
+
+    def set_point_light_world_position(
+        self,
+        position: Sequence[float] | None,
+    ) -> None:
+        """Set or clear the optional world-space preview point light."""
+
+        normalized = _normalize_optional_world_position(position)
+        if normalized == self._point_light_world_position:
+            return
+        self._point_light_world_position = normalized
+        self.update()
+
+    def get_point_light_world_position(self) -> tuple[float, float, float] | None:
+        """Return the current optional point-light position."""
+
+        return self._point_light_world_position
 
     def set_texture_color_balance_preview(
         self,
@@ -2671,6 +2741,10 @@ class TexturedMeshItem(GLGraphicsItem):
             self.mvpMatrix().data(),
             dtype=np.float32,
         )
+        model_view = np.asarray(
+            self.modelViewMatrix().data(),
+            dtype=np.float32,
+        )
         normal_matrix = np.asarray(
             self.modelViewMatrix().normalMatrix().data(),
             dtype=np.float32,
@@ -2685,6 +2759,12 @@ class TexturedMeshItem(GLGraphicsItem):
         )
         _set_matrix_uniform(
             self._shader_program,
+            "u_model_view",
+            model_view,
+            4,
+        )
+        _set_matrix_uniform(
+            self._shader_program,
             "u_normal",
             normal_matrix,
             3,
@@ -2693,6 +2773,17 @@ class TexturedMeshItem(GLGraphicsItem):
             self._shader_program,
             "u_ambient_light",
             self._ambient_light_intensity,
+        )
+        point_light_position_view = self._get_point_light_position_in_view()
+        _set_float_uniform(
+            self._shader_program,
+            "u_point_light_enabled",
+            float(self._point_light_world_position is not None),
+        )
+        _set_vector3_uniform(
+            self._shader_program,
+            "u_point_light_position_view",
+            point_light_position_view,
         )
         _set_float_uniform(
             self._shader_program,
@@ -2842,6 +2933,18 @@ class TexturedMeshItem(GLGraphicsItem):
             GL.glUseProgram(0)
             if not self._double_sided and not culling_was_enabled:
                 GL.glDisable(GL.GL_CULL_FACE)
+
+    def _get_point_light_position_in_view(self) -> tuple[float, float, float]:
+        """Transform the shared world-space light into eye coordinates."""
+
+        position = self._point_light_world_position
+        if position is None:
+            return (0.0, 0.0, 0.0)
+        owning_view = self.view()
+        if owning_view is None:
+            return position
+        mapped = owning_view.viewMatrix().map(QVector3D(*position))
+        return (float(mapped.x()), float(mapped.y()), float(mapped.z()))
 
     def _draw_bound_triangles(self) -> None:
         """Draw opaque and translucent texels with scoped depth-write state."""
@@ -3668,6 +3771,7 @@ class GlbViewerWidget(QWidget):
         tour_html_tooltips_enabled: bool = False,
         symmetric_preview_fade_enabled: bool = True,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
+        orbiting_point_light_with_pbr: bool = False,
     ) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
@@ -3705,6 +3809,19 @@ class GlbViewerWidget(QWidget):
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
+        self._orbiting_point_light_with_pbr = bool(
+            orbiting_point_light_with_pbr
+        )
+        self._orbiting_point_light_enabled = bool(
+            self._orbiting_point_light_with_pbr
+            and any(self._pbr_maps_enabled.values())
+        )
+        self._orbiting_point_light_phase = 0.0
+        self._orbiting_point_light_position: tuple[float, float, float] | None = (
+            None
+        )
+        self._orbiting_point_light_marker_item: gl.GLMeshItem | None = None
+        self._orbiting_point_light_marker_radius: float | None = None
         self._texture_color_balance_preview_settings = TextureColorBalanceSettings()
         self._placed_object_color_balance_preview_object_id: str | None = None
         self._placed_object_color_balance_preview_settings = (
@@ -4010,6 +4127,16 @@ class GlbViewerWidget(QWidget):
         )
         self._canvas_stair_preview_timer.timeout.connect(
             self._advance_canvas_stair_preview_fade
+        )
+        self._orbiting_point_light_timer = QTimer(self)
+        self._orbiting_point_light_timer.setTimerType(
+            Qt.TimerType.PreciseTimer
+        )
+        self._orbiting_point_light_timer.setInterval(
+            ORBITING_POINT_LIGHT_UPDATE_INTERVAL_MILLISECONDS
+        )
+        self._orbiting_point_light_timer.timeout.connect(
+            self._advance_orbiting_point_light
         )
         self._ambient_shader = _build_ambient_shader(self._ambient_light_intensity)
 
@@ -4846,10 +4973,12 @@ class GlbViewerWidget(QWidget):
             self._symmetric_preview_timer.start()
         if self._canvas_stair_preview_groups:
             self._canvas_stair_preview_timer.start()
+        self._sync_orbiting_point_light()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._symmetric_preview_timer.stop()
         self._canvas_stair_preview_timer.stop()
+        self._orbiting_point_light_timer.stop()
         super().hideEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -4857,6 +4986,7 @@ class GlbViewerWidget(QWidget):
 
         self._invalidate_face_rectangle_selection_requests()
         self._cancel_canvas_rectangle_selection()
+        self._orbiting_point_light_timer.stop()
         super().closeEvent(event)
 
     def _build_window_tools_panel(self) -> QWidget:
@@ -14081,6 +14211,7 @@ class GlbViewerWidget(QWidget):
                 opacity=opacity,
                 translucent=actually_fades,
                 pbr_maps_enabled=self._pbr_maps_enabled,
+                point_light_world_position=self._orbiting_point_light_position,
             )
             if not mirrored_texture_data.is_prefab_glass:
                 textured_item.set_texture_color_balance_preview(
@@ -14148,6 +14279,7 @@ class GlbViewerWidget(QWidget):
                 opacity=opacity,
                 translucent=actually_fades,
                 pbr_maps_enabled=self._pbr_maps_enabled,
+                point_light_world_position=self._orbiting_point_light_position,
             )
             if not texture_mesh_data.is_prefab_glass:
                 textured_item.set_texture_color_balance_preview(
@@ -14391,18 +14523,229 @@ class GlbViewerWidget(QWidget):
         """Enable selected auxiliary maps on every textured preview item."""
 
         normalized = _normalize_pbr_maps_enabled(enabled_maps)
-        if normalized == self._pbr_maps_enabled:
-            return
-        self._pbr_maps_enabled = normalized
-        for textured_item in self._iter_textured_mesh_items():
-            textured_item.set_pbr_maps_enabled(normalized)
-        if hasattr(self, "view"):
+        changed = normalized != self._pbr_maps_enabled
+        if changed:
+            self._pbr_maps_enabled = normalized
+            for textured_item in self._iter_textured_mesh_items():
+                textured_item.set_pbr_maps_enabled(normalized)
+        self._sync_orbiting_point_light()
+        if changed and hasattr(self, "view"):
             self.view.update()
 
     def get_pbr_maps_enabled(self) -> dict[str, bool]:
         """Return an isolated copy of the current auxiliary-map state."""
 
         return dict(self._pbr_maps_enabled)
+
+    # ### PBR preview lighting API ###
+    def is_orbiting_point_light_enabled(self) -> bool:
+        """Return whether this viewer currently requests its PBR point light."""
+
+        return self._orbiting_point_light_enabled
+
+    def get_orbiting_point_light_position(
+        self,
+    ) -> tuple[float, float, float] | None:
+        """Return the current world-space point-light position."""
+
+        return self._orbiting_point_light_position
+
+    def _sync_orbiting_point_light(self) -> None:
+        """Match animation and draw-item light state to the active PBR maps."""
+
+        self._orbiting_point_light_enabled = bool(
+            self._orbiting_point_light_with_pbr
+            and any(self._pbr_maps_enabled.values())
+        )
+        textured_items = self._iter_textured_mesh_items()
+        if (
+            not self._orbiting_point_light_enabled
+            or self.model is None
+            or not textured_items
+        ):
+            self._orbiting_point_light_timer.stop()
+            self._remove_orbiting_point_light_marker()
+            self._set_orbiting_point_light_position(None, textured_items)
+            return
+
+        self._ensure_orbiting_point_light_marker()
+        if self._orbiting_point_light_position is None:
+            self._update_orbiting_point_light_position(textured_items)
+        else:
+            self._set_orbiting_point_light_position(
+                self._orbiting_point_light_position,
+                textured_items,
+            )
+        if self.isVisible():
+            self._orbiting_point_light_timer.start()
+        else:
+            self._orbiting_point_light_timer.stop()
+
+    def _advance_orbiting_point_light(self) -> None:
+        """Advance one frame of the slow PBR inspection-light orbit."""
+
+        if (
+            not self._orbiting_point_light_enabled
+            or self.model is None
+            or not self.isVisible()
+        ):
+            self._sync_orbiting_point_light()
+            return
+        phase_step = (
+            math.tau
+            * ORBITING_POINT_LIGHT_UPDATE_INTERVAL_MILLISECONDS
+            / ORBITING_POINT_LIGHT_PERIOD_MILLISECONDS
+        )
+        self._orbiting_point_light_phase = (
+            self._orbiting_point_light_phase + phase_step
+        ) % math.tau
+        self._update_orbiting_point_light_position(
+            self._iter_textured_mesh_items()
+        )
+
+    def _update_orbiting_point_light_position(
+        self,
+        textured_items: Sequence[TexturedMeshItem],
+    ) -> None:
+        """Place the light around the current model at the retained phase."""
+
+        orbit = self._get_orbiting_point_light_geometry()
+        if orbit is None:
+            self._orbiting_point_light_timer.stop()
+            self._remove_orbiting_point_light_marker()
+            self._set_orbiting_point_light_position(None, textured_items)
+            return
+        center, radius, height = orbit
+        angle = self._orbiting_point_light_phase
+        self._set_orbiting_point_light_position(
+            (
+                float(center[0] + math.cos(angle) * radius),
+                float(center[1] + math.sin(angle) * radius),
+                float(height),
+            ),
+            textured_items,
+        )
+
+    def _get_orbiting_point_light_geometry(
+        self,
+    ) -> tuple[np.ndarray, float, float] | None:
+        """Return a stable center, radius, and height for the current model."""
+
+        if self.model is None:
+            return None
+        bounds = np.asarray(self.model.mesh.bounds, dtype=float)
+        if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+            return None
+        minimum, maximum = bounds
+        extents = maximum - minimum
+        center = (minimum + maximum) * 0.5
+        radius = max(
+            float(max(extents[0], extents[1], extents[2] * 0.5))
+            * ORBITING_POINT_LIGHT_RADIUS_SCALE,
+            ORBITING_POINT_LIGHT_MINIMUM_RADIUS_METERS,
+        )
+        height = float(
+            center[2]
+            + max(
+                extents[2] * ORBITING_POINT_LIGHT_HEIGHT_SCALE,
+                radius * 0.2,
+            )
+        )
+        return center, radius, height
+
+    def _set_orbiting_point_light_position(
+        self,
+        position: Sequence[float] | None,
+        textured_items: Sequence[TexturedMeshItem] | None = None,
+    ) -> None:
+        """Propagate one shared light position without rebuilding geometry."""
+
+        normalized = _normalize_optional_world_position(position)
+        self._orbiting_point_light_position = normalized
+        targets = (
+            self._iter_textured_mesh_items()
+            if textured_items is None
+            else tuple(textured_items)
+        )
+        for textured_item in targets:
+            textured_item.set_point_light_world_position(normalized)
+        self._move_orbiting_point_light_marker(normalized)
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def _ensure_orbiting_point_light_marker(self) -> None:
+        """Create the white unlit sphere that identifies the moving light."""
+
+        orbit = self._get_orbiting_point_light_geometry()
+        if orbit is None or not hasattr(self, "view"):
+            self._remove_orbiting_point_light_marker()
+            return
+        marker_radius = max(
+            orbit[1] * ORBITING_POINT_LIGHT_MARKER_RADIUS_SCALE,
+            ORBITING_POINT_LIGHT_MARKER_MINIMUM_RADIUS_METERS,
+        )
+        if (
+            self._orbiting_point_light_marker_item is not None
+            and self._orbiting_point_light_marker_radius is not None
+            and math.isclose(
+                self._orbiting_point_light_marker_radius,
+                marker_radius,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+        ):
+            self._move_orbiting_point_light_marker(
+                self._orbiting_point_light_position
+            )
+            return
+
+        self._remove_orbiting_point_light_marker()
+        marker = gl.GLMeshItem(
+            meshdata=gl.MeshData.sphere(
+                rows=ORBITING_POINT_LIGHT_MARKER_ROWS,
+                cols=ORBITING_POINT_LIGHT_MARKER_COLUMNS,
+                radius=marker_radius,
+            ),
+            color=ORBITING_POINT_LIGHT_MARKER_COLOR,
+            smooth=False,
+            computeNormals=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader=None,
+        )
+        marker.setGLOptions("opaque")
+        self.view.addItem(marker)
+        self._orbiting_point_light_marker_item = marker
+        self._orbiting_point_light_marker_radius = marker_radius
+        self._move_orbiting_point_light_marker(
+            self._orbiting_point_light_position
+        )
+
+    def _move_orbiting_point_light_marker(
+        self,
+        position: Sequence[float] | None,
+    ) -> None:
+        """Move the retained marker without rebuilding its sphere geometry."""
+
+        marker = self._orbiting_point_light_marker_item
+        normalized = _normalize_optional_world_position(position)
+        if marker is None or normalized is None:
+            return
+        marker.resetTransform()
+        marker.translate(*normalized)
+
+    def _remove_orbiting_point_light_marker(self) -> None:
+        """Remove the marker independently from the actual shader light."""
+
+        marker = self._orbiting_point_light_marker_item
+        if (
+            marker is not None
+            and hasattr(self, "view")
+            and marker in self.view.items
+        ):
+            self.view.removeItem(marker)
+        self._orbiting_point_light_marker_item = None
+        self._orbiting_point_light_marker_radius = None
 
     def set_texture_color_balance_preview(
         self,
@@ -14877,6 +15220,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_tour_preview_overlay_items()
             self._refresh_tour_edit_gizmo_items()
             self._refresh_tour_point_hover_item()
+            self._sync_orbiting_point_light()
             return
 
         display_mesh = self._get_display_mesh()
@@ -14909,6 +15253,9 @@ class GlbViewerWidget(QWidget):
                     self._ambient_light_intensity,
                     double_sided=texture_mesh_data.double_sided,
                     pbr_maps_enabled=self._pbr_maps_enabled,
+                    point_light_world_position=(
+                        self._orbiting_point_light_position
+                    ),
                 )
                 self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
                 self.view.addItem(self.textured_mesh_item)
@@ -14922,6 +15269,9 @@ class GlbViewerWidget(QWidget):
                     self._ambient_light_intensity,
                     double_sided=material_texture_data.double_sided,
                     pbr_maps_enabled=self._pbr_maps_enabled,
+                    point_light_world_position=(
+                        self._orbiting_point_light_position
+                    ),
                 )
                 if not material_texture_data.is_prefab_glass:
                     material_item.set_edit_mask(self._texture_edit_mask)
@@ -14994,6 +15344,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_tour_preview_overlay_items()
         self._refresh_tour_edit_gizmo_items()
         self._refresh_tour_point_hover_item()
+        self._sync_orbiting_point_light()
         self.view.update()
 
     def _get_display_mesh(self):
@@ -15163,6 +15514,7 @@ class GlbViewerWidget(QWidget):
                 texture_repeat=True,
                 double_sided=textured_surface.double_sided,
                 pbr_maps_enabled=self._pbr_maps_enabled,
+                point_light_world_position=self._orbiting_point_light_position,
             )
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)
@@ -15264,6 +15616,7 @@ class GlbViewerWidget(QWidget):
                 texture_repeat=True,
                 double_sided=texture_data.double_sided,
                 pbr_maps_enabled=self._pbr_maps_enabled,
+                point_light_world_position=self._orbiting_point_light_position,
             )
             textured_item.setParentItem(root_item)
         face_colors = (
@@ -17723,8 +18076,12 @@ class GlbViewerWidget(QWidget):
         self._cancel_placed_object_instance_drag()
         self._symmetric_preview_timer.stop()
         self._canvas_stair_preview_timer.stop()
+        self._orbiting_point_light_timer.stop()
+        self._orbiting_point_light_position = None
         self._release_textured_mesh_gl_resources()
         self.view.clear()
+        self._orbiting_point_light_marker_item = None
+        self._orbiting_point_light_marker_radius = None
         self.grid_item = None
         self.mesh_item = None
         self.textured_mesh_item = None
@@ -23801,6 +24158,19 @@ def _normalize_ambient_light_intensity(intensity: float) -> float:
         max(normalized_intensity, MIN_AMBIENT_LIGHT_INTENSITY),
         MAX_AMBIENT_LIGHT_INTENSITY,
     )
+
+
+def _normalize_optional_world_position(
+    position: Sequence[float] | None,
+) -> tuple[float, float, float] | None:
+    """Normalize one optional finite XYZ position used by preview lighting."""
+
+    if position is None:
+        return None
+    normalized = np.asarray(position, dtype=float)
+    if normalized.shape != (3,) or not np.all(np.isfinite(normalized)):
+        raise ValueError("Point-light positions must contain three finite values.")
+    return tuple(float(value) for value in normalized)
 
 
 def _normalize_preview_opacity(opacity: float) -> float:

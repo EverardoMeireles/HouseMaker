@@ -220,6 +220,29 @@ class SettingsWidgetTests(unittest.TestCase):
                 ).text(),
                 "Ignore top-down ceiling",
             )
+            object_generation_form = (
+                widget.object_generation_settings_group.layout()
+            )
+            self.assertIsInstance(object_generation_form, QFormLayout)
+            assert isinstance(object_generation_form, QFormLayout)
+            self.assertEqual(
+                object_generation_form.getWidgetPosition(
+                    widget.use_uv_raycast_for_object_generation_checkbox
+                )[0],
+                0,
+            )
+            self.assertEqual(
+                object_generation_form.getWidgetPosition(
+                    widget.unused_face_removal_checkbox
+                )[0],
+                1,
+            )
+            self.assertEqual(
+                object_generation_form.getWidgetPosition(
+                    widget.minimum_face_visibility_percentage_spinbox
+                )[0],
+                2,
+            )
             widget.dispose()
 
     def test_first_person_navigation_mode_persists_and_emits(self) -> None:
@@ -1174,6 +1197,22 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertEqual(spinbox.suffix(), "%")
             self.assertFalse(spinbox.keyboardTracking())
             self.assertIn("tiny glimpses", spinbox.toolTip())
+            self.assertIn("0% does not disable removal", spinbox.toolTip())
+            self.assertIn(
+                "14 cleanup cameras",
+                widget.unused_face_removal_checkbox.toolTip(),
+            )
+            form_layout = widget.object_generation_settings_group.layout()
+            self.assertIsInstance(form_layout, QFormLayout)
+            assert isinstance(form_layout, QFormLayout)
+            field_label = form_layout.labelForField(spinbox)
+            self.assertIsInstance(field_label, QLabel)
+            assert isinstance(field_label, QLabel)
+            self.assertEqual(
+                field_label.text(),
+                "Minimum percentage of face visible to retain(Higher means "
+                "more faces will be removed)",
+            )
 
             spinbox.setValue(37)
 

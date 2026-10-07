@@ -29,6 +29,10 @@ from housemaker.generation_state import GenerationData, MaskPoint, MaskStroke
 from housemaker.generation_workspace import GenerationRequest
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
+from housemaker.object_texture_variants import (
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+)
 from housemaker.project_io import ProjectData
 from housemaker.settings_widget import GenerationServiceSettings
 
@@ -206,6 +210,35 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         self.assertTrue(
             merged.isAncestorOf(self.workspace.generation.object_3d_panel)
         )
+
+    def test_shared_pbr_maps_control_only_requested_preview_lights(self) -> None:
+        generation_viewer = self.workspace.generation.result_view
+        doors_viewer = self.workspace.doors_workspace.preview_viewer
+        atlas_viewer = self.workspace.atlas_object_preview_viewer
+        normal = self.workspace.generation.pbr_map_checkboxes[PBR_MAP_NORMAL]
+        roughness = self.workspace.generation.pbr_map_checkboxes[
+            PBR_MAP_ROUGHNESS
+        ]
+
+        normal.setChecked(True)
+
+        self.assertTrue(generation_viewer.is_orbiting_point_light_enabled())
+        self.assertTrue(doors_viewer.is_orbiting_point_light_enabled())
+        self.assertTrue(atlas_viewer.is_orbiting_point_light_enabled())
+        self.assertFalse(self.workspace.viewer.is_orbiting_point_light_enabled())
+
+        roughness.setChecked(True)
+        normal.setChecked(False)
+
+        self.assertTrue(generation_viewer.is_orbiting_point_light_enabled())
+        self.assertTrue(doors_viewer.is_orbiting_point_light_enabled())
+        self.assertTrue(atlas_viewer.is_orbiting_point_light_enabled())
+
+        roughness.setChecked(False)
+
+        self.assertFalse(generation_viewer.is_orbiting_point_light_enabled())
+        self.assertFalse(doors_viewer.is_orbiting_point_light_enabled())
+        self.assertFalse(atlas_viewer.is_orbiting_point_light_enabled())
 
     def test_generation_controls_follow_the_merged_workflow_layout(self) -> None:
         merged = self.workspace.merged_generation_workspace

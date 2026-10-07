@@ -3387,7 +3387,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(atlas_materials, ["Architecture"])
 
-    def test_canvas_export_omits_unassigned_materialless_surfaces(self) -> None:
+    def test_canvas_export_preserves_unassigned_materialless_surfaces(self) -> None:
         wall_surface_id = _add_square_room_to_level(
             self.workspace.current_level
         )
@@ -3438,7 +3438,64 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 not in dict(getattr(mesh, "metadata", {}) or {})
             )
         ]
-        self.assertEqual(materialless_surface_names, [])
+        self.assertGreater(len(materialless_surface_names), 0)
+        self.assertTrue(
+            any("floor" in name for name in materialless_surface_names)
+        )
+        self.assertTrue(
+            any("ceiling" in name for name in materialless_surface_names)
+        )
+        self.assertAlmostEqual(
+            sum(mesh.area for mesh in result.scene.geometry.values()),
+            result.mesh.area,
+        )
+        exported_scene = trimesh.load(
+            BytesIO(result.glb_bytes),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertIsInstance(exported_scene, trimesh.Scene)
+        self.assertAlmostEqual(
+            sum(mesh.area for mesh in exported_scene.geometry.values()),
+            result.mesh.area,
+            places=5,
+        )
+        self.assertNotIn(
+            "DefaultMaterial",
+            {
+                getattr(getattr(mesh.visual, "material", None), "name", None)
+                for mesh in result.scene.geometry.values()
+            },
+        )
+
+    def test_canvas_export_without_atlases_preserves_all_geometry(self) -> None:
+        _add_square_room_to_level(self.workspace.current_level)
+        self.workspace.surface_texture_generation.set_levels(
+            self.workspace.levels
+        )
+
+        result = self.workspace._build_generated_model(None)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertGreater(len(result.scene.geometry), 0)
+        self.assertAlmostEqual(
+            sum(mesh.area for mesh in result.scene.geometry.values()),
+            result.mesh.area,
+        )
+        exported_scene = trimesh.load(
+            BytesIO(result.glb_bytes),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertIsInstance(exported_scene, trimesh.Scene)
+        self.assertAlmostEqual(
+            sum(mesh.area for mesh in exported_scene.geometry.values()),
+            result.mesh.area,
+            places=5,
+        )
 
     def test_wall_preview_uses_exact_pinned_texture_variant(self) -> None:
         assignment = _wall_texture_assignment_with_variants(

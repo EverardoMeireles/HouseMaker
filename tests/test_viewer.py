@@ -687,6 +687,117 @@ class GlbViewerRenderingTests(unittest.TestCase):
         for item in viewer._iter_textured_mesh_items():
             self.assertFalse(item.visible())
 
+    def test_orbiting_point_light_follows_any_enabled_pbr_map(self) -> None:
+        model = _build_generated_model(textured=True)
+        viewer = self._build_viewer(orbiting_point_light_with_pbr=True)
+        viewer.set_model(model)
+
+        self.assertFalse(viewer.is_orbiting_point_light_enabled())
+        self.assertIsNone(viewer.get_orbiting_point_light_position())
+
+        viewer.set_pbr_maps_enabled((PBR_MAP_NORMAL,))
+
+        first_position = viewer.get_orbiting_point_light_position()
+        self.assertTrue(viewer.is_orbiting_point_light_enabled())
+        self.assertIsNotNone(first_position)
+        self.assertTrue(np.all(np.isfinite(first_position)))
+        for item in viewer._iter_textured_mesh_items():
+            self.assertEqual(item.get_point_light_world_position(), first_position)
+        marker = viewer._orbiting_point_light_marker_item
+        self.assertIsInstance(marker, gl.GLMeshItem)
+        assert marker is not None
+        self.assertIn(marker, viewer.view.items)
+        self.assertEqual(marker.opts["color"], (1.0, 1.0, 1.0, 1.0))
+        self.assertIsNone(marker.opts["shader"])
+        marker_center = marker.transform().map(QVector3D(0.0, 0.0, 0.0))
+        np.testing.assert_allclose(
+            (marker_center.x(), marker_center.y(), marker_center.z()),
+            first_position,
+        )
+
+        viewer.set_pbr_maps_enabled((PBR_MAP_NORMAL, PBR_MAP_METALLIC))
+        viewer.set_pbr_maps_enabled((PBR_MAP_METALLIC,))
+
+        self.assertTrue(viewer.is_orbiting_point_light_enabled())
+        self.assertIs(viewer.model, model)
+
+        viewer.show()
+        _qt_application.processEvents()
+        viewer._orbiting_point_light_timer.stop()
+        position_before_tick = viewer.get_orbiting_point_light_position()
+        viewer._advance_orbiting_point_light()
+        position_after_tick = viewer.get_orbiting_point_light_position()
+
+        self.assertIsNotNone(position_before_tick)
+        self.assertIsNotNone(position_after_tick)
+        self.assertNotEqual(position_after_tick, position_before_tick)
+        self.assertIs(viewer._orbiting_point_light_marker_item, marker)
+        marker_center = marker.transform().map(QVector3D(0.0, 0.0, 0.0))
+        np.testing.assert_allclose(
+            (marker_center.x(), marker_center.y(), marker_center.z()),
+            position_after_tick,
+        )
+        orbit_geometry = viewer._get_orbiting_point_light_geometry()
+        self.assertIsNotNone(orbit_geometry)
+        assert orbit_geometry is not None
+        center, radius, _height = orbit_geometry
+        for position in (position_before_tick, position_after_tick):
+            assert position is not None
+            self.assertAlmostEqual(
+                float(np.linalg.norm(np.asarray(position[:2]) - center[:2])),
+                radius,
+            )
+
+        viewer.set_pbr_maps_enabled(())
+
+        self.assertFalse(viewer.is_orbiting_point_light_enabled())
+        self.assertIsNone(viewer.get_orbiting_point_light_position())
+        self.assertFalse(viewer._orbiting_point_light_timer.isActive())
+        self.assertIsNone(viewer._orbiting_point_light_marker_item)
+        self.assertNotIn(marker, viewer.view.items)
+        for item in viewer._iter_textured_mesh_items():
+            self.assertIsNone(item.get_point_light_world_position())
+
+    def test_orbiting_point_light_marker_is_rebuilt_with_the_model(self) -> None:
+        viewer = self._build_viewer(orbiting_point_light_with_pbr=True)
+        viewer.set_pbr_maps_enabled((PBR_MAP_NORMAL,))
+        self.assertIsNone(viewer._orbiting_point_light_marker_item)
+
+        viewer.set_model(_build_generated_model(textured=True))
+        first_marker = viewer._orbiting_point_light_marker_item
+        self.assertIsNotNone(first_marker)
+        assert first_marker is not None
+
+        replacement_model = _build_generated_model(textured=True)
+        replacement_model.mesh.apply_scale(2.0)
+        viewer.set_model(replacement_model)
+
+        replacement_marker = viewer._orbiting_point_light_marker_item
+        self.assertIsNotNone(replacement_marker)
+        self.assertIsNot(replacement_marker, first_marker)
+        self.assertNotIn(first_marker, viewer.view.items)
+        self.assertEqual(
+            sum(
+                item is replacement_marker
+                for item in viewer.view.items
+            ),
+            1,
+        )
+
+        viewer.clear_model()
+
+        self.assertIsNone(viewer._orbiting_point_light_marker_item)
+        self.assertNotIn(replacement_marker, viewer.view.items)
+
+    def test_pbr_point_light_is_opt_in_per_viewer(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model(textured=True))
+
+        viewer.set_pbr_maps_enabled((PBR_MAP_ROUGHNESS,))
+
+        self.assertFalse(viewer.is_orbiting_point_light_enabled())
+        self.assertIsNone(viewer.get_orbiting_point_light_position())
+
     def test_image_wall_items_are_not_treated_as_textured_mesh_items(self) -> None:
         viewer = self._build_viewer()
         wall_item = gl.GLImageItem(

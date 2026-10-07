@@ -1921,7 +1921,10 @@ class BlueprintWorkspace(QWidget):
         self._external_atlas_host.viewer_restored.connect(
             self._handle_external_atlas_viewer_restored
         )
-        self.atlas_object_preview_viewer = GlbViewerWidget(self.texture_atlas_workspace)
+        self.atlas_object_preview_viewer = GlbViewerWidget(
+            self.texture_atlas_workspace,
+            orbiting_point_light_with_pbr=True,
+        )
         self.atlas_object_preview_viewer.setObjectName(
             "texture_atlas_object_preview_viewer"
         )
@@ -2078,14 +2081,18 @@ class BlueprintWorkspace(QWidget):
         self.doors_workspace.undo_requested.connect(
             self._handle_doors_undo_requested
         )
-        self.doors_workspace.preview_viewer.set_pbr_maps_enabled(
-            tuple(
-                map_type
-                for map_type, checkbox in (
-                    self.merged_generation_workspace.pbr_map_checkboxes.items()
-                )
-                if checkbox.isChecked()
+        enabled_preview_pbr_maps = tuple(
+            map_type
+            for map_type, checkbox in (
+                self.merged_generation_workspace.pbr_map_checkboxes.items()
             )
+            if checkbox.isChecked()
+        )
+        self.doors_workspace.preview_viewer.set_pbr_maps_enabled(
+            enabled_preview_pbr_maps
+        )
+        self.atlas_object_preview_viewer.set_pbr_maps_enabled(
+            enabled_preview_pbr_maps
         )
         self.tour_workspace = TourWorkspace(self)
         self.tour_preview_viewer: GlbViewerWidget | None = None
@@ -14900,7 +14907,7 @@ class BlueprintWorkspace(QWidget):
             surface_materials=(
                 self.surface_texture_generation.get_surface_material_sources()
             ),
-            export_untextured_surfaces=False,
+            export_untextured_surfaces=True,
         )
         authored_models, instance_models = self._build_export_placed_models()
         runtime_source_ids = {
@@ -15548,19 +15555,34 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_generation_scene_pbr_maps_changed(self, _checked: bool) -> None:
-        """Apply the shared Generation map toggles to the shared 3D scene."""
+        """Apply shared Generation map toggles to every related preview."""
 
-        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
-            return
-        enabled_maps = tuple(
-            map_type
+        enabled_map_state = {
+            map_type: checkbox.isChecked()
             for map_type, checkbox in (
                 self.merged_generation_workspace.pbr_map_checkboxes.items()
             )
-            if checkbox.isChecked()
+        }
+        enabled_maps = tuple(
+            map_type
+            for map_type, enabled in enabled_map_state.items()
+            if enabled
         )
-        self.viewer.set_pbr_maps_enabled(enabled_maps)
         self.doors_workspace.preview_viewer.set_pbr_maps_enabled(enabled_maps)
+        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            if self._atlas_preview_display_state is not None:
+                textures_enabled, wireframe_enabled, wireframe_only, _ = (
+                    self._atlas_preview_display_state
+                )
+                self._atlas_preview_display_state = (
+                    textures_enabled,
+                    wireframe_enabled,
+                    wireframe_only,
+                    enabled_map_state,
+                )
+            return
+        self.atlas_object_preview_viewer.set_pbr_maps_enabled(enabled_maps)
+        self.viewer.set_pbr_maps_enabled(enabled_maps)
         if self.tour_preview_viewer is not None:
             self.tour_preview_viewer.set_pbr_maps_enabled(enabled_maps)
 

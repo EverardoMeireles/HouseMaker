@@ -25,6 +25,7 @@ from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     PlacedGeneratedModel,
     compose_placed_generated_models,
+    convert_to_export_scene_model,
     convert_to_glb,
     import_generated_glb,
 )
@@ -383,6 +384,18 @@ class StableRoomSurfaceIdentityTests(unittest.TestCase):
 
 # ### GLB material tests ###
 class SurfaceMaterialGlbTests(unittest.TestCase):
+    def test_export_scene_model_retains_untextured_surfaces(self) -> None:
+        level, _room = _build_one_room_level()
+
+        model = convert_to_export_scene_model([level])
+
+        self.assertGreater(len(model.scene.geometry), 0)
+        self.assertAlmostEqual(
+            sum(mesh.area for mesh in model.scene.geometry.values()),
+            model.mesh.area,
+        )
+        self.assertEqual(model.glb_bytes, b"")
+
     def test_repeat_size_reaches_preview_and_exported_surface_uvs(self) -> None:
         level, room = _build_one_room_level()
         surface_id = f"level:2/room:{room.center_vertex_id}/floor"
@@ -1113,7 +1126,7 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
                     surface_materials={
                         floor_surface_id: texture_path.resolve(),
                     },
-                    export_untextured_surfaces=False,
+                    export_untextured_surfaces=True,
                 )
                 with patch.object(
                     workspace,

@@ -724,7 +724,7 @@ def convert_to_export_scene_model(
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
 ) -> GeneratedModel:
-    """Build the filtered export scene without serializing an intermediate GLB."""
+    """Build the complete export scene without serializing an intermediate GLB."""
 
     return _build_blueprint_model(
         level_source=level_source,
@@ -734,7 +734,7 @@ def convert_to_export_scene_model(
         surface_texture_world_size_meters=(surface_texture_world_size_meters),
         stairs=stairs,
         serialize_glb=False,
-        export_untextured_surfaces=False,
+        export_untextured_surfaces=True,
     )
 
 

@@ -1066,24 +1066,6 @@ class SettingsWidget(QWidget):
             self.wall_vertex_update_delay_spinbox,
         )
 
-        self.unused_face_removal_checkbox = QCheckBox()
-        self.unused_face_removal_checkbox.setObjectName(
-            "unused_face_removal_checkbox"
-        )
-        self.unused_face_removal_checkbox.setToolTip(
-            "Generate geometry first, remove faces that do not meet the "
-            "configured minimum visibility in the six Object-generation "
-            "cameras, then submit the edited GLB to Meshy Retexture. This "
-            "uses two Meshy tasks."
-        )
-        self.unused_face_removal_checkbox.toggled.connect(
-            self._handle_unused_face_removal_changed
-        )
-        object_generation_form.addRow(
-            "Unused face removal",
-            self.unused_face_removal_checkbox,
-        )
-
         self.use_uv_raycast_for_object_generation_checkbox = QCheckBox()
         self.use_uv_raycast_for_object_generation_checkbox.setObjectName(
             "use_uv_raycast_for_object_generation_checkbox"
@@ -1102,6 +1084,24 @@ class SettingsWidget(QWidget):
             self.use_uv_raycast_for_object_generation_checkbox,
         )
 
+        self.unused_face_removal_checkbox = QCheckBox()
+        self.unused_face_removal_checkbox.setObjectName(
+            "unused_face_removal_checkbox"
+        )
+        self.unused_face_removal_checkbox.setToolTip(
+            "Generate geometry first, remove faces that do not meet the "
+            "configured minimum visibility in 14 cleanup cameras (six "
+            "axis-aligned and eight hidden diagonals), then submit the "
+            "edited GLB to Meshy Retexture. This uses two Meshy tasks."
+        )
+        self.unused_face_removal_checkbox.toggled.connect(
+            self._handle_unused_face_removal_changed
+        )
+        object_generation_form.addRow(
+            "Unused face removal",
+            self.unused_face_removal_checkbox,
+        )
+
         self.minimum_face_visibility_percentage_spinbox = QSpinBox()
         self.minimum_face_visibility_percentage_spinbox.setObjectName(
             "minimum_face_visibility_percentage_spinbox"
@@ -1116,15 +1116,19 @@ class SettingsWidget(QWidget):
             False
         )
         self.minimum_face_visibility_percentage_spinbox.setToolTip(
-            "During unused-face removal, retain a face from a camera only "
-            "when at least this percentage of the face is visible. Higher "
-            "values reject tiny glimpses through gaps."
+            "During unused-face removal, retain a meaningfully projected "
+            "face only when at least this percentage is visible in one "
+            "cleanup view. Higher values remove more faces and reject tiny "
+            "glimpses through gaps. Setting 0% does not disable removal: "
+            "fully unseen or unsampled faces and stacked layers can still "
+            "be removed."
         )
         self.minimum_face_visibility_percentage_spinbox.valueChanged.connect(
             self._handle_minimum_face_visibility_percentage_changed
         )
         object_generation_form.addRow(
-            "Minimum percentage of face visible",
+            "Minimum percentage of face visible to retain(Higher means more "
+            "faces will be removed)",
             self.minimum_face_visibility_percentage_spinbox,
         )
 

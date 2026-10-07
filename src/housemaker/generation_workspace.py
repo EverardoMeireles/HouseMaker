@@ -180,6 +180,7 @@ from housemaker.texture_color_balance import (
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     CAMERA_OPTIONS,
+    FACE_REMOVAL_CAMERA_IDS,
     UnusedFaceRemovalOptions,
     UnusedFaceRemovalProgress,
     remove_unused_faces_from_glb,
@@ -2302,6 +2303,7 @@ class ObjectGenerationViewerPanel(QWidget):
             placed_object_editing_enabled=True,
             placed_object_auxiliary_controls_enabled=False,
             face_editing_enabled=True,
+            orbiting_point_light_with_pbr=True,
         )
         self.viewer.set_projection_camera_indicators_visible(True)
         self.viewer.projection_camera_percentage_step_requested.connect(
@@ -11900,11 +11902,11 @@ def _format_external_glb_cleanup_progress(
     if update.stage == "capturing":
         camera_index = (
             -1
-            if update.camera_id not in ALL_CAMERA_IDS
-            else ALL_CAMERA_IDS.index(update.camera_id)
+            if update.camera_id not in FACE_REMOVAL_CAMERA_IDS
+            else FACE_REMOVAL_CAMERA_IDS.index(update.camera_id)
         )
         progress = 8 if camera_index < 0 else 8 + round(
-            50 * (camera_index + 1) / len(ALL_CAMERA_IDS)
+            50 * (camera_index + 1) / len(FACE_REMOVAL_CAMERA_IDS)
         )
         camera_suffix = "" if update.camera_id is None else f" ({update.camera_id})"
         return f"Scanning external GLB faces{camera_suffix} ({progress}%)"

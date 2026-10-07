@@ -26,9 +26,12 @@ from housemaker.unused_face_removal import (
     CAMERA_OPTIONS,
     DEFAULT_MINIMUM_PROJECTED_SAMPLES,
     DEFAULT_MINIMUM_VISIBLE_FRACTION,
+    DIAGONAL_FACE_REMOVAL_CAMERA_IDS,
+    FACE_REMOVAL_CAMERA_IDS,
     UnusedFaceRemovalCancelled,
     UnusedFaceRemovalOptions,
     capture_visible_face_indices,
+    get_fixed_camera_view,
     remove_unused_faces,
     remove_unused_faces_from_glb,
 )
@@ -108,9 +111,60 @@ def _hidden_skinny_triangle() -> trimesh.Trimesh:
     )
 
 
+def _diagonal_blind_spot_glb() -> bytes:
+    """Build one target visible only through the +X/+Y/+Z corner."""
+
+    half_size = 0.55
+    occluders: list[trimesh.Trimesh] = []
+    for axis in range(3):
+        for coordinate in (-3.0, 3.0):
+            if axis == 0:
+                vertices = (
+                    (coordinate, -half_size, -half_size),
+                    (coordinate, half_size, -half_size),
+                    (coordinate, half_size, half_size),
+                    (coordinate, -half_size, half_size),
+                )
+            elif axis == 1:
+                vertices = (
+                    (-half_size, coordinate, -half_size),
+                    (-half_size, coordinate, half_size),
+                    (half_size, coordinate, half_size),
+                    (half_size, coordinate, -half_size),
+                )
+            else:
+                vertices = (
+                    (-half_size, -half_size, coordinate),
+                    (half_size, -half_size, coordinate),
+                    (half_size, half_size, coordinate),
+                    (-half_size, half_size, coordinate),
+                )
+            occluders.append(
+                trimesh.Trimesh(
+                    vertices=np.asarray(vertices, dtype=float),
+                    faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64),
+                    process=False,
+                )
+            )
+    target = _triangle_mesh(
+        np.asarray(
+            (
+                (0.5, -0.5, 0.0),
+                (0.0, 0.5, -0.5),
+                (-0.5, 0.0, 0.5),
+            ),
+            dtype=float,
+        )
+    )
+    return _scene_glb(
+        ("occluders", trimesh.util.concatenate(occluders), None),
+        ("diagonal_target", target, None),
+    )
+
+
 # ### Camera metadata tests ###
 class UnusedFaceCameraTests(unittest.TestCase):
-    def test_camera_metadata_contains_the_six_canonical_views(self) -> None:
+    def test_projection_metadata_keeps_only_the_six_visible_views(self) -> None:
         self.assertEqual(
             ALL_CAMERA_IDS,
             (
@@ -123,14 +177,48 @@ class UnusedFaceCameraTests(unittest.TestCase):
             ),
         )
         self.assertEqual(tuple(option[0] for option in CAMERA_OPTIONS), ALL_CAMERA_IDS)
+        self.assertEqual(len(DIAGONAL_FACE_REMOVAL_CAMERA_IDS), 8)
+        self.assertEqual(
+            FACE_REMOVAL_CAMERA_IDS,
+            ALL_CAMERA_IDS + DIAGONAL_FACE_REMOVAL_CAMERA_IDS,
+        )
+        self.assertTrue(
+            set(ALL_CAMERA_IDS).isdisjoint(DIAGONAL_FACE_REMOVAL_CAMERA_IDS)
+        )
+
+    def test_diagonal_camera_bases_are_orthonormal(self) -> None:
+        for camera_id in DIAGONAL_FACE_REMOVAL_CAMERA_IDS:
+            with self.subTest(camera_id=camera_id):
+                view = get_fixed_camera_view(camera_id)
+                depth = np.asarray(view.depth_axis, dtype=float)
+                horizontal = np.asarray(view.horizontal_axis, dtype=float)
+                vertical = np.asarray(view.vertical_axis, dtype=float)
+
+                self.assertAlmostEqual(float(np.linalg.norm(depth)), 1.0)
+                self.assertAlmostEqual(float(np.linalg.norm(horizontal)), 1.0)
+                self.assertAlmostEqual(float(np.linalg.norm(vertical)), 1.0)
+                self.assertAlmostEqual(float(depth @ horizontal), 0.0)
+                self.assertAlmostEqual(float(depth @ vertical), 0.0)
+                self.assertAlmostEqual(float(horizontal @ vertical), 0.0)
+                np.testing.assert_allclose(
+                    np.cross(horizontal, vertical),
+                    depth,
+                    atol=1e-12,
+                )
 
     def test_camera_selection_is_validated_and_canonically_ordered(self) -> None:
+        diagonal_id = DIAGONAL_FACE_REMOVAL_CAMERA_IDS[-1]
         options = UnusedFaceRemovalOptions(
-            enabled_camera_ids=(CAMERA_ID_BOTTOM, CAMERA_ID_POS_X, CAMERA_ID_BOTTOM)
+            enabled_camera_ids=(
+                diagonal_id,
+                CAMERA_ID_BOTTOM,
+                CAMERA_ID_POS_X,
+                CAMERA_ID_BOTTOM,
+            )
         )
         self.assertEqual(
             options.enabled_camera_ids,
-            (CAMERA_ID_POS_X, CAMERA_ID_BOTTOM),
+            (CAMERA_ID_POS_X, CAMERA_ID_BOTTOM, diagonal_id),
         )
         with self.assertRaisesRegex(ValueError, "Select at least one"):
             UnusedFaceRemovalOptions(enabled_camera_ids=())
@@ -140,6 +228,10 @@ class UnusedFaceCameraTests(unittest.TestCase):
     def test_visibility_threshold_defaults_and_validation(self) -> None:
         options = UnusedFaceRemovalOptions()
 
+        self.assertEqual(
+            options.enabled_camera_ids,
+            FACE_REMOVAL_CAMERA_IDS,
+        )
         self.assertEqual(
             options.minimum_visible_fraction,
             DEFAULT_MINIMUM_VISIBLE_FRACTION,
@@ -173,7 +265,7 @@ class UnusedFaceCameraTests(unittest.TestCase):
 
 # ### Visibility processing tests ###
 class UnusedFaceProcessingTests(unittest.TestCase):
-    def test_six_views_remove_an_enclosed_mesh_and_keep_the_outer_shell(self) -> None:
+    def test_fourteen_views_remove_an_enclosed_mesh_and_keep_outer_shell(self) -> None:
         result = remove_unused_faces_from_glb(_nested_box_glb())
 
         self.assertEqual(result.original_face_count, 24)
@@ -183,7 +275,38 @@ class UnusedFaceProcessingTests(unittest.TestCase):
         self.assertEqual(result.visibility_removed_face_count, 12)
         self.assertEqual(result.stacked_face_removed_count, 0)
         self.assertEqual(len(result.model.mesh.faces), 12)
-        self.assertEqual(result.enabled_camera_ids, ALL_CAMERA_IDS)
+        self.assertEqual(
+            result.enabled_camera_ids,
+            FACE_REMOVAL_CAMERA_IDS,
+        )
+
+    def test_diagonal_views_keep_a_face_hidden_from_all_cardinal_views(
+        self,
+    ) -> None:
+        source_glb = _diagonal_blind_spot_glb()
+
+        cardinal_result = remove_unused_faces_from_glb(
+            source_glb,
+            options=UnusedFaceRemovalOptions(
+                enabled_camera_ids=ALL_CAMERA_IDS,
+                image_size=256,
+            ),
+        )
+        fourteen_view_result = remove_unused_faces_from_glb(
+            source_glb,
+            options=UnusedFaceRemovalOptions(image_size=256),
+        )
+
+        self.assertEqual(cardinal_result.retained_face_count, 12)
+        self.assertNotIn(
+            "diagonal_target",
+            cardinal_result.model.scene.geometry,
+        )
+        self.assertEqual(fourteen_view_result.retained_face_count, 13)
+        self.assertIn(
+            "diagonal_target",
+            fourteen_view_result.model.scene.geometry,
+        )
 
     def test_only_checked_cameras_protect_faces(self) -> None:
         source_glb = _scene_glb(
