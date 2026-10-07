@@ -12,6 +12,10 @@ from pathlib import Path
 
 import numpy as np
 
+from housemaker.directional_light_state import (
+    DirectionalLightData,
+    directional_lights_to_runtime_dicts,
+)
 from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_SIDES,
     DOOR_SIDE_DUPLICATION_UV_MODE,
@@ -27,7 +31,7 @@ from housemaker.tour_state import TourData, tours_to_runtime_dicts
 
 # ### Constants ###
 RUNTIME_SCENE_FORMAT = "housemaker-r3f-scene"
-RUNTIME_SCENE_VERSION = 8
+RUNTIME_SCENE_VERSION = 9
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 GLB_JSON_CHUNK_TYPE = b"JSON"
@@ -107,6 +111,7 @@ def write_runtime_scene_manifest(
     instance_placements: Sequence[PlacedGeneratedModel],
     tours: Sequence[TourData] = (),
     door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
+    directional_lights: Sequence[DirectionalLightData] = (),
 ) -> Path:
     """Write the R3F runtime companion JSON next to an exported GLB."""
 
@@ -139,6 +144,7 @@ def write_runtime_scene_manifest(
         instance_placements=normalized_instances,
         tours=tours,
         door_body_reconstructions=door_body_reconstructions,
+        directional_lights=directional_lights,
     )
     manifest_path = normalized_glb_path.with_suffix(".json")
     _write_json_atomically(manifest_path, manifest)
@@ -153,8 +159,9 @@ def build_runtime_scene_manifest(
     instance_placements: Sequence[PlacedGeneratedModel],
     tours: Sequence[TourData] = (),
     door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
+    directional_lights: Sequence[DirectionalLightData] = (),
 ) -> dict[str, object]:
-    """Build a versioned runtime manifest for instances and camera tours."""
+    """Build a versioned runtime manifest for scene runtime-only features."""
 
     if not isinstance(glb_bytes, bytes) or not glb_bytes:
         raise ValueError("A runtime scene manifest requires exported GLB bytes.")
@@ -208,6 +215,9 @@ def build_runtime_scene_manifest(
             for reconstruction in normalized_door_reconstructions
         ],
         "tours": tours_to_runtime_dicts(tours),
+        "directionalLights": directional_lights_to_runtime_dicts(
+            directional_lights
+        ),
     }
 
 

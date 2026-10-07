@@ -1488,6 +1488,7 @@ class TourMainIntegrationTests(unittest.TestCase):
             instance_placements=(),
             tours=(tour,),
             door_body_reconstructions=(),
+            directional_lights=(),
         )
 
 

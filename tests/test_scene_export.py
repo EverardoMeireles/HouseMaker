@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+from housemaker.directional_light_state import DirectionalLightData
 from housemaker.door_geometry import (
     DoorBodyMirrorConfiguration,
     assemble_door_model,
@@ -192,16 +193,26 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             rotation_degrees=(0.0, 0.0, 60.0),
             scale=1.25,
         )
+        directional_light = DirectionalLightData(
+            light_id="directional-light-1",
+            name="Directional light 1",
+            position=(1.0, 2.0, 3.0),
+            target=(4.0, 5.0, 6.0),
+            color="#fedcba",
+            intensity=1.5,
+            cast_shadow=True,
+        )
         payload = build_runtime_scene_manifest(
             glb_name="house.glb",
             glb_bytes=b"glb",
             source_placements={"chair": source},
             instance_placements=(instance,),
+            directional_lights=(directional_light,),
         )
 
         self.assertEqual(payload["format"], RUNTIME_SCENE_FORMAT)
         self.assertEqual(payload["version"], RUNTIME_SCENE_VERSION)
-        self.assertEqual(payload["version"], 8)
+        self.assertEqual(payload["version"], 9)
         self.assertEqual(payload["coordinateSystem"], "gltf-y-up")
         self.assertEqual(payload["matrixLayout"], "column-major")
         self.assertEqual(payload["asset"]["glb"], "house.glb")
@@ -216,6 +227,20 @@ class RuntimeSceneManifestTests(unittest.TestCase):
         )
         self.assertEqual(group["sourceNodeName"], "chair")
         self.assertEqual(payload["doorBodyReconstructions"], [])
+        self.assertEqual(
+            payload["directionalLights"],
+            [
+                {
+                    "id": "directional-light-1",
+                    "name": "Directional light 1",
+                    "position": [1.0, 3.0, -2.0],
+                    "target": [4.0, 6.0, -5.0],
+                    "color": "#fedcba",
+                    "intensity": 1.5,
+                    "castShadow": True,
+                }
+            ],
+        )
         self.assertEqual(
             [serialized["id"] for serialized in group["instances"]],
             ["chair", "instance-chair-1"],
@@ -703,7 +728,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             ],
             ["chair_prototype", "table_prototype"],
         )
-        self.assertEqual(manifest["version"], 8)
+        self.assertEqual(manifest["version"], 9)
         self.assertEqual(
             manifest["asset"]["sha256"],
             hashlib.sha256(final_glb).hexdigest(),

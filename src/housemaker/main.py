@@ -100,6 +100,7 @@ from housemaker.blueprint_canvas import (
     CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
     CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
     BlueprintCanvas,
+    CanvasDirectionalLightProfile,
     CanvasPlacedObjectProfile,
     CanvasSnapshot,
     PlanImageEraseCommit,
@@ -130,6 +131,10 @@ from housemaker.canvas_surface_edits import (
     restore_canvas_wall_edit_batch,
     validate_canvas_surface_edit_geometry,
     validate_canvas_wall_edit_batch_geometry,
+)
+from housemaker.directional_light_state import (
+    DirectionalLightData,
+    create_directional_light,
 )
 from housemaker.door_geometry import (
     DoorBodyMirrorConfiguration,
@@ -1340,6 +1345,8 @@ class BlueprintWorkspace(QWidget):
         self.image_library_paths: list[str] = []
         self.doorway_presets: list[DoorwayPreset] = create_default_doorway_presets()
         self.stairs: list[StairData] = []
+        self.directional_lights: tuple[DirectionalLightData, ...] = ()
+        self._selected_directional_light_id: str | None = None
         self._is_syncing_stair_controls = False
         self._new_stair_parameters = _StairEditorParameters()
         self._editing_stair_index: int | None = None
@@ -2255,6 +2262,24 @@ class BlueprintWorkspace(QWidget):
         self.viewer.door_placement_requested.connect(
             self._handle_door_placement_requested
         )
+        self.viewer.directional_light_placed.connect(
+            self._handle_viewer_directional_light_placement_requested
+        )
+        self.viewer.directional_light_placement_cancelled.connect(
+            self._handle_directional_light_placement_cancelled
+        )
+        self.viewer.directional_light_selection_changed.connect(
+            self._handle_directional_light_selection_changed
+        )
+        self.viewer.directional_light_transform_preview_changed.connect(
+            self._handle_directional_light_transform_preview_changed
+        )
+        self.viewer.directional_light_transform_changed.connect(
+            self._handle_directional_light_transform_changed
+        )
+        self.viewer.directional_light_intensity_step_requested.connect(
+            self._handle_directional_light_intensity_step_requested
+        )
         self.generation.operation_finished.connect(
             self._handle_object_placement_operation_finished
         )
@@ -2335,6 +2360,15 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.placed_object_transform_committed.connect(
             self._handle_blueprint_placed_object_transform_committed
+        )
+        self.canvas.directional_light_placement_requested.connect(
+            self._handle_canvas_directional_light_placement_requested
+        )
+        self.canvas.directional_light_placement_cancelled.connect(
+            self._handle_directional_light_placement_cancelled
+        )
+        self.canvas.directional_light_selection_requested.connect(
+            self._handle_directional_light_selection_changed
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
@@ -3476,6 +3510,18 @@ class BlueprintWorkspace(QWidget):
         )
         doors_layout.addWidget(self.place_selected_door_button)
         side_layout.addWidget(self.doors_group)
+
+        self.add_directional_light_button = QPushButton("Add directional light")
+        self.add_directional_light_button.setObjectName(
+            "add_directional_light_button"
+        )
+        self.add_directional_light_button.setCheckable(True)
+        self.add_directional_light_button.setMinimumHeight(40)
+        self.add_directional_light_button.toggled.connect(
+            self._handle_add_directional_light_clicked
+        )
+        self._refresh_directional_light_button_tooltip()
+        side_layout.addWidget(self.add_directional_light_button)
 
         self.wall_mirrors_group = QGroupBox("Wall mirrors")
         wall_mirrors_layout = QHBoxLayout(self.wall_mirrors_group)
@@ -10115,6 +10161,7 @@ class BlueprintWorkspace(QWidget):
                 instance_placements=instance_placements,
                 tours=self.tour_workspace.tours(),
                 door_body_reconstructions=door_body_reconstructions,
+                directional_lights=self.directional_lights,
             )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
@@ -15796,6 +15843,7 @@ class BlueprintWorkspace(QWidget):
                 wall_mirror_links=self.wall_mirror_links,
                 tours=self.tour_workspace.tours(),
                 doors=self.doors_workspace.data(),
+                directional_lights=self.directional_lights,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -17808,6 +17856,7 @@ class BlueprintWorkspace(QWidget):
         if level is self.current_level:
             self.canvas.update()
             self._sync_canvas_placed_object_profiles()
+            self._sync_canvas_directional_light_profiles()
         self._sync_canvas_wall_mirror_state()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         self._level_transform_outline_commit_revision = self._viewer_preview_revision
@@ -19161,6 +19210,305 @@ class BlueprintWorkspace(QWidget):
         self._sync_viewer_scene_levels()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    # ### Directional lights ###
+    def _handle_add_directional_light_clicked(self, checked: bool) -> None:
+        """Arm or cancel point placement in both scene authoring views."""
+
+        if not checked:
+            self._cancel_directional_light_placement(notify=False)
+            return
+
+        self.canvas.start_directional_light_placement()
+        base_z = build_level_base_z_lookup(self.levels).get(
+            self.current_level.index,
+            0.0,
+        )
+        viewer_started = self.viewer.begin_directional_light_placement(
+            fallback_plane_z=float(base_z),
+        )
+        if not viewer_started and not self.canvas.is_directional_light_placement_active():
+            self._set_add_directional_light_button_checked(False)
+            QMessageBox.information(
+                self,
+                "Add directional light",
+                "Load a plan image or build scene geometry before placing a light.",
+            )
+            return
+        self._refresh_directional_light_button_tooltip()
+
+    def _handle_canvas_directional_light_placement_requested(
+        self,
+        image_x: float,
+        image_y: float,
+    ) -> None:
+        """Convert one plan-image click into a current-level world point."""
+
+        world_x, world_y = level_image_to_world_xy(
+            self.current_level,
+            float(image_x),
+            float(image_y),
+        )
+        base_z = build_level_base_z_lookup(self.levels).get(
+            self.current_level.index,
+            0.0,
+        )
+        self._complete_directional_light_placement(
+            (
+                float(world_x),
+                float(world_y),
+                float(base_z) + float(self.current_level.height_meters),
+            ),
+            level_index=self.current_level.index,
+        )
+
+    def _handle_viewer_directional_light_placement_requested(
+        self,
+        raw_position: object,
+    ) -> None:
+        """Commit one point dropped directly on the 3D scene."""
+
+        try:
+            position = tuple(float(value) for value in raw_position)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return
+        if len(position) != 3 or not all(math.isfinite(value) for value in position):
+            return
+        self._complete_directional_light_placement(
+            position,
+            level_index=self.current_level.index,
+        )
+
+    def _complete_directional_light_placement(
+        self,
+        position: Sequence[float],
+        *,
+        level_index: int,
+    ) -> DirectionalLightData:
+        """Create, select, and publish one straight-down directional light."""
+
+        light = create_directional_light(
+            self.directional_lights,
+            position=position,
+            level_index=level_index,
+        )
+        self.directional_lights = (*self.directional_lights, light)
+        self._selected_directional_light_id = light.light_id
+        self._cancel_directional_light_placement(notify=False)
+        self._sync_directional_light_views()
+        return light
+
+    def _handle_directional_light_placement_cancelled(self) -> None:
+        """Leave placement mode when either authoring view cancels it."""
+
+        self._cancel_directional_light_placement(notify=False)
+
+    def _cancel_directional_light_placement(self, *, notify: bool) -> None:
+        """Disarm both placement surfaces without recursive cancellation."""
+
+        if notify:
+            self.canvas.cancel_directional_light_placement()
+        else:
+            was_blocked = self.canvas.blockSignals(True)
+            self.canvas.cancel_directional_light_placement()
+            self.canvas.blockSignals(was_blocked)
+        self.viewer.cancel_directional_light_placement(notify=notify)
+        self._set_add_directional_light_button_checked(False)
+        self._refresh_directional_light_button_tooltip()
+
+    def _set_add_directional_light_button_checked(self, checked: bool) -> None:
+        """Synchronize the checkable placement button without re-entering it."""
+
+        was_blocked = self.add_directional_light_button.blockSignals(True)
+        self.add_directional_light_button.setChecked(bool(checked))
+        self.add_directional_light_button.blockSignals(was_blocked)
+
+    def _handle_directional_light_selection_changed(
+        self,
+        light_id: object | None,
+    ) -> None:
+        """Share a light selection between the 2D and 3D authoring views."""
+
+        normalized_id = None if light_id is None else str(light_id).strip() or None
+        if normalized_id is not None and all(
+            light.light_id != normalized_id for light in self.directional_lights
+        ):
+            normalized_id = None
+        self._selected_directional_light_id = normalized_id
+        self.canvas.set_selected_directional_light_id(normalized_id)
+        self.viewer.set_selected_directional_light_id(normalized_id)
+        self._refresh_directional_light_button_tooltip()
+
+    def _handle_directional_light_transform_preview_changed(
+        self,
+        light_id: str,
+        raw_position: object,
+        raw_target: object,
+    ) -> None:
+        """Mirror a live 3D gizmo position onto the 2D Canvas marker."""
+
+        if self._replace_directional_light_transform(
+            light_id,
+            raw_position,
+            raw_target,
+        ):
+            self._sync_canvas_directional_light_profiles()
+
+    def _handle_directional_light_transform_changed(
+        self,
+        light_id: str,
+        raw_position: object,
+        raw_target: object,
+    ) -> None:
+        """Commit a completed or cancelled gizmo edit to every view."""
+
+        if not self._replace_directional_light_transform(
+            light_id,
+            raw_position,
+            raw_target,
+        ) and all(
+            light.light_id != str(light_id).strip()
+            for light in self.directional_lights
+        ):
+            return
+        # The preview handler may already hold these exact endpoints. Always
+        # republish after release because the viewer has just cleared its
+        # transient drag override.
+        self._sync_directional_light_views()
+
+    def _replace_directional_light_transform(
+        self,
+        light_id: object,
+        raw_position: object,
+        raw_target: object,
+    ) -> bool:
+        """Replace one immutable light while preserving its ray direction."""
+
+        normalized_id = str(light_id).strip()
+        try:
+            position = tuple(float(value) for value in raw_position)  # type: ignore[arg-type]
+            target = tuple(float(value) for value in raw_target)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            len(position) != 3
+            or len(target) != 3
+            or not all(math.isfinite(value) for value in (*position, *target))
+        ):
+            return False
+        changed = False
+        replacement: list[DirectionalLightData] = []
+        for light in self.directional_lights:
+            if light.light_id != normalized_id:
+                replacement.append(light)
+                continue
+            try:
+                next_light = replace(light, position=position, target=target)
+            except (TypeError, ValueError):
+                return False
+            replacement.append(next_light)
+            changed = changed or next_light != light
+        if changed:
+            self.directional_lights = tuple(replacement)
+        return changed
+
+    def _handle_directional_light_intensity_step_requested(
+        self,
+        light_id: str,
+        steps: int,
+    ) -> None:
+        """Apply raw Three/R3F intensity units in 0.1 wheel increments."""
+
+        normalized_id = str(light_id).strip()
+        normalized_steps = int(steps)
+        if not normalized_id or normalized_steps == 0:
+            return
+        changed = False
+        replacement: list[DirectionalLightData] = []
+        for light in self.directional_lights:
+            next_light = (
+                light.adjust_intensity(normalized_steps)
+                if light.light_id == normalized_id
+                else light
+            )
+            replacement.append(next_light)
+            changed = changed or next_light != light
+        if not changed:
+            return
+        self.directional_lights = tuple(replacement)
+        self._sync_directional_light_views()
+
+    def _sync_directional_light_views(self) -> None:
+        """Publish canonical light state and selection to both scene editors."""
+
+        self.viewer.set_directional_lights(self.directional_lights)
+        self.viewer.set_selected_directional_light_id(
+            self._selected_directional_light_id
+        )
+        self._sync_canvas_directional_light_profiles()
+        self._refresh_directional_light_button_tooltip()
+
+    def _sync_canvas_directional_light_profiles(self) -> None:
+        """Project current-level light points into plan-image coordinates."""
+
+        if not self.levels or not 0 <= self.current_level_index < len(self.levels):
+            self.canvas.set_directional_light_profiles(())
+            return
+        level = self.current_level
+        profiles: list[CanvasDirectionalLightProfile] = []
+        for light in self.directional_lights:
+            if light.level_index not in {None, level.index}:
+                continue
+            try:
+                image_x, image_y = level_world_to_image_xy(
+                    level,
+                    light.position[0],
+                    light.position[1],
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            profiles.append(
+                CanvasDirectionalLightProfile(
+                    light_id=light.light_id,
+                    image_x=image_x,
+                    image_y=image_y,
+                )
+            )
+        self.canvas.set_directional_light_profiles(profiles)
+        self.canvas.set_selected_directional_light_id(
+            self._selected_directional_light_id
+        )
+
+    def _refresh_directional_light_button_tooltip(self) -> None:
+        """Describe point placement, wheel editing, and the selected intensity."""
+
+        selected = next(
+            (
+                light
+                for light in self.directional_lights
+                if light.light_id == self._selected_directional_light_id
+            ),
+            None,
+        )
+        selection_text = (
+            ""
+            if selected is None
+            else f" Selected intensity: {selected.intensity:.1f}."
+        )
+        placement_text = (
+            " Click a point on the 2D Canvas or 3D scene; right-click or Escape "
+            "cancels."
+            if self.add_directional_light_button.isChecked()
+            else ""
+        )
+        self.add_directional_light_button.setToolTip(
+            "Drop a white directional-light point. It initially shines straight "
+            "down; select it to move it with RGB arrows, aim it with RGB rings, "
+            "and use the wheel to change intensity by 0.1 in native Three/R3F "
+            "units. The selected light projects a hit grid onto scene geometry."
+            f"{placement_text} Current lights: {len(self.directional_lights)}."
+            f"{selection_text}"
+        )
+
     # ### Wall level mirror controls ###
     def _handle_wall_mirror_up_clicked(self) -> None:
         """Mirror the selected wall-vertex group onto the next upper level."""
@@ -20115,6 +20463,7 @@ class BlueprintWorkspace(QWidget):
             wall_mirror_links=project_data.wall_mirror_links,
             tours=project_data.tours,
             doors=project_data.doors,
+            directional_lights=project_data.directional_lights,
         )
 
     def _apply_project_state(
@@ -20130,6 +20479,7 @@ class BlueprintWorkspace(QWidget):
         wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
         tours: Sequence[TourData] | None = None,
         doors: DoorLibraryData | None = None,
+        directional_lights: Sequence[DirectionalLightData] | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -20153,6 +20503,7 @@ class BlueprintWorkspace(QWidget):
         self._pending_generation_placement_anchor = None
         self._cancel_direct_object_placement()
         self.viewer.cancel_door_placement()
+        self._cancel_directional_light_placement(notify=False)
         self._tour_point_request_revision += 1
         self.viewer.clear_tour(restore_camera=True)
         if self.tour_preview_viewer is not None:
@@ -20204,6 +20555,11 @@ class BlueprintWorkspace(QWidget):
             wall_mirror_links or (),
         )
         self.wall_mirror_links = wall_mirror_result.links
+        self.directional_lights = tuple(directional_lights or ())
+        self._selected_directional_light_id = None
+        self.viewer.set_directional_lights(self.directional_lights)
+        self.viewer.set_selected_directional_light_id(None)
+        self._refresh_directional_light_button_tooltip()
         self.tour_workspace.set_tours(tuple(tours or ()))
         self._sync_tour_overlays()
         self._reset_viewer_doorway_snapshots()
@@ -20366,6 +20722,7 @@ class BlueprintWorkspace(QWidget):
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_placed_object_profiles()
+        self._sync_canvas_directional_light_profiles()
         self._sync_canvas_wall_mirror_state()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
@@ -20404,6 +20761,7 @@ class BlueprintWorkspace(QWidget):
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_placed_object_profiles()
+        self._sync_canvas_directional_light_profiles()
         self._sync_canvas_wall_mirror_state()
         self._update_wall_mirror_button_state()
         self._sync_selected_canvas_wall_highlight(

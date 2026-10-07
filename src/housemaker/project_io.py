@@ -10,6 +10,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from housemaker.directional_light_state import (
+    DirectionalLightData,
+    directional_lights_from_payload,
+    directional_lights_to_dicts,
+)
 from housemaker.door_state import DoorLibraryData
 from housemaker.generation_state import GenerationData
 from housemaker.models import (
@@ -106,12 +111,15 @@ class ProjectData:
     wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
     tours: tuple[TourData, ...] = ()
     doors: DoorLibraryData = field(default_factory=DoorLibraryData)
+    directional_lights: tuple[DirectionalLightData, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.doorway_presets:
             self.doorway_presets = [create_fallback_doorway_preset()]
         self.tours = tuple(self.tours)
         tours_to_dicts(self.tours)
+        self.directional_lights = tuple(self.directional_lights)
+        directional_lights_to_dicts(self.directional_lights)
 
 
 # ### Public helpers ###
@@ -128,6 +136,7 @@ def save_project(
     wall_mirror_links: Iterable[WallMirrorVertexLink] | None = None,
     tours: Iterable[TourData] | None = None,
     doors: DoorLibraryData | None = None,
+    directional_lights: Iterable[DirectionalLightData] | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -164,6 +173,9 @@ def save_project(
             doors.to_dict()
             if doors is not None
             else DoorLibraryData().to_dict()
+        ),
+        "directional_lights": directional_lights_to_dicts(
+            directional_lights or ()
         ),
         "levels": [
             {
@@ -336,6 +348,9 @@ def load_project(path: str | Path) -> ProjectData:
     )
     tours = tours_from_payload(payload.get("tours"))
     doors = _deserialize_doors(payload.get("doors"))
+    directional_lights = directional_lights_from_payload(
+        payload.get("directional_lights")
+    )
     loaded_wall_mirror_links = wall_mirror_links_from_payload(
         payload.get("wall_mirror_links"),
         levels=levels,
@@ -368,6 +383,7 @@ def load_project(path: str | Path) -> ProjectData:
         wall_mirror_links=materialized_wall_mirrors.links,
         tours=tours,
         doors=doors,
+        directional_lights=directional_lights,
     )
 
 

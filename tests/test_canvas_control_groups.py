@@ -136,7 +136,9 @@ class CanvasControlGroupingTests(unittest.TestCase):
             labels={"Arch amount"},
         )
 
-    def test_wall_mirrors_group_follows_doorways_with_three_actions(self) -> None:
+    def test_wall_mirrors_group_follows_directional_light_with_three_actions(
+        self,
+    ) -> None:
         self._assert_group_contains(
             "Wall mirrors",
             self.workspace.wall_mirror_up_button,
@@ -166,7 +168,7 @@ class CanvasControlGroupingTests(unittest.TestCase):
         assert side_layout is not None
         self.assertEqual(
             side_layout.indexOf(self.workspace.wall_mirrors_group),
-            side_layout.indexOf(self.workspace.doorways_group) + 1,
+            side_layout.indexOf(self.workspace.add_directional_light_button) + 1,
         )
 
     def test_stairs_group_contains_editor_status_and_add_controls(self) -> None:

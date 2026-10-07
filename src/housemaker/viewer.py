@@ -84,6 +84,10 @@ from housemaker.canvas_surface_edits import (
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
 )
+from housemaker.directional_light_projection import (
+    build_directional_light_projection_grid,
+)
+from housemaker.directional_light_state import DirectionalLightData
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.first_person_navigation import (
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
@@ -317,6 +321,26 @@ TOUR_EDIT_TARGET_ACTION = "action"
 TOUR_EDIT_TARGET_ACTION_ROTATION = "action_rotation"
 TOUR_DRAFT_OVERLAY_ID = "__draft__"
 TOUR_LEGACY_OVERLAY_ID = "__legacy__"
+DIRECTIONAL_LIGHT_MARKER_COLOR = (1.0, 0.82, 0.18, 1.0)
+DIRECTIONAL_LIGHT_SELECTED_COLOR = (1.0, 0.96, 0.56, 1.0)
+DIRECTIONAL_LIGHT_MARKER_SIZE_PIXELS = 18.0
+DIRECTIONAL_LIGHT_MARKER_INTENSITY_GAIN_PIXELS = 3.0
+DIRECTIONAL_LIGHT_MARKER_MIN_SIZE_PIXELS = 14.0
+DIRECTIONAL_LIGHT_MARKER_MAX_SIZE_PIXELS = 28.0
+DIRECTIONAL_LIGHT_MARKER_SELECTED_BONUS_PIXELS = 4.0
+DIRECTIONAL_LIGHT_ARROW_WIDTH_PIXELS = 4.0
+DIRECTIONAL_LIGHT_ARROW_LENGTH_SCALE = 1.25
+DIRECTIONAL_LIGHT_SELECTION_TOLERANCE_PIXELS = 18.0
+DIRECTIONAL_LIGHT_GIZMO_SCREEN_SIZE_PIXELS = 92.0
+DIRECTIONAL_LIGHT_GIZMO_MIN_SIZE_METERS = 0.35
+DIRECTIONAL_LIGHT_GIZMO_AXIS_HIT_RATIO = 0.09
+DIRECTIONAL_LIGHT_GIZMO_RING_RADIUS_RATIO = 0.72
+DIRECTIONAL_LIGHT_GIZMO_RING_HIT_RATIO = 0.085
+DIRECTIONAL_LIGHT_PLACEMENT_HOVER_COLOR = (1.0, 0.82, 0.18, 0.82)
+DIRECTIONAL_LIGHT_PLACEMENT_HOVER_SIZE_PIXELS = 20.0
+DIRECTIONAL_LIGHT_PROJECTION_GRID_COLOR = (1.0, 0.82, 0.18, 0.72)
+DIRECTIONAL_LIGHT_PROJECTION_GRID_WIDTH_PIXELS = 2.0
+DIRECTIONAL_LIGHT_PROJECTION_DIRECTION_DECIMALS = 6
 CANVAS_OPENING_GIZMO_SIDE = "side"
 CANVAS_OPENING_GIZMO_ANCHOR = "anchor"
 CANVAS_OPENING_GIZMO_ARCH = "arch"
@@ -1000,6 +1024,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     face_fill_requested = Signal()
     overlay_selection_requested = Signal(object)
     overlay_wheel_steps_requested = Signal(int)
+    directional_light_wheel_steps_requested = Signal(int)
     object_scale_wheel_steps_requested = Signal(int)
     delete_requested = Signal()
     undo_requested = Signal()
@@ -1023,6 +1048,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._overlay_selection_enabled = False
         self._overlay_wheel_steps_enabled = False
         self._overlay_wheel_delta_remainder = 0
+        self._directional_light_wheel_steps_enabled = False
+        self._directional_light_wheel_delta_remainder = 0
         self._object_scale_wheel_steps_enabled = False
         self._object_scale_wheel_delta_remainder = 0
         self._face_selection_gestures_enabled = False
@@ -1260,6 +1287,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
         self._object_scale_wheel_steps_enabled = normalized_enabled
         self._object_scale_wheel_delta_remainder = 0
+
+    def set_directional_light_wheel_steps_enabled(self, enabled: bool) -> None:
+        """Route wheel ticks to the selected directional light's intensity."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._directional_light_wheel_steps_enabled:
+            return
+        self._directional_light_wheel_steps_enabled = normalized_enabled
+        self._directional_light_wheel_delta_remainder = 0
 
     @property
     def is_face_selection_gesture_active(self) -> bool:
@@ -1951,6 +1987,23 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         """Zoom with the wheel, including when a modifier key is held."""
+
+        if self._directional_light_wheel_steps_enabled:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                delta = event.angleDelta().x()
+            self._directional_light_wheel_delta_remainder += int(delta)
+            wheel_steps = math.trunc(
+                self._directional_light_wheel_delta_remainder
+                / MOUSE_WHEEL_DELTA_PER_STEP
+            )
+            if wheel_steps:
+                self._directional_light_wheel_delta_remainder -= (
+                    wheel_steps * MOUSE_WHEEL_DELTA_PER_STEP
+                )
+                self.directional_light_wheel_steps_requested.emit(wheel_steps)
+            event.accept()
+            return
 
         if self._overlay_wheel_steps_enabled:
             delta = event.angleDelta().y()
@@ -3408,6 +3461,39 @@ class _TourEditDrag:
     camera_snapshot: _TourDragCameraSnapshot | None
 
 
+# ### Directional-light interaction models ###
+@dataclass
+class _DirectionalLightDrag:
+    """Stable axis constraint and translated light endpoints for one drag."""
+
+    light_id: str
+    axis_index: int
+    axis: np.ndarray
+    drag_plane_normal: np.ndarray
+    start_axis_parameter: float
+    start_position: np.ndarray
+    start_target: np.ndarray
+    preview_position: tuple[float, float, float]
+    preview_target: tuple[float, float, float]
+
+
+@dataclass
+class _DirectionalLightRotationDrag:
+    """Stable world-axis rotation and live target for one light drag."""
+
+    light_id: str
+    axis_index: int
+    axis: np.ndarray
+    pivot: np.ndarray
+    start_position: np.ndarray
+    start_target: np.ndarray
+    previous_rotation_vector: np.ndarray
+    preview_position: tuple[float, float, float]
+    preview_target: tuple[float, float, float]
+    accumulated_rotation_degrees: float = 0.0
+
+
+# ### Tour overlay models (continued) ###
 @dataclass
 class _TourRotationDrag:
     """One world-axis text rotation drag and its accumulated preview."""
@@ -3534,12 +3620,76 @@ def sample_open_catmull_rom_curve(
     )
 
 
+# ### Directional-light visual helpers ###
+def _get_directional_light_marker_size_pixels(
+    intensity: object,
+    *,
+    selected: bool,
+) -> float:
+    """Return a gently intensity-scaled marker size in logical pixels."""
+
+    if isinstance(intensity, bool):
+        raise TypeError("Directional-light intensity must be numeric.")
+    try:
+        normalized_intensity = float(intensity)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise TypeError("Directional-light intensity must be numeric.") from error
+    if not math.isfinite(normalized_intensity) or normalized_intensity < 0.0:
+        raise ValueError(
+            "Directional-light intensity must be finite and non-negative."
+        )
+    base_size = (
+        DIRECTIONAL_LIGHT_MARKER_SIZE_PIXELS
+        + DIRECTIONAL_LIGHT_MARKER_INTENSITY_GAIN_PIXELS
+        * (math.sqrt(normalized_intensity) - 1.0)
+    )
+    clamped_size = float(
+        np.clip(
+            base_size,
+            DIRECTIONAL_LIGHT_MARKER_MIN_SIZE_PIXELS,
+            DIRECTIONAL_LIGHT_MARKER_MAX_SIZE_PIXELS,
+        )
+    )
+    return clamped_size + (
+        DIRECTIONAL_LIGHT_MARKER_SELECTED_BONUS_PIXELS if selected else 0.0
+    )
+
+
+def _mesh_has_projectable_triangles(mesh: object) -> bool:
+    """Return whether a mesh is safe to include in the light-hit lattice."""
+
+    if not isinstance(mesh, trimesh.Trimesh):
+        return False
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    return bool(
+        vertices.ndim == 2
+        and vertices.shape[1:] == (3,)
+        and len(vertices)
+        and np.all(np.isfinite(vertices))
+        and faces.ndim == 2
+        and faces.shape[1:] == (3,)
+        and len(faces)
+        and np.all(faces >= 0)
+        and np.all(faces < len(vertices))
+    )
+
+
 # ### Tour direction-arrow helpers ###
 def _build_tour_direction_arrow_positions(
     camera_position: object,
     camera_target: object,
+    *,
+    length_scale: float = 1.0,
 ) -> np.ndarray | None:
     """Build a shaft and four-sided arrowhead pointing at the camera target."""
+
+    normalized_length_scale = float(length_scale)
+    if (
+        not math.isfinite(normalized_length_scale)
+        or normalized_length_scale <= 0.0
+    ):
+        raise ValueError("Direction-arrow length scale must be finite and positive.")
 
     origin = _normalize_tour_point(camera_position)
     target = _normalize_tour_point(camera_target)
@@ -3548,7 +3698,7 @@ def _build_tour_direction_arrow_positions(
     if direction is None:
         return None
     target_distance = float(np.linalg.norm(target_delta))
-    arrow_length = float(
+    arrow_length = normalized_length_scale * float(
         np.clip(
             target_distance * TOUR_TIMELINE_DIRECTION_ARROW_TARGET_DISTANCE_RATIO,
             TOUR_TIMELINE_DIRECTION_ARROW_MIN_LENGTH_METERS,
@@ -3723,6 +3873,12 @@ class GlbViewerWidget(QWidget):
     tour_point_placed = Signal(str, object)
     tour_point_placement_cancelled = Signal(str)
     tour_curve_finished = Signal(object)
+    directional_light_placed = Signal(object)
+    directional_light_placement_cancelled = Signal()
+    directional_light_selection_changed = Signal(object)
+    directional_light_transform_preview_changed = Signal(str, object, object)
+    directional_light_transform_changed = Signal(str, object, object)
+    directional_light_intensity_step_requested = Signal(str, int)
     tour_selection_changed = Signal(object)
     tour_edit_target_selected = Signal(str, str, object)
     tour_edit_preview_changed = Signal(str, str, object, object)
@@ -3942,6 +4098,35 @@ class GlbViewerWidget(QWidget):
         self._tour_preview_overlay_items: list[GLGraphicsItem] = []
         self._tour_rendered_text_step_index: int | None = None
         self._tour_point_hover_items: list[GLGraphicsItem] = []
+        self._directional_lights: tuple[DirectionalLightData, ...] = ()
+        self._directional_light_overlay_items: list[GLGraphicsItem] = []
+        self._selected_directional_light_id: str | None = None
+        self._directional_light_gizmo_items: list[GLGraphicsItem] = []
+        self._directional_light_projection_grid_item: (
+            _DepthTestedOverlayLineItem | None
+        ) = None
+        self._directional_light_projection_collision_mesh: (
+            trimesh.Trimesh | None
+        ) = None
+        self._directional_light_projection_cached_collision_key: (
+            tuple[object, ...] | None
+        ) = None
+        self._directional_light_projection_render_key: tuple[object, ...] | None = None
+        self._directional_light_gizmo_size = (
+            DIRECTIONAL_LIGHT_GIZMO_MIN_SIZE_METERS
+        )
+        self._directional_light_drag: (
+            _DirectionalLightDrag | _DirectionalLightRotationDrag | None
+        ) = None
+        self._directional_light_placement_active = False
+        self._directional_light_placement_fallback_plane_z: float | None = None
+        self._directional_light_placement_hover_position: (
+            tuple[float, float, float] | None
+        ) = None
+        self._directional_light_placement_pointer_pressed = False
+        self._directional_light_placement_hover_item: (
+            gl.GLScatterPlotItem | None
+        ) = None
         self._tour_curve_overlay_items: dict[str, gl.GLLinePlotItem] = {}
         self._tour_trigger_overlay_items: dict[str, gl.GLMeshItem] = {}
         self._tour_step_overlay_items: dict[str, gl.GLScatterPlotItem] = {}
@@ -4160,6 +4345,145 @@ class GlbViewerWidget(QWidget):
         )
         self._populate_scene()
 
+    # ### Directional-light overlay API ###
+    def set_directional_lights(
+        self,
+        lights: Sequence[DirectionalLightData],
+    ) -> None:
+        """Render immutable authoring markers for the scene's runtime lights."""
+
+        normalized = tuple(lights)
+        if not all(isinstance(light, DirectionalLightData) for light in normalized):
+            raise TypeError(
+                "Directional-light overlays require DirectionalLightData values."
+            )
+        if normalized == self._directional_lights:
+            return
+        retained_ids = {light.light_id for light in normalized}
+        selection_removed = bool(
+            self._selected_directional_light_id is not None
+            and self._selected_directional_light_id not in retained_ids
+        )
+        if selection_removed:
+            self._cancel_directional_light_drag()
+            self._selected_directional_light_id = None
+            self._invalidate_directional_light_projection_collision_cache()
+        self._directional_lights = normalized
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+        self._sync_directional_light_wheel_input_state()
+        self._sync_primary_pointer_input_state()
+        if selection_removed:
+            self.directional_light_selection_changed.emit(None)
+
+    @property
+    def is_directional_light_placement_active(self) -> bool:
+        """Whether the next scene click will place a directional-light point."""
+
+        return self._directional_light_placement_active
+
+    def begin_directional_light_placement(
+        self,
+        *,
+        fallback_plane_z: float | None = None,
+    ) -> bool:
+        """Arm one scene-hit point placement for a directional light."""
+
+        normalized_fallback = (
+            None if fallback_plane_z is None else float(fallback_plane_z)
+        )
+        if normalized_fallback is not None and not math.isfinite(normalized_fallback):
+            raise ValueError("A directional-light fallback height must be finite.")
+        if self.model is None and normalized_fallback is None:
+            return False
+
+        self.cancel_directional_light_placement(notify=False)
+        self.cancel_tour_point_placement(notify=True)
+        self.cancel_object_placement(notify=True)
+        self.cancel_door_placement()
+        self.cancel_architectural_trim_placement()
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+        if self.is_surface_vertex_placement_active():
+            self.cancel_surface_vertex_placement()
+        self._cancel_directional_light_drag()
+        self._cancel_canvas_gizmo_drag()
+        self.set_selected_directional_light_id(None)
+        self._directional_light_placement_active = True
+        self._directional_light_placement_fallback_plane_z = normalized_fallback
+        self._directional_light_placement_hover_position = None
+        self._directional_light_placement_pointer_pressed = False
+        self.view.set_primary_pointer_tool_active(True)
+        self._sync_primary_pointer_input_state()
+        self._sync_directional_light_wheel_input_state()
+        self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.view.setToolTip(
+            "Click a visible surface to place the directional light. "
+            "Right-click or press Escape to cancel."
+        )
+        self._refresh_directional_light_placement_hover_item()
+        return True
+
+    def cancel_directional_light_placement(
+        self,
+        *,
+        notify: bool = True,
+    ) -> bool:
+        """Disarm light placement and remove its transient hover marker."""
+
+        if not self._directional_light_placement_active:
+            return False
+        self._directional_light_placement_active = False
+        self._directional_light_placement_fallback_plane_z = None
+        self._directional_light_placement_hover_position = None
+        self._directional_light_placement_pointer_pressed = False
+        if self.view.is_primary_pointer_drag_reserved:
+            self.view.cancel_primary_pointer_drag()
+        self.view.set_primary_pointer_tool_active(False)
+        self._sync_primary_pointer_input_state()
+        self._sync_directional_light_wheel_input_state()
+        self.view.unsetCursor()
+        self.view.setToolTip("")
+        self._remove_directional_light_placement_hover_item()
+        if notify:
+            self.directional_light_placement_cancelled.emit()
+        return True
+
+    def set_selected_directional_light_id(self, light_id: str | None) -> bool:
+        """Select one light marker and expose its translation gizmo."""
+
+        normalized_id = None if light_id is None else str(light_id).strip()
+        available_ids = {light.light_id for light in self._directional_lights}
+        if normalized_id is not None and normalized_id not in available_ids:
+            return False
+        if normalized_id == self._selected_directional_light_id:
+            return False
+
+        self._cancel_directional_light_drag()
+        self._selected_directional_light_id = normalized_id
+        self._invalidate_directional_light_projection_collision_cache()
+        if normalized_id is not None:
+            self._set_selected_canvas_opening_key(None)
+            self.set_selected_placed_object_ids(())
+            self.set_selected_canvas_surface_ids(())
+            self.set_selected_canvas_stair_part_ids(())
+            self.set_selected_architectural_trim_part_ids(())
+            self.select_wall_target(None)
+            self.set_selected_projection_camera_id(None)
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+        self._sync_directional_light_wheel_input_state()
+        self._sync_primary_pointer_input_state()
+        if normalized_id is None and self._placed_object_editing_enabled:
+            self._sync_placed_object_selection_rendering()
+        self.directional_light_selection_changed.emit(normalized_id)
+        return True
+
+    def get_selected_directional_light_id(self) -> str | None:
+        """Return the selected directional-light ID, if any."""
+
+        return self._selected_directional_light_id
+
     # ### Tour placement and preview API ###
     @property
     def is_tour_point_placement_active(self) -> bool:
@@ -4191,6 +4515,8 @@ class GlbViewerWidget(QWidget):
         if self.model is None and normalized_fallback is None:
             return False
 
+        self.cancel_directional_light_placement()
+        self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement(notify=False)
         self.cancel_object_placement(notify=True)
         self.cancel_architectural_trim_placement()
@@ -4896,6 +5222,9 @@ class GlbViewerWidget(QWidget):
         )
         self.view.object_scale_wheel_steps_requested.connect(
             self._handle_placed_object_scale_wheel_steps_requested
+        )
+        self.view.directional_light_wheel_steps_requested.connect(
+            self._handle_directional_light_wheel_steps_requested
         )
         if self._window_editing_enabled:
             self._build_architectural_trim_hover_action_widget()
@@ -5812,6 +6141,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
             self.set_selected_architectural_trim_part_ids(())
@@ -6115,6 +6445,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
             self.set_selected_canvas_stair_part_ids(())
@@ -6426,6 +6757,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_directional_light_id(None)
             self.set_selected_canvas_stair_part_ids(())
             self.set_selected_architectural_trim_part_ids(())
         selection_changed = normalized_ids != self._selected_canvas_surface_ids
@@ -6628,6 +6960,8 @@ class GlbViewerWidget(QWidget):
             self._set_add_surface_vertex_button_checked(False)
             return False
         self._clear_architectural_trim_passive_hover()
+        self.cancel_directional_light_placement()
+        self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
         if self.is_window_placement_active():
             self.cancel_window_placement(status_message=None)
@@ -7006,6 +7340,7 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_opening_edit_drag()
         self._selected_canvas_opening_key = normalized_key
         if normalized_key is not None:
+            self.set_selected_directional_light_id(None)
             if self.is_window_placement_active():
                 self.cancel_window_placement(status_message=None)
             self.set_selected_canvas_stair_part_ids(())
@@ -7082,6 +7417,8 @@ class GlbViewerWidget(QWidget):
             ):
                 return False
             normalized_candidates[candidate.opening_key] = candidate
+        self.cancel_directional_light_placement()
+        self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
         self._clear_door_placement(notify=False)
         if self.is_object_placement_active:
@@ -7541,6 +7878,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_directional_light_id(None)
             self.set_selected_canvas_stair_part_ids(())
             self.set_selected_architectural_trim_part_ids(())
             self.set_selected_projection_camera_id(None)
@@ -7612,6 +7950,8 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._clear_architectural_trim_passive_hover()
+        self.cancel_directional_light_placement()
+        self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
         self.cancel_object_placement(notify=False)
         self.cancel_architectural_trim_placement()
@@ -7828,6 +8168,8 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._clear_architectural_trim_passive_hover()
+        self.cancel_directional_light_placement()
+        self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
         self.cancel_architectural_trim_placement()
         self.cancel_object_placement(notify=True)
@@ -8293,6 +8635,8 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._clear_architectural_trim_passive_hover()
+        self.cancel_directional_light_placement()
+        self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
         self.cancel_door_placement()
         if self.is_surface_vertex_placement_active():
@@ -8348,12 +8692,21 @@ class GlbViewerWidget(QWidget):
         )
 
     def _handle_tour_pointer_hovered(self, position: QPointF) -> None:
+        if self.is_directional_light_placement_active:
+            self._update_directional_light_placement_hover(position)
+            return
         if self.is_tour_point_placement_active:
             self._update_tour_point_hover(position)
             return
         self._update_tour_tooltip_hover(position)
 
     def _handle_tour_pointer_left(self) -> None:
+        if self.is_directional_light_placement_active:
+            if self._directional_light_placement_pointer_pressed:
+                return
+            self._directional_light_placement_hover_position = None
+            self._refresh_directional_light_placement_hover_item()
+            return
         if not self.is_tour_point_placement_active:
             self._tour_hovered_tooltip_action_id = None
             self._refresh_tour_tooltip_overlay()
@@ -8364,6 +8717,13 @@ class GlbViewerWidget(QWidget):
         self._refresh_tour_point_hover_item()
 
     def _handle_tour_pointer_pressed(self, position: QPointF) -> None:
+        if self.is_directional_light_placement_active:
+            self._update_directional_light_placement_hover(position)
+            if self._directional_light_placement_hover_position is None:
+                return
+            self._directional_light_placement_pointer_pressed = True
+            self.view.reserve_primary_pointer_drag()
+            return
         if self.is_tour_point_placement_active:
             self._update_tour_point_hover(position)
             if self._tour_point_hover_position is None:
@@ -8396,6 +8756,9 @@ class GlbViewerWidget(QWidget):
         self._apply_tour_overlay_pick(picked)
 
     def _handle_tour_pointer_moved(self, position: QPointF) -> None:
+        if self._directional_light_placement_pointer_pressed:
+            self._update_directional_light_placement_hover(position)
+            return
         if self._tour_point_pointer_pressed:
             self._update_tour_point_hover(position)
             return
@@ -8403,6 +8766,12 @@ class GlbViewerWidget(QWidget):
             self._update_tour_edit_drag(position)
 
     def _handle_tour_pointer_released(self, position: QPointF) -> None:
+        if self._directional_light_placement_pointer_pressed:
+            self._directional_light_placement_pointer_pressed = False
+            self._update_directional_light_placement_hover(position)
+            self.view.release_primary_pointer_drag()
+            self._commit_directional_light_placement()
+            return
         if self._tour_edit_drag is not None:
             self._finish_tour_edit_drag(position)
             return
@@ -8418,6 +8787,9 @@ class GlbViewerWidget(QWidget):
         self._commit_tour_point_placement()
 
     def _handle_tour_placement_cancel_requested(self) -> None:
+        if self.is_directional_light_placement_active:
+            self.cancel_directional_light_placement()
+            return
         if self._tour_edit_drag is not None:
             self._cancel_tour_edit_drag()
             return
@@ -8427,6 +8799,45 @@ class GlbViewerWidget(QWidget):
             return
         if self.is_tour_point_placement_active:
             self.cancel_tour_point_placement()
+
+    # ### Directional-light placement input ###
+    def _update_directional_light_placement_hover(
+        self,
+        position: QPointF,
+    ) -> bool:
+        """Resolve and display the scene point under the placement cursor."""
+
+        camera_ray = self.view.build_camera_ray(position)
+        point = (
+            None
+            if camera_ray is None
+            else self._pick_scene_world_point(
+                *camera_ray,
+                fallback_plane_z=(
+                    self._directional_light_placement_fallback_plane_z
+                ),
+            )
+        )
+        next_position = (
+            None
+            if point is None
+            else tuple(float(value) for value in point)
+        )
+        if next_position == self._directional_light_placement_hover_position:
+            return False
+        self._directional_light_placement_hover_position = next_position
+        self._refresh_directional_light_placement_hover_item()
+        return True
+
+    def _commit_directional_light_placement(self) -> bool:
+        """Emit the chosen point and leave one-shot placement mode."""
+
+        point = self._directional_light_placement_hover_position
+        if not self.is_directional_light_placement_active or point is None:
+            return False
+        self.cancel_directional_light_placement(notify=False)
+        self.directional_light_placed.emit(point)
+        return True
 
     def _update_tour_point_hover(self, position: QPointF) -> None:
         camera_ray = self.view.build_camera_ray(position)
@@ -8463,16 +8874,33 @@ class GlbViewerWidget(QWidget):
     ) -> np.ndarray | None:
         """Resolve the nearest visible scene hit, with an optional ground fallback."""
 
+        return self._pick_scene_world_point(
+            ray_origin,
+            ray_direction,
+            fallback_plane_z=self._tour_point_fallback_plane_z,
+            vertical_offset_meters=self._tour_point_vertical_offset_meters,
+        )
+
+    def _pick_scene_world_point(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+        *,
+        fallback_plane_z: float | None = None,
+        vertical_offset_meters: float = 0.0,
+    ) -> np.ndarray | None:
+        """Resolve the nearest visible scene hit or one horizontal fallback."""
+
         origin = np.asarray(ray_origin, dtype=float)
         direction = np.asarray(ray_direction, dtype=float)
         nearest_hit = self._pick_nearest_tour_scene_hit(origin, direction)
         if nearest_hit is not None:
             point = np.asarray(nearest_hit[0], dtype=float).copy()
-        elif self._tour_point_fallback_plane_z is not None:
+        elif fallback_plane_z is not None:
             point = _intersect_ray_with_plane(
                 origin,
                 direction,
-                np.asarray((0.0, 0.0, self._tour_point_fallback_plane_z)),
+                np.asarray((0.0, 0.0, fallback_plane_z)),
                 np.asarray((0.0, 0.0, 1.0)),
             )
             if point is None:
@@ -8480,7 +8908,7 @@ class GlbViewerWidget(QWidget):
             point = np.asarray(point, dtype=float)
         else:
             return None
-        point[2] += self._tour_point_vertical_offset_meters
+        point[2] += float(vertical_offset_meters)
         return point
 
     def _pick_nearest_tour_scene_hit(
@@ -8569,6 +8997,721 @@ class GlbViewerWidget(QWidget):
             self.cancel_tour_point_placement(notify=False)
         self.tour_point_placed.emit(kind, placed_value)
         return True
+
+    # ### Directional-light overlay rendering ###
+    def _refresh_directional_light_overlay_items(self) -> None:
+        """Rebuild visible markers and arrows without affecting scene lighting."""
+
+        self._remove_tour_item_group(self._directional_light_overlay_items)
+        self._directional_light_overlay_items = []
+        if not hasattr(self, "view"):
+            return
+        for light in self._directional_lights:
+            position, target = self._get_directional_light_display_endpoints(light)
+            selected = light.light_id == self._selected_directional_light_id
+            color = (
+                DIRECTIONAL_LIGHT_SELECTED_COLOR
+                if selected
+                else DIRECTIONAL_LIGHT_MARKER_COLOR
+            )
+            marker_size = _get_directional_light_marker_size_pixels(
+                light.intensity,
+                selected=selected,
+            )
+            marker = gl.GLScatterPlotItem(
+                pos=np.asarray((position,), dtype=np.float32),
+                color=color,
+                size=marker_size,
+                pxMode=True,
+            )
+            marker.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            marker.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 6.0)
+            marker._housemaker_directional_light_id = light.light_id
+            marker._housemaker_directional_light_marker_size_pixels = marker_size
+            self.view.addItem(marker)
+            self._directional_light_overlay_items.append(marker)
+
+            arrow_positions = _build_tour_direction_arrow_positions(
+                position,
+                target,
+                length_scale=DIRECTIONAL_LIGHT_ARROW_LENGTH_SCALE,
+            )
+            if arrow_positions is None:
+                continue
+            arrow = gl.GLLinePlotItem(
+                pos=arrow_positions,
+                color=color,
+                width=DIRECTIONAL_LIGHT_ARROW_WIDTH_PIXELS,
+                antialias=True,
+                mode="lines",
+            )
+            arrow.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            arrow.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 6.0)
+            arrow._housemaker_directional_light_id = light.light_id
+            self.view.addItem(arrow)
+            self._directional_light_overlay_items.append(arrow)
+        self._refresh_directional_light_projection_grid_item()
+        self.view.update()
+
+    # ### Directional-light projection grid ###
+    def _refresh_directional_light_projection_grid_item(self) -> None:
+        """Project a depth-tested first-hit lattice for the selected light."""
+
+        light = self._get_selected_directional_light()
+        if light is None or not hasattr(self, "view"):
+            self._remove_directional_light_projection_grid_item()
+            self._directional_light_projection_render_key = None
+            return
+        position, target = self._get_directional_light_display_endpoints(light)
+        direction = np.asarray(target, dtype=float) - np.asarray(
+            position,
+            dtype=float,
+        )
+        normalized_direction = _normalize_vector(direction)
+        if normalized_direction is None:
+            self._remove_directional_light_projection_grid_item()
+            self._directional_light_projection_render_key = None
+            return
+        direction_key = tuple(
+            float(value)
+            for value in np.round(
+                normalized_direction,
+                DIRECTIONAL_LIGHT_PROJECTION_DIRECTION_DECIMALS,
+            )
+        )
+        collision_key = self._get_directional_light_projection_collision_key()
+        render_key = (collision_key, *direction_key)
+        if render_key == self._directional_light_projection_render_key:
+            return
+
+        self._remove_directional_light_projection_grid_item()
+        self._directional_light_projection_render_key = render_key
+        collision_mesh = self._get_directional_light_projection_collision_mesh()
+        if collision_mesh is None:
+            return
+        try:
+            positions = build_directional_light_projection_grid(
+                collision_mesh,
+                normalized_direction,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return
+        if not len(positions):
+            return
+        item = _DepthTestedOverlayLineItem(
+            pos=positions,
+            color=DIRECTIONAL_LIGHT_PROJECTION_GRID_COLOR,
+            width=DIRECTIONAL_LIGHT_PROJECTION_GRID_WIDTH_PIXELS,
+            antialias=True,
+            mode="lines",
+        )
+        item.setGLOptions("translucent")
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 2.0)
+        item._housemaker_directional_light_id = light.light_id
+        self.view.addItem(item)
+        self._directional_light_projection_grid_item = item
+
+    def _get_directional_light_projection_collision_mesh(
+        self,
+    ) -> trimesh.Trimesh | None:
+        """Cache the currently visible world-space geometry used for ray hits."""
+
+        collision_key = self._get_directional_light_projection_collision_key()
+        if (
+            self._directional_light_projection_cached_collision_key
+            == collision_key
+        ):
+            return self._directional_light_projection_collision_mesh
+
+        collision_meshes: list[trimesh.Trimesh] = []
+        display_mesh = self._get_display_mesh()
+        if _mesh_has_projectable_triangles(display_mesh):
+            assert isinstance(display_mesh, trimesh.Trimesh)
+            collision_meshes.append(display_mesh)
+        if self.model is not None:
+            for textured_surface in self.model.preview_textured_surfaces:
+                stair_part = self._canvas_stair_part_targets.get(
+                    textured_surface.surface_id
+                )
+                if self._window_editing_enabled and (
+                    (
+                        stair_part is not None
+                        and not self._canvas_stair_part_is_visible(stair_part)
+                    )
+                    or (
+                        stair_part is None
+                        and (
+                            not self._canvas_level_is_visible(
+                                textured_surface.level_index
+                            )
+                            or not self._canvas_surface_type_is_visible(
+                                textured_surface.surface_type
+                            )
+                        )
+                    )
+                ):
+                    continue
+                if (
+                    self._placed_object_editing_enabled
+                    and self.model.preview_placed_objects
+                    and textured_surface.surface_type == "generated_object"
+                ):
+                    continue
+                if _mesh_has_projectable_triangles(textured_surface.mesh):
+                    collision_meshes.append(textured_surface.mesh)
+        for object_id, group in self._placed_object_render_groups.items():
+            if not self._canvas_placed_object_is_visible(object_id):
+                continue
+            for source_mesh in group.pick_meshes:
+                if not _mesh_has_projectable_triangles(source_mesh):
+                    continue
+                world_mesh = source_mesh.copy()
+                world_mesh.apply_transform(group.current_transform)
+                collision_meshes.append(world_mesh)
+
+        collision_mesh = (
+            None
+            if not collision_meshes
+            else trimesh.util.concatenate(collision_meshes)
+        )
+        if not _mesh_has_projectable_triangles(collision_mesh):
+            collision_mesh = None
+        self._directional_light_projection_collision_mesh = collision_mesh
+        self._directional_light_projection_cached_collision_key = collision_key
+        return collision_mesh
+
+    def _get_directional_light_projection_collision_key(
+        self,
+    ) -> tuple[object, ...]:
+        """Identify visible geometry, including live placed-object transforms."""
+
+        placed_object_transforms = tuple(
+            (
+                object_id,
+                tuple(
+                    float(value)
+                    for value in np.round(group.current_transform, decimals=10).flat
+                ),
+            )
+            for object_id, group in sorted(self._placed_object_render_groups.items())
+            if self._canvas_placed_object_is_visible(object_id)
+        )
+        return (
+            self._canvas_selection_geometry_revision,
+            placed_object_transforms,
+        )
+
+    def _invalidate_directional_light_projection_collision_cache(self) -> None:
+        """Discard cached world geometry after scene or selection changes."""
+
+        self._directional_light_projection_collision_mesh = None
+        self._directional_light_projection_cached_collision_key = None
+        self._directional_light_projection_render_key = None
+        self._remove_directional_light_projection_grid_item()
+
+    def _remove_directional_light_projection_grid_item(self) -> None:
+        """Remove the selected light's depth-tested hit grid, if present."""
+
+        item = self._directional_light_projection_grid_item
+        self._directional_light_projection_grid_item = None
+        if item is not None and hasattr(self, "view") and item in self.view.items:
+            self.view.removeItem(item)
+
+    # ### Directional-light endpoint helpers ###
+    def _get_directional_light_display_endpoints(
+        self,
+        light: DirectionalLightData,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """Return persisted endpoints or the active drag's live translation."""
+
+        drag = self._directional_light_drag
+        if drag is not None and drag.light_id == light.light_id:
+            return drag.preview_position, drag.preview_target
+        return light.position, light.target
+
+    def _refresh_directional_light_placement_hover_item(self) -> None:
+        """Draw the current one-shot placement point above scene geometry."""
+
+        self._remove_directional_light_placement_hover_item()
+        point = self._directional_light_placement_hover_position
+        if point is None or not hasattr(self, "view"):
+            return
+        item = gl.GLScatterPlotItem(
+            pos=np.asarray((point,), dtype=np.float32),
+            color=DIRECTIONAL_LIGHT_PLACEMENT_HOVER_COLOR,
+            size=DIRECTIONAL_LIGHT_PLACEMENT_HOVER_SIZE_PIXELS,
+            pxMode=True,
+        )
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 12.0)
+        self.view.addItem(item)
+        self._directional_light_placement_hover_item = item
+        self.view.update()
+
+    def _remove_directional_light_placement_hover_item(self) -> None:
+        item = self._directional_light_placement_hover_item
+        self._directional_light_placement_hover_item = None
+        if item is not None and hasattr(self, "view") and item in self.view.items:
+            self.view.removeItem(item)
+
+    # ### Directional-light selection and gizmos ###
+    def _get_selected_directional_light(self) -> DirectionalLightData | None:
+        selected_id = self._selected_directional_light_id
+        return next(
+            (
+                light
+                for light in self._directional_lights
+                if light.light_id == selected_id
+            ),
+            None,
+        )
+
+    def _pick_directional_light_id(self, position: QPointF) -> str | None:
+        """Pick the closest visible light marker in logical screen pixels."""
+
+        if not self._directional_lights or not hasattr(self, "view"):
+            return None
+        width = max(int(self.view.width()), 1)
+        height = max(int(self.view.height()), 1)
+        viewport = (0, 0, width, height)
+        try:
+            view_projection = (
+                self.view.projectionMatrix(viewport, viewport)
+                * self.view.viewMatrix()
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        pointer = np.asarray((position.x(), position.y()), dtype=float)
+        candidates: list[tuple[float, float, int, str]] = []
+        for index, light in enumerate(self._directional_lights):
+            light_position, _target = self._get_directional_light_display_endpoints(
+                light
+            )
+            projected = _project_vertices_to_view(
+                np.asarray((light_position,), dtype=float),
+                view_projection,
+                width,
+                height,
+            )[0]
+            if not _is_usable_projected_point(projected):
+                continue
+            distance = float(np.linalg.norm(pointer - projected[:2]))
+            marker_size = _get_directional_light_marker_size_pixels(
+                light.intensity,
+                selected=light.light_id == self._selected_directional_light_id,
+            )
+            selection_tolerance = max(
+                DIRECTIONAL_LIGHT_SELECTION_TOLERANCE_PIXELS,
+                marker_size / 2.0 + 6.0,
+            )
+            if distance <= selection_tolerance:
+                candidates.append((distance, float(projected[2]), index, light.light_id))
+        return None if not candidates else min(candidates)[3]
+
+    def _refresh_directional_light_gizmo_items(self) -> None:
+        """Build RGB translation arrows and rotation rings for one light."""
+
+        self._remove_directional_light_gizmo_items()
+        light = self._get_selected_directional_light()
+        if light is None or not hasattr(self, "view"):
+            return
+        position, _target = self._get_directional_light_display_endpoints(light)
+        pivot = np.asarray(position, dtype=float)
+        try:
+            pixel_size = float(
+                self.view.pixelSize(QVector3D(*[float(value) for value in pivot]))
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        self._directional_light_gizmo_size = max(
+            DIRECTIONAL_LIGHT_GIZMO_MIN_SIZE_METERS,
+            (
+                pixel_size * DIRECTIONAL_LIGHT_GIZMO_SCREEN_SIZE_PIXELS
+                if math.isfinite(pixel_size) and pixel_size > 0.0
+                else DIRECTIONAL_LIGHT_GIZMO_MIN_SIZE_METERS
+            ),
+        )
+        for axis_index, axis in enumerate(np.eye(3, dtype=float)):
+            color = TRANSFORM_GIZMO_AXIS_COLORS[axis_index]
+            endpoint = pivot + axis * self._directional_light_gizmo_size
+            axis_item = gl.GLLinePlotItem(
+                pos=np.asarray((pivot, endpoint), dtype=float),
+                color=color,
+                width=3.0,
+                antialias=True,
+                mode="lines",
+            )
+            endpoint_item = gl.GLScatterPlotItem(
+                pos=np.asarray((endpoint,), dtype=float),
+                color=color,
+                size=10.0,
+                pxMode=True,
+            )
+            for item in (axis_item, endpoint_item):
+                item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+                item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 12.0)
+                self.view.addItem(item)
+                self._directional_light_gizmo_items.append(item)
+            ring_item = gl.GLLinePlotItem(
+                pos=_build_rotation_ring_positions(
+                    pivot,
+                    axis_index,
+                    (
+                        self._directional_light_gizmo_size
+                        * DIRECTIONAL_LIGHT_GIZMO_RING_RADIUS_RATIO
+                    ),
+                ),
+                color=color,
+                width=2.0,
+                antialias=True,
+                mode="line_strip",
+            )
+            ring_item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            ring_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 12.0)
+            self.view.addItem(ring_item)
+            self._directional_light_gizmo_items.append(ring_item)
+        self._sync_directional_light_status_label(light)
+        self.view.update()
+
+    def _sync_directional_light_status_label(
+        self,
+        light: DirectionalLightData,
+    ) -> None:
+        """Describe the selected light and its raw Three/R3F intensity."""
+
+        if self.object_transform_status_label is None:
+            return
+        self.object_transform_status_label.setText(
+            f"{light.name}: intensity {light.intensity:g}. Drag an RGB arrow "
+            "to move it or an RGB ring to rotate it; use the wheel to change "
+            "intensity by 0.1."
+        )
+
+    def _remove_directional_light_gizmo_items(self) -> None:
+        if hasattr(self, "view"):
+            for item in self._directional_light_gizmo_items:
+                if item in self.view.items:
+                    self.view.removeItem(item)
+        self._directional_light_gizmo_items = []
+
+    def _pick_directional_light_gizmo_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> _TransformGizmoHandle | None:
+        """Pick one selected-light translation arrow or rotation ring."""
+
+        light = self._get_selected_directional_light()
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        if light is None or origin is None or direction is None:
+            return None
+        position, _target = self._get_directional_light_display_endpoints(light)
+        pivot = np.asarray(position, dtype=float)
+        tolerance = (
+            self._directional_light_gizmo_size
+            * DIRECTIONAL_LIGHT_GIZMO_AXIS_HIT_RATIO
+        )
+        candidates: list[tuple[float, _TransformGizmoHandle]] = []
+        for axis_index, axis in enumerate(np.eye(3, dtype=float)):
+            endpoint = pivot + axis * self._directional_light_gizmo_size
+            segment_distance = _get_ray_segment_distance(
+                origin,
+                direction,
+                pivot,
+                endpoint,
+            )
+            if segment_distance is not None and segment_distance <= tolerance:
+                candidates.append(
+                    (
+                        segment_distance / max(tolerance, 1e-12),
+                        _TransformGizmoHandle(
+                            TRANSFORM_GIZMO_TRANSLATE,
+                            axis_index,
+                        ),
+                    )
+                )
+            point_hit = _get_ray_point_distance(origin, direction, endpoint)
+            if point_hit is not None and point_hit[0] <= tolerance * 1.5:
+                candidates.append(
+                    (
+                        point_hit[0] / max(tolerance * 1.5, 1e-12),
+                        _TransformGizmoHandle(
+                            TRANSFORM_GIZMO_TRANSLATE,
+                            axis_index,
+                        ),
+                    )
+                )
+            ring_hit = _intersect_ray_with_plane(
+                origin,
+                direction,
+                pivot,
+                axis,
+            )
+            if ring_hit is None:
+                continue
+            ring_radius = (
+                self._directional_light_gizmo_size
+                * DIRECTIONAL_LIGHT_GIZMO_RING_RADIUS_RATIO
+            )
+            ring_error = abs(float(np.linalg.norm(ring_hit - pivot)) - ring_radius)
+            ring_tolerance = (
+                self._directional_light_gizmo_size
+                * DIRECTIONAL_LIGHT_GIZMO_RING_HIT_RATIO
+            )
+            if ring_error <= ring_tolerance:
+                candidates.append(
+                    (
+                        ring_error / max(ring_tolerance, 1e-12),
+                        _TransformGizmoHandle(
+                            TRANSFORM_GIZMO_ROTATE,
+                            axis_index,
+                        ),
+                    )
+                )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda candidate: (
+                candidate[0],
+                candidate[1].kind != TRANSFORM_GIZMO_TRANSLATE,
+                candidate[1].axis_index,
+            ),
+        )[1]
+
+    def _begin_directional_light_gizmo_drag(
+        self,
+        handle: _TransformGizmoHandle,
+        position: QPointF,
+    ) -> bool:
+        """Start translating the point or rotating its direction vector."""
+
+        light = self._get_selected_directional_light()
+        camera_ray = self.view.build_camera_ray(position)
+        if (
+            light is None
+            or handle.kind
+            not in {TRANSFORM_GIZMO_TRANSLATE, TRANSFORM_GIZMO_ROTATE}
+            or camera_ray is None
+        ):
+            return False
+        axis = np.eye(3, dtype=float)[handle.axis_index]
+        start_position = np.asarray(light.position, dtype=float)
+        start_target = np.asarray(light.target, dtype=float)
+        if handle.kind == TRANSFORM_GIZMO_ROTATE:
+            hit = _intersect_ray_with_plane(
+                *camera_ray,
+                start_position,
+                axis,
+            )
+            initial_vector = (
+                None
+                if hit is None
+                else _normalize_vector(hit - start_position)
+            )
+            if initial_vector is None:
+                return False
+            self._directional_light_drag = _DirectionalLightRotationDrag(
+                light_id=light.light_id,
+                axis_index=handle.axis_index,
+                axis=axis,
+                pivot=start_position,
+                start_position=start_position,
+                start_target=start_target,
+                previous_rotation_vector=initial_vector,
+                preview_position=light.position,
+                preview_target=light.target,
+            )
+            self._sync_directional_light_wheel_input_state()
+            self.view.reserve_primary_pointer_drag()
+            return True
+
+        drag_plane_normal = _build_axis_drag_plane_normal(axis, camera_ray[1])
+        hit = _intersect_ray_with_plane(
+            *camera_ray,
+            start_position,
+            drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        self._directional_light_drag = _DirectionalLightDrag(
+            light_id=light.light_id,
+            axis_index=handle.axis_index,
+            axis=axis,
+            drag_plane_normal=drag_plane_normal,
+            start_axis_parameter=float(np.dot(hit - start_position, axis)),
+            start_position=start_position,
+            start_target=start_target,
+            preview_position=light.position,
+            preview_target=light.target,
+        )
+        self._sync_directional_light_wheel_input_state()
+        self.view.reserve_primary_pointer_drag()
+        return True
+
+    def _update_directional_light_gizmo_drag(self, position: QPointF) -> bool:
+        """Update one constrained translation or world-axis rotation."""
+
+        drag = self._directional_light_drag
+        camera_ray = self.view.build_camera_ray(position)
+        if drag is None or camera_ray is None:
+            return False
+        if isinstance(drag, _DirectionalLightRotationDrag):
+            hit = _intersect_ray_with_plane(
+                *camera_ray,
+                drag.pivot,
+                drag.axis,
+            )
+            current_vector = (
+                None if hit is None else _normalize_vector(hit - drag.pivot)
+            )
+            if current_vector is None:
+                return False
+            drag.accumulated_rotation_degrees += _get_signed_rotation_degrees(
+                drag.axis,
+                drag.previous_rotation_vector,
+                current_vector,
+            )
+            drag.previous_rotation_vector = current_vector
+            rotation = trimesh.transformations.rotation_matrix(
+                math.radians(drag.accumulated_rotation_degrees),
+                drag.axis,
+            )[:3, :3]
+            target_offset = drag.start_target - drag.start_position
+            next_position = tuple(float(value) for value in drag.start_position)
+            next_target = tuple(
+                float(value)
+                for value in drag.start_position + rotation @ target_offset
+            )
+            if np.allclose(
+                next_target,
+                drag.preview_target,
+                atol=1e-9,
+                rtol=0.0,
+            ):
+                return False
+            drag.preview_position = next_position
+            drag.preview_target = next_target
+            self._refresh_directional_light_overlay_items()
+            self._refresh_directional_light_gizmo_items()
+            self.directional_light_transform_preview_changed.emit(
+                drag.light_id,
+                next_position,
+                next_target,
+            )
+            return True
+
+        hit = _intersect_ray_with_plane(
+            *camera_ray,
+            drag.start_position,
+            drag.drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        parameter = float(np.dot(hit - drag.start_position, drag.axis))
+        delta = drag.axis * (parameter - drag.start_axis_parameter)
+        next_position = tuple(float(value) for value in drag.start_position + delta)
+        next_target = tuple(float(value) for value in drag.start_target + delta)
+        if np.allclose(next_position, drag.preview_position, atol=1e-9, rtol=0.0):
+            return False
+        drag.preview_position = next_position
+        drag.preview_target = next_target
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+        self.directional_light_transform_preview_changed.emit(
+            drag.light_id,
+            next_position,
+            next_target,
+        )
+        return True
+
+    def _finish_directional_light_gizmo_drag(self, position: QPointF) -> bool:
+        """Commit one translated or rotated endpoint pair after release."""
+
+        drag = self._directional_light_drag
+        if drag is None:
+            return False
+        self._update_directional_light_gizmo_drag(position)
+        changed = bool(
+            not np.allclose(
+                drag.preview_position,
+                drag.start_position,
+                atol=1e-9,
+                rtol=0.0,
+            )
+            or not np.allclose(
+                drag.preview_target,
+                drag.start_target,
+                atol=1e-9,
+                rtol=0.0,
+            )
+        )
+        self._directional_light_drag = None
+        self.view.release_primary_pointer_drag()
+        self._sync_directional_light_wheel_input_state()
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+        if changed:
+            self.directional_light_transform_changed.emit(
+                drag.light_id,
+                drag.preview_position,
+                drag.preview_target,
+            )
+        return changed
+
+    def _cancel_directional_light_drag(
+        self,
+        *_args: object,
+        notify_preview: bool = True,
+    ) -> bool:
+        """Restore a live light translation or rotation without committing."""
+
+        drag = self._directional_light_drag
+        if drag is None:
+            return False
+        self._directional_light_drag = None
+        if hasattr(self, "view"):
+            self.view.cancel_primary_pointer_drag()
+        self._sync_directional_light_wheel_input_state()
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+        if notify_preview:
+            self.directional_light_transform_preview_changed.emit(
+                drag.light_id,
+                tuple(float(value) for value in drag.start_position),
+                tuple(float(value) for value in drag.start_target),
+            )
+        return True
+
+    def _sync_directional_light_wheel_input_state(self) -> None:
+        """Reserve wheel input only for one idle selected light."""
+
+        if not hasattr(self, "view"):
+            return
+        self.view.set_directional_light_wheel_steps_enabled(
+            bool(
+                self._get_selected_directional_light() is not None
+                and self._directional_light_drag is None
+                and not self.is_directional_light_placement_active
+            )
+        )
+
+    @Slot(int)
+    def _handle_directional_light_wheel_steps_requested(self, steps: int) -> None:
+        """Forward signed raw ticks; the controller owns intensity persistence."""
+
+        normalized_steps = int(steps)
+        selected_id = self._selected_directional_light_id
+        if (
+            normalized_steps == 0
+            or selected_id is None
+            or self._directional_light_drag is not None
+        ):
+            return
+        self.directional_light_intensity_step_requested.emit(
+            selected_id,
+            normalized_steps,
+        )
 
     # ### Tour overlay rendering ###
     def _refresh_tour_point_hover_item(self) -> None:
@@ -9288,10 +10431,23 @@ class GlbViewerWidget(QWidget):
         return self._tour_overlays.get(selected_id or "")
 
     def _sync_tour_pointer_input_state(self) -> None:
+        """Compatibility wrapper for the shared primary-pointer ownership."""
+
+        self._sync_primary_pointer_input_state()
+
+    def _sync_primary_pointer_input_state(self) -> None:
+        """Keep every retained overlay and edit tool reachable by the pointer."""
+
         if not hasattr(self, "view"):
             return
         self.view.set_primary_pointer_interaction_enabled(
-            bool(self._tour_overlays or self.is_tour_point_placement_active)
+            bool(
+                self._placed_object_editing_enabled
+                or self._tour_overlays
+                or self.is_tour_point_placement_active
+                or self.is_directional_light_placement_active
+                or self._selected_directional_light_id is not None
+            )
         )
 
     def _get_tour_trigger_display_position(
@@ -10439,6 +11595,10 @@ class GlbViewerWidget(QWidget):
         if self.is_door_placement_active:
             self._handle_door_placement_pick(position)
             return
+        directional_light_id = self._pick_directional_light_id(position)
+        if directional_light_id is not None:
+            self.set_selected_directional_light_id(directional_light_id)
+            return
         if self._canvas_face_orientation_visible:
             self._handle_canvas_face_orientation_pick_requested(position)
             return
@@ -10457,6 +11617,7 @@ class GlbViewerWidget(QWidget):
         if camera_ray is None:
             if additive:
                 return
+            self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
             self.select_architectural_trim_part(None)
@@ -10547,11 +11708,13 @@ class GlbViewerWidget(QWidget):
             )
         ):
             assert opening_hit is not None
+            self.set_selected_directional_light_id(None)
             self.select_canvas_opening(opening_hit[0].reference)
             return
         if winning_kind == "object":
             assert object_hit is not None
             object_id = object_hit[0].object_id
+            self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
             if additive and object_id in self._selected_placed_object_ids:
@@ -10579,6 +11742,7 @@ class GlbViewerWidget(QWidget):
             return
         if winning_kind == "architectural_trim_part":
             assert trim_hit is not None
+            self.set_selected_directional_light_id(None)
             self.select_architectural_trim_part(
                 trim_hit[0].semantic_id,
                 additive=additive,
@@ -10586,6 +11750,7 @@ class GlbViewerWidget(QWidget):
             return
         if winning_kind == "stair_part":
             assert stair_hit is not None
+            self.set_selected_directional_light_id(None)
             self.select_canvas_stair_part_target(
                 stair_hit[0].semantic_id,
                 additive=additive,
@@ -10593,6 +11758,7 @@ class GlbViewerWidget(QWidget):
             return
         if winning_kind is None and additive:
             return
+        self.set_selected_directional_light_id(None)
         self._set_selected_canvas_opening_key(None)
         self._set_selected_placed_object(None)
         self.select_architectural_trim_part(None)
@@ -10768,7 +11934,10 @@ class GlbViewerWidget(QWidget):
 
     def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
         if (
-            self.is_tour_point_placement_active
+            self.is_directional_light_placement_active
+            or self._directional_light_placement_pointer_pressed
+            or self._directional_light_drag is not None
+            or self.is_tour_point_placement_active
             or self._tour_edit_drag is not None
             or self._tour_overlay_pointer_pressed
         ):
@@ -10788,8 +11957,7 @@ class GlbViewerWidget(QWidget):
             self.view.reserve_primary_pointer_drag()
             return
         if (
-            not self._placed_object_editing_enabled
-            or self.is_window_placement_active()
+            self.is_window_placement_active()
             or self.view.is_first_person_pointer_captured
         ):
             return
@@ -10799,6 +11967,17 @@ class GlbViewerWidget(QWidget):
             return
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
+            return
+        directional_light_handle = self._pick_directional_light_gizmo_handle(
+            *camera_ray
+        )
+        if directional_light_handle is not None:
+            self._begin_directional_light_gizmo_drag(
+                directional_light_handle,
+                position,
+            )
+            return
+        if not self._placed_object_editing_enabled:
             return
         if self.is_surface_vertex_placement_active():
             self._begin_surface_vertex_pointer_interaction(
@@ -10842,6 +12021,11 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
 
+        if self._directional_light_drag is not None:
+            self._update_directional_light_gizmo_drag(position)
+            return
+        if self.is_directional_light_placement_active:
+            return
         if self.is_tour_point_placement_active:
             return
         if self.is_door_placement_active:
@@ -10879,6 +12063,11 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
         """Finish the one Canvas gizmo that currently owns the pointer."""
 
+        if self._directional_light_drag is not None:
+            self._finish_directional_light_gizmo_drag(position)
+            return
+        if self.is_directional_light_placement_active:
+            return
         if self.is_tour_point_placement_active:
             return
         if self.is_door_placement_active:
@@ -10932,6 +12121,9 @@ class GlbViewerWidget(QWidget):
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
         """Cancel the Canvas gizmo that owns the pointer before navigation."""
 
+        if self._directional_light_drag is not None:
+            self._cancel_directional_light_drag()
+            return
         if self.cancel_door_placement():
             return
         if self.is_object_placement_active:
@@ -11460,6 +12652,8 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Show contextual insertion or the currently armed pointer preview."""
 
+        if self.is_directional_light_placement_active:
+            return self._update_directional_light_placement_hover(position)
         if self.is_door_placement_active:
             return self._update_door_placement_hover(position)
         if self.is_object_placement_active:
@@ -11485,6 +12679,11 @@ class GlbViewerWidget(QWidget):
     def _handle_surface_vertex_pointer_left(self) -> None:
         """Hide only the transient hover candidate outside the viewport."""
 
+        if self.is_directional_light_placement_active:
+            if not self._directional_light_placement_pointer_pressed:
+                self._directional_light_placement_hover_position = None
+                self._refresh_directional_light_placement_hover_item()
+            return
         if self.is_door_placement_active:
             self._door_placement_hover_opening_key = None
             self._remove_door_placement_preview_items()
@@ -14978,6 +16177,7 @@ class GlbViewerWidget(QWidget):
         if normalized_id == self._selected_projection_camera_id:
             return False
         if normalized_id is not None and self._placed_object_editing_enabled:
+            self.set_selected_directional_light_id(None)
             self._set_selected_placed_object(None)
         # A partial high-resolution wheel gesture belongs to the camera that
         # was selected when it began.  Disable routing before changing IDs so
@@ -15215,6 +16415,9 @@ class GlbViewerWidget(QWidget):
             self._refresh_architectural_trim_hover_preview_items()
             self._refresh_architectural_trim_edit_preview_items()
             self._refresh_canvas_stair_preview_items()
+            self._refresh_directional_light_overlay_items()
+            self._refresh_directional_light_gizmo_items()
+            self._refresh_directional_light_placement_hover_item()
             self._refresh_tour_static_overlay_items()
             self._refresh_tour_text_overlay_items()
             self._refresh_tour_preview_overlay_items()
@@ -15339,6 +16542,9 @@ class GlbViewerWidget(QWidget):
         self._refresh_architectural_trim_hover_preview_items()
         self._refresh_architectural_trim_edit_preview_items()
         self._refresh_canvas_stair_preview_items()
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+        self._refresh_directional_light_placement_hover_item()
         self._refresh_tour_static_overlay_items()
         self._refresh_tour_text_overlay_items()
         self._refresh_tour_preview_overlay_items()
@@ -18136,6 +19342,13 @@ class GlbViewerWidget(QWidget):
         self._tour_text_overlay_items = []
         self._tour_preview_overlay_items = []
         self._tour_point_hover_items = []
+        self._directional_light_overlay_items = []
+        self._directional_light_gizmo_items = []
+        self._directional_light_projection_grid_item = None
+        self._directional_light_projection_collision_mesh = None
+        self._directional_light_projection_cached_collision_key = None
+        self._directional_light_projection_render_key = None
+        self._directional_light_placement_hover_item = None
         self._tour_curve_overlay_items = {}
         self._tour_trigger_overlay_items = {}
         self._tour_step_overlay_items = {}

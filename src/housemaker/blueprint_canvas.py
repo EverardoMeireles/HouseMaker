@@ -135,6 +135,14 @@ CAMERA_INDICATOR_RADIUS_SCREEN = 7.0
 CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN = 34.0
 CAMERA_INDICATOR_ARROW_HEAD_LENGTH_SCREEN = 10.0
 CAMERA_INDICATOR_ARROW_HEAD_HALF_WIDTH_SCREEN = 6.0
+DIRECTIONAL_LIGHT_MARKER_COLOR = QColor("#ffd54f")
+DIRECTIONAL_LIGHT_MARKER_OUTLINE_COLOR = QColor("#20242a")
+DIRECTIONAL_LIGHT_MARKER_SELECTED_COLOR = QColor("#ffffff")
+DIRECTIONAL_LIGHT_MARKER_RADIUS_SCREEN = 7.0
+DIRECTIONAL_LIGHT_MARKER_HIT_RADIUS_SCREEN = 13.0
+DIRECTIONAL_LIGHT_MARKER_SELECTED_RADIUS_SCREEN = 11.0
+DIRECTIONAL_LIGHT_HOVER_COLOR = QColor(255, 213, 79, 120)
+DIRECTIONAL_LIGHT_HOVER_RADIUS_SCREEN = 10.0
 LEVEL_COMPARISON_OPACITY = 0.42
 LEVEL_COMPARISON_EDGE_COLOR = QColor("#ff7ad9")
 OPEN_SPACE_FILL_COLOR = QColor(255, 121, 198, 72)
@@ -400,6 +408,29 @@ class StairHit:
 
 
 @dataclass(frozen=True)
+class CanvasDirectionalLightProfile:
+    """One directional-light authoring point in blueprint image coordinates."""
+
+    light_id: str
+    image_x: float
+    image_y: float
+
+    def __post_init__(self) -> None:
+        normalized_id = str(self.light_id).strip()
+        normalized_x = float(self.image_x)
+        normalized_y = float(self.image_y)
+        if not normalized_id:
+            raise ValueError("Canvas directional-light IDs cannot be empty.")
+        if not math.isfinite(normalized_x) or not math.isfinite(normalized_y):
+            raise ValueError(
+                "Canvas directional-light coordinates must be finite."
+            )
+        object.__setattr__(self, "light_id", normalized_id)
+        object.__setattr__(self, "image_x", normalized_x)
+        object.__setattr__(self, "image_y", normalized_y)
+
+
+@dataclass(frozen=True)
 class CanvasPlacedObjectProfile:
     """One placed object's complete top-down footprint in image coordinates."""
 
@@ -497,6 +528,10 @@ class BlueprintCanvas(QWidget):
     plan_image_erase_committed = Signal(object)
     plan_image_erase_failed = Signal(str)
     level_comparison_direction_changed = Signal(object)
+    directional_light_placement_requested = Signal(float, float)
+    directional_light_placement_changed = Signal(bool)
+    directional_light_placement_cancelled = Signal()
+    directional_light_selection_requested = Signal(object)
     placed_object_selection_requested = Signal(object, object)
     placed_object_transform_committed = Signal(str, float, float, float)
 
@@ -576,6 +611,13 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_guides: list[SnapGuide] = []
         self.level_context: LevelData | None = None
         self._camera_indicator_pose: CameraPose | None = None
+        self._directional_light_profiles: tuple[
+            CanvasDirectionalLightProfile,
+            ...,
+        ] = ()
+        self._selected_directional_light_id: str | None = None
+        self._directional_light_placement_active = False
+        self._directional_light_hover_image_point: QPointF | None = None
         self._selected_wall_surface_id: str | None = None
         self._placed_object_profiles: tuple[CanvasPlacedObjectProfile, ...] = ()
         self._selected_placed_object_ids: tuple[str, ...] = ()
@@ -1063,6 +1105,117 @@ class BlueprintCanvas(QWidget):
 
         return self._camera_indicator_pose
 
+    # ### Directional-light placement and profiles ###
+    def start_directional_light_placement(self) -> bool:
+        """Arm a one-shot directional-light point placement on the plan."""
+
+        if self.blueprint_image is None:
+            return False
+        self.stop_plan_image_erasing()
+        self.cancel_open_space_placement()
+        self._cancel_stair_placement_for_other_mode()
+        self._reset_doorway_placement()
+        self._reset_doorway_pointer_state()
+        self._reset_vertex_selection_gesture()
+        self._cancel_placed_object_edit_drag(restore_initial=True)
+        self._clear_active_vertex_chain_for_selection()
+        self._directional_light_hover_image_point = None
+        if not self._directional_light_placement_active:
+            self._directional_light_placement_active = True
+            self.directional_light_placement_changed.emit(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.update()
+        return True
+
+    def cancel_directional_light_placement(self) -> bool:
+        """Cancel the pending point without creating a light."""
+
+        if not self._directional_light_placement_active:
+            return False
+        self._finish_directional_light_placement()
+        self.directional_light_placement_cancelled.emit()
+        return True
+
+    def is_directional_light_placement_active(self) -> bool:
+        """Return whether the next valid plan click places a light."""
+
+        return self._directional_light_placement_active
+
+    def set_directional_light_profiles(
+        self,
+        profiles: Iterable[CanvasDirectionalLightProfile],
+    ) -> bool:
+        """Replace the immutable light points displayed on the plan."""
+
+        normalized_profiles = tuple(profiles)
+        if not all(
+            isinstance(profile, CanvasDirectionalLightProfile)
+            for profile in normalized_profiles
+        ):
+            raise TypeError(
+                "Canvas directional-light profiles must contain profile values."
+            )
+        profile_ids = tuple(profile.light_id for profile in normalized_profiles)
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("Canvas directional-light profile IDs must be unique.")
+        if normalized_profiles == self._directional_light_profiles:
+            return False
+        self._directional_light_profiles = normalized_profiles
+        if self._selected_directional_light_id not in profile_ids:
+            self._selected_directional_light_id = None
+        self.update()
+        return True
+
+    def get_directional_light_profiles(
+        self,
+    ) -> tuple[CanvasDirectionalLightProfile, ...]:
+        """Return the light points currently displayed by the Canvas."""
+
+        return self._directional_light_profiles
+
+    def set_selected_directional_light_id(
+        self,
+        light_id: object | None,
+    ) -> bool:
+        """Mirror the selected 3D light without emitting a user request."""
+
+        normalized_id = (
+            None if light_id is None else str(light_id).strip() or None
+        )
+        profile_ids = {
+            profile.light_id for profile in self._directional_light_profiles
+        }
+        if normalized_id not in profile_ids:
+            normalized_id = None
+        if normalized_id == self._selected_directional_light_id:
+            return False
+        self._selected_directional_light_id = normalized_id
+        self.update()
+        return True
+
+    def get_selected_directional_light_id(self) -> str | None:
+        """Return the selected light point, if any."""
+
+        return self._selected_directional_light_id
+
+    def _finish_directional_light_placement(self) -> None:
+        """Release the one-shot tool without reporting a cancellation."""
+
+        was_active = self._directional_light_placement_active
+        self._directional_light_placement_active = False
+        self._directional_light_hover_image_point = None
+        if (
+            not self._plan_image_erase_active
+            and not self._open_space_placement_active
+            and not self._is_stair_placement_active()
+            and self.pending_doorway_preset is None
+        ):
+            self.unsetCursor()
+        if was_active:
+            self.directional_light_placement_changed.emit(False)
+        self.update()
+
     # ### Placed-object profiles ###
     def set_placed_object_profiles(
         self,
@@ -1243,6 +1396,7 @@ class BlueprintCanvas(QWidget):
         ):
             return False
 
+        self.cancel_directional_light_placement()
         self.cancel_open_space_placement()
         self._cancel_stair_placement_for_other_mode()
         self._reset_doorway_placement()
@@ -1549,6 +1703,7 @@ class BlueprintCanvas(QWidget):
 
         if self.blueprint_image is None:
             return False
+        self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
         if self._open_space_placement_active:
@@ -1634,6 +1789,7 @@ class BlueprintCanvas(QWidget):
     ) -> None:
         """Start endpoint placement followed by optional curve refinement."""
 
+        self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
         self.cancel_open_space_placement()
@@ -1782,6 +1938,7 @@ class BlueprintCanvas(QWidget):
 
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
         """Begin placing one doorway using the selected hole dimensions."""
+        self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
         self.cancel_open_space_placement()
@@ -1818,6 +1975,7 @@ class BlueprintCanvas(QWidget):
         preserve_view: bool = False,
     ) -> None:
         self._cancel_placed_object_edit_drag(restore_initial=True)
+        self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
         self.blueprint_image = blueprint_image
@@ -1956,6 +2114,13 @@ class BlueprintCanvas(QWidget):
                 self.level_comparison_direction_changed.emit(
                     comparison_direction
                 )
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self.cancel_directional_light_placement()
+        ):
             event.accept()
             return
 
@@ -2109,6 +2274,13 @@ class BlueprintCanvas(QWidget):
 
         if (
             event.button() == Qt.MouseButton.RightButton
+            and self.cancel_directional_light_placement()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
             and self._plan_image_erase_active
         ):
             self.stop_plan_image_erasing()
@@ -2165,6 +2337,19 @@ class BlueprintCanvas(QWidget):
             super().mousePressEvent(event)
             return
 
+        if self._directional_light_placement_active:
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None:
+                image_x = image_point.x()
+                image_y = image_point.y()
+                self._finish_directional_light_placement()
+                self.directional_light_placement_requested.emit(
+                    image_x,
+                    image_y,
+                )
+            event.accept()
+            return
+
         if self._plan_image_erase_active:
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
@@ -2204,6 +2389,17 @@ class BlueprintCanvas(QWidget):
                     event.modifiers(),
                 )
                 self._commit_pending_doorway()
+            event.accept()
+            return
+
+        light_profile = self._find_directional_light_profile_at(
+            event.position()
+        )
+        if light_profile is not None:
+            self.set_selected_directional_light_id(light_profile.light_id)
+            self.directional_light_selection_requested.emit(
+                light_profile.light_id
+            )
             event.accept()
             return
 
@@ -2351,6 +2547,15 @@ class BlueprintCanvas(QWidget):
 
         if self.is_panning and event.buttons() & Qt.MouseButton.MiddleButton:
             self._update_pan(event.position())
+            event.accept()
+            return
+
+        if self._directional_light_placement_active:
+            image_point = self._widget_to_image(event.position())
+            self._directional_light_hover_image_point = (
+                None if image_point is None else QPointF(image_point)
+            )
+            self.update()
             event.accept()
             return
 
@@ -2600,6 +2805,12 @@ class BlueprintCanvas(QWidget):
                 self._finish_wall_vertex_interaction()
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            self._directional_light_placement_active
+            and self._directional_light_hover_image_point is not None
+        ):
+            self._directional_light_hover_image_point = None
+            self.update()
         if self._is_stair_placement_active():
             self.pending_stair_preview_point = None
             self.pending_stair_preview_guides = []
@@ -2620,6 +2831,7 @@ class BlueprintCanvas(QWidget):
             and not self._is_stair_placement_active()
             and not self._open_space_placement_active
             and not self._plan_image_erase_active
+            and not self._directional_light_placement_active
             and self._placed_object_edit_drag is None
         ):
             self.unsetCursor()
@@ -2654,6 +2866,8 @@ class BlueprintCanvas(QWidget):
         self._paint_camera_indicator(painter)
         self._paint_level_comparison_overlay(painter)
         self._paint_placed_object_profiles(painter)
+        self._paint_directional_light_profiles(painter)
+        self._paint_directional_light_hover(painter)
         self._paint_vertex_selection_marquee(painter)
         self._paint_plan_image_erase_selection(painter)
 
@@ -2946,6 +3160,83 @@ class BlueprintCanvas(QWidget):
             return None
         direction *= CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN / direction_length
         return center, center + direction
+
+    # ### Directional-light painting and hit testing ###
+    def _paint_directional_light_profiles(self, painter: QPainter) -> None:
+        """Draw scene-global light authoring points above Canvas geometry."""
+
+        if not self._directional_light_profiles:
+            return
+        painter.save()
+        for profile in self._directional_light_profiles:
+            center = self._image_to_widget(profile.image_x, profile.image_y)
+            selected = profile.light_id == self._selected_directional_light_id
+            if selected:
+                selected_pen = QPen(
+                    DIRECTIONAL_LIGHT_MARKER_SELECTED_COLOR,
+                    2.5,
+                )
+                selected_pen.setCosmetic(True)
+                painter.setPen(selected_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(
+                    center,
+                    DIRECTIONAL_LIGHT_MARKER_SELECTED_RADIUS_SCREEN,
+                    DIRECTIONAL_LIGHT_MARKER_SELECTED_RADIUS_SCREEN,
+                )
+            outline_pen = QPen(DIRECTIONAL_LIGHT_MARKER_OUTLINE_COLOR, 3.5)
+            outline_pen.setCosmetic(True)
+            painter.setPen(outline_pen)
+            painter.setBrush(DIRECTIONAL_LIGHT_MARKER_COLOR)
+            painter.drawEllipse(
+                center,
+                DIRECTIONAL_LIGHT_MARKER_RADIUS_SCREEN,
+                DIRECTIONAL_LIGHT_MARKER_RADIUS_SCREEN,
+            )
+        painter.restore()
+
+    def _paint_directional_light_hover(self, painter: QPainter) -> None:
+        """Draw the pending one-shot point under the Canvas pointer."""
+
+        point = self._directional_light_hover_image_point
+        if not self._directional_light_placement_active or point is None:
+            return
+        center = self._image_to_widget(point.x(), point.y())
+        hover_pen = QPen(DIRECTIONAL_LIGHT_MARKER_COLOR, 2.0)
+        hover_pen.setCosmetic(True)
+        painter.save()
+        painter.setPen(hover_pen)
+        painter.setBrush(DIRECTIONAL_LIGHT_HOVER_COLOR)
+        painter.drawEllipse(
+            center,
+            DIRECTIONAL_LIGHT_HOVER_RADIUS_SCREEN,
+            DIRECTIONAL_LIGHT_HOVER_RADIUS_SCREEN,
+        )
+        painter.drawLine(
+            QPointF(center.x() - 15.0, center.y()),
+            QPointF(center.x() + 15.0, center.y()),
+        )
+        painter.drawLine(
+            QPointF(center.x(), center.y() - 15.0),
+            QPointF(center.x(), center.y() + 15.0),
+        )
+        painter.restore()
+
+    def _find_directional_light_profile_at(
+        self,
+        widget_point: QPointF,
+    ) -> CanvasDirectionalLightProfile | None:
+        """Return the topmost light point inside its stable screen hit radius."""
+
+        closest_profile: CanvasDirectionalLightProfile | None = None
+        closest_distance = DIRECTIONAL_LIGHT_MARKER_HIT_RADIUS_SCREEN
+        for profile in reversed(self._directional_light_profiles):
+            center = self._image_to_widget(profile.image_x, profile.image_y)
+            distance = _qpoint_distance(widget_point, center)
+            if distance <= closest_distance:
+                closest_profile = profile
+                closest_distance = distance
+        return closest_profile
 
     def _apply_active_chain(self) -> None:
         if self.active_vertex_id is None:
@@ -3869,6 +4160,9 @@ class BlueprintCanvas(QWidget):
     def _update_edit_hover_cursor(self, widget_point: QPointF) -> None:
         """Show movement feedback for editable points and doorways."""
 
+        if self._find_directional_light_profile_at(widget_point) is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
         if self._find_placed_object_rotation_handle(widget_point) is not None:
             self.setCursor(Qt.CursorShape.CrossCursor)
             return

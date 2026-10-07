@@ -93,10 +93,17 @@ class CanvasLevelTransformPreviewTests(unittest.TestCase):
             60_000,
         )
 
-        with patch.object(
-            self.workspace,
-            "_schedule_viewer_preview_refresh",
-        ) as schedule_refresh:
+        with (
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+            patch.object(
+                self.workspace,
+                "_sync_canvas_directional_light_profiles",
+                wraps=self.workspace._sync_canvas_directional_light_profiles,
+            ) as sync_light_profiles,
+        ):
             self.workspace._handle_level_scale_changed(1.5)
             self.workspace._handle_level_x_offset_changed(1.2)
             self.workspace._handle_level_y_offset_changed(-0.8)
@@ -141,6 +148,7 @@ class CanvasLevelTransformPreviewTests(unittest.TestCase):
         )
         self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
         schedule_refresh.assert_called_once()
+        sync_light_profiles.assert_called_once_with()
 
     def test_drag_starts_delay_only_on_release_and_commits_one_undo_step(
         self,
@@ -209,6 +217,14 @@ class CanvasLevelTransformPreviewTests(unittest.TestCase):
         )
         QTest.qWait(80)
         _qt_application.processEvents()
+        for _attempt in range(20):
+            if (
+                self.workspace._canvas_viewer_preview_revision
+                == self.workspace._viewer_preview_revision
+            ):
+                break
+            QTest.qWait(25)
+            _qt_application.processEvents()
 
         self.assertAlmostEqual(self.level.offset_x_meters, 0.75)
         self.assertIsNone(self.workspace._pending_level_transform)
