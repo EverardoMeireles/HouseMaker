@@ -4,8 +4,11 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+
+import trimesh
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,8 +21,12 @@ from housemaker.architectural_trim import (
     TRIM_HANDLE_HEIGHT,
     ArchitecturalTrimPlacementRequest,
 )
+from housemaker.generation_state import MESHY_GENERATION_PROVIDER
+from housemaker.glb import import_generated_glb
 from housemaker.main import BlueprintWorkspace
+from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.models import (
+    TRIM_KIND_CORNICE,
     TRIM_KIND_SKIRTING_BOARD,
     LevelData,
     RoomData,
@@ -102,6 +109,29 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             )
         )
 
+    def _place_cornice(self, trim_id: str, wall_surface_id: str) -> None:
+        self.workspace._handle_architectural_trim_placement_requested(
+            ArchitecturalTrimPlacementRequest(
+                trim_id=trim_id,
+                kind=TRIM_KIND_CORNICE,
+                wall_surface_ids=(wall_surface_id,),
+            )
+        )
+
+    def _seed_stale_atlas_object(self) -> str:
+        mesh = trimesh.creation.box(extents=(0.4, 0.5, 0.6))
+        glb_bytes = bytes(trimesh.Scene(mesh).export(file_type="glb"))
+        model = import_generated_glb(glb_bytes)
+        self.workspace.generation._handle_generation_succeeded(
+            MeshyGenerationResult(
+                "stale-atlas-object-task",
+                glb_bytes,
+                "Atlas object",
+            ),
+            model,
+        )
+        return self.workspace.generation.get_data().generated_objects[-1].object_id
+
     def test_placement_selects_semantic_parts_and_undo_removes_component(
         self,
     ) -> None:
@@ -125,6 +155,132 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             self.workspace._handle_canvas_undo_requested()
 
         self.assertEqual(self.level.architectural_trims, [])
+
+    def test_selecting_cornice_replaces_stale_atlas_generation_target(
+        self,
+    ) -> None:
+        trim_id = "c" * 32
+        stale_object_id = self._seed_stale_atlas_object()
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_cornice(trim_id, _wall_surface_id(1, 2))
+        semantic_id = next(
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == trim_id and part.part_kind == "front"
+        )
+
+        self.assertTrue(
+            self.workspace.generation.select_generated_object(stale_object_id)
+        )
+        self.assertEqual(
+            self.workspace.generation._selected_object_id,
+            stale_object_id,
+        )
+
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (semantic_id,)
+        )
+
+        target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.level_index, self.level.index)
+        self.assertEqual(target.trim_id, trim_id)
+        self.assertNotEqual(target.object_id, stale_object_id)
+        self.assertEqual(
+            self.workspace.generation._selected_object_id,
+            target.object_id,
+        )
+        trim_model = self.workspace.generation.get_generated_object_model(
+            target.object_id
+        )
+        self.assertIsNotNone(trim_model)
+        self.assertIs(self.workspace.generation.result_view.model, trim_model)
+
+    def test_reselecting_cornice_reuses_its_generation_component(self) -> None:
+        trim_id = "d" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_cornice(trim_id, _wall_surface_id(1, 2))
+        semantic_id = next(
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == trim_id and part.part_kind == "front"
+        )
+
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (semantic_id,)
+        )
+        first_target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(first_target)
+        first_record_count = len(
+            self.workspace.generation.get_data().generated_objects
+        )
+
+        self.workspace._handle_architectural_trim_part_selection_changed(())
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (semantic_id,)
+        )
+
+        second_target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(second_target)
+        assert first_target is not None and second_target is not None
+        self.assertEqual(second_target.object_id, first_target.object_id)
+        self.assertEqual(
+            len(self.workspace.generation.get_data().generated_objects),
+            first_record_count,
+        )
+
+    def test_generated_cornice_replaces_procedural_preview_and_export(self) -> None:
+        trim_id = "e" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_cornice(trim_id, _wall_surface_id(1, 2))
+        target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+
+        record_index = next(
+            index
+            for index, record in enumerate(
+                self.workspace.generation._data.generated_objects
+            )
+            if record.object_id == target.object_id
+        )
+        seed_record = self.workspace.generation._data.generated_objects[
+            record_index
+        ]
+        self.workspace.generation._data.generated_objects[record_index] = replace(
+            seed_record,
+            provider=MESHY_GENERATION_PROVIDER,
+            provider_task_id="generated-cornice-task",
+        )
+
+        preview = self.workspace._build_viewer_preview_model(None)
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(
+            [
+                placed.object_id
+                for placed in preview.preview_placed_objects
+                if placed.object_id == target.object_id
+            ],
+            [target.object_id],
+        )
+        self.assertFalse(
+            any(
+                part.trim_id == trim_id
+                for part in preview.preview_architectural_trim_parts
+            )
+        )
+
+        export_scene = self.workspace._build_pre_atlas_export_scene()
+        self.assertEqual(
+            [
+                placed.object_id
+                for placed in export_scene.placed_models
+                if placed.object_id == target.object_id
+            ],
+            [target.object_id],
+        )
 
     def test_joined_run_dimension_edit_updates_both_members_and_deletes_both(
         self,

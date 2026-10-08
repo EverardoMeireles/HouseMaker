@@ -234,6 +234,7 @@ GLASS_MATERIAL_SOURCE_PREFAB = "housemaker_prefab"
 SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY = "safe_duplicate_face_removal"
 EXTERNAL_GLB_IMPORT_PIPELINE_KEY = "external_glb_import"
 DOOR_COMPONENT_PIPELINE_KEY = "door_component"
+ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY = "architectural_trim_component"
 DOOR_SIDE_DUPLICATION_PIPELINE_KEY = "door_side_duplication"
 DOOR_BODY_DISPLACEMENT_PIPELINE_KEY = "door_body_displacement"
 DOOR_SIDE_DUPLICATION_AXIS = 1
@@ -449,6 +450,7 @@ class _ActiveObjectOperation:
     committed_object_id: str | None = None
     pending_placement: GeneratedObjectPlacement | None = None
     door_slot_target: _DoorSlotEditingTarget | None = None
+    architectural_trim_target: _ArchitecturalTrimEditingTarget | None = None
     replaced_object_record: GeneratedObjectRecord | None = None
     _operation_id: str = field(
         default_factory=lambda: uuid.uuid4().hex,
@@ -585,6 +587,21 @@ def _apply_door_slot_pipeline_metadata(
             ),
             "geometry_generation": True,
         }
+
+
+def _apply_architectural_trim_pipeline_metadata(
+    pipeline: dict[str, object],
+    target: _ArchitecturalTrimEditingTarget | None,
+) -> None:
+    """Keep one generated asset bound to its persistent scene trim."""
+
+    if target is None:
+        return
+    pipeline["mode"] = "architectural_trim_component"
+    pipeline[ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY] = {
+        "level_index": target.level_index,
+        "trim_id": target.trim_id,
+    }
 
 
 # ### Symmetric-division metadata ###
@@ -1367,6 +1384,36 @@ class _DoorSlotEditingTarget:
             )
         if not isinstance(self.generation_ready, bool):
             raise TypeError("Door slot generation readiness must be boolean.")
+
+
+@dataclass(frozen=True)
+class _ArchitecturalTrimEditingTarget:
+    """Stable routing state for one architectural trim edited in Generation."""
+
+    level_index: int
+    trim_id: str
+    object_id: str
+    object_name: str
+    generation_ready: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.level_index, bool) or not isinstance(
+            self.level_index,
+            int,
+        ):
+            raise TypeError("Architectural trim level indices must be integers.")
+        normalized_trim_id = str(self.trim_id).strip().lower()
+        if not normalized_trim_id:
+            raise ValueError("Architectural trim IDs cannot be empty.")
+        normalized_object_id = str(self.object_id).strip()
+        normalized_object_name = str(self.object_name).strip()
+        if not normalized_object_id or not normalized_object_name:
+            raise ValueError("Architectural trim component identities cannot be empty.")
+        if not isinstance(self.generation_ready, bool):
+            raise TypeError("Architectural trim generation readiness must be boolean.")
+        object.__setattr__(self, "trim_id", normalized_trim_id)
+        object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(self, "object_name", normalized_object_name)
 
 
 @dataclass(frozen=True)
@@ -3637,6 +3684,7 @@ class GenerationWorkspace(QWidget):
     external_glb_import_completed = Signal(object, object)
     external_glb_import_failed = Signal(str)
     door_slot_editing_changed = Signal(bool)
+    architectural_trim_editing_changed = Signal(bool)
     door_slot_generation_status_changed = Signal(str)
     door_side_duplication_changed = Signal(str, object)
 
@@ -3723,6 +3771,9 @@ class GenerationWorkspace(QWidget):
         self._is_emitting_texture_repair = False
         self._selected_object_id: str | None = None
         self._door_slot_editing_target: _DoorSlotEditingTarget | None = None
+        self._architectural_trim_editing_target: (
+            _ArchitecturalTrimEditingTarget | None
+        ) = None
         self._door_slot_generation_prompt_visible = False
         self._build_ui()
         self._sync_video_controls()
@@ -4024,6 +4075,53 @@ class GenerationWorkspace(QWidget):
         self._emit_data_changed()
         return record
 
+    def register_architectural_trim_component_model(
+        self,
+        *,
+        level_index: int,
+        trim_id: str,
+        object_id: str,
+        object_name: str,
+        model: GeneratedModel,
+    ) -> GeneratedObjectRecord:
+        """Persist one procedural trim model as a scene-bound source asset."""
+
+        target = _ArchitecturalTrimEditingTarget(
+            level_index=level_index,
+            trim_id=trim_id,
+            object_id=object_id,
+            object_name=object_name,
+        )
+        if self._find_generated_object_record(target.object_id) is not None:
+            raise ValueError("The architectural trim object ID is already in use.")
+        if not isinstance(model, GeneratedModel) or not model.glb_bytes:
+            raise ValueError(
+                "Architectural trim components require a valid generated model."
+            )
+        import_generated_glb(bytes(model.glb_bytes))
+        asset_key = hashlib.sha256(target.object_id.encode("utf-8")).hexdigest()
+        asset_path = self._persist_meshy_named_asset(
+            f"architectural-trim-{asset_key}.glb",
+            bytes(model.glb_bytes),
+        )
+        # Procedural trim seeds intentionally have no UVs. Let Meshy unwrap the
+        # first texture generation instead of requesting original-UV retention.
+        pipeline: dict[str, object] = {}
+        _apply_architectural_trim_pipeline_metadata(pipeline, target)
+        record = GeneratedObjectRecord(
+            object_id=target.object_id,
+            frame_index=0,
+            object_name=target.object_name,
+            pipeline=pipeline,
+            provider=GENERATION_BACKEND_EXTERNAL_GLB,
+            provider_task_id=None,
+            asset_path=asset_path,
+        )
+        self._data.generated_objects.append(record)
+        self._cache_generated_model(record, model)
+        self._emit_data_changed()
+        return record
+
     def set_door_slot_editing_target(
         self,
         *,
@@ -4095,6 +4193,8 @@ class GenerationWorkspace(QWidget):
             self._door_slot_generation_prompt_visible = False
         elif not same_target or not previous_target.generation_ready:
             self._door_slot_generation_prompt_visible = True
+        if self._architectural_trim_editing_target is not None:
+            self.clear_architectural_trim_editing_target()
         self._door_slot_editing_target = next_target
         self.result_view.cancel_transient_pointer_interactions()
         self.result_view.set_face_editing_enabled(False)
@@ -4110,6 +4210,63 @@ class GenerationWorkspace(QWidget):
         self.door_slot_editing_changed.emit(True)
         self._emit_active_door_slot_generation_status()
         return True
+
+    def set_architectural_trim_editing_target(
+        self,
+        *,
+        level_index: int,
+        trim_id: str,
+        object_id: str,
+        object_name: str,
+        generation_ready: bool = True,
+    ) -> bool:
+        """Route Generation actions to one persistent architectural trim."""
+
+        try:
+            target = _ArchitecturalTrimEditingTarget(
+                level_index=level_index,
+                trim_id=trim_id,
+                object_id=object_id,
+                object_name=object_name,
+                generation_ready=bool(generation_ready),
+            )
+        except (TypeError, ValueError):
+            return False
+        record = self._find_generated_object_record(target.object_id)
+        if (
+            record is None
+            or get_architectural_trim_component_identity(record)
+            != (target.level_index, target.trim_id)
+        ):
+            return False
+        if self._door_slot_editing_target is not None:
+            self.clear_door_slot_editing_target()
+        self._architectural_trim_editing_target = target
+        self.result_view.cancel_transient_pointer_interactions()
+        self.result_view.set_face_editing_enabled(False)
+        self.result_view.set_selected_placed_object_ids(())
+        self._selected_object_id = record.object_id
+        self._display_generated_object(record)
+        self._sync_face_selection_outputs()
+        self._sync_controls()
+        self.architectural_trim_editing_changed.emit(True)
+        return True
+
+    def is_architectural_trim_generation_ready(
+        self,
+        level_index: int,
+        trim_id: str,
+    ) -> bool:
+        """Return whether the selected trim accepts Generation actions."""
+
+        target = self._architectural_trim_editing_target
+        return bool(
+            target is not None
+            and not isinstance(level_index, bool)
+            and target.level_index == level_index
+            and target.trim_id == str(trim_id).strip().lower()
+            and target.generation_ready
+        )
 
     def is_door_slot_generation_ready(
         self,
@@ -4137,6 +4294,16 @@ class GenerationWorkspace(QWidget):
         self._select_generated_object(None)
         self.door_slot_editing_changed.emit(False)
         self._emit_active_door_slot_generation_status()
+
+    def clear_architectural_trim_editing_target(self) -> None:
+        """Return Generation to its ordinary generated-object context."""
+
+        if self._architectural_trim_editing_target is None:
+            return
+        self._architectural_trim_editing_target = None
+        self.result_view.set_selected_placed_object_ids(())
+        self._select_generated_object(None)
+        self.architectural_trim_editing_changed.emit(False)
 
     def import_external_glb(
         self,
@@ -4331,15 +4498,22 @@ class GenerationWorkspace(QWidget):
     def select_generated_object(self, object_id: str | None) -> bool:
         """Select one generated object for preview and editing without a list."""
 
-        if self._door_slot_editing_target is not None:
-            target_object_id = self._door_slot_editing_target.object_id
-            normalized_object_id = (
-                None if object_id is None else str(object_id).strip() or None
-            )
-            if normalized_object_id != target_object_id:
-                self.clear_door_slot_editing_target()
+        normalized_object_id = (
+            None if object_id is None else str(object_id).strip() or None
+        )
+        if (
+            self._door_slot_editing_target is not None
+            and normalized_object_id != self._door_slot_editing_target.object_id
+        ):
+            self.clear_door_slot_editing_target()
+        if (
+            self._architectural_trim_editing_target is not None
+            and normalized_object_id
+            != self._architectural_trim_editing_target.object_id
+        ):
+            self.clear_architectural_trim_editing_target()
         return self._select_generated_object(
-            object_id,
+            normalized_object_id,
             repair_missing_variant=True,
         )
 
@@ -4431,7 +4605,15 @@ class GenerationWorkspace(QWidget):
     def get_placeable_object_names_by_id(self) -> dict[str, str]:
         """Return completed object IDs and eligible active operation IDs."""
 
-        placeable_objects = self.get_generated_object_names_by_id()
+        placeable_objects = {
+            object_id: object_name
+            for object_id, object_name in (
+                self.get_generated_object_names_by_id().items()
+            )
+            if not is_architectural_trim_component_record(
+                self._find_generated_object_record(object_id)
+            )
+        }
         for runtime in self._object_job_runtimes.values():
             if not self._can_place_active_operation(runtime.operation):
                 continue
@@ -4451,6 +4633,7 @@ class GenerationWorkspace(QWidget):
             record.object_id
             for record in self._data.generated_objects
             if not is_door_component_record(record)
+            and not is_architectural_trim_component_record(record)
         }
         for blob_index, placeable_id in (
             self._latest_generation_batch_member_ids.items()
@@ -4463,7 +4646,9 @@ class GenerationWorkspace(QWidget):
             if is_active or placeable_id in completed_object_ids:
                 placeable_ids_by_index[blob_index] = placeable_id
         for record in self._data.generated_objects:
-            if is_door_component_record(record):
+            if is_door_component_record(
+                record
+            ) or is_architectural_trim_component_record(record):
                 continue
             raw_metadata = record.pipeline.get(GENERATION_BATCH_PIPELINE_KEY)
             if not isinstance(raw_metadata, Mapping):
@@ -4480,6 +4665,7 @@ class GenerationWorkspace(QWidget):
             if (
                 operation.batch_id != batch_id
                 or operation.door_slot_target is not None
+                or operation.architectural_trim_target is not None
             ):
                 continue
             if operation.committed_object_id is not None:
@@ -4667,6 +4853,7 @@ class GenerationWorkspace(QWidget):
         source_record = self._find_generated_object_record(normalized_source_id)
         if (
             source_record is None
+            or is_architectural_trim_component_record(source_record)
             or not isinstance(placement, GeneratedObjectPlacement)
         ):
             return None
@@ -4712,6 +4899,9 @@ class GenerationWorkspace(QWidget):
         if instance_index is None:
             return False
         existing = self._data.object_instances[instance_index]
+        source = self._find_generated_object_record(existing.source_object_id)
+        if source is None or is_architectural_trim_component_record(source):
+            return False
         if existing.placement == placement:
             return True
         self._data.object_instances[instance_index] = replace(
@@ -4736,7 +4926,7 @@ class GenerationWorkspace(QWidget):
         if not isinstance(instance, GeneratedObjectInstance):
             return False
         source = self._find_generated_object_record(instance.source_object_id)
-        if source is None:
+        if source is None or is_architectural_trim_component_record(source):
             return False
         if any(
             record.object_id == instance.instance_id
@@ -4842,6 +5032,7 @@ class GenerationWorkspace(QWidget):
             raise RuntimeError("Cannot replace Generation data while generating.")
         self._finish_existing_object_placement_request()
         self._door_slot_editing_target = None
+        self._architectural_trim_editing_target = None
         self._door_slot_generation_prompt_visible = False
         self._latest_generation_batch_id = None
         self._latest_generation_batch_member_ids.clear()
@@ -4883,6 +5074,7 @@ class GenerationWorkspace(QWidget):
             self._is_rebuilding_generation_data = False
         self._sync_controls()
         self.door_slot_editing_changed.emit(False)
+        self.architectural_trim_editing_changed.emit(False)
         self._emit_active_door_slot_generation_status()
         self._emit_placeable_objects_changed()
 
@@ -4942,6 +5134,31 @@ class GenerationWorkspace(QWidget):
                     _get_object_symmetric_division_metadata(source_record),
                     True,
                     instance.source_object_id,
+                )
+            )
+        return tuple(signature)
+
+    def get_architectural_trim_component_dependency_signature(
+        self,
+    ) -> tuple[tuple[object, ...], ...]:
+        """Snapshot every scene-bound trim asset used by preview and export."""
+
+        signature: list[tuple[object, ...]] = []
+        for record in self._data.generated_objects:
+            identity = get_architectural_trim_component_identity(record)
+            if identity is None:
+                continue
+            level_index, trim_id = identity
+            signature.append(
+                (
+                    record.object_id,
+                    level_index,
+                    trim_id,
+                    _build_generation_asset_revision(
+                        self._asset_directory,
+                        record.asset_path,
+                    ),
+                    _get_selected_texture_resolution(record),
                 )
             )
         return tuple(signature)
@@ -5508,6 +5725,7 @@ class GenerationWorkspace(QWidget):
         record = self._find_generated_object_record(str(object_id).strip())
         if (
             record is None
+            or is_architectural_trim_component_record(record)
             or self._object_has_active_mutation_job(record.object_id)
         ):
             return False
@@ -5721,6 +5939,8 @@ class GenerationWorkspace(QWidget):
         if record_index is None:
             return False
         record = self._data.generated_objects[record_index]
+        if is_architectural_trim_component_record(record):
+            return False
         if record.placement == placement:
             return True
 
@@ -5870,6 +6090,11 @@ class GenerationWorkspace(QWidget):
     def delete_selected_object_faces(self) -> bool:
         """Start a local face deletion for the current viewer selection."""
 
+        if self._architectural_trim_editing_target is not None:
+            self.status_label.setText(
+                "Architectural trim faces cannot be deleted in Generation."
+            )
+            return False
         self.result_view.cancel_transient_pointer_interactions()
         self._sync_face_selection_outputs()
         record = self._find_generated_object_record(self._selected_object_id)
@@ -5903,6 +6128,25 @@ class GenerationWorkspace(QWidget):
     def generate_selected_object_texture(self) -> bool:
         """Generate the selected object's texture from the current mask."""
 
+        trim_target = self._architectural_trim_editing_target
+        if trim_target is not None:
+            trim_record = self._find_generated_object_record(trim_target.object_id)
+            if (
+                not trim_target.generation_ready
+                or trim_record is None
+                or get_architectural_trim_component_identity(trim_record)
+                != (trim_target.level_index, trim_target.trim_id)
+            ):
+                self.status_label.setText(
+                    "Select the architectural trim again before generating its "
+                    "texture."
+                )
+                return False
+            if self._selected_object_id != trim_record.object_id:
+                self._select_generated_object(
+                    trim_record.object_id,
+                    repair_missing_variant=True,
+                )
         target = self._door_slot_editing_target
         if (
             target is not None
@@ -5975,9 +6219,53 @@ class GenerationWorkspace(QWidget):
         )
         return True
 
+    def _start_architectural_trim_model_generation(
+        self,
+        target: _ArchitecturalTrimEditingTarget,
+        *,
+        geometry_only: bool,
+    ) -> bool:
+        """Generate an atomic replacement for one scene-bound trim model."""
+
+        if not target.generation_ready:
+            self.status_label.setText(
+                "Select the architectural trim again before generating it."
+            )
+            return False
+        record = self._find_generated_object_record(target.object_id)
+        if (
+            record is None
+            or get_architectural_trim_component_identity(record)
+            != (target.level_index, target.trim_id)
+        ):
+            self.status_label.setText(
+                "The selected architectural trim model is no longer available."
+            )
+            return False
+        if self._object_has_active_mutation_job(target.object_id):
+            self.status_label.setText(
+                "Wait for this architectural trim's active job to finish."
+            )
+            return False
+        request = self._build_generation_request(geometry_only=geometry_only)
+        if request is None:
+            return False
+        self._start_generation(
+            request,
+            requested_name=target.object_name,
+            architectural_trim_target=target,
+            replaced_object_record=record,
+        )
+        return True
+
     def convert_selected_faces_to_glass(self) -> bool:
         """Run a PBR texture job for the authoritative selected faces."""
 
+        if self._architectural_trim_editing_target is not None:
+            self.status_label.setText(
+                "Architectural trim faces cannot be converted to glass."
+            )
+            return False
         self.result_view.cancel_transient_pointer_interactions()
         self._sync_face_selection_outputs()
         selected_faces = self.result_view.get_selected_face_indices()
@@ -6179,6 +6467,13 @@ class GenerationWorkspace(QWidget):
             deleted_record
         )
 
+        trim_target_was_deleted = bool(
+            self._architectural_trim_editing_target is not None
+            and self._architectural_trim_editing_target.object_id == object_id
+        )
+        if trim_target_was_deleted:
+            self._architectural_trim_editing_target = None
+
         preferred_object_id = self._selected_object_id
         if preferred_object_id == object_id:
             preferred_object_id = (
@@ -6189,6 +6484,8 @@ class GenerationWorkspace(QWidget):
                 ].object_id
             )
         self._select_generated_object(preferred_object_id)
+        if trim_target_was_deleted:
+            self.architectural_trim_editing_changed.emit(False)
         if asset_cleanup_failed:
             self.status_label.setText(
                 f"Deleted: {deleted_record.object_name}. Some local GLB "
@@ -6292,6 +6589,13 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
 
     def generate(self) -> None:
+        trim_target = self._architectural_trim_editing_target
+        if trim_target is not None:
+            self._start_architectural_trim_model_generation(
+                trim_target,
+                geometry_only=False,
+            )
+            return
         target = self._door_slot_editing_target
         if target is not None and is_door_body_slot(target.slot_id):
             if (
@@ -6313,6 +6617,13 @@ class GenerationWorkspace(QWidget):
     def generate_geometry(self) -> None:
         """Generate and locally process geometry without submitting Retexture."""
 
+        trim_target = self._architectural_trim_editing_target
+        if trim_target is not None:
+            self._start_architectural_trim_model_generation(
+                trim_target,
+                geometry_only=True,
+            )
+            return
         if self._door_slot_editing_target is not None:
             self.status_label.setText(
                 "Door components use Generate for model creation or Generate "
@@ -6426,21 +6737,25 @@ class GenerationWorkspace(QWidget):
         blob_index: int = 1,
         blob_count: int = 1,
         door_slot_target: _DoorSlotEditingTarget | None = None,
+        architectural_trim_target: _ArchitecturalTrimEditingTarget | None = None,
         replaced_object_record: GeneratedObjectRecord | None = None,
     ) -> str:
         """Start one independently owned model-generation request."""
 
+        if door_slot_target is not None and architectural_trim_target is not None:
+            raise ValueError("A generation job cannot target two scene components.")
+        component_target = door_slot_target or architectural_trim_target
         if replaced_object_record is not None and (
-            door_slot_target is None
-            or replaced_object_record.object_id != door_slot_target.object_id
+            component_target is None
+            or replaced_object_record.object_id != component_target.object_id
         ):
             raise ValueError(
-                "A model replacement must target the same door slot object."
+                "A model replacement must target the same scene component."
             )
 
         resolved_name = (
-            door_slot_target.object_name
-            if door_slot_target is not None
+            component_target.object_name
+            if component_target is not None
             else str(requested_name or "").strip()
         )
         if not resolved_name:
@@ -6450,13 +6765,14 @@ class GenerationWorkspace(QWidget):
             kind=OBJECT_OPERATION_GENERATE_MODEL,
             target_object_id=(
                 None
-                if door_slot_target is None
-                else door_slot_target.object_id
+                if component_target is None
+                else component_target.object_id
             ),
             batch_id=None if batch_id is None else str(batch_id),
             blob_index=int(blob_index),
             blob_count=int(blob_count),
             door_slot_target=door_slot_target,
+            architectural_trim_target=architectural_trim_target,
             replaced_object_record=(
                 None
                 if replaced_object_record is None
@@ -6544,6 +6860,15 @@ class GenerationWorkspace(QWidget):
                 if (
                     self._door_slot_editing_target is not None
                     and self._door_slot_editing_target.object_id
+                    == request.object_id
+                )
+                else None
+            ),
+            architectural_trim_target=(
+                self._architectural_trim_editing_target
+                if (
+                    self._architectural_trim_editing_target is not None
+                    and self._architectural_trim_editing_target.object_id
                     == request.object_id
                 )
                 else None
@@ -7420,6 +7745,7 @@ class GenerationWorkspace(QWidget):
             operation is not None
             and operation.kind == OBJECT_OPERATION_GENERATE_MODEL
             and operation.door_slot_target is None
+            and operation.architectural_trim_target is None
             and not operation.cancel_requested
             and operation.committed_object_id is None
             and runtime is not None
@@ -7506,22 +7832,31 @@ class GenerationWorkspace(QWidget):
         operation: _ActiveObjectOperation | None,
         object_id: str,
     ) -> GeneratedObjectRecord | None:
-        """Validate the stable door-slot record captured when a job started."""
+        """Validate the stable component record captured when a job started."""
 
-        if operation is None or operation.door_slot_target is None:
+        if operation is None:
             return None
+        component_target = (
+            operation.door_slot_target or operation.architectural_trim_target
+        )
+        if component_target is None:
+            return None
+        if object_id != component_target.object_id:
+            raise RuntimeError(
+                "The generated replacement no longer matches its scene component."
+            )
         current_record = self._find_generated_object_record(object_id)
         snapshot = operation.replaced_object_record
         if snapshot is None:
             if current_record is not None:
                 raise RuntimeError(
-                    "The target door slot received another model before this "
+                    "The target scene component received another model before this "
                     "generation completed."
                 )
             return None
         if current_record is None or current_record != snapshot:
             raise RuntimeError(
-                "The target door slot changed before its replacement model "
+                "The target scene component changed before its replacement model "
                 "could be applied."
             )
         return current_record
@@ -7535,7 +7870,7 @@ class GenerationWorkspace(QWidget):
         operation_id: str | None,
         preview_asset_revision: tuple[object, ...] | None = None,
     ) -> bool:
-        """Append a new model or atomically replace one stable door slot."""
+        """Append a new model or atomically replace one stable component."""
 
         if replacement_source is None:
             self._data.generated_objects.append(record)
@@ -7552,9 +7887,17 @@ class GenerationWorkspace(QWidget):
         ):
             return False
 
-        self._selected_object_id = record.object_id
-        self._generated_model = preview_model
-        self._select_generated_object(record.object_id)
+        should_select_result = True
+        if is_architectural_trim_component_record(record):
+            active_trim_target = self._architectural_trim_editing_target
+            should_select_result = bool(
+                active_trim_target is not None
+                and active_trim_target.object_id == record.object_id
+            )
+        if should_select_result:
+            self._selected_object_id = record.object_id
+            self._generated_model = preview_model
+            self._select_generated_object(record.object_id)
         self._record_operation_commit(
             OBJECT_OPERATION_GENERATE_MODEL,
             record.object_id,
@@ -8034,6 +8377,12 @@ class GenerationWorkspace(QWidget):
             if active_operation is None
             else active_operation.door_slot_target
         )
+        architectural_trim_target = (
+            None
+            if active_operation is None
+            else active_operation.architectural_trim_target
+        )
+        component_target = door_slot_target or architectural_trim_target
         if isinstance(result, _SavedObjectGeneration):
             self._commit_saved_object_generation(
                 result,
@@ -8050,12 +8399,12 @@ class GenerationWorkspace(QWidget):
             return
         object_id = (
             uuid.uuid4().hex
-            if door_slot_target is None
-            else door_slot_target.object_id
+            if component_target is None
+            else component_target.object_id
         )
         object_name = (
-            door_slot_target.object_name
-            if door_slot_target is not None
+            component_target.object_name
+            if component_target is not None
             else (
                 runtime.requested_name
                 if runtime is not None and runtime.requested_name
@@ -8292,6 +8641,10 @@ class GenerationWorkspace(QWidget):
             return
         _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
         _apply_door_slot_pipeline_metadata(pipeline, door_slot_target)
+        _apply_architectural_trim_pipeline_metadata(
+            pipeline,
+            architectural_trim_target,
+        )
         if replacement_source is not None:
             pipeline = _push_object_operation_undo_snapshot(
                 replacement_source,
@@ -8330,7 +8683,7 @@ class GenerationWorkspace(QWidget):
         ):
             self._remove_newly_persisted_assets(persisted_asset_paths)
             self._handle_generation_failed(
-                "The target door slot could not accept its replacement model.",
+                "The target scene component could not accept its replacement model.",
                 operation_id=operation_id,
             )
             return
@@ -8404,14 +8757,20 @@ class GenerationWorkspace(QWidget):
             if active_operation is None
             else active_operation.door_slot_target
         )
+        architectural_trim_target = (
+            None
+            if active_operation is None
+            else active_operation.architectural_trim_target
+        )
+        component_target = door_slot_target or architectural_trim_target
         object_id = (
             saved.object_id
-            if door_slot_target is None
-            else door_slot_target.object_id
+            if component_target is None
+            else component_target.object_id
         )
         object_name = (
-            door_slot_target.object_name
-            if door_slot_target is not None
+            component_target.object_name
+            if component_target is not None
             else (
                 runtime.requested_name
                 if runtime is not None and runtime.requested_name
@@ -8434,6 +8793,10 @@ class GenerationWorkspace(QWidget):
         pipeline = copy.deepcopy(saved.pipeline)
         _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
         _apply_door_slot_pipeline_metadata(pipeline, door_slot_target)
+        _apply_architectural_trim_pipeline_metadata(
+            pipeline,
+            architectural_trim_target,
+        )
         if replacement_source is not None:
             pipeline = _push_object_operation_undo_snapshot(
                 replacement_source,
@@ -8484,7 +8847,7 @@ class GenerationWorkspace(QWidget):
             preview_asset_revision=saved.preview_asset_revision,
         ):
             self._handle_generation_failed(
-                "The target door slot could not accept its replacement model.",
+                "The target scene component could not accept its replacement model.",
                 operation_id=operation_id,
             )
             return
@@ -9185,6 +9548,7 @@ class GenerationWorkspace(QWidget):
         symmetric_division_enabled = (
             not geometry_only
             and self.symmetric_division_checkbox.isChecked()
+            and self._architectural_trim_editing_target is None
             and (
                 door_slot_target is None
                 or is_door_body_slot(door_slot_target.slot_id)
@@ -9526,6 +9890,10 @@ class GenerationWorkspace(QWidget):
     # ### Control synchronization ###
     def _sync_controls(self) -> None:
         door_slot_mode = self._door_slot_editing_target is not None
+        architectural_trim_mode = (
+            self._architectural_trim_editing_target is not None
+        )
+        component_mode = door_slot_mode or architectural_trim_mode
         door_body_slot_mode = bool(
             self._door_slot_editing_target is not None
             and is_door_body_slot(self._door_slot_editing_target.slot_id)
@@ -9614,6 +9982,32 @@ class GenerationWorkspace(QWidget):
             not self._settings.use_uv_raycast_for_object_generation
             or self.object_3d_panel.projection_camera_percentages_are_valid()
         )
+        trim_target = self._architectural_trim_editing_target
+        architectural_trim_can_generate_geometry = bool(
+            trim_target is not None
+            and trim_target.generation_ready
+            and selected_record is not None
+            and selected_record.object_id == trim_target.object_id
+            and get_architectural_trim_component_identity(selected_record)
+            == (trim_target.level_index, trim_target.trim_id)
+            and not selected_object_is_busy
+            and not has_untracked_legacy_job
+            and has_reference_source
+            and has_generation_reference
+            and required_key_is_available
+        )
+        architectural_trim_can_generate_model = bool(
+            architectural_trim_can_generate_geometry
+            and projection_camera_percentages_are_valid
+        )
+        architectural_trim_can_generate_texture = bool(
+            trim_target is not None
+            and trim_target.generation_ready
+            and selected_record is not None
+            and selected_record.object_id == trim_target.object_id
+            and get_architectural_trim_component_identity(selected_record)
+            == (trim_target.level_index, trim_target.trim_id)
+        )
         self.meshy_target_polycount_control.setVisible(True)
         self.meshy_target_polycount_spinbox.setEnabled(
             not has_untracked_legacy_job
@@ -9626,19 +10020,19 @@ class GenerationWorkspace(QWidget):
             self.result_view.get_selected_face_indices()
         )
         face_selection_is_available = (
-            not door_slot_mode
+            not component_mode
             and selected_record is not None
             and self.result_view.face_edit_face_count > 0
             and not selected_object_is_busy
         )
         self.delete_selected_faces_button.setEnabled(
-            not door_slot_mode
+            not component_mode
             and selected_record is not None
             and selected_face_count > 0
             and not selected_object_is_busy
         )
         self.convert_faces_to_glass_button.setEnabled(
-            not door_slot_mode
+            not component_mode
             and selected_record is not None
             and selected_face_count > 0
             and not selected_object_is_busy
@@ -9651,10 +10045,17 @@ class GenerationWorkspace(QWidget):
             face_selection_is_available
         )
         self.regenerate_texture_button.setEnabled(
-            missing_door_slot_can_generate
-            or (
-                self._can_regenerate_object_texture(selected_record)
-                and projection_camera_percentages_are_valid
+            (
+                missing_door_slot_can_generate
+                or not architectural_trim_mode
+                or architectural_trim_can_generate_texture
+            )
+            and (
+                missing_door_slot_can_generate
+                or (
+                    self._can_regenerate_object_texture(selected_record)
+                    and projection_camera_percentages_are_valid
+                )
             )
         )
 
@@ -9665,13 +10066,26 @@ class GenerationWorkspace(QWidget):
                 and not self._active_object_operation.cancel_requested
             )
         self.symmetric_division_checkbox.setEnabled(
-            (not door_slot_mode or door_body_slot_mode)
+            not architectural_trim_mode
+            and (not door_slot_mode or door_body_slot_mode)
             and not has_untracked_legacy_job
         )
         if not self._shared_control_state_managed_externally:
             self.ai_prompt_edit.setEnabled(not has_untracked_legacy_job)
-        self.generate_button.setEnabled(
-            (
+        ordinary_geometry_generation_is_available = bool(
+            has_reference_source
+            and has_generation_reference
+            and required_key_is_available
+            and not has_untracked_legacy_job
+        )
+        ordinary_generation_is_available = bool(
+            ordinary_geometry_generation_is_available
+            and projection_camera_percentages_are_valid
+        )
+        if architectural_trim_mode:
+            generate_is_available = architectural_trim_can_generate_model
+        elif door_slot_mode:
+            generate_is_available = (
                 self._can_regenerate_object_texture(selected_record)
                 if (
                     door_body_slot_mode
@@ -9681,24 +10095,19 @@ class GenerationWorkspace(QWidget):
                 )
                 else door_slot_can_generate_model
             )
-            if door_slot_mode
+        else:
+            generate_is_available = ordinary_generation_is_available
+        self.generate_button.setEnabled(generate_is_available)
+        self.generate_geometry_button.setEnabled(
+            architectural_trim_can_generate_geometry
+            if architectural_trim_mode
             else (
-                has_reference_source
-                and has_generation_reference
-                and required_key_is_available
-                and projection_camera_percentages_are_valid
-                and not has_untracked_legacy_job
+                not door_slot_mode
+                and ordinary_geometry_generation_is_available
+                and not self.symmetric_division_checkbox.isChecked()
             )
         )
-        self.generate_geometry_button.setEnabled(
-            not door_slot_mode
-            and has_reference_source
-            and has_generation_reference
-            and required_key_is_available
-            and not self.symmetric_division_checkbox.isChecked()
-            and not has_untracked_legacy_job
-        )
-        self.place_button.setEnabled(not door_slot_mode)
+        self.place_button.setEnabled(not component_mode)
         self.object_3d_panel.projection_camera_controls.setEnabled(
             not door_slot_mode
         )
@@ -9756,6 +10165,7 @@ class GenerationWorkspace(QWidget):
             or (
                 record.provider != GENERATION_BACKEND_MESHY
                 and not is_door_component_record(record)
+                and not is_architectural_trim_component_record(record)
             )
         )
 
@@ -9774,9 +10184,24 @@ class GenerationWorkspace(QWidget):
         return min(max(int(frame_index), 0), metadata.frame_count - 1)
 
     def _rebuild_generated_objects(self) -> None:
-        preferred_id = self._selected_object_id
-        if self._find_generated_object_record(preferred_id) is None:
-            visible_ids = self.get_generated_object_ids()
+        trim_target = self._architectural_trim_editing_target
+        preferred_id = (
+            trim_target.object_id
+            if trim_target is not None
+            else self._selected_object_id
+        )
+        preferred_record = self._find_generated_object_record(preferred_id)
+        if preferred_record is None or (
+            trim_target is None
+            and is_architectural_trim_component_record(preferred_record)
+        ):
+            visible_ids = tuple(
+                object_id
+                for object_id in self.get_generated_object_ids()
+                if not is_architectural_trim_component_record(
+                    self._find_generated_object_record(object_id)
+                )
+            )
             preferred_id = None if not visible_ids else visible_ids[-1]
         self._select_generated_object(
             preferred_id,
@@ -11397,6 +11822,39 @@ def _encode_color_balance_png_rgba(rgba: np.ndarray) -> bytes:
     if not did_encode:
         raise ValueError("The adjusted object texture could not be encoded.")
     return bytes(encoded)
+
+
+# ### Component provenance helpers ###
+def get_architectural_trim_component_identity(
+    record: object,
+) -> tuple[int, str] | None:
+    """Return the validated level and trim identity for one bound asset."""
+
+    if not isinstance(record, GeneratedObjectRecord):
+        return None
+    raw_metadata = record.pipeline.get(
+        ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY
+    )
+    if not isinstance(raw_metadata, Mapping):
+        return None
+    raw_level_index = raw_metadata.get("level_index")
+    raw_trim_id = raw_metadata.get("trim_id")
+    if (
+        isinstance(raw_level_index, bool)
+        or not isinstance(raw_level_index, int)
+        or not isinstance(raw_trim_id, str)
+    ):
+        return None
+    trim_id = raw_trim_id.strip().lower()
+    if not trim_id:
+        return None
+    return raw_level_index, trim_id
+
+
+def is_architectural_trim_component_record(record: object) -> bool:
+    """Return whether a generated asset is bound to an architectural trim."""
+
+    return get_architectural_trim_component_identity(record) is not None
 
 
 # ### Texture-regeneration helpers ###

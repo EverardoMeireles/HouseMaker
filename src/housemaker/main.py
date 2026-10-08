@@ -79,6 +79,12 @@ from housemaker.architectural_trim import (
     is_architectural_trim_surface_id,
     remove_architectural_trim,
 )
+from housemaker.architectural_trim_generation import (
+    build_architectural_trim_component_frame,
+    build_architectural_trim_component_placement,
+    build_architectural_trim_component_seed_model,
+    remove_generated_architectural_trims_from_levels,
+)
 from housemaker.atlas_export import (
     AtlasDrawCallEstimate,
     SurfaceAmbientOcclusionAtlasContext,
@@ -162,6 +168,7 @@ from housemaker.doors_workspace import DoorsWorkspace
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.generation_jobs import GenerationJobManager, JobsWindow
 from housemaker.generation_state import (
+    EXTERNAL_GLB_GENERATION_PROVIDER,
     GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
@@ -170,6 +177,8 @@ from housemaker.generation_state import (
 from housemaker.generation_workspace import (
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
     GenerationWorkspace,
+    get_architectural_trim_component_identity,
+    is_architectural_trim_component_record,
     is_door_component_record,
 )
 from housemaker.glb import (
@@ -313,7 +322,6 @@ from housemaker.surface_materials import (
     SurfaceMaterialSourceSpec,
 )
 from housemaker.surface_orientation_edits import (
-    flip_surface_orientation,
     remap_flipped_surface_ids_with_lineage,
 )
 from housemaker.surface_texture_state import (
@@ -1457,6 +1465,10 @@ class BlueprintWorkspace(QWidget):
         ] = ()
         self._pending_canvas_wall_surface_ids: tuple[str, ...] = ()
         self._pending_floor_thickness_level_index: int | None = None
+        self._pending_canvas_face_orientation_undo_state: (
+            _CanvasTopologyUndoState | None
+        ) = None
+        self._pending_canvas_face_orientation_surface_ids: set[str] = set()
         self._pending_canvas_opening_key: str | None = None
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
@@ -1479,6 +1491,14 @@ class BlueprintWorkspace(QWidget):
         )
         self._canvas_surface_mesh_update_timer.timeout.connect(
             self._commit_pending_canvas_surface_mesh_update
+        )
+        self._canvas_face_orientation_update_timer = QTimer(self)
+        self._canvas_face_orientation_update_timer.setSingleShot(True)
+        self._canvas_face_orientation_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._canvas_face_orientation_update_timer.timeout.connect(
+            self._commit_pending_canvas_face_orientation_update
         )
         self._architectural_trim_mesh_update_timer = QTimer(self)
         self._architectural_trim_mesh_update_timer.setSingleShot(True)
@@ -1645,6 +1665,7 @@ class BlueprintWorkspace(QWidget):
             sync_controls=False,
             restore_canvas_tools=False,
         )
+        self._cancel_pending_canvas_face_orientation_update(restore=False)
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
         self._clear_pending_architectural_trim_mesh_update()
@@ -4894,6 +4915,7 @@ class BlueprintWorkspace(QWidget):
             self._sync_surface_generation_selection(())
             self._sync_atlas_texture_selection_from_canvas_scene()
             return
+        self.generation.clear_architectural_trim_editing_target()
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
         self._desired_canvas_architectural_trim_part_ids = ()
@@ -4982,6 +5004,9 @@ class BlueprintWorkspace(QWidget):
         self._sync_surface_generation_selection(
             self._desired_canvas_architectural_trim_part_ids
         )
+        self._sync_architectural_trim_generation_target(
+            self._desired_canvas_architectural_trim_part_ids
+        )
         self._sync_atlas_texture_selection_from_canvas_scene()
         self._reconcile_surface_assignments_with_scene()
         self._record_canvas_undo_state(
@@ -5025,9 +5050,129 @@ class BlueprintWorkspace(QWidget):
             self._desired_canvas_object_ids = ()
             self._discard_staged_stair_edit(clear_selection=True)
             self._sync_blueprint_placed_object_selection()
+        self._sync_architectural_trim_generation_target(semantic_ids)
         self._sync_surface_generation_selection(semantic_ids)
         self._sync_atlas_texture_selection_from_canvas_scene()
         self._sync_selected_canvas_wall_highlight(None)
+
+    def _sync_architectural_trim_generation_target(
+        self,
+        semantic_ids: Sequence[str],
+    ) -> bool:
+        """Show and bind the active trim instead of a stale Atlas object."""
+
+        active_part = next(
+            (
+                self._canvas_architectural_trim_parts_by_id[semantic_id]
+                for semantic_id in reversed(tuple(semantic_ids))
+                if semantic_id in self._canvas_architectural_trim_parts_by_id
+            ),
+            None,
+        )
+        if active_part is None:
+            self.generation.clear_architectural_trim_editing_target()
+            return False
+        owner = self._get_architectural_trim_owner(
+            active_part.level_index,
+            active_part.trim_id,
+        )
+        if owner is None:
+            self.generation.clear_architectural_trim_editing_target()
+            return False
+        level, trim = owner
+        record = next(
+            (
+                candidate
+                for candidate in self.generation.get_data().generated_objects
+                if get_architectural_trim_component_identity(candidate)
+                == (level.index, trim.trim_id)
+            ),
+            None,
+        )
+        object_name = (
+            f"{trim.kind.replace('_', ' ').title()} {trim.trim_id[:8]}"
+        )
+        if record is None:
+            wall_surfaces = self._get_architectural_trim_wall_surfaces(trim)
+            try:
+                seed_model, _frame = build_architectural_trim_component_seed_model(
+                    level,
+                    trim,
+                    wall_surfaces,
+                )
+                record = self.generation.register_architectural_trim_component_model(
+                    level_index=level.index,
+                    trim_id=trim.trim_id,
+                    object_id=f"architectural-trim-{trim.trim_id}",
+                    object_name=object_name,
+                    model=seed_model,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self.generation.clear_architectural_trim_editing_target()
+                self.viewer.set_architectural_trim_status(
+                    "The selected architectural trim could not be opened in "
+                    f"Generation: {error}"
+                )
+                return False
+        accepted = self.generation.set_architectural_trim_editing_target(
+            level_index=level.index,
+            trim_id=trim.trim_id,
+            object_id=record.object_id,
+            object_name=record.object_name,
+            generation_ready=True,
+        )
+        if not accepted:
+            self.generation.clear_architectural_trim_editing_target()
+        return accepted
+
+    def _get_architectural_trim_owner(
+        self,
+        level_index: int,
+        trim_id: str,
+    ) -> tuple[LevelData, ArchitecturalTrimData] | None:
+        """Resolve one stable trim identity without trusting selection caches."""
+
+        normalized_trim_id = str(trim_id).strip().lower()
+        level = self._get_level_by_index(int(level_index))
+        if level is None:
+            return None
+        trim = next(
+            (
+                candidate
+                for candidate in level.architectural_trims
+                if candidate.trim_id == normalized_trim_id
+            ),
+            None,
+        )
+        return None if trim is None else (level, trim)
+
+    def _get_architectural_trim_wall_surfaces(
+        self,
+        trim: ArchitecturalTrimData,
+    ) -> tuple[object, ...]:
+        """Resolve exactly the host walls needed by a generated trim frame."""
+
+        wall_surface_ids = tuple(getattr(trim, "wall_surface_ids", ()))
+        surfaces_by_id = {
+            surface_id: self._canvas_surface_targets_by_id.get(surface_id)
+            for surface_id in wall_surface_ids
+        }
+        if any(surface is None for surface in surfaces_by_id.values()):
+            fallback = {
+                surface.surface_id: surface
+                for surface in build_base_fixed_surfaces(self.levels)
+            }
+            for surface_id in wall_surface_ids:
+                if surfaces_by_id.get(surface_id) is None:
+                    surfaces_by_id[surface_id] = fallback.get(surface_id)
+        surfaces = tuple(
+            surfaces_by_id[surface_id]
+            for surface_id in wall_surface_ids
+            if surfaces_by_id.get(surface_id) is not None
+        )
+        if len(surfaces) != len(wall_surface_ids):
+            raise ValueError("A host wall for the selected trim is unavailable.")
+        return surfaces
 
     def _handle_architectural_trim_deletion_requested(
         self,
@@ -5060,6 +5205,7 @@ class BlueprintWorkspace(QWidget):
 
         self._desired_canvas_architectural_trim_part_ids = ()
         self._atlas_surface_assignment_target_ids = ()
+        self.generation.clear_architectural_trim_editing_target()
         self._sync_surface_generation_selection(())
         self._reconcile_surface_assignments_with_scene()
         self._record_canvas_undo_state(
@@ -5577,6 +5723,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_surface_ids = surface_ids
         self._atlas_surface_assignment_target_ids = surface_ids
         if surface_ids:
+            self.generation.clear_architectural_trim_editing_target()
             self._desired_canvas_architectural_trim_part_ids = ()
             self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_object_id = None
@@ -5626,20 +5773,157 @@ class BlueprintWorkspace(QWidget):
         )
         self.surface_texture_generation.set_scene_surface_selection(selected_surfaces)
 
+    # ### Canvas face-orientation batching ###
     def _handle_canvas_surface_orientation_flip_requested(
         self,
         surface_id: str,
     ) -> None:
-        """Persist one clicked surface winding change through normal history."""
+        """Stage clicked winding changes for one delayed mesh rebuild."""
 
-        self._apply_canvas_surface_topology_edit(
-            lambda: flip_surface_orientation(self.levels, surface_id),
-            success_message=(
-                "Surface orientation flipped. Click it again to restore the "
-                "automatic orientation."
+        normalized_surface_id = str(surface_id).strip().lower()
+        surface = self._canvas_surface_targets_by_id.get(normalized_surface_id)
+        if surface is None and normalized_surface_id:
+            try:
+                surface = next(
+                    (
+                        candidate
+                        for candidate in build_fixed_surfaces(self.levels)
+                        if candidate.surface_id == normalized_surface_id
+                    ),
+                    None,
+                )
+            except (RuntimeError, TypeError, ValueError):
+                surface = None
+        if surface is None:
+            self.viewer.set_surface_tools_status(
+                "Surface orientation could not be queued because the selected "
+                "surface no longer exists."
+            )
+            return
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == surface.level_index
             ),
+            None,
+        )
+        if level is None:
+            self.viewer.set_surface_tools_status(
+                "Surface orientation could not be queued because its Canvas "
+                "level no longer exists."
+            )
+            return
+
+        if self._pending_canvas_face_orientation_undo_state is None:
+            self._commit_pending_level_transform_update()
+            self._commit_pending_canvas_surface_mesh_update()
+            self._commit_pending_architectural_trim_mesh_update()
+            self._commit_pending_wall_vertex_update()
+            self._commit_pending_doorway_mesh_update()
+            self._pending_canvas_face_orientation_undo_state = (
+                self._capture_canvas_topology_undo_state()
+            )
+
+        flipped_surface_ids = set(level.flipped_surface_ids)
+        if normalized_surface_id in flipped_surface_ids:
+            flipped_surface_ids.remove(normalized_surface_id)
+        else:
+            flipped_surface_ids.add(normalized_surface_id)
+        level.flipped_surface_ids = flipped_surface_ids
+
+        pending_surface_ids = self._pending_canvas_face_orientation_surface_ids
+        if normalized_surface_id in pending_surface_ids:
+            pending_surface_ids.remove(normalized_surface_id)
+        else:
+            pending_surface_ids.add(normalized_surface_id)
+
+        baseline = self._pending_canvas_face_orientation_undo_state
+        if baseline is None or self._canvas_face_orientations_match_state(baseline):
+            self._canvas_face_orientation_update_timer.stop()
+            self._pending_canvas_face_orientation_undo_state = None
+            pending_surface_ids.clear()
+            self._queue_viewer_preview_refresh()
+            self.viewer.set_surface_tools_status(
+                "Pending surface orientation changes cancelled."
+            )
+            return
+
+        self._canvas_face_orientation_update_timer.start()
+        pending_count = len(pending_surface_ids)
+        self.viewer.set_surface_tools_status(
+            f"{pending_count} surface orientation "
+            f"{'change' if pending_count == 1 else 'changes'} queued. The mesh "
+            f"will update after {self._mesh_edit_update_delay_seconds:g} seconds."
         )
 
+    def _canvas_face_orientations_match_state(
+        self,
+        state: _CanvasTopologyUndoState,
+    ) -> bool:
+        """Return whether live orientation flags equal one captured baseline."""
+
+        expected_by_level_index = {
+            level_index: set(surface_ids)
+            for level_index, surface_ids in state.flipped_surface_ids_by_level
+        }
+        return len(expected_by_level_index) == len(self.levels) and all(
+            expected_by_level_index.get(level.index) == level.flipped_surface_ids
+            for level in self.levels
+        )
+
+    def _commit_pending_canvas_face_orientation_update(self) -> None:
+        """Commit every queued face flip as one undoable mesh update."""
+
+        self._canvas_face_orientation_update_timer.stop()
+        undo_state = self._pending_canvas_face_orientation_undo_state
+        pending_surface_ids = tuple(
+            sorted(self._pending_canvas_face_orientation_surface_ids)
+        )
+        self._pending_canvas_face_orientation_undo_state = None
+        self._pending_canvas_face_orientation_surface_ids.clear()
+        if undo_state is None or self._canvas_face_orientations_match_state(
+            undo_state
+        ):
+            return
+
+        self._record_canvas_undo_state(
+            self._finalize_canvas_topology_undo_state(undo_state),
+            commit_pending_level_transform_edit=False,
+            commit_pending_surface_edit=False,
+            commit_pending_architectural_trim_edit=False,
+            commit_pending_face_orientation_edit=False,
+        )
+        self._sync_canvas_surface_drawing_overlay()
+        changed_count = len(pending_surface_ids)
+        self.viewer.set_surface_tools_status(
+            f"{changed_count} surface orientation "
+            f"{'change' if changed_count == 1 else 'changes'} applied."
+        )
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _cancel_pending_canvas_face_orientation_update(
+        self,
+        *,
+        restore: bool,
+    ) -> bool:
+        """Cancel a queued orientation batch and optionally restore its flags."""
+
+        undo_state = self._pending_canvas_face_orientation_undo_state
+        if undo_state is None:
+            return False
+        self._canvas_face_orientation_update_timer.stop()
+        self._pending_canvas_face_orientation_undo_state = None
+        self._pending_canvas_face_orientation_surface_ids.clear()
+        if restore:
+            levels_by_index = {level.index: level for level in self.levels}
+            for level_index, surface_ids in undo_state.flipped_surface_ids_by_level:
+                level = levels_by_index.get(level_index)
+                if level is not None:
+                    level.flipped_surface_ids = set(surface_ids)
+        return True
+
+    # ### Canvas wall-selection synchronization ###
     def _sync_selected_canvas_wall_highlight(
         self,
         surface_id: str | None,
@@ -5668,14 +5952,19 @@ class BlueprintWorkspace(QWidget):
         self,
         state: _CanvasUndoState,
         *,
+        commit_pending_level_transform_edit: bool = True,
         commit_pending_surface_edit: bool = True,
         commit_pending_architectural_trim_edit: bool = True,
+        commit_pending_face_orientation_edit: bool = True,
     ) -> None:
         """Append one action after committing every chronologically older edit."""
 
         if self._is_restoring_canvas_undo:
             return
-        self._commit_pending_level_transform_update()
+        if commit_pending_face_orientation_edit:
+            self._commit_pending_canvas_face_orientation_update()
+        if commit_pending_level_transform_edit:
+            self._commit_pending_level_transform_update()
         if commit_pending_surface_edit:
             self._commit_pending_canvas_surface_mesh_update()
         if commit_pending_architectural_trim_edit:
@@ -5685,6 +5974,7 @@ class BlueprintWorkspace(QWidget):
     def _clear_canvas_undo_history(self) -> None:
         """Start a new history branch after replacing Canvas coordinates."""
 
+        self._cancel_pending_canvas_face_orientation_update(restore=False)
         self._stair_point_mesh_update_timer.stop()
         self._pending_stair_point_mesh_update = False
         self._pending_stair_point_undo_state = None
@@ -6031,6 +6321,12 @@ class BlueprintWorkspace(QWidget):
         if self._undo_pending_architectural_trim_mesh_update():
             self.viewer.set_architectural_trim_status(
                 "Architectural trim preview undone."
+            )
+            return
+        if self._cancel_pending_canvas_face_orientation_update(restore=True):
+            self._queue_viewer_preview_refresh()
+            self.viewer.set_surface_tools_status(
+                "Pending surface orientation changes undone."
             )
             return
         if self._pending_stair_point_mesh_update:
@@ -7099,6 +7395,7 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Apply geometry and texture-lineage changes as one UI transaction."""
 
+        self._commit_pending_canvas_face_orientation_update()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
@@ -7848,6 +8145,10 @@ class BlueprintWorkspace(QWidget):
         object_id = (
             None if raw_object_id is None else str(raw_object_id).strip() or None
         )
+        if object_id is not None and self._select_architectural_trim_component(
+            object_id
+        ):
+            return
         try:
             viewer_object_ids = self.viewer.get_selected_placed_object_ids()
         except (AttributeError, TypeError):
@@ -7879,10 +8180,45 @@ class BlueprintWorkspace(QWidget):
             active_object_id = self.viewer.get_selected_placed_object_id()
         except (AttributeError, TypeError):
             active_object_id = self._desired_canvas_object_id
+        if active_object_id is not None and self._select_architectural_trim_component(
+            str(active_object_id).strip()
+        ):
+            return
         self._remember_desired_canvas_object_selection(
             object_ids,
             active_object_id=active_object_id,
         )
+
+    def _select_architectural_trim_component(self, object_id: str) -> bool:
+        """Translate a generated trim mesh click back to semantic trim parts."""
+
+        record = next(
+            (
+                candidate
+                for candidate in self.generation.get_data().generated_objects
+                if candidate.object_id == object_id
+            ),
+            None,
+        )
+        identity = get_architectural_trim_component_identity(record)
+        if identity is None:
+            return False
+        level_index, trim_id = identity
+        semantic_ids = tuple(
+            semantic_id
+            for semantic_id, part in self._canvas_architectural_trim_parts_by_id.items()
+            if part.level_index == level_index and part.trim_id == trim_id
+        )
+        if not semantic_ids:
+            return False
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.set_selected_placed_object_ids(())
+            self.viewer.set_selected_architectural_trim_part_ids(semantic_ids)
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+        self._handle_architectural_trim_part_selection_changed(semantic_ids)
+        return True
 
     def _remember_desired_canvas_object_selection(
         self,
@@ -7963,6 +8299,42 @@ class BlueprintWorkspace(QWidget):
             self.texture_atlas_workspace.select_source_ids(
                 textured_object_ids,
                 active_source_id=active_object_id,
+            )
+            self._selected_atlas_surface_source_id = None
+            self._set_atlas_canvas_surface_highlights(())
+            self._sync_atlas_green_outline_to_canvas_highlight(None)
+            return
+
+        active_trim_part = next(
+            (
+                self._canvas_architectural_trim_parts_by_id[semantic_id]
+                for semantic_id in reversed(
+                    self._desired_canvas_architectural_trim_part_ids
+                )
+                if semantic_id in self._canvas_architectural_trim_parts_by_id
+            ),
+            None,
+        )
+        active_trim_record = (
+            None
+            if active_trim_part is None
+            else next(
+                (
+                    record
+                    for record in self.generation.get_data().generated_objects
+                    if get_architectural_trim_component_identity(record)
+                    == (active_trim_part.level_index, active_trim_part.trim_id)
+                    and self._is_active_architectural_trim_component_record(record)
+                    and self.generation.get_active_texture_variant(record.object_id)
+                    is not None
+                ),
+                None,
+            )
+        )
+        if active_trim_record is not None:
+            self.texture_atlas_workspace.select_source_ids(
+                (active_trim_record.object_id,),
+                active_source_id=active_trim_record.object_id,
             )
             self._selected_atlas_surface_source_id = None
             self._set_atlas_canvas_surface_highlights(())
@@ -8518,7 +8890,7 @@ class BlueprintWorkspace(QWidget):
     ) -> _SurfaceAmbientOcclusionSceneSnapshot:
         """Copy only plain scene state and placed-asset paths on the GUI thread."""
 
-        if len(dependency_signature) != 3 or not isinstance(
+        if len(dependency_signature) not in (3, 4) or not isinstance(
             dependency_signature[1],
             tuple,
         ):
@@ -8754,6 +9126,7 @@ class BlueprintWorkspace(QWidget):
 
         return bool(
             self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._active_architectural_trim_undo_state is not None
@@ -10264,6 +10637,7 @@ class BlueprintWorkspace(QWidget):
     # ### GLB export ###
     def _handle_glb_export_clicked(self) -> None:
         self._cancel_active_canvas_surface_edit()
+        self._commit_pending_canvas_face_orientation_update()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
@@ -10992,9 +11366,11 @@ class BlueprintWorkspace(QWidget):
                 or self.generation.get_generated_object_instances(
                     raw_record.object_id
                 )
+                or is_architectural_trim_component_record(raw_record)
             )
         ):
             self._sync_canvas_placed_object_profiles()
+            self._sync_viewer_scene_levels()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_generated_object_placement_changed_for_canvas(
@@ -11848,6 +12224,8 @@ class BlueprintWorkspace(QWidget):
         normalized_id = str(object_id).strip()
         if not normalized_id:
             return
+        if self._select_architectural_trim_component(normalized_id):
+            return
         scene_object_ids = self._scene_object_ids_for_atlas_sources(
             (normalized_id,)
         )
@@ -11909,6 +12287,8 @@ class BlueprintWorkspace(QWidget):
         if active_id not in normalized_ids:
             active_id = normalized_ids[-1]
         assert active_id is not None
+        if self._select_architectural_trim_component(active_id):
+            return
         if len(normalized_ids) == 1:
             self._handle_atlas_object_texture_selected(active_id)
             return
@@ -13451,13 +13831,27 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.set_scene_texture_source_ids(required_source_ids)
         if not automatically_assign or self._is_automatically_assigning_atlas_textures:
             return
-        self._automatically_assign_scene_textures()
+        auto_assignment_source_ids = tuple(
+            dict.fromkeys(
+                (
+                    *required_source_ids,
+                    *self._build_bound_surface_atlas_source_ids(),
+                )
+            )
+        )
+        self._automatically_assign_scene_textures(auto_assignment_source_ids)
 
     def _build_required_scene_atlas_source_ids(self) -> tuple[str, ...]:
         """Return texture source IDs used by included scene content."""
 
         included_level_indices = {
             level.index for level in self.levels if level.include_in_export
+        }
+        trim_models, generated_trim_keys = (
+            self._build_active_architectural_trim_component_models()
+        )
+        active_trim_source_ids = {
+            str(model.source_object_id or model.object_id) for model in trim_models
         }
         required_ids: list[str] = []
         for object_id in self.generation.get_generated_object_ids():
@@ -13481,8 +13875,20 @@ class BlueprintWorkspace(QWidget):
                 )
             ):
                 required_ids.append(source_id)
+        required_ids.extend(
+            source_id
+            for source_id in active_trim_source_ids
+            if (
+                source_id in self._atlas_available_source_ids
+                or self.generation.has_generated_object_texture_variants(source_id)
+            )
+        )
+        export_levels = remove_generated_architectural_trims_from_levels(
+            self.levels,
+            generated_trim_keys,
+        )
         exported_surface_ids = {
-            surface.surface_id for surface in build_fixed_surfaces(self.levels)
+            surface.surface_id for surface in build_fixed_surfaces(export_levels)
         }
         exported_surface_ids.update(
             semantic_id
@@ -13502,7 +13908,24 @@ class BlueprintWorkspace(QWidget):
         )
         return tuple(dict.fromkeys(required_ids))
 
-    def _automatically_assign_scene_textures(self) -> None:
+    def _build_bound_surface_atlas_source_ids(self) -> tuple[str, ...]:
+        """Return available texture sources applied to any live surface."""
+
+        source_ids: list[str] = []
+        for assignment in self.surface_texture_generation.get_assignments():
+            if not assignment.surface_ids:
+                continue
+            source_id = build_atlas_wall_texture_source_id(
+                assignment.assignment_id
+            )
+            if source_id in self._atlas_wall_texture_source_ids:
+                source_ids.append(source_id)
+        return tuple(source_ids)
+
+    def _automatically_assign_scene_textures(
+        self,
+        source_ids: Sequence[str] | None = None,
+    ) -> None:
         """Pack all currently unassigned scene textures in one Atlas update."""
 
         if self._is_automatically_assigning_atlas_textures:
@@ -13517,6 +13940,7 @@ class BlueprintWorkspace(QWidget):
             allow_atlas_creation,
             sort_by_pbr,
             use_half_mesh_texture_prefix,
+            source_ids=source_ids,
         )
         if attempt_key == self._last_automatic_atlas_assignment_key:
             return
@@ -13535,6 +13959,7 @@ class BlueprintWorkspace(QWidget):
                     sort_by_pbr=sort_by_pbr,
                     use_half_mesh_texture_prefix=(use_half_mesh_texture_prefix),
                     allow_atlas_creation=allow_atlas_creation,
+                    source_ids=source_ids,
                 )
             )
             if not assigned_source_ids:
@@ -13552,6 +13977,7 @@ class BlueprintWorkspace(QWidget):
                     allow_atlas_creation,
                     sort_by_pbr,
                     use_half_mesh_texture_prefix,
+                    source_ids=source_ids,
                 )
             )
 
@@ -13561,6 +13987,8 @@ class BlueprintWorkspace(QWidget):
         allow_atlas_creation: bool,
         sort_by_pbr: bool,
         use_half_mesh_texture_prefix: bool,
+        *,
+        source_ids: Sequence[str] | None = None,
     ) -> tuple[object, ...]:
         """Describe inputs whose changes make a failed auto-pack worth retrying."""
 
@@ -13592,7 +14020,14 @@ class BlueprintWorkspace(QWidget):
             bool(allow_atlas_creation),
             bool(sort_by_pbr),
             bool(use_half_mesh_texture_prefix),
-            self.texture_atlas_workspace.get_unpacked_scene_texture_source_ids(),
+            (
+                self.texture_atlas_workspace
+                .get_unpacked_scene_texture_source_ids()
+                if source_ids is None
+                else self.texture_atlas_workspace.get_unpacked_texture_source_ids(
+                    source_ids
+                )
+            ),
             atlas_signature,
             self._atlas_generation_signature,
         )
@@ -13741,6 +14176,13 @@ class BlueprintWorkspace(QWidget):
         generated_object_id_lookup = set(generated_object_ids)
         scene_bound_source_ids = list(
             self.generation.get_scene_bound_placeable_object_ids()
+        )
+        scene_bound_source_ids.extend(
+            record.object_id
+            for record in self.generation.get_data().generated_objects
+            if self._is_active_architectural_trim_component_record(record)
+            and self.generation.get_active_texture_variant(record.object_id)
+            is not None
         )
         signature_items.append(
             (
@@ -14702,6 +15144,7 @@ class BlueprintWorkspace(QWidget):
             room_texture_signature,
             self.generation.get_placed_preview_dependency_signature(),
             self.surface_texture_generation.get_preview_dependency_signature(),
+            self.generation.get_architectural_trim_component_dependency_signature(),
         )
 
     @staticmethod
@@ -14732,12 +15175,17 @@ class BlueprintWorkspace(QWidget):
         expected_placements = dict(placements_by_object_id)
         if not expected_placements:
             return False
-        if len(signature_before) != 3 or len(signature_after) != 3:
+        if (
+            len(signature_before) != len(signature_after)
+            or len(signature_before) not in (3, 4)
+        ):
             return False
         if (
             signature_before[0] != signature_after[0]
             or signature_before[2] != signature_after[2]
         ):
+            return False
+        if len(signature_before) == 4 and signature_before[3] != signature_after[3]:
             return False
         placed_before = signature_before[1]
         placed_after = signature_after[1]
@@ -14951,6 +15399,17 @@ class BlueprintWorkspace(QWidget):
                 for placement in self.doors_workspace.data().placements
             }
         )
+        placed_object_levels.update(
+            {
+                record.object_id: identity[0]
+                for record in self.generation.get_data().generated_objects
+                if self._is_active_architectural_trim_component_record(record)
+                and (
+                    identity := get_architectural_trim_component_identity(record)
+                )
+                is not None
+            }
+        )
         self.viewer.set_canvas_scene_levels(
             level_items,
             placed_object_levels=placed_object_levels,
@@ -14973,6 +15432,7 @@ class BlueprintWorkspace(QWidget):
         timers = (
             self._doorway_mesh_update_timer,
             self._canvas_surface_mesh_update_timer,
+            self._canvas_face_orientation_update_timer,
             self._architectural_trim_mesh_update_timer,
             self._level_transform_mesh_update_timer,
             self._stair_point_mesh_update_timer,
@@ -15111,8 +15571,15 @@ class BlueprintWorkspace(QWidget):
     def _build_pre_atlas_export_scene(self) -> _PreAtlasExportScene:
         """Build the exact shared geometry snapshot used by Atlas export."""
 
-        base_model = convert_to_glb(
+        _trim_models, generated_trim_keys = (
+            self._build_active_architectural_trim_component_models()
+        )
+        export_levels = remove_generated_architectural_trims_from_levels(
             self.levels,
+            generated_trim_keys,
+        )
+        base_model = convert_to_glb(
+            export_levels,
             stairs=self.stairs,
             surface_materials=(
                 self.surface_texture_generation.get_surface_material_sources()
@@ -15299,8 +15766,18 @@ class BlueprintWorkspace(QWidget):
 
         try:
             try:
+                preview_levels = self._build_viewer_preview_levels()
+                _trim_models, generated_trim_keys = (
+                    self._build_active_architectural_trim_component_models(
+                        include_excluded_levels=True,
+                    )
+                )
+                preview_levels = remove_generated_architectural_trims_from_levels(
+                    preview_levels,
+                    generated_trim_keys,
+                )
                 base_model = convert_to_preview_model(
-                    self._build_viewer_preview_levels(),
+                    preview_levels,
                     stairs=self.stairs,
                     surface_materials=(
                         self.surface_texture_generation.get_surface_material_sources()
@@ -15349,6 +15826,8 @@ class BlueprintWorkspace(QWidget):
         }
         placed_models: list[PlacedGeneratedModel] = []
         for record in generation_data.generated_objects:
+            if is_architectural_trim_component_record(record):
+                continue
             placement = record.placement
             if placement is None:
                 continue
@@ -15383,7 +15862,81 @@ class BlueprintWorkspace(QWidget):
                 base_z_by_level_index=base_z_by_level_index,
             )
         )
+        trim_models, _generated_trim_keys = (
+            self._build_active_architectural_trim_component_models(
+                include_excluded_levels=include_excluded_levels,
+            )
+        )
+        placed_models.extend(trim_models)
         return tuple(placed_models)
+
+    def _build_active_architectural_trim_component_models(
+        self,
+        *,
+        include_excluded_levels: bool = False,
+    ) -> tuple[
+        tuple[PlacedGeneratedModel, ...],
+        tuple[tuple[int, str], ...],
+    ]:
+        """Fit generated trim assets onto their current procedural owners."""
+
+        included_level_indices = {
+            level.index
+            for level in self.levels
+            if include_excluded_levels or level.include_in_export
+        }
+        placed_models: list[PlacedGeneratedModel] = []
+        generated_trim_keys: list[tuple[int, str]] = []
+        for record in self.generation.get_data().generated_objects:
+            identity = get_architectural_trim_component_identity(record)
+            if (
+                identity is None
+                or identity[0] not in included_level_indices
+                or not self._is_active_architectural_trim_component_record(record)
+            ):
+                continue
+            owner = self._get_architectural_trim_owner(*identity)
+            if owner is None:
+                continue
+            level, trim = owner
+            model = self.generation.get_generated_object_model(record.object_id)
+            if model is None:
+                continue
+            try:
+                frame = build_architectural_trim_component_frame(
+                    level,
+                    trim,
+                    self._get_architectural_trim_wall_surfaces(trim),
+                )
+                placed_model = build_architectural_trim_component_placement(
+                    model,
+                    frame,
+                    object_id=record.object_id,
+                    object_name=record.object_name,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            placed_models.append(placed_model)
+            generated_trim_keys.append(identity)
+        return tuple(placed_models), tuple(generated_trim_keys)
+
+    def _is_active_architectural_trim_component_record(
+        self,
+        record: GeneratedObjectRecord,
+    ) -> bool:
+        """Exclude the local procedural seed until generation changes it."""
+
+        identity = get_architectural_trim_component_identity(record)
+        return bool(
+            identity is not None
+            and self._get_architectural_trim_owner(*identity) is not None
+            and (
+                record.provider != EXTERNAL_GLB_GENERATION_PROVIDER
+                or self.generation.has_generated_object_texture_variants(
+                    record.object_id
+                )
+            )
+        )
 
     def _build_placed_door_models(
         self,
@@ -15799,6 +16352,7 @@ class BlueprintWorkspace(QWidget):
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         if (
             self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
@@ -15911,6 +16465,7 @@ class BlueprintWorkspace(QWidget):
             return
         if (
             self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
@@ -15958,6 +16513,7 @@ class BlueprintWorkspace(QWidget):
             return
         if (
             self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
@@ -15987,6 +16543,7 @@ class BlueprintWorkspace(QWidget):
 
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
+        self._commit_pending_canvas_face_orientation_update()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
@@ -17628,6 +18185,7 @@ class BlueprintWorkspace(QWidget):
             self._commit_pending_level_transform_update()
             self._finish_canvas_transform_drag()
             self._cancel_active_canvas_surface_edit()
+            self._commit_pending_canvas_face_orientation_update()
             self._commit_pending_canvas_surface_mesh_update()
             self._commit_pending_architectural_trim_mesh_update()
             self._commit_pending_wall_vertex_update()
@@ -20831,6 +21389,9 @@ class BlueprintWorkspace(QWidget):
             and surface_id not in self._canvas_architectural_trim_parts_by_id
         )
         self._atlas_surface_assignment_target_ids = restored_surface_ids
+        self._sync_architectural_trim_generation_target(
+            self._desired_canvas_architectural_trim_part_ids
+        )
         selected_stair_target = (
             self._canvas_stair_part_targets_by_id.get(
                 self._desired_canvas_stair_part_ids[-1]

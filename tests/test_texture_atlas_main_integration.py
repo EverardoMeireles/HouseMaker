@@ -53,6 +53,7 @@ from housemaker.surface_texture_state import (
     SURFACE_TEXTURE_RESOLUTIONS,
     SURFACE_TILING_MODE_EDGE_VARIANTS,
     SURFACE_TILING_MODE_WHOLE_REPEATS,
+    SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
@@ -116,6 +117,7 @@ def _wall_texture_assignment_with_variants(
     *,
     assignment_id: str = "brick-wall-variants",
     surface_ids: tuple[str, ...] = ("level:2/wall:1:2",),
+    surface_type: str = SURFACE_TYPE_WALL,
     selected_resolution: int = 512,
 ) -> SurfaceTextureAssignment:
     directory = Path(asset_directory)
@@ -143,7 +145,7 @@ def _wall_texture_assignment_with_variants(
     )
     return SurfaceTextureAssignment(
         assignment_id=assignment_id,
-        surface_type=SURFACE_TYPE_WALL,
+        surface_type=surface_type,
         surface_ids=surface_ids,
         provider="test",
         asset_path=active_path,
@@ -2995,6 +2997,97 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.workspace.texture_atlas_workspace
             .get_unpacked_scene_texture_source_ids(),
             (),
+        )
+
+    def test_included_ceiling_texture_is_automatically_added_to_atlas(
+        self,
+    ) -> None:
+        _add_square_room_to_level(self.workspace.current_level)
+        ceiling_surface_id = next(
+            surface.surface_id
+            for surface in build_fixed_surfaces(self.workspace.levels)
+            if surface.surface_type == SURFACE_TYPE_CEILING
+        )
+        self.workspace.surface_texture_generation.set_levels(
+            self.workspace.levels
+        )
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Ceiling textures",
+            2048,
+            atlas_id="ceiling-textures",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        assignment = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="included-ceiling",
+            surface_ids=(ceiling_surface_id,),
+            surface_type=SURFACE_TYPE_CEILING,
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        packed_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+                atlas.atlas_id
+            )
+        )
+        assert packed_atlas is not None
+        self.assertIsNotNone(packed_atlas.placement_for_object(source_id))
+        self.assertIn(
+            source_id,
+            self.workspace._build_required_scene_atlas_source_ids(),
+        )
+
+    def test_excluded_ceiling_texture_auto_packs_without_becoming_export_required(
+        self,
+    ) -> None:
+        _add_square_room_to_level(self.workspace.current_level)
+        ceiling_surface_id = next(
+            surface.surface_id
+            for surface in build_fixed_surfaces(self.workspace.levels)
+            if surface.surface_type == SURFACE_TYPE_CEILING
+        )
+        self.workspace.current_level.include_in_export = False
+        self.workspace.surface_texture_generation.set_levels(
+            self.workspace.levels
+        )
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Excluded ceiling textures",
+            2048,
+            atlas_id="excluded-ceiling-textures",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        assignment = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="excluded-ceiling",
+            surface_ids=(ceiling_surface_id,),
+            surface_type=SURFACE_TYPE_CEILING,
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        packed_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+                atlas.atlas_id
+            )
+        )
+        assert packed_atlas is not None
+        self.assertIsNotNone(packed_atlas.placement_for_object(source_id))
+        self.assertNotIn(
+            source_id,
+            self.workspace._build_required_scene_atlas_source_ids(),
         )
 
     def test_selected_surface_texture_creates_overflow_atlas_when_enabled(

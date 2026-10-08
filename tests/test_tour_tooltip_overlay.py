@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PySide6.QtCore import QPointF
+from PySide6.QtGui import QTextTable
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.tour_tooltip_overlay import (
@@ -90,6 +91,33 @@ class TourTooltipOverlayTests(unittest.TestCase):
 
         rendered_html = tooltip.toHtml().casefold()
         self.assertIn("#00ff00", rendered_html)
+
+    def test_multiple_paragraphs_share_one_continuous_background(self) -> None:
+        viewport = QWidget()
+        self.addCleanup(viewport.close)
+        viewport.resize(800, 500)
+        tooltip = TourTooltipOverlay(viewport)
+
+        tooltip.show_tooltip(
+            anchor_screen_position=QPointF(400.0, 250.0),
+            tooltip_position="left",
+            html_body="<p>First paragraph</p><p>Second paragraph</p>",
+            style="background: rgba(24, 27, 34, 0.94); padding: 16px;",
+        )
+
+        tables = tuple(
+            frame
+            for frame in tooltip.document().rootFrame().childFrames()
+            if isinstance(frame, QTextTable)
+        )
+        self.assertEqual(len(tables), 1)
+        table = tables[0]
+        self.assertEqual((table.rows(), table.columns()), (1, 1))
+        self.assertGreater(
+            table.cellAt(0, 0).format().background().color().alpha(),
+            0,
+        )
+        self.assertIn("First paragraph", table.cellAt(0, 0).firstCursorPosition().block().text())
 
 
 if __name__ == "__main__":

@@ -138,6 +138,15 @@ class CanvasUndoMainTests(unittest.TestCase):
             )
         )
 
+    def _wall_surface_ids(self) -> tuple[str, ...]:
+        """Return stable wall IDs for face-orientation transaction tests."""
+
+        return tuple(
+            surface.surface_id
+            for surface in build_fixed_surfaces([self.level])
+            if surface.surface_type == "wall"
+        )
+
     def _wall_translation_target(self):
         """Install and return the bottom wall's delayed Y translation target."""
 
@@ -204,6 +213,86 @@ class CanvasUndoMainTests(unittest.TestCase):
         _send_undo_to_viewer(self.workspace)
 
         self.assertEqual(self.level.flipped_surface_ids, original_flips)
+
+    def test_face_orientation_clicks_wait_and_commit_as_one_mesh_update(
+        self,
+    ) -> None:
+        surface_ids = self._wall_surface_ids()[:2]
+        self.assertEqual(len(surface_ids), 2)
+        timer = self.workspace._canvas_face_orientation_update_timer
+        timer.setInterval(60_000)
+        self.addCleanup(timer.stop)
+
+        with patch.object(
+            self.workspace,
+            "_schedule_viewer_preview_refresh",
+        ) as schedule_refresh:
+            for surface_id in surface_ids:
+                self.workspace._handle_canvas_surface_orientation_flip_requested(
+                    surface_id
+                )
+
+            self.assertEqual(
+                self.level.flipped_surface_ids,
+                set(surface_ids),
+            )
+            self.assertTrue(timer.isActive())
+            self.assertEqual(self.workspace._canvas_undo_stack, [])
+            schedule_refresh.assert_not_called()
+
+            self.workspace._commit_pending_canvas_face_orientation_update()
+
+            self.assertFalse(timer.isActive())
+            self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+            schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+    def test_repeated_face_orientation_click_is_a_delayed_no_op(self) -> None:
+        surface_id = self._wall_surface_ids()[0]
+        timer = self.workspace._canvas_face_orientation_update_timer
+        timer.setInterval(60_000)
+        self.addCleanup(timer.stop)
+
+        with patch.object(
+            self.workspace,
+            "_schedule_viewer_preview_refresh",
+        ) as schedule_refresh:
+            self.workspace._handle_canvas_surface_orientation_flip_requested(
+                surface_id
+            )
+            self.workspace._handle_canvas_surface_orientation_flip_requested(
+                surface_id
+            )
+
+            self.assertEqual(self.level.flipped_surface_ids, set())
+            self.assertEqual(self.workspace._canvas_undo_stack, [])
+            schedule_refresh.assert_not_called()
+
+            self.workspace._commit_pending_canvas_face_orientation_update()
+
+            self.assertFalse(timer.isActive())
+            self.assertEqual(self.workspace._canvas_undo_stack, [])
+            schedule_refresh.assert_not_called()
+
+    def test_ctrl_z_restores_committed_face_orientation_batch(self) -> None:
+        surface_ids = self._wall_surface_ids()[:2]
+        self.assertEqual(len(surface_ids), 2)
+        timer = self.workspace._canvas_face_orientation_update_timer
+        timer.setInterval(60_000)
+        self.addCleanup(timer.stop)
+
+        for surface_id in surface_ids:
+            self.workspace._handle_canvas_surface_orientation_flip_requested(
+                surface_id
+            )
+        self.workspace._commit_pending_canvas_face_orientation_update()
+
+        self.assertEqual(self.level.flipped_surface_ids, set(surface_ids))
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+
+        _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(self.level.flipped_surface_ids, set())
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_deleted_direct_face_is_restored_by_ctrl_z(self) -> None:
         points = (

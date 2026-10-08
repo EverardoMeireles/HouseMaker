@@ -144,6 +144,8 @@ DOORWAY_DEPTH_HANDLE_RADIUS_SCREEN = 7.0
 DOORWAY_DEPTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
 DOORWAY_DEPTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
 DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN = 24.0
+DOORWAY_WALL_SPAN_ALIGNMENT_TOLERANCE_PIXELS = 0.5
+DOORWAY_WALL_SPAN_MINIMUM_DIRECTION_DOT = math.cos(math.radians(2.0))
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
 ZOOM_STEP_FACTOR = 1.15
@@ -2664,11 +2666,8 @@ class BlueprintCanvas(QWidget):
                 else (image_point.x(), image_point.y())
             )
             self.doorway_drag_initial_doorway = copy.deepcopy(doorway)
-            nearest_wall = self._find_nearest_wall_projection(
-                (doorway.center_x, doorway.center_y)
-            )
-            self.doorway_drag_wall_edge = (
-                None if nearest_wall is None else nearest_wall.edge
+            self.doorway_drag_wall_edge = self._find_doorway_wall_span_edge(
+                doorway
             )
             self.doorway_drag_width_side_sign = doorway_hit.width_side_sign
             self.doorway_drag_depth_side_sign = doorway_hit.depth_side_sign
@@ -5699,6 +5698,242 @@ class BlueprintCanvas(QWidget):
                 )
 
         return nearest_projection
+
+    # ### Doorway wall-span resolution ###
+    def _doorway_wall_edge_overlaps_footprint(
+        self,
+        start_vertex: Vertex,
+        end_vertex: Vertex,
+        doorway: DoorwayData,
+    ) -> bool:
+        """Return whether one edge reaches the oriented doorway rectangle."""
+
+        width_axis = self._get_doorway_width_direction(doorway)
+        depth_axis = self._get_doorway_depth_direction(doorway)
+        local_positions = tuple(
+            (
+                (vertex.x - doorway.center_x) * width_axis[0]
+                + (vertex.y - doorway.center_y) * width_axis[1],
+                (vertex.x - doorway.center_x) * depth_axis[0]
+                + (vertex.y - doorway.center_y) * depth_axis[1],
+            )
+            for vertex in (start_vertex, end_vertex)
+        )
+        tolerance = DOORWAY_WALL_SPAN_ALIGNMENT_TOLERANCE_PIXELS
+        half_width = doorway.width_meters / PIXEL_TO_METER * 0.5 + tolerance
+        half_depth = doorway.depth_meters / PIXEL_TO_METER * 0.5 + tolerance
+        width_positions = tuple(position[0] for position in local_positions)
+        depth_positions = tuple(position[1] for position in local_positions)
+        return bool(
+            min(width_positions) <= half_width
+            and max(width_positions) >= -half_width
+            and min(depth_positions) <= half_depth
+            and max(depth_positions) >= -half_depth
+        )
+
+    def _find_doorway_wall_span_edge(
+        self,
+        doorway: DoorwayData,
+    ) -> Edge | None:
+        """Resolve the full straight wall span supporting a doorway drag."""
+
+        doorway_width_axis = self._get_doorway_width_direction(doorway)
+        ignored_vertex_ids = {room.center_vertex_id for room in self.rooms}
+        vertices_by_id = {
+            vertex.id: vertex for vertex in self.vertex_data.vertices
+        }
+        edge_candidates: list[
+            tuple[Edge, Vertex, Vertex, float, float, float]
+        ] = []
+        doorway_center = (doorway.center_x, doorway.center_y)
+        for edge in self.vertex_data.edges:
+            if (
+                edge.start_vertex_id in ignored_vertex_ids
+                or edge.end_vertex_id in ignored_vertex_ids
+            ):
+                continue
+            start_vertex = vertices_by_id.get(edge.start_vertex_id)
+            end_vertex = vertices_by_id.get(edge.end_vertex_id)
+            if start_vertex is None or end_vertex is None:
+                continue
+            delta_x = end_vertex.x - start_vertex.x
+            delta_y = end_vertex.y - start_vertex.y
+            edge_length = math.hypot(delta_x, delta_y)
+            if edge_length <= 1e-6:
+                continue
+            direction_dot = abs(
+                (
+                    delta_x * doorway_width_axis[0]
+                    + delta_y * doorway_width_axis[1]
+                )
+                / edge_length
+            )
+            projected_point = _project_point_onto_segment(
+                doorway_center,
+                (start_vertex.x, start_vertex.y),
+                (end_vertex.x, end_vertex.y),
+            )
+            if projected_point is None:
+                continue
+            line_distance = abs(
+                (doorway.center_x - start_vertex.x) * delta_y
+                - (doorway.center_y - start_vertex.y) * delta_x
+            ) / edge_length
+            edge_candidates.append(
+                (
+                    edge,
+                    start_vertex,
+                    end_vertex,
+                    self._point_distance(doorway_center, projected_point),
+                    line_distance,
+                    direction_dot,
+                )
+            )
+        if not edge_candidates:
+            return None
+
+        local_aligned_candidates = tuple(
+            candidate
+            for candidate in edge_candidates
+            if candidate[5] >= DOORWAY_WALL_SPAN_MINIMUM_DIRECTION_DOT
+            and self._doorway_wall_edge_overlaps_footprint(
+                candidate[1],
+                candidate[2],
+                doorway,
+            )
+        )
+        seed_edge, seed_start, seed_end, _segment_distance, _line_distance, _dot = (
+            min(
+                local_aligned_candidates,
+                key=lambda candidate: (candidate[4], candidate[3]),
+            )
+            if local_aligned_candidates
+            else min(edge_candidates, key=lambda candidate: candidate[3])
+        )
+        seed_delta_x = seed_end.x - seed_start.x
+        seed_delta_y = seed_end.y - seed_start.y
+        seed_length = math.hypot(seed_delta_x, seed_delta_y)
+        if seed_length <= 1e-6:
+            return seed_edge
+        width_axis = (
+            seed_delta_x / seed_length,
+            seed_delta_y / seed_length,
+        )
+        if (
+            width_axis[0] * doorway_width_axis[0]
+            + width_axis[1] * doorway_width_axis[1]
+        ) < 0.0:
+            width_axis = (-width_axis[0], -width_axis[1])
+        origin_x = seed_start.x
+        origin_y = seed_start.y
+        normal_axis = (-width_axis[1], width_axis[0])
+        intervals: list[tuple[float, float, int, int]] = []
+        for edge, start_vertex, end_vertex, _distance, _line_distance, _dot in (
+            edge_candidates
+        ):
+            delta_x = end_vertex.x - start_vertex.x
+            delta_y = end_vertex.y - start_vertex.y
+            edge_length = math.hypot(delta_x, delta_y)
+            direction_dot = abs(
+                (delta_x * width_axis[0] + delta_y * width_axis[1])
+                / edge_length
+            )
+            if direction_dot < DOORWAY_WALL_SPAN_MINIMUM_DIRECTION_DOT:
+                continue
+            start_normal_offset = (
+                (start_vertex.x - origin_x) * normal_axis[0]
+                + (start_vertex.y - origin_y) * normal_axis[1]
+            )
+            end_normal_offset = (
+                (end_vertex.x - origin_x) * normal_axis[0]
+                + (end_vertex.y - origin_y) * normal_axis[1]
+            )
+            if max(
+                abs(start_normal_offset),
+                abs(end_normal_offset),
+            ) > DOORWAY_WALL_SPAN_ALIGNMENT_TOLERANCE_PIXELS:
+                continue
+            start_position = (
+                (start_vertex.x - origin_x) * width_axis[0]
+                + (start_vertex.y - origin_y) * width_axis[1]
+            )
+            end_position = (
+                (end_vertex.x - origin_x) * width_axis[0]
+                + (end_vertex.y - origin_y) * width_axis[1]
+            )
+            if start_position <= end_position:
+                intervals.append(
+                    (
+                        start_position,
+                        end_position,
+                        edge.start_vertex_id,
+                        edge.end_vertex_id,
+                    )
+                )
+            else:
+                intervals.append(
+                    (
+                        end_position,
+                        start_position,
+                        edge.end_vertex_id,
+                        edge.start_vertex_id,
+                    )
+                )
+        if not intervals:
+            return seed_edge
+
+        center_position = (
+            (doorway.center_x - origin_x) * width_axis[0]
+            + (doorway.center_y - origin_y) * width_axis[1]
+        )
+        half_width_pixels = doorway.width_meters / PIXEL_TO_METER * 0.5
+        seed_end_position = (
+            (seed_end.x - origin_x) * width_axis[0]
+            + (seed_end.y - origin_y) * width_axis[1]
+        )
+        span_start = min(
+            center_position - half_width_pixels,
+            0.0,
+            seed_end_position,
+        )
+        span_end = max(
+            center_position + half_width_pixels,
+            0.0,
+            seed_end_position,
+        )
+        included_indices: set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            for index, interval in enumerate(intervals):
+                if index in included_indices:
+                    continue
+                interval_start, interval_end, _start_id, _end_id = interval
+                tolerance = DOORWAY_WALL_SPAN_ALIGNMENT_TOLERANCE_PIXELS
+                if (
+                    interval_start > span_end + tolerance
+                    or interval_end < span_start - tolerance
+                ):
+                    continue
+                included_indices.add(index)
+                span_start = min(span_start, interval_start)
+                span_end = max(span_end, interval_end)
+                changed = True
+        if not included_indices:
+            return seed_edge
+
+        included_intervals = tuple(
+            intervals[index] for index in sorted(included_indices)
+        )
+        first_interval = min(included_intervals, key=lambda interval: interval[0])
+        last_interval = max(included_intervals, key=lambda interval: interval[1])
+        span_edge = Edge(
+            start_vertex_id=first_interval[2],
+            end_vertex_id=last_interval[3],
+        )
+        if span_edge.start_vertex_id == span_edge.end_vertex_id:
+            return seed_edge
+        return span_edge
 
     def _get_wall_normal_rotation_degrees(self, edge: Edge) -> float:
         start_vertex = self.vertex_data.get_vertex(edge.start_vertex_id)

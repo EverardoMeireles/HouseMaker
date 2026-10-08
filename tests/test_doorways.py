@@ -312,6 +312,89 @@ class DoorwayTests(unittest.TestCase):
         self.widgets.append(widget)
         return widget
 
+    def _assert_split_wall_doorway_can_downsize_from_both_sides(
+        self,
+        *,
+        connect_inner_vertices: bool,
+    ) -> None:
+        """Verify inner wall vertices do not block either width handle."""
+
+        for side_sign in (-1.0, 1.0):
+            with self.subTest(
+                connect_inner_vertices=connect_inner_vertices,
+                side_sign=side_sign,
+            ):
+                vertex_data = VertexData()
+                left_outer = vertex_data.add_vertex(10.0, 50.0)
+                left_inner = vertex_data.add_vertex(40.0, 50.0)
+                right_inner = vertex_data.add_vertex(60.0, 50.0)
+                right_outer = vertex_data.add_vertex(90.0, 50.0)
+                vertex_data.add_edge(left_outer.id, left_inner.id)
+                if connect_inner_vertices:
+                    vertex_data.add_edge(left_inner.id, right_inner.id)
+                vertex_data.add_edge(right_inner.id, right_outer.id)
+                doorway = DoorwayData(
+                    center_x=50.0,
+                    center_y=50.0,
+                    width_meters=0.8,
+                    height_meters=2.1,
+                    depth_meters=0.2,
+                    rotation_degrees=90.0,
+                )
+                canvas = self._track_widget(
+                    _build_canvas(vertex_data, [doorway])
+                )
+                QTest.mouseClick(
+                    canvas,
+                    Qt.MouseButton.LeftButton,
+                    pos=_image_position(canvas, doorway.center_x, doorway.center_y),
+                )
+
+                moving_x, moving_y = _get_width_border_image_position(
+                    doorway,
+                    side_sign,
+                )
+                anchored_x, anchored_y = _get_width_border_image_position(
+                    doorway,
+                    -side_sign,
+                )
+                target_x = moving_x + (anchored_x - moving_x) * 0.375
+                target_y = moving_y + (anchored_y - moving_y) * 0.375
+                handle_position = _image_position(canvas, moving_x, moving_y)
+                target_position = _image_position(canvas, target_x, target_y)
+                target_image_point = canvas._widget_to_image_clamped(
+                    QPointF(target_position)
+                )
+
+                QTest.mousePress(
+                    canvas,
+                    Qt.MouseButton.LeftButton,
+                    pos=handle_position,
+                )
+                _send_drag_move(canvas, target_position)
+                QTest.mouseRelease(
+                    canvas,
+                    Qt.MouseButton.LeftButton,
+                    pos=target_position,
+                )
+
+                resized = canvas.doorways[0]
+                expected_width_meters = math.hypot(
+                    target_image_point.x() - anchored_x,
+                    target_image_point.y() - anchored_y,
+                ) * PIXEL_TO_METER
+                self.assertLess(resized.width_meters, doorway.width_meters)
+                self.assertAlmostEqual(
+                    resized.width_meters,
+                    expected_width_meters,
+                )
+                resized_anchor = _get_width_border_image_position(
+                    resized,
+                    -side_sign,
+                )
+                self.assertAlmostEqual(resized_anchor[0], anchored_x)
+                self.assertAlmostEqual(resized_anchor[1], anchored_y)
+
     def test_doorway_shape_is_normalized_and_strictly_validated(self) -> None:
         doorway = DoorwayData(
             center_x=10.0,
@@ -1024,6 +1107,20 @@ class DoorwayTests(unittest.TestCase):
         self.assertEqual(resize_events, ["started", True])
         canvas.undo_last_step()
         self.assertEqual(canvas.doorways[0], doorway)
+
+    def test_doorway_width_handles_downsize_across_connected_wall_segments(
+        self,
+    ) -> None:
+        self._assert_split_wall_doorway_can_downsize_from_both_sides(
+            connect_inner_vertices=True,
+        )
+
+    def test_doorway_width_handles_downsize_across_disconnected_wall_gap(
+        self,
+    ) -> None:
+        self._assert_split_wall_doorway_can_downsize_from_both_sides(
+            connect_inner_vertices=False,
+        )
 
     def test_selected_doorway_exposes_both_width_side_handles(self) -> None:
         vertex_data = VertexData()

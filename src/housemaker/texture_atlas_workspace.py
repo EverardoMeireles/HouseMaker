@@ -2514,6 +2514,23 @@ class TextureAtlasWorkspace(QWidget):
     def get_unpacked_scene_texture_source_ids(self) -> tuple[str, ...]:
         """Return required source IDs which are absent from every atlas."""
 
+        return self.get_unpacked_texture_source_ids(
+            self._scene_texture_source_ids
+        )
+
+    def get_unpacked_texture_source_ids(
+        self,
+        source_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return the requested source IDs which are absent from every atlas."""
+
+        normalized_source_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for source_id in (str(value).strip() for value in source_ids)
+                if source_id
+            )
+        )
         packed_ids = {
             placement.object_id
             for atlas in self._data.atlases
@@ -2521,7 +2538,7 @@ class TextureAtlasWorkspace(QWidget):
         }
         return tuple(
             source_id
-            for source_id in self._scene_texture_source_ids
+            for source_id in normalized_source_ids
             if source_id not in packed_ids
         )
 
@@ -2541,6 +2558,7 @@ class TextureAtlasWorkspace(QWidget):
         sort_by_pbr: bool = False,
         use_half_mesh_texture_prefix: bool = False,
         allow_atlas_creation: bool = False,
+        source_ids: Sequence[str] | None = None,
     ) -> tuple[str, ...]:
         """Pack every currently-unpacked source into an appropriate Atlas.
 
@@ -2575,7 +2593,12 @@ class TextureAtlasWorkspace(QWidget):
         source_overrides: dict[tuple[str, int], AtlasObjectTextureSource] = {}
         failed_names: list[str] = []
         selectability_resolver = self._texture_variant_selectability_resolver
-        for source_id in self.get_unpacked_scene_texture_source_ids():
+        unpacked_source_ids = (
+            self.get_unpacked_scene_texture_source_ids()
+            if source_ids is None
+            else self.get_unpacked_texture_source_ids(source_ids)
+        )
+        for source_id in unpacked_source_ids:
             active_source = self._sources_by_object_id.get(source_id)
             if active_source is None:
                 failed_names.append(self._object_display_name(source_id))

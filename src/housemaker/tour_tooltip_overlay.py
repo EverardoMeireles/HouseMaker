@@ -162,7 +162,8 @@ def _build_tooltip_document(html_body: str, style: str) -> str:
     return (
         "<!doctype html><html><head><meta charset='utf-8'><style>"
         f"{_TOUR_TOOLTIP_BASE_STYLE}\n{authored_style}"
-        "</style></head><body><div class='housemaker-tour-tooltip'>"
+        "</style></head><body><table width='100%' cellspacing='0' "
+        "cellpadding='0'><tr><td class='housemaker-tour-tooltip'>"
         f"{html_body}"
-        "</div></body></html>"
+        "</td></tr></table></body></html>"
     )
