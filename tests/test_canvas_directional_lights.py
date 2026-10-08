@@ -129,6 +129,24 @@ class CanvasDirectionalLightTests(unittest.TestCase):
         )
         self.assertEqual(self.canvas.vertex_data.vertices, [])
 
+    def test_delete_requests_removal_of_the_selected_light(self) -> None:
+        profile = CanvasDirectionalLightProfile(
+            light_id="directional-light-1",
+            image_x=80.0,
+            image_y=35.0,
+        )
+        deletion_requests: list[str] = []
+        self.canvas.set_directional_light_profiles((profile,))
+        self.canvas.set_selected_directional_light_id(profile.light_id)
+        self.canvas.directional_light_deletion_requested.connect(
+            deletion_requests.append
+        )
+
+        QTest.keyClick(self.canvas, Qt.Key.Key_Delete)
+
+        self.assertEqual(deletion_requests, [profile.light_id])
+        self.assertIsNone(self.canvas.get_selected_directional_light_id())
+
     def test_marker_reprojects_with_zoom_and_remains_hit_testable(self) -> None:
         profile = CanvasDirectionalLightProfile(
             light_id="directional-light-1",

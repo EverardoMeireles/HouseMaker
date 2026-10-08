@@ -919,7 +919,7 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             _edit(target, 0.0)
         )
 
-    def test_singular_wall_restoration_rearms_add_window(self) -> None:
+    def test_singular_wall_restoration_rearms_window_placement(self) -> None:
         level = _build_plain_connected_level()
         surfaces = self._install_level(level)
         wall = _surface(
@@ -933,8 +933,7 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             self.workspace._desired_canvas_surface_ids,
             (wall.surface_id,),
         )
-        assert viewer.add_window_button is not None
-        self.assertTrue(viewer.add_window_button.isEnabled())
+        self.assertTrue(self.workspace.add_window_button.isEnabled())
 
         self.workspace._is_syncing_canvas_scene_selection = True
         try:
@@ -951,7 +950,8 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             viewer.get_selected_wall_surface_id(),
             wall.surface_id,
         )
-        self.assertTrue(viewer.add_window_button.isEnabled())
+        self.workspace.add_window_button.click()
+        self.assertTrue(viewer.is_window_placement_active())
 
 
 # ### Direct execution ###

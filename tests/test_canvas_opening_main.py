@@ -14,13 +14,18 @@ from unittest.mock import patch
 
 import numpy as np
 import trimesh
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QImage, QMouseEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
+    CANVAS_OPENING_WINDOW,
     CanvasOpeningBounds,
     CanvasOpeningEdit,
+    CanvasOpeningTarget,
     build_canvas_opening_targets,
 )
 from housemaker.main import BlueprintWorkspace
@@ -91,6 +96,24 @@ def _build_level_and_wall() -> tuple[LevelData, FixedSurface]:
     return level, wall
 
 
+def _send_canvas_drag_move(
+    workspace: BlueprintWorkspace,
+    position: QPointF,
+) -> None:
+    """Send one left-button move because QTest.mouseMove has no held buttons."""
+
+    canvas = workspace.canvas
+    event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        position,
+        canvas.mapToGlobal(position.toPoint()),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(canvas, event)
+
+
 # ### Main opening edit integration tests ###
 class CanvasOpeningMainTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -124,6 +147,28 @@ class CanvasOpeningMainTests(unittest.TestCase):
             )
             if target.reference.kind == kind
         )
+
+    def _prepare_2d_window_canvas(
+        self,
+    ) -> tuple[CanvasOpeningTarget, tuple[QPointF, QPointF]]:
+        """Expose the fixture wall through an image-backed 2D Canvas."""
+
+        start = self.level.vertex_data.add_vertex(0.0, 0.0)
+        end = self.level.vertex_data.add_vertex(200.0, 0.0)
+        self.level.vertex_data.add_edge(start.id, end.id)
+        self.workspace._sync_canvas_to_current_level()
+        canvas = self.workspace.canvas
+        canvas.resize(720, 520)
+        canvas.blueprint_image = QImage(200, 100, QImage.Format.Format_RGB32)
+        canvas.blueprint_image.fill(Qt.GlobalColor.white)
+        self.workspace.show()
+        _qt_application.processEvents()
+
+        target = self._get_target(CANVAS_OPENING_WINDOW)
+        segment = canvas._get_window_widget_segment(self.level.windows[0])
+        self.assertIsNotNone(segment)
+        assert segment is not None
+        return target, segment
 
     def test_doorway_drag_keeps_the_old_mesh_until_release_delay(self) -> None:
         target = self._get_target(CANVAS_OPENING_DOORWAY)
@@ -166,6 +211,132 @@ class CanvasOpeningMainTests(unittest.TestCase):
             tuple(self.level.doorways),
         )
         schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+    def test_2d_window_move_holds_mesh_snapshot_until_release_delay(
+        self,
+    ) -> None:
+        _target, segment = self._prepare_2d_window_canvas()
+        canvas = self.workspace.canvas
+        original_window = self.level.windows[0]
+        committed_before = self.workspace._viewer_windows_by_level_index[2]
+        initial_undo_count = len(self.workspace._canvas_undo_stack)
+        center = (segment[0] + segment[1]) * 0.5
+        drag_target = canvas._image_to_widget(100.0, 0.0)
+
+        QTest.mousePress(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=center.toPoint(),
+        )
+        _send_canvas_drag_move(self.workspace, drag_target)
+        _qt_application.processEvents()
+
+        moved_window = self.level.windows[0]
+        self.assertNotEqual(moved_window, original_window)
+        self.assertAlmostEqual(
+            moved_window.end_ratio - moved_window.start_ratio,
+            original_window.end_ratio - original_window.start_ratio,
+        )
+        self.assertEqual(
+            (moved_window.bottom_ratio, moved_window.top_ratio),
+            (original_window.bottom_ratio, original_window.top_ratio),
+        )
+        self.assertTrue(self.workspace._is_canvas_opening_drag_active)
+        self.assertEqual(
+            self.workspace._viewer_windows_by_level_index[2],
+            committed_before,
+        )
+        self.assertEqual(
+            len(self.workspace._canvas_undo_stack),
+            initial_undo_count,
+        )
+        self.assertFalse(self.workspace._doorway_mesh_update_timer.isActive())
+
+        QTest.mouseRelease(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=drag_target.toPoint(),
+        )
+        _qt_application.processEvents()
+
+        self.assertFalse(self.workspace._is_canvas_opening_drag_active)
+        self.assertEqual(
+            self.workspace._viewer_windows_by_level_index[2],
+            committed_before,
+        )
+        self.assertEqual(
+            len(self.workspace._canvas_undo_stack),
+            initial_undo_count + 1,
+        )
+        self.assertEqual(canvas.undo_stack, [])
+        self.assertTrue(self.workspace._doorway_mesh_update_timer.isActive())
+
+    def test_2d_window_move_records_one_shared_undo_for_many_previews(
+        self,
+    ) -> None:
+        target, segment = self._prepare_2d_window_canvas()
+        canvas = self.workspace.canvas
+        original_window = self.level.windows[0]
+        initial_undo_count = len(self.workspace._canvas_undo_stack)
+        center = (segment[0] + segment[1]) * 0.5
+
+        QTest.mousePress(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=center.toPoint(),
+        )
+        for image_x in (130.0, 120.0, 110.0, 100.0):
+            _send_canvas_drag_move(
+                self.workspace,
+                canvas._image_to_widget(image_x, 0.0),
+            )
+        release_position = canvas._image_to_widget(100.0, 0.0)
+        QTest.mouseRelease(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=release_position.toPoint(),
+        )
+        _qt_application.processEvents()
+
+        self.assertNotEqual(self.level.windows[0], original_window)
+        self.assertEqual(
+            len(self.workspace._canvas_undo_stack),
+            initial_undo_count + 1,
+        )
+        selected_reference = (
+            self.workspace.viewer.get_selected_canvas_opening_reference()
+        )
+        self.assertEqual(selected_reference, target.reference)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(self.level.windows[0], original_window)
+        self.assertEqual(
+            len(self.workspace._canvas_undo_stack),
+            initial_undo_count,
+        )
+        self.assertEqual(canvas.undo_stack, [])
+
+    def test_2d_and_3d_window_selection_stay_synchronized(self) -> None:
+        target, segment = self._prepare_2d_window_canvas()
+        canvas = self.workspace.canvas
+        center = ((segment[0] + segment[1]) * 0.5).toPoint()
+
+        QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=center)
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            self.workspace.viewer.get_selected_canvas_opening_reference(),
+            target.reference,
+        )
+        self.assertEqual(canvas.selected_window_id, "editable-window")
+
+        self.workspace.viewer.select_canvas_opening(None)
+        self.assertIsNone(canvas.selected_window_id)
+        self.workspace.viewer.select_canvas_opening(target.reference)
+
+        self.assertEqual(canvas.selected_window_id, "editable-window")
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_arch_checkbox_immediately_exposes_3d_shoulders(self) -> None:
         target = self._get_target(CANVAS_OPENING_DOORWAY)

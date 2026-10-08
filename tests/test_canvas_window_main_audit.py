@@ -507,7 +507,9 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         assert self.workspace.viewer.undo_window_button is not None
         self.assertFalse(self.workspace.viewer.undo_window_button.isEnabled())
 
-    def test_detached_canvas_keeps_the_same_right_side_window_tools(self) -> None:
+    def test_detached_canvas_keeps_undo_tools_and_uses_canvas_add_button(
+        self,
+    ) -> None:
         level = _build_square_level()
         self.workspace.levels = [level]
         model = convert_to_glb([level])
@@ -523,14 +525,17 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         viewer.set_wall_targets(tuple(build_fixed_surfaces([level])))
         self.assertTrue(viewer.select_wall_target(wall.surface_id))
         panel = viewer.window_tools_panel
-        button = viewer.add_window_button
+        button = self.workspace.add_window_button
         undo_button = viewer.undo_window_button
         self.assertIsNotNone(panel)
-        self.assertIsNotNone(button)
         self.assertIsNotNone(undo_button)
         assert panel is not None
-        assert button is not None
         assert undo_button is not None
+        self.assertFalse(hasattr(viewer, "add_window_button"))
+        self.assertIsNone(
+            panel.findChild(type(button), "canvas-add-window-button")
+        )
+        self.assertFalse(viewer.isAncestorOf(button))
         viewer.set_window_undo_available(True)
 
         screen = _primary_screen()

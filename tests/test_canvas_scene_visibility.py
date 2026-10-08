@@ -345,8 +345,7 @@ class CanvasSceneVisibilityTests(unittest.TestCase):
             (floor_id,),
         )
         self.assertIsNone(self.viewer.get_selected_wall_surface_id())
-        assert self.viewer.add_window_button is not None
-        self.assertFalse(self.viewer.add_window_button.isEnabled())
+        self.assertFalse(self.viewer.begin_window_placement())
 
         self.viewer.set_canvas_surface_focus_type(None)
         self.viewer.set_canvas_ceiling_hidden(True)

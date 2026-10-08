@@ -1535,6 +1535,7 @@ class BlueprintWorkspace(QWidget):
             int,
             tuple[object, ...],
         ] = {}
+        self._is_syncing_window_placement_modes = False
         self._canvas_window_undo_ids: list[str] = []
         self._canvas_undo_stack: list[_CanvasUndoState] = []
         self._is_restoring_canvas_undo = False
@@ -2271,6 +2272,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.directional_light_selection_changed.connect(
             self._handle_directional_light_selection_changed
         )
+        self.viewer.directional_light_deletion_requested.connect(
+            self._handle_directional_light_deletion_requested
+        )
         self.viewer.directional_light_transform_preview_changed.connect(
             self._handle_directional_light_transform_preview_changed
         )
@@ -2316,8 +2320,17 @@ class BlueprintWorkspace(QWidget):
             "Settings",
         )
         self.workspace_tabs.currentChanged.connect(self._handle_workspace_tab_changed)
+        self.canvas.window_placement_requested.connect(
+            self._handle_canvas_window_placement_requested
+        )
+        self.canvas.window_placement_changed.connect(
+            self._handle_window_placement_mode_changed
+        )
         self.viewer.window_placement_requested.connect(
             self._handle_canvas_window_placement_requested
+        )
+        self.viewer.window_placement_changed.connect(
+            self._handle_window_placement_mode_changed
         )
         self.viewer.window_undo_requested.connect(
             self._handle_canvas_window_undo_requested
@@ -2369,6 +2382,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.directional_light_selection_requested.connect(
             self._handle_directional_light_selection_changed
+        )
+        self.canvas.directional_light_deletion_requested.connect(
+            self._handle_directional_light_deletion_requested
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
@@ -3481,6 +3497,23 @@ class BlueprintWorkspace(QWidget):
         doorways_layout.addLayout(doorway_buttons_layout)
         side_layout.addWidget(self.doorways_group)
 
+        self.windows_group = QGroupBox("Windows")
+        windows_layout = QVBoxLayout(self.windows_group)
+
+        self.add_window_button = QPushButton("Add window")
+        self.add_window_button.setObjectName("canvas-add-window-button")
+        self.add_window_button.setMinimumHeight(40)
+        self.add_window_button.setCheckable(True)
+        self.add_window_button.setToolTip(
+            "Click a wall on the plan to add a purple, vertically centered "
+            "window. A selected wall can also be drawn on in the 3D scene."
+        )
+        self.add_window_button.toggled.connect(
+            self._handle_add_window_button_toggled
+        )
+        windows_layout.addWidget(self.add_window_button)
+        side_layout.addWidget(self.windows_group)
+
         self.doors_group = QGroupBox("Doors")
         doors_layout = QVBoxLayout(self.doors_group)
 
@@ -3963,6 +3996,21 @@ class BlueprintWorkspace(QWidget):
         self.canvas.selected_doorway_changed.connect(
             self._handle_canvas_doorway_selection_changed
         )
+        self.canvas.canvas_opening_selection_requested.connect(
+            self._handle_blueprint_canvas_opening_selection_requested
+        )
+        self.canvas.canvas_opening_edit_started.connect(
+            self._handle_canvas_opening_edit_started
+        )
+        self.canvas.canvas_opening_edit_preview_changed.connect(
+            self._handle_blueprint_canvas_opening_edit_preview_changed
+        )
+        self.canvas.canvas_opening_edit_finished.connect(
+            self._handle_canvas_opening_edit_finished
+        )
+        self.canvas.canvas_opening_edit_cancelled.connect(
+            self._handle_blueprint_canvas_opening_edit_cancelled
+        )
         self.canvas.stair_start_placed.connect(self._handle_stair_start_placed)
         self.canvas.stair_placement_ready.connect(self._handle_stair_placement_ready)
         self.canvas.stair_placement_completed.connect(
@@ -4058,6 +4106,61 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_camera_indicator_pose(
             self.viewer.get_first_person_camera_pose()
         )
+
+    # ### Canvas window placement ###
+    def _handle_add_window_button_toggled(self, checked: bool) -> None:
+        """Arm or cancel the shared 2D/3D window-placement operation."""
+
+        if self._is_syncing_window_placement_modes:
+            return
+        canvas_started = False
+        viewer_started = False
+        self._is_syncing_window_placement_modes = True
+        try:
+            if not checked:
+                self.canvas.cancel_window_placement()
+                self.viewer.cancel_window_placement()
+                return
+
+            canvas_started = self.canvas.start_window_placement()
+            viewer_started = self.viewer.begin_window_placement()
+        finally:
+            self._is_syncing_window_placement_modes = False
+
+        if not canvas_started and not viewer_started:
+            self._set_add_window_button_checked(False)
+            self.viewer.set_window_tools_status(
+                "Add a plan image with walls, or select one wall in 3D."
+            )
+            return
+        if canvas_started and not viewer_started:
+            self.viewer.set_window_tools_status(
+                "Click a wall on the 2D plan to place a centered window."
+            )
+
+    def _handle_window_placement_mode_changed(self, active: bool) -> None:
+        """Keep both authoring views and the moved button in one state."""
+
+        if self._is_syncing_window_placement_modes:
+            return
+        if active:
+            self._set_add_window_button_checked(True)
+            return
+
+        self._is_syncing_window_placement_modes = True
+        try:
+            self._set_add_window_button_checked(False)
+            self.canvas.cancel_window_placement()
+            self.viewer.cancel_window_placement(status_message=None)
+        finally:
+            self._is_syncing_window_placement_modes = False
+
+    def _set_add_window_button_checked(self, checked: bool) -> None:
+        """Reflect placement state without recursively invoking its handler."""
+
+        was_blocked = self.add_window_button.blockSignals(True)
+        self.add_window_button.setChecked(bool(checked))
+        self.add_window_button.blockSignals(was_blocked)
 
     def _handle_canvas_window_placement_requested(
         self,
@@ -4212,6 +4315,55 @@ class BlueprintWorkspace(QWidget):
         ]
 
     # ### Canvas opening gizmo edits ###
+    def _handle_blueprint_canvas_opening_selection_requested(
+        self,
+        raw_reference: object,
+    ) -> None:
+        """Mirror a 2D window selection into the shared 3D opening editor."""
+
+        reference = (
+            raw_reference
+            if isinstance(raw_reference, CanvasOpeningReference)
+            else None
+        )
+        self.viewer.select_canvas_opening(reference)
+
+    def _handle_blueprint_canvas_opening_edit_preview_changed(
+        self,
+        raw_edit: object,
+    ) -> None:
+        """Apply a 2D edit and refresh only its lightweight 3D gizmo."""
+
+        self._handle_canvas_opening_edit_preview_changed(raw_edit)
+        if not isinstance(raw_edit, CanvasOpeningEdit):
+            return
+        target = self._canvas_opening_targets_by_key.get(raw_edit.reference.key)
+        if target is None:
+            return
+        try:
+            self.viewer.update_canvas_opening_target(target)
+        except (RuntimeError, ValueError):
+            return
+
+    def _handle_blueprint_canvas_opening_edit_cancelled(
+        self,
+        raw_start_edit: object,
+    ) -> None:
+        """Restore a cancelled 2D edit in both project data and its gizmo."""
+
+        self._handle_canvas_opening_edit_cancelled(raw_start_edit)
+        if not isinstance(raw_start_edit, CanvasOpeningEdit):
+            return
+        target = self._canvas_opening_targets_by_key.get(
+            raw_start_edit.reference.key
+        )
+        if target is None:
+            return
+        try:
+            self.viewer.update_canvas_opening_target(target)
+        except (RuntimeError, ValueError):
+            return
+
     def _handle_canvas_opening_selection_changed(
         self,
         raw_reference: object,
@@ -4235,7 +4387,15 @@ class BlueprintWorkspace(QWidget):
             and reference.level_index == self.current_level.index
         ):
             doorway_index = reference.item_index
+        window_id = None
+        if (
+            reference is not None
+            and reference.kind == CANVAS_OPENING_WINDOW
+            and reference.level_index == self.current_level.index
+        ):
+            window_id = reference.stable_id
         self.canvas._set_selected_doorway_index(doorway_index)
+        self.canvas._set_selected_window_id(window_id, notify=False)
         self.canvas.update()
 
     def _handle_canvas_opening_edit_started(
@@ -5850,6 +6010,9 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_surface_tools_status(
                 "Current Canvas interaction cancelled."
             )
+            return
+        if self.canvas._cancel_window_pointer_state(restore_initial=True):
+            self.viewer.set_surface_tools_status("Current opening drag cancelled.")
             return
         if self.viewer.cancel_canvas_opening_edit():
             self.viewer.set_surface_tools_status("Current opening drag cancelled.")
@@ -19337,6 +19500,27 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_selected_directional_light_id(normalized_id)
         self.viewer.set_selected_directional_light_id(normalized_id)
         self._refresh_directional_light_button_tooltip()
+
+    def _handle_directional_light_deletion_requested(
+        self,
+        light_id: object,
+    ) -> None:
+        """Delete one requested light and republish canonical scene state."""
+
+        normalized_id = str(light_id).strip()
+        if not normalized_id:
+            return
+        retained_lights = tuple(
+            light
+            for light in self.directional_lights
+            if light.light_id != normalized_id
+        )
+        if len(retained_lights) == len(self.directional_lights):
+            return
+        self.directional_lights = retained_lights
+        if self._selected_directional_light_id == normalized_id:
+            self._selected_directional_light_id = None
+        self._sync_directional_light_views()
 
     def _handle_directional_light_transform_preview_changed(
         self,

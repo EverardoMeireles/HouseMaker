@@ -3843,6 +3843,7 @@ class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
     window_placement_requested = Signal(object)
+    window_placement_changed = Signal(bool)
     window_undo_requested = Signal()
     door_creation_requested = Signal(object)
     canvas_opening_selection_changed = Signal(object)
@@ -3876,6 +3877,7 @@ class GlbViewerWidget(QWidget):
     directional_light_placed = Signal(object)
     directional_light_placement_cancelled = Signal()
     directional_light_selection_changed = Signal(object)
+    directional_light_deletion_requested = Signal(str)
     directional_light_transform_preview_changed = Signal(str, object, object)
     directional_light_transform_changed = Signal(str, object, object)
     directional_light_intensity_step_requested = Signal(str, int)
@@ -4269,7 +4271,6 @@ class GlbViewerWidget(QWidget):
         self._window_preview_item: gl.GLMeshItem | None = None
         self.window_tools_panel: QWidget | None = None
         self.window_tools_status_label: QLabel | None = None
-        self.add_window_button: QPushButton | None = None
         self.undo_window_button: QPushButton | None = None
         self.add_surface_vertex_button: QPushButton | None = None
         self.canvas_level_visibility_list: QListWidget | None = None
@@ -5331,13 +5332,6 @@ class GlbViewerWidget(QWidget):
         title_label = QLabel("Window tools")
         title_label.setObjectName("canvas-window-tools-title")
         panel_layout.addWidget(title_label)
-
-        self.add_window_button = QPushButton("Add window")
-        self.add_window_button.setObjectName("canvas-add-window-button")
-        self.add_window_button.setCheckable(True)
-        self.add_window_button.setEnabled(False)
-        self.add_window_button.toggled.connect(self._handle_add_window_button_toggled)
-        panel_layout.addWidget(self.add_window_button)
 
         self.undo_window_button = QPushButton("Undo window")
         self.undo_window_button.setObjectName("canvas-undo-window-button")
@@ -7778,6 +7772,11 @@ class GlbViewerWidget(QWidget):
         """Route Delete to Canvas placement removal or the generic consumer."""
 
         self._invalidate_external_canvas_rectangle_selection()
+        selected_light_id = self._selected_directional_light_id
+        if selected_light_id is not None:
+            self.set_selected_directional_light_id(None)
+            self.directional_light_deletion_requested.emit(selected_light_id)
+            return
         selected_stair_ids = tuple(
             dict.fromkeys(
                 part.stair_id
@@ -8631,9 +8630,9 @@ class GlbViewerWidget(QWidget):
             or self._selected_window_wall_surface_id not in self._window_wall_targets
         ):
             self._set_window_tools_status("Select one wall.")
-            self._set_add_window_button_checked(False)
             return False
 
+        was_active = self.is_window_placement_active()
         self._clear_architectural_trim_passive_hover()
         self.cancel_directional_light_placement()
         self.set_selected_directional_light_id(None)
@@ -8649,11 +8648,12 @@ class GlbViewerWidget(QWidget):
         self._window_preview_is_valid = False
         self._remove_window_preview_item()
         self.view.set_rectangle_drawing_enabled(True)
-        self._set_add_window_button_checked(True)
         self._sync_window_undo_button()
         self._set_window_tools_status(
             "Drag on the selected wall. Escape or right-click cancels."
         )
+        if not was_active:
+            self.window_placement_changed.emit(True)
         return True
 
     def cancel_window_placement(
@@ -8665,15 +8665,17 @@ class GlbViewerWidget(QWidget):
 
         if not self._window_editing_enabled:
             return
+        was_active = self.is_window_placement_active()
         self.view.set_rectangle_drawing_enabled(False)
         self._window_drag_first_world = None
         self._window_preview_placement = None
         self._window_preview_is_valid = False
         self._remove_window_preview_item()
-        self._set_add_window_button_checked(False)
         self._sync_window_undo_button()
         if status_message is not None:
             self._set_window_tools_status(status_message)
+        if was_active:
+            self.window_placement_changed.emit(False)
 
     # ### Tour pointer input ###
     def _connect_tour_input(self) -> None:
@@ -11562,13 +11564,6 @@ class GlbViewerWidget(QWidget):
         )
         self.navigation_mode_changed.connect(self._cancel_canvas_gizmo_drag)
 
-    def _handle_add_window_button_toggled(self, checked: bool) -> None:
-        if checked:
-            self.begin_window_placement()
-            return
-        if self.is_window_placement_active():
-            self.cancel_window_placement()
-
     def _handle_add_surface_vertex_button_toggled(self, checked: bool) -> None:
         """Synchronize the repeated surface-vertex insertion mode."""
 
@@ -14061,18 +14056,12 @@ class GlbViewerWidget(QWidget):
     # ### Canvas window editor controls ###
     def _sync_window_tools_controls(self) -> None:
         if self._level_transform_preview_level_index is not None:
-            if self.add_window_button is not None:
-                self.add_window_button.setEnabled(False)
             self._sync_window_undo_button()
             self._set_window_tools_status(
                 "Window editing resumes after the level transform is applied."
             )
             return
         selected = self._get_selected_window_wall() is not None
-        if self.add_window_button is not None:
-            self.add_window_button.setEnabled(
-                selected and not self._canvas_face_orientation_visible
-            )
         self._sync_window_undo_button()
         if self.is_window_placement_active():
             return
@@ -14082,15 +14071,10 @@ class GlbViewerWidget(QWidget):
             )
             return
         self._set_window_tools_status(
-            "Wall selected. Click Add window." if selected else "Select one wall."
+            "Wall selected. Use Add window in the Canvas tab."
+            if selected
+            else "Select one wall."
         )
-
-    def _set_add_window_button_checked(self, checked: bool) -> None:
-        if self.add_window_button is None:
-            return
-        was_blocked = self.add_window_button.blockSignals(True)
-        self.add_window_button.setChecked(bool(checked))
-        self.add_window_button.blockSignals(was_blocked)
 
     def _sync_window_undo_button(self) -> None:
         if self.undo_window_button is None:

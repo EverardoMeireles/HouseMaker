@@ -344,8 +344,7 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         self.assertNotIn(child.surface_id, viewer._window_wall_targets)
         self.assertEqual(viewer._canvas_surface_edit_targets, {})
         self.assertIsNone(viewer.get_selected_wall_surface_id())
-        assert viewer.add_window_button is not None
-        self.assertFalse(viewer.add_window_button.isEnabled())
+        self.assertFalse(viewer.begin_window_placement())
 
     def test_add_vertices_button_uses_plural_label(self) -> None:
         viewer = self._build_viewer((_build_wall(),))

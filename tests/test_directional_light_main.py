@@ -148,6 +148,27 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
             self.workspace.add_directional_light_button.toolTip(),
         )
 
+    def test_delete_from_viewer_removes_only_the_selected_light(self) -> None:
+        first_light = _directional_light()
+        second_light = _directional_light(
+            light_id="directional-light-2",
+            name="Directional light 2",
+        )
+        self.workspace.directional_lights = (first_light, second_light)
+        self.workspace._selected_directional_light_id = first_light.light_id
+        self.workspace._sync_directional_light_views()
+
+        self.workspace.viewer._handle_view_delete_requested()
+
+        self.assertEqual(self.workspace.directional_lights, (second_light,))
+        self.assertIsNone(self.workspace._selected_directional_light_id)
+        self.assertIsNone(
+            self.workspace.viewer.get_selected_directional_light_id()
+        )
+        self.assertIsNone(
+            self.workspace.canvas.get_selected_directional_light_id()
+        )
+
     def test_wheel_steps_use_raw_r3f_intensity_units(self) -> None:
         light = _directional_light()
         self.workspace.directional_lights = (light,)

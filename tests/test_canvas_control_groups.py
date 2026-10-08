@@ -136,6 +136,27 @@ class CanvasControlGroupingTests(unittest.TestCase):
             labels={"Arch amount"},
         )
 
+    def test_windows_group_owns_the_shared_add_window_control(self) -> None:
+        self._assert_group_contains(
+            "Windows",
+            self.workspace.add_window_button,
+        )
+        self.assertEqual(self.workspace.add_window_button.text(), "Add window")
+        self.assertTrue(self.workspace.add_window_button.isCheckable())
+        self.assertFalse(hasattr(self.workspace.viewer, "add_window_button"))
+
+        side_layout = self.workspace.windows_group.parentWidget().layout()
+        self.assertIsNotNone(side_layout)
+        assert side_layout is not None
+        self.assertEqual(
+            side_layout.indexOf(self.workspace.windows_group),
+            side_layout.indexOf(self.workspace.doorways_group) + 1,
+        )
+        self.assertEqual(
+            side_layout.indexOf(self.workspace.doors_group),
+            side_layout.indexOf(self.workspace.windows_group) + 1,
+        )
+
     def test_wall_mirrors_group_follows_directional_light_with_three_actions(
         self,
     ) -> None:

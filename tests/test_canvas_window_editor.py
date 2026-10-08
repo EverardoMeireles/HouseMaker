@@ -154,39 +154,35 @@ class CanvasWindowEditorTests(unittest.TestCase):
         ):
             viewer._handle_window_pointer_moved(QPointF(40.0, 40.0))
 
-    def test_window_tools_are_canvas_opt_in_and_require_one_wall(self) -> None:
+    def test_window_tools_are_canvas_opt_in_and_placement_requires_one_wall(
+        self,
+    ) -> None:
         ordinary_viewer = self._build_viewer(enabled=False)
         canvas_viewer = self._build_viewer()
 
         self.assertIsNone(ordinary_viewer.window_tools_panel)
-        self.assertIsNone(ordinary_viewer.add_window_button)
         self.assertIsNone(ordinary_viewer.undo_window_button)
         self.assertIsNotNone(canvas_viewer.window_tools_panel)
-        self.assertIsNotNone(canvas_viewer.add_window_button)
         self.assertIsNotNone(canvas_viewer.undo_window_button)
-        assert canvas_viewer.add_window_button is not None
         assert canvas_viewer.undo_window_button is not None
-        self.assertEqual(canvas_viewer.add_window_button.text(), "Add window")
+        self.assertFalse(hasattr(ordinary_viewer, "add_window_button"))
+        self.assertFalse(hasattr(canvas_viewer, "add_window_button"))
         self.assertEqual(canvas_viewer.undo_window_button.text(), "Undo window")
-        self.assertFalse(canvas_viewer.add_window_button.isEnabled())
         self.assertFalse(canvas_viewer.undo_window_button.isEnabled())
 
         panel_layout = canvas_viewer.window_tools_panel.layout()
         self.assertIs(
             panel_layout.itemAt(1).widget(),
-            canvas_viewer.add_window_button,
-        )
-        self.assertIs(
-            panel_layout.itemAt(2).widget(),
             canvas_viewer.undo_window_button,
         )
 
         wall = _build_wall()
         canvas_viewer.set_wall_targets((_build_floor(), wall))
 
-        self.assertFalse(canvas_viewer.add_window_button.isEnabled())
+        self.assertFalse(canvas_viewer.begin_window_placement())
         self.assertTrue(canvas_viewer.select_wall_target(wall.surface_id))
-        self.assertTrue(canvas_viewer.add_window_button.isEnabled())
+        self.assertTrue(canvas_viewer.begin_window_placement())
+        self.assertTrue(canvas_viewer.is_window_placement_active())
 
     def test_undo_availability_is_independent_of_selection_and_pauses_drawing(
         self,
@@ -225,8 +221,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
             viewer._handle_window_wall_pick_requested(QPointF(20.0, 20.0))
 
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
-        assert viewer.add_window_button is not None
-        self.assertTrue(viewer.add_window_button.isEnabled())
+        self.assertTrue(viewer.begin_window_placement())
 
     def test_plain_pick_selects_floor_or_ceiling_and_clears_window_wall(
         self,
@@ -260,8 +255,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
             (floor.surface_id,),
         )
         self.assertIsNone(viewer.get_selected_wall_surface_id())
-        assert viewer.add_window_button is not None
-        self.assertFalse(viewer.add_window_button.isEnabled())
+        self.assertFalse(viewer.begin_window_placement())
 
         with (
             patch.object(
@@ -347,8 +341,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
             (ceiling.surface_id,),
         )
         self.assertIsNone(viewer.get_selected_wall_surface_id())
-        assert viewer.add_window_button is not None
-        self.assertFalse(viewer.add_window_button.isEnabled())
+        self.assertFalse(viewer.begin_window_placement())
 
     def test_floor_hit_occludes_a_placed_object_behind_it(self) -> None:
         viewer = self._build_viewer()
@@ -557,8 +550,6 @@ class CanvasWindowEditorTests(unittest.TestCase):
         self.assertEqual(emitted, [])
         self.assertFalse(viewer.is_window_placement_active())
         self.assertIsNone(viewer._window_preview_item)
-        assert viewer.add_window_button is not None
-        self.assertFalse(viewer.add_window_button.isChecked())
 
     def test_selection_survives_scene_repopulation_and_stable_target_refresh(
         self,

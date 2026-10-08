@@ -170,8 +170,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
             )
 
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
-        assert viewer.add_window_button is not None
-        self.assertTrue(viewer.add_window_button.isEnabled())
+        self.assertTrue(self.workspace.add_window_button.isEnabled())
         QTest.keyRelease(viewer.view, Qt.Key.Key_Control)
 
         self.assertTrue(viewer.is_first_person_pointer_captured)
@@ -182,7 +181,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
             viewer.get_navigation_mode(),
             NAVIGATION_MODE_FIRST_PERSON,
         )
-        viewer.add_window_button.click()
+        self.workspace.add_window_button.click()
 
         self.assertTrue(viewer.is_window_placement_active())
         self.assertFalse(viewer.is_first_person_pointer_captured)

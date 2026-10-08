@@ -121,6 +121,26 @@ class DirectionalLightViewerInteractionTests(unittest.TestCase):
         self.viewer._handle_directional_light_wheel_steps_requested(2)
         self.assertEqual(emitted, [("directional-light-1", 2)])
 
+    def test_delete_routes_the_selected_light_to_its_dedicated_consumer(
+        self,
+    ) -> None:
+        deletion_requests: list[str] = []
+        generic_deletion_requests: list[bool] = []
+        self.viewer.set_directional_lights((_light(),))
+        self.viewer.set_selected_directional_light_id("directional-light-1")
+        self.viewer.directional_light_deletion_requested.connect(
+            deletion_requests.append
+        )
+        self.viewer.delete_requested.connect(
+            lambda: generic_deletion_requests.append(True)
+        )
+
+        self.viewer._handle_view_delete_requested()
+
+        self.assertEqual(deletion_requests, ["directional-light-1"])
+        self.assertEqual(generic_deletion_requests, [])
+        self.assertIsNone(self.viewer.get_selected_directional_light_id())
+
     def test_marker_size_scales_gently_with_intensity(self) -> None:
         self.assertEqual(
             _get_directional_light_marker_size_pixels(0.0, selected=False),

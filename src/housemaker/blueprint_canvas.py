@@ -26,6 +26,12 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from housemaker.camera_models import CameraPose
+from housemaker.canvas_openings import (
+    CANVAS_OPENING_WINDOW,
+    CanvasOpeningBounds,
+    CanvasOpeningEdit,
+    CanvasOpeningReference,
+)
 from housemaker.doorway_bridge import (
     find_doorway_bridge_target,
     find_doorway_bridges_covered_by_rectangle,
@@ -64,7 +70,11 @@ from housemaker.models import (
     normalize_doorway_shape,
     snap_point,
 )
-from housemaker.surface_geometry import build_wall_surface_id
+from housemaker.surface_geometry import (
+    MIN_WINDOW_SIZE_METERS,
+    WallWindowPlacement,
+    build_wall_surface_id,
+)
 from housemaker.uv_layout import build_room_walls
 
 # ### Constants ###
@@ -93,8 +103,14 @@ DOORWAY_EDGE_COLOR = QColor("#32b8ff")
 SELECTED_DOORWAY_EDGE_COLOR = QColor("#f6c85f")
 PENDING_DOORWAY_FILL_COLOR = QColor(255, 209, 102, 115)
 PENDING_DOORWAY_EDGE_COLOR = QColor("#ffd166")
-WINDOW_FILL_COLOR = QColor(74, 214, 255, 105)
-WINDOW_EDGE_COLOR = QColor("#46d6ff")
+WINDOW_FILL_COLOR = QColor(181, 108, 255, 105)
+WINDOW_EDGE_COLOR = QColor("#b56cff")
+SELECTED_WINDOW_EDGE_COLOR = QColor("#f6c85f")
+PENDING_WINDOW_FILL_COLOR = QColor(204, 153, 255, 120)
+PENDING_WINDOW_EDGE_COLOR = QColor("#d0a0ff")
+DEFAULT_CANVAS_WINDOW_WIDTH_METERS = 1.0
+DEFAULT_CANVAS_WINDOW_HEIGHT_METERS = 1.0
+CANVAS_WINDOW_WALL_MARGIN_METERS = 0.05
 STAIR_SUPPORTED_COLOR = QColor("#65d6ff")
 STAIR_FLOATING_COLOR = QColor("#c99cff")
 STAIR_FLOATING_WITH_RISER_COLOR = QColor("#ff9f6e")
@@ -119,6 +135,8 @@ CENTER_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
 DRAG_THRESHOLD_SCREEN = 4.0
 WINDOW_STRIP_HALF_WIDTH_SCREEN = 5.0
+WINDOW_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
+WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 12.0
 DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
 DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
@@ -288,6 +306,13 @@ class DoorwayHit:
 class WindowWallFrame:
     start_point: tuple[float, float]
     end_point: tuple[float, float]
+    height_meters: float = 0.0
+
+
+@dataclass(frozen=True)
+class WindowHit:
+    window_index: int
+    width_side_sign: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -512,6 +537,11 @@ class BlueprintCanvas(QWidget):
     doorway_resize_drag_finished = Signal(bool)
     doorway_bridge_edges_added = Signal()
     selected_doorway_changed = Signal(int)
+    canvas_opening_selection_requested = Signal(object)
+    canvas_opening_edit_started = Signal(object)
+    canvas_opening_edit_preview_changed = Signal(object)
+    canvas_opening_edit_finished = Signal(object, bool)
+    canvas_opening_edit_cancelled = Signal(object)
     stair_start_placed = Signal(object)
     stair_placement_ready = Signal(object)
     stair_placement_completed = Signal(object)
@@ -532,6 +562,9 @@ class BlueprintCanvas(QWidget):
     directional_light_placement_changed = Signal(bool)
     directional_light_placement_cancelled = Signal()
     directional_light_selection_requested = Signal(object)
+    directional_light_deletion_requested = Signal(str)
+    window_placement_requested = Signal(object)
+    window_placement_changed = Signal(bool)
     placed_object_selection_requested = Signal(object, object)
     placed_object_transform_committed = Signal(str, float, float, float)
 
@@ -585,6 +618,17 @@ class BlueprintCanvas(QWidget):
         self.pending_doorway: DoorwayData | None = None
         self.pending_doorway_image_point: QPointF | None = None
         self.pending_doorway_bridge_vertex_ids: tuple[int, int] | None = None
+        self._window_placement_active = False
+        self._pending_window_placement: WallWindowPlacement | None = None
+        self.selected_window_id: str | None = None
+        self.pressed_window_index: int | None = None
+        self.drag_window_index: int | None = None
+        self.window_drag_press_position: QPointF | None = None
+        self.window_drag_press_image_point: tuple[float, float] | None = None
+        self.window_drag_initial_window: WindowData | None = None
+        self.window_drag_wall_frame: WindowWallFrame | None = None
+        self.window_drag_width_side_sign = 0.0
+        self.window_drag_start_edit: CanvasOpeningEdit | None = None
         self.selected_doorway_index: int | None = None
         self.pressed_doorway_index: int | None = None
         self.drag_doorway_index: int | None = None
@@ -1111,6 +1155,7 @@ class BlueprintCanvas(QWidget):
 
         if self.blueprint_image is None:
             return False
+        self.cancel_window_placement()
         self.stop_plan_image_erasing()
         self.cancel_open_space_placement()
         self._cancel_stair_placement_for_other_mode()
@@ -1198,6 +1243,17 @@ class BlueprintCanvas(QWidget):
         """Return the selected light point, if any."""
 
         return self._selected_directional_light_id
+
+    def _request_selected_directional_light_deletion(self) -> bool:
+        """Request deletion of the selected light without owning scene state."""
+
+        light_id = self._selected_directional_light_id
+        if light_id is None:
+            return False
+        self._selected_directional_light_id = None
+        self.update()
+        self.directional_light_deletion_requested.emit(light_id)
+        return True
 
     def _finish_directional_light_placement(self) -> None:
         """Release the one-shot tool without reporting a cancellation."""
@@ -1396,6 +1452,7 @@ class BlueprintCanvas(QWidget):
         ):
             return False
 
+        self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.cancel_open_space_placement()
         self._cancel_stair_placement_for_other_mode()
@@ -1703,6 +1760,7 @@ class BlueprintCanvas(QWidget):
 
         if self.blueprint_image is None:
             return False
+        self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
@@ -1789,6 +1847,7 @@ class BlueprintCanvas(QWidget):
     ) -> None:
         """Start endpoint placement followed by optional curve refinement."""
 
+        self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
@@ -1936,8 +1995,72 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self.update()
 
+    # ### Window placement ###
+    def start_window_placement(self) -> bool:
+        """Arm one-click placement of a centered window on the nearest wall."""
+
+        if self.blueprint_image is None or not self._build_window_wall_frames():
+            return False
+        self._cancel_window_pointer_state(restore_initial=True)
+        self._set_selected_window_id(None)
+        self.cancel_directional_light_placement()
+        self.stop_plan_image_erasing()
+        self.cancel_open_space_placement()
+        self._cancel_stair_placement_for_other_mode()
+        self._reset_doorway_placement()
+        self._reset_doorway_pointer_state()
+        self._reset_vertex_selection_gesture()
+        self._cancel_placed_object_edit_drag(restore_initial=True)
+        self._clear_active_vertex_chain_for_selection()
+        self.selected_open_space_id = None
+        self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
+        self._pending_window_placement = None
+        if not self._window_placement_active:
+            self._window_placement_active = True
+            self.window_placement_changed.emit(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.update()
+        return True
+
+    def cancel_window_placement(self) -> bool:
+        """Cancel the pending plan-view window without changing the project."""
+
+        if not self._window_placement_active:
+            return False
+        self._finish_window_placement()
+        return True
+
+    def is_window_placement_active(self) -> bool:
+        """Return whether the next valid plan click places a window."""
+
+        return self._window_placement_active
+
+    def _finish_window_placement(self) -> None:
+        """Release the one-shot plan tool without reporting a cancellation."""
+
+        was_active = self._window_placement_active
+        self._window_placement_active = False
+        self._pending_window_placement = None
+        if (
+            not self._plan_image_erase_active
+            and not self._open_space_placement_active
+            and not self._is_stair_placement_active()
+            and self.pending_doorway_preset is None
+            and not self._directional_light_placement_active
+        ):
+            self.unsetCursor()
+        if was_active:
+            self.window_placement_changed.emit(False)
+        self.update()
+
+    # ### Doorway placement ###
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
         """Begin placing one doorway using the selected hole dimensions."""
+        self._cancel_window_pointer_state(restore_initial=True)
+        self._set_selected_window_id(None)
+        self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
@@ -1974,7 +2097,9 @@ class BlueprintCanvas(QWidget):
         blueprint_revision: tuple[object, ...] | None,
         preserve_view: bool = False,
     ) -> None:
+        self._cancel_window_pointer_state(restore_initial=True)
         self._cancel_placed_object_edit_drag(restore_initial=True)
+        self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
@@ -2010,6 +2135,7 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_guides = []
         self.level_context = None
         self._set_selected_doorway_index(None)
+        self._set_selected_window_id(None, notify=False)
         self.selected_stair_index = None
         self.selected_stair_endpoint_name = None
         self._reset_stair_drag()
@@ -2126,6 +2252,20 @@ class BlueprintCanvas(QWidget):
 
         if (
             event.key() == Qt.Key.Key_Escape
+            and self.cancel_window_placement()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._cancel_window_pointer_state(restore_initial=True)
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Escape
             and self._cancel_placed_object_edit_drag(restore_initial=True)
         ):
             event.accept()
@@ -2148,6 +2288,13 @@ class BlueprintCanvas(QWidget):
         if (
             event.key() == Qt.Key.Key_Escape
             and self.cancel_open_space_placement()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self._request_selected_directional_light_deletion()
         ):
             event.accept()
             return
@@ -2281,6 +2428,20 @@ class BlueprintCanvas(QWidget):
 
         if (
             event.button() == Qt.MouseButton.RightButton
+            and self.cancel_window_placement()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._cancel_window_pointer_state(restore_initial=True)
+        ):
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
             and self._plan_image_erase_active
         ):
             self.stop_plan_image_erasing()
@@ -2347,6 +2508,17 @@ class BlueprintCanvas(QWidget):
                     image_x,
                     image_y,
                 )
+            event.accept()
+            return
+
+        if self._window_placement_active:
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None:
+                self._update_pending_window(image_point)
+                placement = self._pending_window_placement
+                if placement is not None:
+                    self._finish_window_placement()
+                    self.window_placement_requested.emit(placement)
             event.accept()
             return
 
@@ -2454,13 +2626,29 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        if self._find_window_at(event.position()) is not None:
+        window_hit = self._find_window_hit(event.position())
+        if window_hit is not None:
             self._set_selected_doorway_index(None)
             self.selected_vertex_id = None
+            self._reset_window_pointer_state(emit_finished=False)
+            window = self.windows[window_hit.window_index]
+            self._set_selected_window_id(window.window_id)
+            image_point = self._widget_to_image(event.position())
+            self.pressed_window_index = window_hit.window_index
+            self.window_drag_press_position = QPointF(event.position())
+            self.window_drag_press_image_point = (
+                None
+                if image_point is None
+                else (image_point.x(), image_point.y())
+            )
+            self.window_drag_initial_window = window
+            self.window_drag_wall_frame = self._get_window_wall_frame(window)
+            self.window_drag_width_side_sign = window_hit.width_side_sign
             self.update()
             event.accept()
             return
 
+        self._set_selected_window_id(None)
         doorway_hit = self._find_doorway_hit(event.position())
         if doorway_hit is not None:
             self._set_selected_doorway_index(doorway_hit.doorway_index)
@@ -2559,6 +2747,16 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if self._window_placement_active:
+            image_point = self._widget_to_image(event.position())
+            if image_point is None:
+                self._pending_window_placement = None
+            else:
+                self._update_pending_window(image_point)
+            self.update()
+            event.accept()
+            return
+
         if self._plan_image_erase_active:
             if (
                 self._plan_image_erase_selection_start is not None
@@ -2638,6 +2836,23 @@ class BlueprintCanvas(QWidget):
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
             self._move_dragged_stair_point(event.position())
+            event.accept()
+            return
+
+        if (
+            self.pressed_window_index is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            if self._should_start_window_drag(event.position()):
+                self._start_window_drag()
+
+            if self.drag_window_index is not None:
+                image_point = self._widget_to_image_clamped(event.position())
+                if self.window_drag_width_side_sign:
+                    self._resize_dragged_window(image_point)
+                else:
+                    self._move_dragged_window(image_point)
+                self.update()
             event.accept()
             return
 
@@ -2753,6 +2968,16 @@ class BlueprintCanvas(QWidget):
 
             if (
                 event.button() == Qt.MouseButton.LeftButton
+                and self.pressed_window_index is not None
+            ):
+                self._reset_window_pointer_state(emit_finished=True)
+                self._update_edit_hover_cursor(event.position())
+                self.update()
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
                 and self.pressed_doorway_index is not None
             ):
                 bridge_edges_added = self._commit_extended_doorway_bridges()
@@ -2820,6 +3045,12 @@ class BlueprintCanvas(QWidget):
             self.pending_doorway_image_point = None
             self.pending_doorway_bridge_vertex_ids = None
             self.update()
+        if (
+            self._window_placement_active
+            and self._pending_window_placement is not None
+        ):
+            self._pending_window_placement = None
+            self.update()
         if self._open_space_placement_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
         if self.drag_vertex_id is None and self.active_vertex_id is not None:
@@ -2832,6 +3063,7 @@ class BlueprintCanvas(QWidget):
             and not self._open_space_placement_active
             and not self._plan_image_erase_active
             and not self._directional_light_placement_active
+            and not self._window_placement_active
             and self._placed_object_edit_drag is None
         ):
             self.unsetCursor()
@@ -2855,6 +3087,7 @@ class BlueprintCanvas(QWidget):
         self._paint_generated_wall_preview(painter)
         self._paint_selected_wall(painter)
         self._paint_windows(painter)
+        self._paint_pending_window(painter)
         self._paint_doorways(painter)
         self._paint_pending_doorway(painter)
         self._paint_preview_guides(painter)
@@ -4128,34 +4361,96 @@ class BlueprintCanvas(QWidget):
         return replaced
 
     # ### Window helpers ###
-    def _find_window_at(self, widget_point: QPointF) -> int | None:
-        """Return the topmost visible window strip under the pointer."""
+    def _set_selected_window_id(
+        self,
+        window_id: str | None,
+        *,
+        notify: bool = True,
+    ) -> None:
+        """Select one stable window identity and optionally notify the 3D scene."""
+
+        normalized_id = None if window_id is None else str(window_id)
+        if normalized_id is not None and self._find_window_index_by_id(
+            normalized_id
+        ) is None:
+            normalized_id = None
+        if normalized_id == self.selected_window_id:
+            return
+        self.selected_window_id = normalized_id
+        if notify:
+            reference = None
+            selected_index = self._find_window_index_by_id(normalized_id)
+            level = self.level_context
+            if selected_index is not None and level is not None:
+                reference = CanvasOpeningReference(
+                    kind=CANVAS_OPENING_WINDOW,
+                    level_index=level.index,
+                    item_index=selected_index,
+                    stable_id=normalized_id,
+                )
+            self.canvas_opening_selection_requested.emit(reference)
+        self.update()
+
+    def _find_window_index_by_id(self, window_id: str | None) -> int | None:
+        if window_id is None:
+            return None
+        return next(
+            (
+                index
+                for index, window in enumerate(self.windows)
+                if window.window_id == window_id
+            ),
+            None,
+        )
+
+    def _find_window_hit(self, widget_point: QPointF) -> WindowHit | None:
+        """Prefer selected endpoint handles, then test visible window bodies."""
 
         if not self.windows:
             return None
+        selected_index = self._find_window_index_by_id(self.selected_window_id)
+        if selected_index is not None:
+            selected_window = self.windows[selected_index]
+            segment = self._get_window_widget_segment(selected_window)
+            if segment is not None:
+                for side_sign, handle_center in (
+                    (-1.0, segment[0]),
+                    (1.0, segment[1]),
+                ):
+                    if self._point_distance(
+                        (widget_point.x(), widget_point.y()),
+                        (handle_center.x(), handle_center.y()),
+                    ) <= WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN:
+                        return WindowHit(selected_index, side_sign)
+
         point = (widget_point.x(), widget_point.y())
         wall_frames = self._build_window_wall_frames()
         for window_index in range(len(self.windows) - 1, -1, -1):
             window = self.windows[window_index]
-            wall_frame = wall_frames.get(window.wall_surface_id)
-            segment = self._get_window_widget_segment(window, wall_frame)
+            segment = self._get_window_widget_segment(
+                window,
+                wall_frames.get(window.wall_surface_id),
+            )
             if segment is None:
                 continue
-            start, end = segment
-            start_tuple = (start.x(), start.y())
-            end_tuple = (end.x(), end.y())
             projected_point = _project_point_onto_segment(
                 point,
-                start_tuple,
-                end_tuple,
+                (segment[0].x(), segment[0].y()),
+                (segment[1].x(), segment[1].y()),
             )
             if (
                 projected_point is not None
                 and self._point_distance(point, projected_point)
                 <= WINDOW_STRIP_HALF_WIDTH_SCREEN + 4.0
             ):
-                return window_index
+                return WindowHit(window_index)
         return None
+
+    def _find_window_at(self, widget_point: QPointF) -> int | None:
+        """Return the topmost window index for compatibility with callers."""
+
+        hit = self._find_window_hit(widget_point)
+        return None if hit is None else hit.window_index
 
     def _update_edit_hover_cursor(self, widget_point: QPointF) -> None:
         """Show movement feedback for editable points and doorways."""
@@ -4172,14 +4467,255 @@ class BlueprintCanvas(QWidget):
         if self._find_stair_hit(widget_point) is not None:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             return
-        if self._find_window_at(widget_point) is not None:
-            self.unsetCursor()
+        window_hit = self._find_window_hit(widget_point)
+        if window_hit is not None:
+            if window_hit.width_side_sign:
+                window = self.windows[window_hit.window_index]
+                frame = self._get_window_wall_frame(window)
+                if frame is not None:
+                    self._set_directional_resize_cursor(
+                        frame.end_point[0] - frame.start_point[0],
+                        frame.end_point[1] - frame.start_point[1],
+                    )
+                    return
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
             return
         self._update_doorway_hover_cursor(widget_point)
 
+    def _should_start_window_drag(self, widget_point: QPointF) -> bool:
+        if (
+            self.drag_window_index is not None
+            or self.window_drag_press_position is None
+        ):
+            return False
+        return (
+            math.hypot(
+                widget_point.x() - self.window_drag_press_position.x(),
+                widget_point.y() - self.window_drag_press_position.y(),
+            )
+            >= DRAG_THRESHOLD_SCREEN
+        )
+
+    def _start_window_drag(self) -> None:
+        window_index = self.pressed_window_index
+        initial_window = self.window_drag_initial_window
+        if (
+            window_index is None
+            or initial_window is None
+            or self.window_drag_wall_frame is None
+        ):
+            return
+        current_index = self._find_window_index_by_id(initial_window.window_id)
+        if current_index is None:
+            return
+        start_edit = self._build_window_edit(current_index, initial_window)
+        if start_edit is None:
+            return
+        self.drag_window_index = current_index
+        self.window_drag_start_edit = start_edit
+        self.canvas_opening_edit_started.emit(start_edit)
+        if self.window_drag_width_side_sign:
+            frame = self.window_drag_wall_frame
+            self._set_directional_resize_cursor(
+                frame.end_point[0] - frame.start_point[0],
+                frame.end_point[1] - frame.start_point[1],
+            )
+        else:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _move_dragged_window(self, image_point: QPointF) -> None:
+        """Move a window only along its owning semantic wall."""
+
+        initial_window = self.window_drag_initial_window
+        frame = self.window_drag_wall_frame
+        press_point = self.window_drag_press_image_point
+        if initial_window is None or frame is None or press_point is None:
+            return
+        pressed_ratio = self._project_image_point_to_window_ratio(
+            QPointF(*press_point),
+            frame,
+        )
+        pointer_ratio = self._project_image_point_to_window_ratio(image_point, frame)
+        if pressed_ratio is None or pointer_ratio is None:
+            return
+        span = initial_window.end_ratio - initial_window.start_ratio
+        initial_center = (
+            initial_window.start_ratio + initial_window.end_ratio
+        ) * 0.5
+        requested_center = initial_center + pointer_ratio - pressed_ratio
+        half_span = span * 0.5
+        center = min(max(requested_center, half_span), 1.0 - half_span)
+        self._preview_dragged_window(
+            replace(
+                initial_window,
+                start_ratio=center - half_span,
+                end_ratio=center + half_span,
+            )
+        )
+
+    def _resize_dragged_window(self, image_point: QPointF) -> None:
+        """Move one plan-view endpoint while anchoring the opposite endpoint."""
+
+        initial_window = self.window_drag_initial_window
+        frame = self.window_drag_wall_frame
+        side_sign = self.window_drag_width_side_sign
+        minimum_span = self._get_window_minimum_width_ratio(frame)
+        if (
+            initial_window is None
+            or frame is None
+            or not side_sign
+            or minimum_span is None
+        ):
+            return
+        requested_ratio = self._project_image_point_to_window_ratio(
+            image_point,
+            frame,
+        )
+        if requested_ratio is None:
+            return
+        if side_sign < 0.0:
+            resized = replace(
+                initial_window,
+                start_ratio=min(
+                    max(requested_ratio, 0.0),
+                    max(0.0, initial_window.end_ratio - minimum_span),
+                ),
+            )
+        else:
+            resized = replace(
+                initial_window,
+                end_ratio=max(
+                    min(requested_ratio, 1.0),
+                    min(1.0, initial_window.start_ratio + minimum_span),
+                ),
+            )
+        self._preview_dragged_window(resized)
+
+    def _preview_dragged_window(self, window: WindowData) -> None:
+        initial_window = self.window_drag_initial_window
+        if initial_window is None:
+            return
+        window_index = self._find_window_index_by_id(initial_window.window_id)
+        if window_index is None or self.windows[window_index] == window:
+            return
+        edit = self._build_window_edit(window_index, window)
+        if edit is None:
+            return
+        self.windows[window_index] = window
+        self.drag_window_index = window_index
+        self.canvas_opening_edit_preview_changed.emit(edit)
+
+    def _reset_window_pointer_state(self, *, emit_finished: bool) -> None:
+        """Release one 2D window edit without changing its selection."""
+
+        initial_window = self.window_drag_initial_window
+        start_edit = self.window_drag_start_edit
+        current_index = (
+            None
+            if initial_window is None
+            else self._find_window_index_by_id(initial_window.window_id)
+        )
+        current_window = (
+            None if current_index is None else self.windows[current_index]
+        )
+        final_edit = (
+            None
+            if current_index is None or current_window is None
+            else self._build_window_edit(current_index, current_window)
+        )
+        changed = bool(
+            start_edit is not None
+            and initial_window is not None
+            and current_window is not None
+            and current_window != initial_window
+        )
+        self.pressed_window_index = None
+        self.drag_window_index = None
+        self.window_drag_press_position = None
+        self.window_drag_press_image_point = None
+        self.window_drag_initial_window = None
+        self.window_drag_wall_frame = None
+        self.window_drag_width_side_sign = 0.0
+        self.window_drag_start_edit = None
+        if emit_finished and start_edit is not None and final_edit is not None:
+            self.canvas_opening_edit_finished.emit(final_edit, changed)
+
+    def _cancel_window_pointer_state(self, *, restore_initial: bool) -> bool:
+        """Cancel a pressed/dragged window and restore its exact start bounds."""
+
+        if self.pressed_window_index is None and self.window_drag_start_edit is None:
+            return False
+        initial_window = self.window_drag_initial_window
+        start_edit = self.window_drag_start_edit
+        if restore_initial and initial_window is not None:
+            current_index = self._find_window_index_by_id(initial_window.window_id)
+            if current_index is not None:
+                self.windows[current_index] = initial_window
+        self._reset_window_pointer_state(emit_finished=False)
+        if start_edit is not None:
+            self.canvas_opening_edit_cancelled.emit(start_edit)
+        self.unsetCursor()
+        self.update()
+        return True
+
+    def _build_window_edit(
+        self,
+        window_index: int,
+        window: WindowData,
+    ) -> CanvasOpeningEdit | None:
+        level = self.level_context
+        if level is None:
+            return None
+        return CanvasOpeningEdit(
+            reference=CanvasOpeningReference(
+                kind=CANVAS_OPENING_WINDOW,
+                level_index=level.index,
+                item_index=window_index,
+                stable_id=window.window_id,
+            ),
+            wall_surface_id=window.wall_surface_id,
+            bounds=CanvasOpeningBounds(
+                start_ratio=window.start_ratio,
+                end_ratio=window.end_ratio,
+                bottom_ratio=window.bottom_ratio,
+                top_ratio=window.top_ratio,
+            ),
+        )
+
+    @staticmethod
+    def _project_image_point_to_window_ratio(
+        image_point: QPointF,
+        frame: WindowWallFrame,
+    ) -> float | None:
+        delta_x = frame.end_point[0] - frame.start_point[0]
+        delta_y = frame.end_point[1] - frame.start_point[1]
+        length_squared = delta_x * delta_x + delta_y * delta_y
+        if length_squared <= 1e-12:
+            return None
+        return (
+            (image_point.x() - frame.start_point[0]) * delta_x
+            + (image_point.y() - frame.start_point[1]) * delta_y
+        ) / length_squared
+
+    def _get_window_minimum_width_ratio(
+        self,
+        frame: WindowWallFrame,
+    ) -> float | None:
+        level = self.level_context
+        if level is None:
+            return None
+        wall_length_pixels = math.hypot(
+            frame.end_point[0] - frame.start_point[0],
+            frame.end_point[1] - frame.start_point[1],
+        )
+        wall_length_meters = wall_length_pixels * PIXEL_TO_METER * float(level.scale)
+        if not math.isfinite(wall_length_meters) or wall_length_meters <= 0.0:
+            return None
+        return min(1.0, MIN_WINDOW_SIZE_METERS / wall_length_meters)
+
     def _get_window_widget_segment(
         self,
-        window: WindowData,
+        window: WindowData | WallWindowPlacement,
         wall_frame: WindowWallFrame | None = None,
     ) -> tuple[QPointF, QPointF] | None:
         frame = wall_frame or self._get_window_wall_frame(window)
@@ -4199,9 +4735,130 @@ class BlueprintCanvas(QWidget):
             ),
         )
 
+    def _get_window_widget_strip(
+        self,
+        window: WindowData | WallWindowPlacement,
+        wall_frame: WindowWallFrame | None = None,
+    ) -> QPolygonF | None:
+        """Return the fixed-screen-width plan strip for one wall opening."""
+
+        segment = self._get_window_widget_segment(window, wall_frame)
+        if segment is None:
+            return None
+        start, end = segment
+        delta_x = end.x() - start.x()
+        delta_y = end.y() - start.y()
+        segment_length = math.hypot(delta_x, delta_y)
+        if segment_length <= 1e-6:
+            return None
+        perpendicular = QPointF(
+            -delta_y / segment_length * WINDOW_STRIP_HALF_WIDTH_SCREEN,
+            delta_x / segment_length * WINDOW_STRIP_HALF_WIDTH_SCREEN,
+        )
+        return QPolygonF(
+            (
+                start + perpendicular,
+                end + perpendicular,
+                end - perpendicular,
+                start - perpendicular,
+            )
+        )
+
+    def _update_pending_window(self, image_point: QPointF) -> None:
+        """Snap the default opening to the nearest semantic wall frame."""
+
+        level = self.level_context
+        if level is None:
+            self._pending_window_placement = None
+            return
+        try:
+            level_scale = float(level.scale)
+        except (TypeError, ValueError, OverflowError):
+            self._pending_window_placement = None
+            return
+        if not math.isfinite(level_scale) or level_scale <= 0.0:
+            self._pending_window_placement = None
+            return
+
+        pointer = (float(image_point.x()), float(image_point.y()))
+        selected_surface_id = self._selected_wall_surface_id
+        nearest: tuple[
+            tuple[float, int, str],
+            str,
+            WindowWallFrame,
+            tuple[float, float],
+        ] | None = None
+        for surface_id, frame in self._build_window_wall_frames().items():
+            projection = _project_point_onto_segment(
+                pointer,
+                frame.start_point,
+                frame.end_point,
+            )
+            if projection is None:
+                continue
+            rank = (
+                self._point_distance(pointer, projection),
+                0 if surface_id == selected_surface_id else 1,
+                surface_id,
+            )
+            if nearest is None or rank < nearest[0]:
+                nearest = (rank, surface_id, frame, projection)
+        if nearest is None:
+            self._pending_window_placement = None
+            return
+
+        _rank, surface_id, frame, projection = nearest
+        wall_delta_x = frame.end_point[0] - frame.start_point[0]
+        wall_delta_y = frame.end_point[1] - frame.start_point[1]
+        wall_length_pixels = math.hypot(wall_delta_x, wall_delta_y)
+        wall_length_meters = wall_length_pixels * PIXEL_TO_METER * level_scale
+        wall_height_meters = float(frame.height_meters)
+        available_width_meters = (
+            wall_length_meters - 2.0 * CANVAS_WINDOW_WALL_MARGIN_METERS
+        )
+        available_height_meters = (
+            wall_height_meters - 2.0 * CANVAS_WINDOW_WALL_MARGIN_METERS
+        )
+        if (
+            wall_length_pixels <= 1e-6
+            or available_width_meters < CANVAS_WINDOW_WALL_MARGIN_METERS
+            or available_height_meters < CANVAS_WINDOW_WALL_MARGIN_METERS
+        ):
+            self._pending_window_placement = None
+            return
+
+        width_meters = min(
+            DEFAULT_CANVAS_WINDOW_WIDTH_METERS,
+            available_width_meters,
+        )
+        height_meters = min(
+            DEFAULT_CANVAS_WINDOW_HEIGHT_METERS,
+            available_height_meters,
+        )
+        width_ratio = width_meters / wall_length_meters
+        wall_distance_squared = wall_length_pixels * wall_length_pixels
+        center_ratio = (
+            (projection[0] - frame.start_point[0]) * wall_delta_x
+            + (projection[1] - frame.start_point[1]) * wall_delta_y
+        ) / wall_distance_squared
+        margin_ratio = CANVAS_WINDOW_WALL_MARGIN_METERS / wall_length_meters
+        half_width_ratio = width_ratio * 0.5
+        center_ratio = min(
+            max(center_ratio, margin_ratio + half_width_ratio),
+            1.0 - margin_ratio - half_width_ratio,
+        )
+        half_height_ratio = height_meters / wall_height_meters * 0.5
+        self._pending_window_placement = WallWindowPlacement(
+            wall_surface_id=surface_id,
+            start_ratio=center_ratio - half_width_ratio,
+            end_ratio=center_ratio + half_width_ratio,
+            bottom_ratio=0.5 - half_height_ratio,
+            top_ratio=0.5 + half_height_ratio,
+        )
+
     def _get_window_wall_frame(
         self,
-        window: WindowData,
+        window: WindowData | WallWindowPlacement,
     ) -> WindowWallFrame | None:
         return self._build_window_wall_frames().get(window.wall_surface_id)
 
@@ -4227,6 +4884,7 @@ class BlueprintCanvas(QWidget):
                 frames[surface_id] = WindowWallFrame(
                     start_point=wall.start_point,
                     end_point=wall.end_point,
+                    height_meters=float(room.height_meters),
                 )
 
         for edge in level.vertex_data.edges:
@@ -4252,6 +4910,7 @@ class BlueprintCanvas(QWidget):
             frames[surface_id] = WindowWallFrame(
                 start_point=(start_vertex.x, start_vertex.y),
                 end_point=(end_vertex.x, end_vertex.y),
+                height_meters=float(level.height_meters),
             )
         return frames
 
@@ -6396,39 +7055,79 @@ class BlueprintCanvas(QWidget):
 
     # ### Window painting ###
     def _paint_windows(self, painter: QPainter) -> None:
-        """Draw inert plan-view strips for the level's wall windows."""
+        """Draw purple windows and endpoint handles for the selected one."""
 
         if not self.windows:
             return
         wall_frames = self._build_window_wall_frames()
         for window in self.windows:
-            segment = self._get_window_widget_segment(
+            strip = self._get_window_widget_strip(
                 window,
                 wall_frames.get(window.wall_surface_id),
             )
-            if segment is None:
+            if strip is None:
                 continue
-            start, end = segment
-            delta_x = end.x() - start.x()
-            delta_y = end.y() - start.y()
-            segment_length = math.hypot(delta_x, delta_y)
-            if segment_length <= 1e-6:
-                continue
-            perpendicular = QPointF(
-                -delta_y / segment_length * WINDOW_STRIP_HALF_WIDTH_SCREEN,
-                delta_x / segment_length * WINDOW_STRIP_HALF_WIDTH_SCREEN,
+            is_selected = window.window_id == self.selected_window_id
+            edge_pen = QPen(
+                SELECTED_WINDOW_EDGE_COLOR if is_selected else WINDOW_EDGE_COLOR,
+                2.5 if is_selected else 2.0,
             )
-            strip = QPolygonF(
-                (
-                    start + perpendicular,
-                    end + perpendicular,
-                    end - perpendicular,
-                    start - perpendicular,
-                )
-            )
-            painter.setPen(QPen(WINDOW_EDGE_COLOR, 2.0))
+            edge_pen.setCosmetic(True)
+            painter.setPen(edge_pen)
             painter.setBrush(WINDOW_FILL_COLOR)
             painter.drawPolygon(strip)
+            if is_selected:
+                self._paint_window_resize_handles(
+                    painter,
+                    window,
+                    wall_frames.get(window.wall_surface_id),
+                )
+
+    def _paint_window_resize_handles(
+        self,
+        painter: QPainter,
+        window: WindowData,
+        wall_frame: WindowWallFrame | None,
+    ) -> None:
+        """Paint fixed-screen endpoint handles for horizontal expansion."""
+
+        segment = self._get_window_widget_segment(window, wall_frame)
+        if segment is None:
+            return
+        painter.save()
+        handle_pen = QPen(VERTEX_OUTLINE_COLOR, 2.0)
+        handle_pen.setCosmetic(True)
+        painter.setPen(handle_pen)
+        painter.setBrush(SELECTED_WINDOW_EDGE_COLOR)
+        for handle_center in segment:
+            painter.drawEllipse(
+                handle_center,
+                WINDOW_WIDTH_HANDLE_RADIUS_SCREEN,
+                WINDOW_WIDTH_HANDLE_RADIUS_SCREEN,
+            )
+        painter.restore()
+
+    def _paint_pending_window(self, painter: QPainter) -> None:
+        """Draw the snapped plan preview before its one-click commit."""
+
+        placement = self._pending_window_placement
+        if placement is None:
+            return
+        frame = self._build_window_wall_frames().get(
+            placement.wall_surface_id
+        )
+        strip = self._get_window_widget_strip(placement, frame)
+        if strip is None:
+            return
+        preview_pen = QPen(
+            PENDING_WINDOW_EDGE_COLOR,
+            2.5,
+            Qt.PenStyle.DashLine,
+        )
+        preview_pen.setDashPattern([6.0, 4.0])
+        painter.setPen(preview_pen)
+        painter.setBrush(PENDING_WINDOW_FILL_COLOR)
+        painter.drawPolygon(strip)
 
     def _paint_doorways(self, painter: QPainter) -> None:
         for doorway_index, doorway in enumerate(self.doorways):
