@@ -70,13 +70,17 @@ from housemaker.architectural_trim import (
     TRIM_HANDLE_DEPTH,
     TRIM_HANDLE_HEIGHT,
     TRIM_HANDLE_WIDTH,
+    ArchitecturalTrimCorniceMiterDescriptor,
     ArchitecturalTrimEditTarget,
+    ArchitecturalTrimEndpointMiter,
     ArchitecturalTrimPart,
     ArchitecturalTrimPlacementRequest,
     add_architectural_trim,
     build_architectural_trim_edit_targets,
     build_architectural_trim_geometry,
+    build_cornice_miter_descriptors,
     is_architectural_trim_surface_id,
+    parse_architectural_trim_surface_id,
     remove_architectural_trim,
 )
 from housemaker.architectural_trim_generation import (
@@ -176,7 +180,10 @@ from housemaker.generation_state import (
 )
 from housemaker.generation_workspace import (
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
+    OBJECT_OPERATION_GENERATE_TEXTURE,
+    PBR_MAPS_ENABLED_PIPELINE_KEY,
     GenerationWorkspace,
+    ObjectTextureImageVariant,
     get_architectural_trim_component_identity,
     is_architectural_trim_component_record,
     is_door_component_record,
@@ -262,6 +269,7 @@ from housemaker.models import (
     STAIR_TREAD_EDGE_STRAIGHT,
     STAIR_TYPE_FLOATING,
     STAIR_TYPE_SUPPORTED,
+    TRIM_KIND_CORNICE,
     ArchitecturalTrimData,
     DoorwayData,
     DoorwayPreset,
@@ -1539,6 +1547,11 @@ class BlueprintWorkspace(QWidget):
         ) = None
         self._atlas_pending_source_content_refresh_ids: set[str] = set()
         self._atlas_wall_texture_source_ids: set[str] = set()
+        self._atlas_surface_assignment_id_by_source_id: dict[str, str] = {}
+        self._architectural_trim_texture_targets_by_operation_id: dict[
+            str,
+            tuple[str, tuple[str, ...]],
+        ] = {}
         self._atlas_available_source_ids: set[str] = set()
         self._is_automatically_assigning_atlas_textures = False
         self._is_assigning_surface_texture_from_atlas = False
@@ -2307,6 +2320,12 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.operation_finished.connect(
             self._handle_object_placement_operation_finished
+        )
+        self.generation.operation_started.connect(
+            self._handle_generation_operation_started_for_architectural_trim_texture
+        )
+        self.generation.operation_finished.connect(
+            self._handle_generation_operation_finished_for_atlases
         )
         self.generation.placement_request_finished.connect(
             self._handle_object_placement_operation_finished
@@ -4579,6 +4598,9 @@ class BlueprintWorkspace(QWidget):
         wall_targets = tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
         if not self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
             self._set_canvas_viewer_targets(wall_targets)
+            self._sync_viewer_architectural_trim_placed_object_bindings(
+                generated_model
+            )
             self._is_syncing_canvas_scene_selection = True
             try:
                 self.viewer.set_model(generated_model, preserve_camera=True)
@@ -5092,10 +5114,10 @@ class BlueprintWorkspace(QWidget):
         object_name = (
             f"{trim.kind.replace('_', ' ').title()} {trim.trim_id[:8]}"
         )
-        if record is None:
+        try:
             wall_surfaces = self._get_architectural_trim_wall_surfaces(trim)
-            try:
-                seed_model, _frame = build_architectural_trim_component_seed_model(
+            if record is None:
+                seed_model, frame = build_architectural_trim_component_seed_model(
                     level,
                     trim,
                     wall_surfaces,
@@ -5106,19 +5128,29 @@ class BlueprintWorkspace(QWidget):
                     object_id=f"architectural-trim-{trim.trim_id}",
                     object_name=object_name,
                     model=seed_model,
+                    fit_dimensions=frame.target_extents,
+                    trim_kind=trim.kind,
                 )
-            except (OSError, RuntimeError, TypeError, ValueError) as error:
-                self.generation.clear_architectural_trim_editing_target()
-                self.viewer.set_architectural_trim_status(
-                    "The selected architectural trim could not be opened in "
-                    f"Generation: {error}"
+            else:
+                frame = build_architectural_trim_component_frame(
+                    level,
+                    trim,
+                    wall_surfaces,
                 )
-                return False
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.generation.clear_architectural_trim_editing_target()
+            self.viewer.set_architectural_trim_status(
+                "The selected architectural trim could not be opened in "
+                f"Generation: {error}"
+            )
+            return False
         accepted = self.generation.set_architectural_trim_editing_target(
             level_index=level.index,
             trim_id=trim.trim_id,
             object_id=record.object_id,
             object_name=record.object_name,
+            fit_dimensions=frame.target_extents,
+            trim_kind=trim.kind,
             generation_ready=True,
         )
         if not accepted:
@@ -5392,6 +5424,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.clear_architectural_trim_edit_preview()
         self._refresh_canvas_architectural_trim_targets()
+        self._sync_architectural_trim_generation_target(
+            self._desired_canvas_architectural_trim_part_ids
+        )
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         self.viewer.set_architectural_trim_status(
             "Architectural trim dimensions updated."
@@ -5417,6 +5452,9 @@ class BlueprintWorkspace(QWidget):
         self._clear_pending_architectural_trim_mesh_update()
         self._restore_architectural_trims_from_topology_state(undo_state)
         self._refresh_canvas_architectural_trim_targets()
+        self._sync_architectural_trim_generation_target(
+            self._desired_canvas_architectural_trim_part_ids
+        )
         self._queue_viewer_preview_refresh()
         return True
 
@@ -6003,7 +6041,7 @@ class BlueprintWorkspace(QWidget):
             else ()
         )
         assignment_source_ids = {
-            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            self._atlas_source_id_for_surface_assignment(assignment)
             for assignment in assignments
         }
         self._record_canvas_undo_state(
@@ -6069,7 +6107,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         affected_source_ids = {
-            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            self._atlas_source_id_for_surface_assignment(assignment)
             for assignment in affected_assignments
         }
         self._canvas_undo_stack[-1] = replace(
@@ -6130,7 +6168,7 @@ class BlueprintWorkspace(QWidget):
 
         assignments = self.surface_texture_generation.snapshot_assignments()
         assignment_source_ids = {
-            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            self._atlas_source_id_for_surface_assignment(assignment)
             for assignment in assignments
         }
         atlas_placements = tuple(
@@ -6192,7 +6230,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         affected_source_ids = {
-            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            self._atlas_source_id_for_surface_assignment(assignment)
             for assignment in affected_assignments
         }
         return replace(
@@ -6221,7 +6259,7 @@ class BlueprintWorkspace(QWidget):
         )
         assignments = self.surface_texture_generation.snapshot_assignments()
         assignment_source_ids = {
-            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            self._atlas_source_id_for_surface_assignment(assignment)
             for assignment in assignments
         }
         atlas_placements = tuple(
@@ -6258,7 +6296,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         affected_source_ids = {
-            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            self._atlas_source_id_for_surface_assignment(assignment)
             for assignment in affected_assignments
         }
         finalized_state = replace(
@@ -6427,8 +6465,8 @@ class BlueprintWorkspace(QWidget):
         """Restore one Surface tiling revision and any changed Atlas paths."""
 
         revision = state.revision
-        source_id = build_atlas_wall_texture_source_id(
-            revision.previous_assignment.assignment_id
+        source_id = self._atlas_source_id_for_surface_assignment(
+            revision.previous_assignment
         )
         previous_was_activated = False
         try:
@@ -6502,7 +6540,9 @@ class BlueprintWorkspace(QWidget):
 
         revision = state.revision
         assignment_id = revision.previous_assignment.assignment_id
-        source_id = build_atlas_wall_texture_source_id(assignment_id)
+        source_id = self._atlas_source_id_for_surface_assignment(
+            revision.previous_assignment
+        )
         previous_was_activated = False
         try:
             previous_was_activated = self.surface_texture_generation.activate_assignment_color_balance_revision(
@@ -6834,12 +6874,9 @@ class BlueprintWorkspace(QWidget):
             self.levels,
             emit_signals=False,
         )
-        restorable_assignment_ids = {
-            assignment.assignment_id for assignment in restorable_assignments
-        }
         restorable_source_ids = {
-            build_atlas_wall_texture_source_id(assignment_id)
-            for assignment_id in restorable_assignment_ids
+            self._atlas_source_id_for_surface_assignment(assignment)
+            for assignment in restorable_assignments
         }
         restorable_atlas_placements = tuple(
             (atlas_id, placement)
@@ -7048,16 +7085,16 @@ class BlueprintWorkspace(QWidget):
                 )
             )
         )
+        restorable_assignment_ids = {
+            assignment.assignment_id for assignment in restorable_assignments
+        }
         self.surface_texture_generation.restore_assignment_target_snapshot(
             restorable_assignments,
             emit_signals=False,
         )
-        restorable_assignment_ids = {
-            assignment.assignment_id for assignment in restorable_assignments
-        }
         restorable_source_ids = {
-            build_atlas_wall_texture_source_id(assignment_id)
-            for assignment_id in restorable_assignment_ids
+            self._atlas_source_id_for_surface_assignment(assignment)
+            for assignment in restorable_assignments
         }
         restorable_atlas_placements = tuple(
             (atlas_id, placement)
@@ -7075,10 +7112,12 @@ class BlueprintWorkspace(QWidget):
             if assignment.assignment_id in restorable_assignment_ids
         }
         live_sources: dict[str, AtlasObjectTextureSource] = {}
-        for assignment_id, assignment in restored_assignments_by_id.items():
+        for assignment in restored_assignments_by_id.values():
             source = self._build_atlas_wall_texture_source(assignment)
             if source is not None:
-                live_sources[build_atlas_wall_texture_source_id(assignment_id)] = source
+                live_sources[
+                    self._atlas_source_id_for_surface_assignment(assignment)
+                ] = source
         unresolved_placement_source_ids = {
             placement.object_id
             for _atlas_id, placement in restorable_atlas_placements
@@ -7167,16 +7206,13 @@ class BlueprintWorkspace(QWidget):
                 )
             )
         )
-        restorable_assignment_ids = {
-            assignment.assignment_id for assignment in restorable_assignments
-        }
         self.surface_texture_generation.restore_assignment_target_snapshot(
             restorable_assignments,
             emit_signals=False,
         )
         restorable_source_ids = {
-            build_atlas_wall_texture_source_id(assignment_id)
-            for assignment_id in restorable_assignment_ids
+            self._atlas_source_id_for_surface_assignment(assignment)
+            for assignment in restorable_assignments
         }
         restorable_atlas_placements = tuple(
             (atlas_id, placement)
@@ -7198,6 +7234,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.texture_atlas_workspace.refresh_texture_source_content(affected_source_ids)
         self._sync_canvas_surface_drawing_overlay()
+        self._sync_architectural_trim_generation_target(
+            self._desired_canvas_architectural_trim_part_ids
+        )
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return (
             len(state.assignments)
@@ -8145,10 +8184,19 @@ class BlueprintWorkspace(QWidget):
         object_id = (
             None if raw_object_id is None else str(raw_object_id).strip() or None
         )
-        if object_id is not None and self._select_architectural_trim_component(
-            object_id
-        ):
-            return
+        if object_id is not None:
+            component_ids = self._architectural_trim_component_semantic_ids(
+                object_id
+            )
+            if component_ids:
+                if set(component_ids).issubset(
+                    self._desired_canvas_architectural_trim_part_ids
+                ):
+                    return
+                if self._select_architectural_trim_components(
+                    (object_id,),
+                ):
+                    return
         try:
             viewer_object_ids = self.viewer.get_selected_placed_object_ids()
         except (AttributeError, TypeError):
@@ -8176,21 +8224,36 @@ class BlueprintWorkspace(QWidget):
             )
         except TypeError:
             return
+        normalized_object_ids = tuple(
+            dict.fromkeys(
+                object_id
+                for value in object_ids
+                if (object_id := str(value).strip())
+            )
+        )
+        if normalized_object_ids and self._select_architectural_trim_components(
+            normalized_object_ids,
+        ):
+            return
         try:
             active_object_id = self.viewer.get_selected_placed_object_id()
         except (AttributeError, TypeError):
             active_object_id = self._desired_canvas_object_id
-        if active_object_id is not None and self._select_architectural_trim_component(
-            str(active_object_id).strip()
-        ):
-            return
         self._remember_desired_canvas_object_selection(
-            object_ids,
+            normalized_object_ids,
             active_object_id=active_object_id,
         )
 
     def _select_architectural_trim_component(self, object_id: str) -> bool:
         """Translate a generated trim mesh click back to semantic trim parts."""
+
+        return self._select_architectural_trim_components((object_id,))
+
+    def _architectural_trim_component_semantic_ids(
+        self,
+        object_id: str,
+    ) -> tuple[str, ...]:
+        """Resolve every selectable semantic part owned by one trim mesh."""
 
         record = next(
             (
@@ -8202,15 +8265,37 @@ class BlueprintWorkspace(QWidget):
         )
         identity = get_architectural_trim_component_identity(record)
         if identity is None:
-            return False
+            return ()
         level_index, trim_id = identity
-        semantic_ids = tuple(
+        return tuple(
             semantic_id
             for semantic_id, part in self._canvas_architectural_trim_parts_by_id.items()
             if part.level_index == level_index and part.trim_id == trim_id
         )
-        if not semantic_ids:
+
+    def _select_architectural_trim_components(
+        self,
+        object_ids: Sequence[str],
+    ) -> bool:
+        """Translate one or more generated trim meshes into one semantic set."""
+
+        component_groups = tuple(
+            self._architectural_trim_component_semantic_ids(object_id)
+            for object_id in object_ids
+        )
+        if not component_groups or any(not group for group in component_groups):
             return False
+        semantic_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        semantic_id
+                        for group in component_groups
+                        for semantic_id in group
+                    ),
+                )
+            )
+        )
         self._is_syncing_canvas_scene_selection = True
         try:
             self.viewer.set_selected_placed_object_ids(())
@@ -8332,13 +8417,18 @@ class BlueprintWorkspace(QWidget):
             )
         )
         if active_trim_record is not None:
-            self.texture_atlas_workspace.select_source_ids(
+            selected_source_ids = self.texture_atlas_workspace.select_source_ids(
                 (active_trim_record.object_id,),
                 active_source_id=active_trim_record.object_id,
             )
-            self._selected_atlas_surface_source_id = None
-            self._set_atlas_canvas_surface_highlights(())
-            self._sync_atlas_green_outline_to_canvas_highlight(None)
+            if self._is_atlas_surface_texture_source_id(
+                active_trim_record.object_id
+            ):
+                self._handle_atlas_surface_textures_selected(selected_source_ids)
+            else:
+                self._selected_atlas_surface_source_id = None
+                self._set_atlas_canvas_surface_highlights(())
+                self._sync_atlas_green_outline_to_canvas_highlight(None)
             return
 
         surface_ids = tuple(
@@ -9163,6 +9253,9 @@ class BlueprintWorkspace(QWidget):
             assert cached_model is not None
             self._set_canvas_viewer_targets(
                 tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+            )
+            self._sync_viewer_architectural_trim_placed_object_bindings(
+                cached_model
             )
             self._is_syncing_canvas_scene_selection = True
             try:
@@ -10851,6 +10944,93 @@ class BlueprintWorkspace(QWidget):
         self._sync_atlas_object_texture_sources()
         self._request_hosted_atlas_object_preview()
 
+    def _handle_generation_operation_finished_for_atlases(
+        self,
+        operation_id: str,
+    ) -> None:
+        """Retry Atlas packing after the completed job leaves active state."""
+
+        self._architectural_trim_texture_targets_by_operation_id.pop(
+            str(operation_id),
+            None,
+        )
+        if self._is_shutdown:
+            return
+        self._last_automatic_atlas_assignment_key = None
+        self._sync_atlas_object_texture_sources()
+
+    def _handle_generation_operation_started_for_architectural_trim_texture(
+        self,
+        operation_id: str,
+        operation_kind: str,
+        raw_object_id: object,
+    ) -> None:
+        """Snapshot every selected cornice before an asynchronous retexture."""
+
+        if str(operation_kind) != OBJECT_OPERATION_GENERATE_TEXTURE:
+            return
+        object_id = (
+            None
+            if raw_object_id is None
+            else str(raw_object_id).strip() or None
+        )
+        if object_id is None:
+            return
+        record = next(
+            (
+                candidate
+                for candidate in self.generation.get_data().generated_objects
+                if candidate.object_id == object_id
+            ),
+            None,
+        )
+        component_identity = get_architectural_trim_component_identity(record)
+        if component_identity is None:
+            return
+        owner = self._get_architectural_trim_owner(*component_identity)
+        if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+            return
+        target_surface_ids = self._expand_cornice_surface_targets(
+            self._desired_canvas_architectural_trim_part_ids
+        )
+        if target_surface_ids is None:
+            return
+        selected_component_identities = {
+            (part.level_index, part.trim_id)
+            for semantic_id in target_surface_ids
+            if (
+                part := self._canvas_architectural_trim_parts_by_id.get(
+                    semantic_id
+                )
+            )
+            is not None
+        }
+        if component_identity not in selected_component_identities:
+            return
+        self._architectural_trim_texture_targets_by_operation_id[
+            str(operation_id)
+        ] = (object_id, target_surface_ids)
+
+    def _get_architectural_trim_texture_operation_targets(
+        self,
+        object_id: str,
+    ) -> tuple[str, ...]:
+        """Return the immutable selected-cornice snapshot for one live job."""
+
+        normalized_object_id = str(object_id).strip()
+        return next(
+            (
+                surface_ids
+                for source_object_id, surface_ids in reversed(
+                    tuple(
+                        self._architectural_trim_texture_targets_by_operation_id.values()
+                    )
+                )
+                if source_object_id == normalized_object_id
+            ),
+            (),
+        )
+
     def _handle_placeable_objects_changed_for_atlases(
         self,
         _placeable_objects: object,
@@ -12119,12 +12299,46 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     # ### Texture Atlas synchronization ###
+    def _atlas_source_id_for_surface_assignment(
+        self,
+        assignment: SurfaceTextureAssignment,
+    ) -> str:
+        """Keep object-backed trim textures bound to their exported mesh ID."""
+
+        source_object_id = str(assignment.source_object_id or "").strip()
+        if source_object_id:
+            return source_object_id
+        return build_atlas_wall_texture_source_id(assignment.assignment_id)
+
+    def _atlas_surface_assignment_id_for_source(
+        self,
+        source_id: object,
+    ) -> str | None:
+        """Resolve both legacy prefixed and object-backed Surface sources."""
+
+        normalized_id = str(source_id).strip()
+        if not normalized_id:
+            return None
+        linked_assignment_id = self._atlas_surface_assignment_id_by_source_id.get(
+            normalized_id
+        )
+        if linked_assignment_id is not None:
+            return linked_assignment_id
+        for assignment in self.surface_texture_generation.get_assignments():
+            if self._atlas_source_id_for_surface_assignment(assignment) == normalized_id:
+                return assignment.assignment_id
+        return get_atlas_wall_texture_assignment_id(normalized_id)
+
     def _is_atlas_surface_texture_source_id(self, source_id: object) -> bool:
-        """Classify reserved IDs without shadowing a real generated object."""
+        """Classify Surface sources without shadowing a placeable object."""
 
         normalized_id = str(source_id).strip()
         return bool(
-            is_atlas_wall_texture_source_id(normalized_id)
+            (
+                is_atlas_wall_texture_source_id(normalized_id)
+                or self._atlas_surface_assignment_id_for_source(normalized_id)
+                is not None
+            )
             and normalized_id not in self.generation.get_placeable_object_names_by_id()
         )
 
@@ -12167,29 +12381,38 @@ class BlueprintWorkspace(QWidget):
         if not assignment_ids:
             return
         removed_source_ids: set[str] = set()
-        removable_assignment_ids: list[str] = []
         for assignment_id in assignment_ids:
-            source_id = build_atlas_wall_texture_source_id(assignment_id)
+            source_id = next(
+                (
+                    candidate_source_id
+                    for candidate_source_id, candidate_assignment_id in (
+                        self._atlas_surface_assignment_id_by_source_id.items()
+                    )
+                    if candidate_assignment_id == assignment_id
+                ),
+                build_atlas_wall_texture_source_id(assignment_id),
+            )
             if not self._is_atlas_surface_texture_source_id(source_id):
                 continue
             removed_source_ids.add(source_id)
-            removable_assignment_ids.append(assignment_id)
         selected_source_was_removed = any(
             source_id in removed_source_ids
             for source_id in (self.texture_atlas_workspace.selected_surface_texture_ids)
         )
-        if removable_assignment_ids:
-            self.texture_atlas_workspace.remove_deleted_wall_texture_assignments(
-                tuple(removable_assignment_ids)
-            )
+        for source_id in removed_source_ids:
+            self.texture_atlas_workspace.remove_deleted_object(source_id)
         if self._selected_atlas_surface_source_id in removed_source_ids:
             self._selected_atlas_surface_source_id = None
             self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
-        for assignment_id in removable_assignment_ids:
-            self._atlas_wall_texture_source_ids.discard(
-                build_atlas_wall_texture_source_id(assignment_id)
+        self._atlas_wall_texture_source_ids.difference_update(removed_source_ids)
+        self._atlas_surface_assignment_id_by_source_id = {
+            source_id: assignment_id
+            for source_id, assignment_id in (
+                self._atlas_surface_assignment_id_by_source_id.items()
             )
+            if assignment_id not in assignment_ids
+        }
         self._atlas_generation_signature = None
         self._sync_atlas_object_texture_sources()
         if selected_source_was_removed:
@@ -12376,7 +12599,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_atlas_surface_texture_selected(self, source_id: str) -> None:
         """Highlight every Canvas surface using the selected texture family."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             self._selected_atlas_surface_source_id = None
             self._set_atlas_canvas_surface_highlights(())
@@ -12413,7 +12636,11 @@ class BlueprintWorkspace(QWidget):
         assignments = {
             source_id: self.surface_texture_generation.get_assignment(assignment_id)
             for source_id in normalized_ids
-            if (assignment_id := get_atlas_wall_texture_assignment_id(source_id))
+            if (
+                assignment_id := self._atlas_surface_assignment_id_for_source(
+                    source_id
+                )
+            )
             is not None
         }
         surface_ids = tuple(
@@ -12452,7 +12679,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Apply one metres-per-repeat value to the selected Surface family."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             return
         try:
@@ -12507,7 +12734,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Persist one Atlas surface-list rename in Surface generation state."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             self._atlas_generation_signature = None
             self._sync_atlas_object_texture_sources(
@@ -12834,7 +13061,9 @@ class BlueprintWorkspace(QWidget):
         if source_kind != "surface":
             return
 
-        assignment_id = get_atlas_wall_texture_assignment_id(normalized_source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(
+            normalized_source_id
+        )
         if assignment_id is None:
             return
         self._is_assigning_surface_texture_from_atlas = True
@@ -12867,7 +13096,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Confirm and permanently delete one selected Surface texture family."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             self.texture_atlas_workspace.status_label.setText(
                 "Select a Surface texture to delete."
@@ -13023,7 +13252,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Commit a Surface base-color revision with Atlas rollback."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             raise ValueError("Select one loaded Surface texture.")
         revision: SurfaceTextureColorBalanceRevision | None = None
@@ -13111,7 +13340,9 @@ class BlueprintWorkspace(QWidget):
         """Prepare edge-compatible tiling outside the GUI thread."""
 
         normalized_source_id = str(source_id).strip()
-        assignment_id = get_atlas_wall_texture_assignment_id(normalized_source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(
+            normalized_source_id
+        )
         if assignment_id is None:
             self.texture_atlas_workspace.status_label.setText(
                 "Select a loaded Surface texture to fix its tiling."
@@ -13348,13 +13579,23 @@ class BlueprintWorkspace(QWidget):
     def _handle_atlas_surface_assign_requested(self, source_id: str) -> None:
         """Apply and pack one surface texture as a single user transaction."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             return
         assignment = self.surface_texture_generation.get_assignment(assignment_id)
         if assignment is None:
             return
         target_surface_ids = self._atlas_surface_assignment_targets(assignment)
+        target_surface_ids = self._expand_linked_cornice_assignment_targets(
+            assignment,
+            target_surface_ids,
+        )
+        if target_surface_ids is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "Generated cornice textures can only be assigned to complete "
+                "cornice components."
+            )
+            return
         if not target_surface_ids:
             self.texture_atlas_workspace.status_label.setText(
                 "Select at least one Canvas surface before assigning a texture."
@@ -13446,7 +13687,7 @@ class BlueprintWorkspace(QWidget):
                 or not set(assignment.surface_ids).issubset(target_ids)
             ):
                 continue
-            source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+            source_id = self._atlas_source_id_for_surface_assignment(assignment)
             if self._is_atlas_surface_texture_source_id(source_id):
                 displaced_source_ids.append(source_id)
         return tuple(displaced_source_ids)
@@ -13466,6 +13707,78 @@ class BlueprintWorkspace(QWidget):
         if selected_stair_ids:
             return selected_stair_ids
         return self.viewer.get_selected_architectural_trim_part_ids()
+
+    def _linked_cornice_source_record(
+        self,
+        assignment: SurfaceTextureAssignment,
+        records_by_id: Mapping[str, GeneratedObjectRecord] | None = None,
+    ) -> GeneratedObjectRecord | None:
+        """Resolve a valid generated cornice behind one Surface-list entry."""
+
+        source_object_id = str(assignment.source_object_id or "").strip()
+        if not source_object_id:
+            return None
+        record_lookup = (
+            {
+                record.object_id: record
+                for record in self.generation.get_data().generated_objects
+            }
+            if records_by_id is None
+            else records_by_id
+        )
+        record = record_lookup.get(source_object_id)
+        if record is None or not self._is_active_architectural_trim_component_record(
+            record
+        ):
+            return None
+        identity = get_architectural_trim_component_identity(record)
+        if identity is None:
+            return None
+        owner = self._get_architectural_trim_owner(*identity)
+        if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+            return None
+        return record
+
+    def _expand_linked_cornice_assignment_targets(
+        self,
+        assignment: SurfaceTextureAssignment,
+        target_surface_ids: Sequence[str],
+    ) -> tuple[str, ...] | None:
+        """Bind an object UV atlas to whole cornices, never planar fragments."""
+
+        normalized_targets = tuple(
+            dict.fromkeys(str(surface_id).strip() for surface_id in target_surface_ids)
+        )
+        if assignment.source_object_id is None:
+            return normalized_targets
+        if self._linked_cornice_source_record(assignment) is None:
+            return None
+
+        return self._expand_cornice_surface_targets(normalized_targets)
+
+    def _expand_cornice_surface_targets(
+        self,
+        target_surface_ids: Sequence[str],
+    ) -> tuple[str, ...] | None:
+        """Expand selected semantic parts into complete cornice components."""
+
+        target_trim_keys: set[tuple[int, str]] = set()
+        for surface_id in target_surface_ids:
+            part = self._canvas_architectural_trim_parts_by_id.get(surface_id)
+            if part is None:
+                return None
+            owner = self._get_architectural_trim_owner(
+                part.level_index,
+                part.trim_id,
+            )
+            if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+                return None
+            target_trim_keys.add((part.level_index, part.trim_id))
+        return tuple(
+            part.semantic_id
+            for part in self._canvas_architectural_trim_parts_by_id.values()
+            if (part.level_index, part.trim_id) in target_trim_keys
+        )
 
     def _atlas_surface_targets_match_assignment(
         self,
@@ -13491,8 +13804,188 @@ class BlueprintWorkspace(QWidget):
         object_id = getattr(raw_record, "object_id", None)
         if not isinstance(object_id, str) or not object_id:
             return
+        self._publish_architectural_trim_texture_as_surface(raw_record)
         self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.refresh_regenerated_object_texture(object_id)
+
+    def _publish_architectural_trim_texture_as_surface(
+        self,
+        raw_record: object,
+    ) -> SurfaceTextureAssignment | None:
+        """Copy one trim's object-retexture family into Surface ownership."""
+
+        if not isinstance(raw_record, GeneratedObjectRecord):
+            return None
+        component_identity = get_architectural_trim_component_identity(raw_record)
+        if component_identity is None:
+            return None
+        owner = self._get_architectural_trim_owner(*component_identity)
+        if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+            return None
+
+        variants_by_resolution: dict[int, ObjectTextureImageVariant] = {}
+        for resolution in sorted(OBJECT_TEXTURE_RESOLUTIONS):
+            variant = self.generation.get_texture_image_variant(
+                raw_record.object_id,
+                resolution,
+            )
+            if variant is None:
+                return None
+            variants_by_resolution[resolution] = variant
+
+        try:
+            base_color_png_by_resolution = {
+                resolution: variant.texture_asset_path.read_bytes()
+                for resolution, variant in variants_by_resolution.items()
+            }
+            common_pbr_maps = set.intersection(
+                *(
+                    set(variant.map_texture_asset_paths).difference(
+                        {ATLAS_MAP_BASE_COLOR}
+                    )
+                    for variant in variants_by_resolution.values()
+                )
+            )
+            pbr_png_by_map_and_resolution = {
+                map_type: {
+                    resolution: variant.map_texture_asset_paths[
+                        map_type
+                    ].read_bytes()
+                    for resolution, variant in variants_by_resolution.items()
+                }
+                for map_type in ATLAS_MAP_TYPES
+                if map_type in common_pbr_maps
+            }
+        except OSError as error:
+            self.texture_atlas_workspace.status_label.setText(
+                "The generated trim texture could not be added to Surface "
+                f"textures: {error}"
+            )
+            return None
+
+        level_index, trim_id = component_identity
+        matching_parts = tuple(
+            part
+            for part in self._canvas_architectural_trim_parts_by_id.values()
+            if part.level_index == level_index and part.trim_id == trim_id
+        )
+        assignment_id = f"trim-texture-{raw_record.object_id}"
+        previous_assignment = self.surface_texture_generation.get_assignment(
+            assignment_id
+        )
+        operation_target_surface_ids = (
+            self._get_architectural_trim_texture_operation_targets(
+                raw_record.object_id
+            )
+        )
+        surface_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(part.semantic_id for part in matching_parts),
+                    *operation_target_surface_ids,
+                    *(
+                        ()
+                        if previous_assignment is None
+                        else previous_assignment.surface_ids
+                    ),
+                )
+            )
+        )
+        surface_type = matching_parts[0].surface_type if matching_parts else "wall"
+        active_variant = self.generation.get_active_texture_variant(
+            raw_record.object_id
+        )
+        selected_resolution = (
+            1024 if active_variant is None else active_variant.resolution
+        )
+        raw_enabled_pbr_maps = raw_record.pipeline.get(
+            PBR_MAPS_ENABLED_PIPELINE_KEY,
+            (),
+        )
+        requested_pbr_maps = (
+            set(raw_enabled_pbr_maps)
+            if isinstance(raw_enabled_pbr_maps, list | tuple | set)
+            else set()
+        )
+        enabled_pbr_maps = tuple(
+            map_type
+            for map_type in ATLAS_MAP_TYPES
+            if map_type in requested_pbr_maps
+            and map_type in pbr_png_by_map_and_resolution
+        )
+        if previous_assignment is not None:
+            expected_map_types = {
+                ATLAS_MAP_BASE_COLOR,
+                *pbr_png_by_map_and_resolution,
+            }
+            copied_family_matches = True
+            for resolution in sorted(OBJECT_TEXTURE_RESOLUTIONS):
+                copied_paths = (
+                    self.surface_texture_generation.get_assignment_map_asset_paths(
+                        previous_assignment.assignment_id,
+                        resolution,
+                    )
+                )
+                expected_png_by_map = {
+                    ATLAS_MAP_BASE_COLOR: base_color_png_by_resolution[resolution],
+                    **{
+                        map_type: png_by_resolution[resolution]
+                        for map_type, png_by_resolution in (
+                            pbr_png_by_map_and_resolution.items()
+                        )
+                    },
+                }
+                if set(copied_paths) != expected_map_types:
+                    copied_family_matches = False
+                    break
+                try:
+                    if any(
+                        copied_paths[map_type].read_bytes() != expected_png
+                        for map_type, expected_png in expected_png_by_map.items()
+                    ):
+                        copied_family_matches = False
+                        break
+                except OSError:
+                    copied_family_matches = False
+                    break
+            if (
+                copied_family_matches
+                and previous_assignment.source_object_id == raw_record.object_id
+                and previous_assignment.surface_ids == surface_ids
+                and previous_assignment.selected_texture_resolution
+                == selected_resolution
+                and previous_assignment.enabled_pbr_maps == enabled_pbr_maps
+            ):
+                return previous_assignment
+        try:
+            return self.surface_texture_generation.import_external_texture_family(
+                assignment_id=assignment_id,
+                source_object_id=raw_record.object_id,
+                surface_type=surface_type,
+                surface_ids=surface_ids,
+                base_color_png_by_resolution=base_color_png_by_resolution,
+                pbr_png_by_map_and_resolution=pbr_png_by_map_and_resolution,
+                selected_resolution=selected_resolution,
+                display_name=(
+                    raw_record.object_name
+                    if previous_assignment is None
+                    else previous_assignment.display_name or raw_record.object_name
+                ),
+                provider=raw_record.provider,
+                provider_task_id=raw_record.provider_task_id,
+                enabled_pbr_maps=enabled_pbr_maps,
+                tiling_fix_needed=(
+                    False
+                    if previous_assignment is None
+                    else previous_assignment.tiling_fix_needed
+                ),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.texture_atlas_workspace.status_label.setText(
+                "The generated trim texture could not be added to Surface "
+                f"textures: {error}"
+            )
+            return None
 
     def _handle_generated_object_generated_for_atlases(
         self,
@@ -13506,7 +13999,13 @@ class BlueprintWorkspace(QWidget):
         object_id = getattr(raw_record, "object_id", None)
         if not isinstance(object_id, str) or not object_id.strip():
             return
-        self.texture_atlas_workspace.mark_sources_new((object_id,))
+        assignment = self._publish_architectural_trim_texture_as_surface(raw_record)
+        source_id = (
+            object_id
+            if assignment is None
+            else self._atlas_source_id_for_surface_assignment(assignment)
+        )
+        self.texture_atlas_workspace.mark_sources_new((source_id,))
 
     def _handle_generated_object_deleted_for_atlases(
         self,
@@ -13645,7 +14144,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Display one exact surface texture on an upright square plane."""
 
-        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         try:
             normalized_resolution = int(texture_resolution)
         except (TypeError, ValueError, OverflowError):
@@ -13719,20 +14218,73 @@ class BlueprintWorkspace(QWidget):
         """Make an accepted Atlas size the source's globally active variant."""
 
         assignment_id = (
-            get_atlas_wall_texture_assignment_id(object_id)
+            self._atlas_surface_assignment_id_for_source(object_id)
             if self._is_atlas_surface_texture_source_id(object_id)
             else None
         )
         if assignment_id is not None:
-            if self.surface_texture_generation.select_assignment_texture_resolution(
+            assignment = self.surface_texture_generation.get_assignment(assignment_id)
+            if assignment is None:
+                self._append_atlas_preview_status(
+                    "The selected Surface texture no longer exists."
+                )
+                return
+            source_object_id = assignment.source_object_id
+            if source_object_id is None:
+                if self.surface_texture_generation.select_assignment_texture_resolution(
+                    assignment_id,
+                    texture_resolution,
+                ):
+                    return
+                self._append_atlas_preview_status(
+                    "The atlas was resized, but its exact surface texture "
+                    "variant could not be assigned globally."
+                )
+                return
+
+            previous_object_variant = self.generation.get_active_texture_variant(
+                source_object_id
+            )
+            if (
+                previous_object_variant is None
+                or not self.surface_texture_generation.can_select_assignment_texture_resolution(
+                    assignment_id,
+                    texture_resolution,
+                )
+                or self.generation.get_texture_variant(
+                    source_object_id,
+                    texture_resolution,
+                )
+                is None
+            ):
+                self._append_atlas_preview_status(
+                    "The linked trim does not have matching 3D and Surface "
+                    "texture variants at that resolution."
+                )
+                return
+            if not self.generation.select_object_texture_resolution(
+                source_object_id,
+                texture_resolution,
+            ):
+                self._append_atlas_preview_status(
+                    "The trim's matching 3D texture variant could not be "
+                    "activated."
+                )
+                return
+            if not self.surface_texture_generation.select_assignment_texture_resolution(
                 assignment_id,
                 texture_resolution,
             ):
+                self.generation.select_object_texture_resolution(
+                    source_object_id,
+                    previous_object_variant.resolution,
+                )
+                self._append_atlas_preview_status(
+                    "The linked Surface texture could not be activated; the "
+                    "trim was restored to its previous resolution."
+                )
                 return
-            self._append_atlas_preview_status(
-                "The atlas was resized, but its exact surface texture variant "
-                "could not be assigned globally."
-            )
+            self._refresh_placed_object_texture_if_needed(source_object_id)
             return
 
         if self.generation.select_object_texture_resolution(
@@ -13851,7 +14403,12 @@ class BlueprintWorkspace(QWidget):
             self._build_active_architectural_trim_component_models()
         )
         active_trim_source_ids = {
-            str(model.source_object_id or model.object_id) for model in trim_models
+            str(
+                model.atlas_source_object_id
+                or model.source_object_id
+                or model.object_id
+            )
+            for model in trim_models
         }
         required_ids: list[str] = []
         for object_id in self.generation.get_generated_object_ids():
@@ -13878,10 +14435,7 @@ class BlueprintWorkspace(QWidget):
         required_ids.extend(
             source_id
             for source_id in active_trim_source_ids
-            if (
-                source_id in self._atlas_available_source_ids
-                or self.generation.has_generated_object_texture_variants(source_id)
-            )
+            if source_id in self._atlas_available_source_ids
         )
         export_levels = remove_generated_architectural_trims_from_levels(
             self.levels,
@@ -13915,9 +14469,7 @@ class BlueprintWorkspace(QWidget):
         for assignment in self.surface_texture_generation.get_assignments():
             if not assignment.surface_ids:
                 continue
-            source_id = build_atlas_wall_texture_source_id(
-                assignment.assignment_id
-            )
+            source_id = self._atlas_source_id_for_surface_assignment(assignment)
             if source_id in self._atlas_wall_texture_source_ids:
                 source_ids.append(source_id)
         return tuple(source_ids)
@@ -14042,7 +14594,7 @@ class BlueprintWorkspace(QWidget):
         applied_changes: list[tuple[str, str, int]] = []
         for source_id in source_ids:
             assignment_id = (
-                get_atlas_wall_texture_assignment_id(source_id)
+                self._atlas_surface_assignment_id_for_source(source_id)
                 if self._is_atlas_surface_texture_source_id(source_id)
                 else None
             )
@@ -14140,7 +14692,7 @@ class BlueprintWorkspace(QWidget):
             if record.object_id == source_id:
                 return record.object_name
         assignment_id = (
-            get_atlas_wall_texture_assignment_id(source_id)
+            self._atlas_surface_assignment_id_for_source(source_id)
             if self._is_atlas_surface_texture_source_id(source_id)
             else None
         )
@@ -14174,6 +14726,20 @@ class BlueprintWorkspace(QWidget):
         )
         generated_object_ids = self.generation.get_generated_object_ids()
         generated_object_id_lookup = set(generated_object_ids)
+        surface_assignments = list(self.surface_texture_generation.get_assignments())
+        self._atlas_surface_assignment_id_by_source_id = {}
+        for assignment in surface_assignments:
+            source_id = self._atlas_source_id_for_surface_assignment(assignment)
+            self._atlas_surface_assignment_id_by_source_id.setdefault(
+                source_id,
+                assignment.assignment_id,
+            )
+        object_backed_surface_source_ids = {
+            assignment.source_object_id
+            for assignment in surface_assignments
+            if assignment.source_object_id is not None
+            and assignment.source_object_id in generated_object_id_lookup
+        }
         scene_bound_source_ids = list(
             self.generation.get_scene_bound_placeable_object_ids()
         )
@@ -14181,6 +14747,7 @@ class BlueprintWorkspace(QWidget):
             record.object_id
             for record in self.generation.get_data().generated_objects
             if self._is_active_architectural_trim_component_record(record)
+            and record.object_id in object_backed_surface_source_ids
             and self.generation.get_active_texture_variant(record.object_id)
             is not None
         )
@@ -14303,8 +14870,8 @@ class BlueprintWorkspace(QWidget):
                 )
             )
 
-        surface_assignments = list(self.surface_texture_generation.get_assignments())
         surface_texture_entries: list[AtlasSurfaceTextureEntry] = []
+        colliding_surface_texture_count = 0
         for assignment in surface_assignments:
             variant_signature: list[tuple[object, ...]] = []
             candidate_variants = (
@@ -14362,13 +14929,22 @@ class BlueprintWorkspace(QWidget):
                     assignment.surface_ids,
                     assignment.texture_repeat_size_m,
                     assignment.tiling_fix_needed,
+                    assignment.source_object_id,
                     tuple(variant_signature),
                 )
             )
-            surface_source_id = build_atlas_wall_texture_source_id(
-                assignment.assignment_id
+            surface_source_id = self._atlas_source_id_for_surface_assignment(
+                assignment
             )
-            if surface_source_id not in generated_object_id_lookup:
+            if (
+                self._atlas_surface_assignment_id_by_source_id.get(
+                    surface_source_id
+                )
+                != assignment.assignment_id
+            ):
+                colliding_surface_texture_count += 1
+                continue
+            if surface_source_id not in placeable_object_names_by_id:
                 surface_texture_entries.append(
                     AtlasSurfaceTextureEntry(
                         source_id=surface_source_id,
@@ -14440,27 +15016,36 @@ class BlueprintWorkspace(QWidget):
         failed_source_ids: set[str] = set()
         source_build_failed = False
         for variant, symmetry in active_variants:
+            variant_object_id = str(getattr(variant, "object_id"))
+            if variant_object_id in object_backed_surface_source_ids:
+                continue
             source = self._build_atlas_object_texture_source(
                 variant,
                 symmetry,
             )
             if source is None:
                 source_build_failed = True
-                failed_source_ids.add(str(getattr(variant, "object_id")))
+                failed_source_ids.add(variant_object_id)
                 continue
             active_sources.append(source)
-            available_source_ids.add(str(getattr(variant, "object_id")))
+            available_source_ids.add(variant_object_id)
         surface_sources: dict[str, AtlasObjectTextureSource] = {}
         surface_assignments_by_source_id: dict[
             str,
             SurfaceTextureAssignment,
         ] = {}
-        colliding_surface_texture_count = 0
         for assignment in surface_assignments:
-            surface_source_id = build_atlas_wall_texture_source_id(
-                assignment.assignment_id
+            surface_source_id = self._atlas_source_id_for_surface_assignment(
+                assignment
             )
-            if surface_source_id in generated_object_id_lookup:
+            if (
+                self._atlas_surface_assignment_id_by_source_id.get(
+                    surface_source_id
+                )
+                != assignment.assignment_id
+            ):
+                continue
+            if surface_source_id in placeable_object_names_by_id:
                 colliding_surface_texture_count += 1
                 continue
             active_resolution = (
@@ -14522,10 +15107,26 @@ class BlueprintWorkspace(QWidget):
         ) -> bool:
             surface_assignment = surface_assignments_by_source_id.get(object_id)
             if surface_assignment is not None:
-                return self.surface_texture_generation.can_select_assignment_texture_resolution(
+                surface_variant_is_selectable = self.surface_texture_generation.can_select_assignment_texture_resolution(
                     surface_assignment.assignment_id,
                     resolution,
                 )
+                source_object_id = surface_assignment.source_object_id
+                if not surface_variant_is_selectable or source_object_id is None:
+                    return surface_variant_is_selectable
+                if self.generation.has_active_object_job(source_object_id):
+                    return False
+                object_variant = self.generation.get_texture_variant(
+                    source_object_id,
+                    resolution,
+                )
+                if object_variant is None:
+                    return False
+                try:
+                    import_generated_glb(object_variant.glb_asset_path.read_bytes())
+                except Exception:
+                    return False
+                return True
             if self.generation.has_active_object_job(object_id):
                 return False
             variant = self.generation.get_texture_variant(
@@ -14564,9 +15165,9 @@ class BlueprintWorkspace(QWidget):
             self._handle_atlas_surface_textures_selected(selected_surface_source_ids)
         zero_usage_cleanup_failed = False
         for assignment in surface_assignments:
-            if assignment.surface_ids:
+            if assignment.surface_ids or assignment.source_object_id is not None:
                 continue
-            source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+            source_id = self._atlas_source_id_for_surface_assignment(assignment)
             if not self._is_atlas_surface_texture_source_id(source_id):
                 continue
             if self.texture_atlas_workspace.is_source_assigned_to_any_atlas(source_id):
@@ -14757,7 +15358,7 @@ class BlueprintWorkspace(QWidget):
                 asset_path = assignment.asset_path
             surface_count = len(assignment.surface_ids)
             return load_atlas_object_texture_source(
-                object_id=build_atlas_wall_texture_source_id(assignment.assignment_id),
+                object_id=self._atlas_source_id_for_surface_assignment(assignment),
                 object_name=(
                     assignment.display_name
                     or f"{assignment.surface_type.title()} texture"
@@ -15637,11 +16238,8 @@ class BlueprintWorkspace(QWidget):
         """Map each assigned architectural surface to its Atlas source ID."""
 
         source_ids: dict[str, str] = {}
-        generated_object_ids = set(self.generation.get_generated_object_ids())
         for assignment in self.surface_texture_generation.get_assignments():
-            source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
-            if source_id in generated_object_ids:
-                continue
+            source_id = self._atlas_source_id_for_surface_assignment(assignment)
             for surface_id in assignment.surface_ids:
                 source_ids[surface_id] = source_id
         return source_ids
@@ -15804,6 +16402,46 @@ class BlueprintWorkspace(QWidget):
                 QMessageBox.warning(self, failure_title, str(error))
             return None
 
+    def _sync_viewer_architectural_trim_placed_object_bindings(
+        self,
+        model: GeneratedModel | None,
+    ) -> None:
+        """Bind only currently rendered replacement trims to semantic parts."""
+
+        parts_by_identity: dict[tuple[int, str], list[str]] = {}
+        for semantic_id, part in self._canvas_architectural_trim_parts_by_id.items():
+            parts_by_identity.setdefault(
+                (part.level_index, part.trim_id),
+                [],
+            ).append(semantic_id)
+
+        records_by_id = {
+            record.object_id: record
+            for record in self.generation.get_data().generated_objects
+        }
+        fallback_identity_by_object_id: dict[str, tuple[int, str] | None] = {}
+        for identity in parts_by_identity:
+            fallback_object_id = f"architectural-trim-{identity[1]}"
+            if fallback_object_id in fallback_identity_by_object_id:
+                fallback_identity_by_object_id[fallback_object_id] = None
+            else:
+                fallback_identity_by_object_id[fallback_object_id] = identity
+
+        bindings: dict[str, tuple[str, ...]] = {}
+        previews = () if model is None else tuple(model.preview_placed_objects)
+        for preview in previews:
+            object_id = str(preview.object_id).strip()
+            record = records_by_id.get(object_id)
+            identity = get_architectural_trim_component_identity(record)
+            if identity is None:
+                identity = fallback_identity_by_object_id.get(object_id)
+            if identity is None:
+                continue
+            semantic_ids = tuple(parts_by_identity.get(identity, ()))
+            if semantic_ids:
+                bindings[object_id] = semantic_ids
+        self.viewer.set_architectural_trim_placed_object_bindings(bindings)
+
     def _build_placed_generated_models(
         self,
         *,
@@ -15878,20 +16516,57 @@ class BlueprintWorkspace(QWidget):
         tuple[PlacedGeneratedModel, ...],
         tuple[tuple[int, str], ...],
     ]:
-        """Fit generated trim assets onto their current procedural owners."""
+        """Fit generated trims and their joined procedural companions."""
 
         included_level_indices = {
             level.index
             for level in self.levels
             if include_excluded_levels or level.include_in_export
         }
-        placed_models: list[PlacedGeneratedModel] = []
-        generated_trim_keys: list[tuple[int, str]] = []
-        for record in self.generation.get_data().generated_objects:
+        generation_data = self.generation.get_data()
+        records_by_id = {
+            record.object_id: record for record in generation_data.generated_objects
+        }
+        records_by_trim_key = {
+            identity: record
+            for record in generation_data.generated_objects
+            if (identity := get_architectural_trim_component_identity(record))
+            is not None
+        }
+        cornice_miters_by_trim_key = {
+            (descriptor.level_index, descriptor.trim_id): descriptor
+            for descriptor in build_cornice_miter_descriptors(self.levels)
+        }
+        active_record_trim_keys = {
+            identity
+            for record in generation_data.generated_objects
+            if (identity := get_architectural_trim_component_identity(record))
+            is not None
+            and identity[0] in included_level_indices
+            and self._is_active_architectural_trim_component_record(record)
+        }
+        linked_bindings = self._collect_linked_cornice_component_bindings(
+            included_level_indices,
+            records_by_id=records_by_id,
+        )
+        replacement_trim_keys = self._expand_connected_cornice_replacement_keys(
+            active_record_trim_keys | set(linked_bindings),
+            included_level_indices=included_level_indices,
+            cornice_miters_by_trim_key=cornice_miters_by_trim_key,
+        )
+        linked_models = self._build_linked_cornice_component_models(
+            linked_bindings,
+            records_by_trim_key=records_by_trim_key,
+            cornice_miters_by_trim_key=cornice_miters_by_trim_key,
+            replacement_trim_keys=replacement_trim_keys,
+        )
+        placements_by_trim_key = dict(linked_models)
+        for record in generation_data.generated_objects:
             identity = get_architectural_trim_component_identity(record)
             if (
                 identity is None
                 or identity[0] not in included_level_indices
+                or identity in placements_by_trim_key
                 or not self._is_active_architectural_trim_component_record(record)
             ):
                 continue
@@ -15913,12 +16588,260 @@ class BlueprintWorkspace(QWidget):
                     frame,
                     object_id=record.object_id,
                     object_name=record.object_name,
+                    cornice_miter=self._cornice_miter_for_replaced_neighbors(
+                        cornice_miters_by_trim_key.get(identity),
+                        replacement_trim_keys,
+                    ),
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
-            placed_models.append(placed_model)
-            generated_trim_keys.append(identity)
-        return tuple(placed_models), tuple(generated_trim_keys)
+            placements_by_trim_key[identity] = placed_model
+
+        companion_trim_keys = replacement_trim_keys.difference(
+            active_record_trim_keys,
+            linked_bindings,
+        )
+        for identity in sorted(companion_trim_keys):
+            if identity in placements_by_trim_key:
+                continue
+            owner = self._get_architectural_trim_owner(*identity)
+            if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+                continue
+            level, trim = owner
+            try:
+                model, frame = build_architectural_trim_component_seed_model(
+                    level,
+                    trim,
+                    self._get_architectural_trim_wall_surfaces(trim),
+                )
+                record = records_by_trim_key.get(identity)
+                object_id = (
+                    f"architectural-trim-{trim.trim_id}"
+                    if record is None
+                    else record.object_id
+                )
+                object_name = (
+                    f"Cornice {trim.trim_id[:8]}"
+                    if record is None
+                    else record.object_name
+                )
+                placements_by_trim_key[identity] = (
+                    build_architectural_trim_component_placement(
+                        model,
+                        frame,
+                        object_id=object_id,
+                        object_name=object_name,
+                        cornice_miter=self._cornice_miter_for_replaced_neighbors(
+                            cornice_miters_by_trim_key.get(identity),
+                            replacement_trim_keys,
+                        ),
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+
+        ordered_trim_keys = tuple(sorted(placements_by_trim_key))
+        return (
+            tuple(placements_by_trim_key[key] for key in ordered_trim_keys),
+            ordered_trim_keys,
+        )
+
+    def _collect_linked_cornice_component_bindings(
+        self,
+        included_level_indices: set[int],
+        *,
+        records_by_id: Mapping[str, GeneratedObjectRecord],
+    ) -> dict[
+        tuple[int, str],
+        tuple[GeneratedObjectRecord, LevelData, ArchitecturalTrimData],
+    ]:
+        """Resolve every cornice surface assignment before fitting models."""
+
+        owners_by_trim_id: dict[
+            str,
+            tuple[LevelData, ArchitecturalTrimData],
+        ] = {}
+        duplicate_trim_ids: set[str] = set()
+        for level in self.levels:
+            for trim in level.architectural_trims:
+                if trim.trim_id in owners_by_trim_id:
+                    duplicate_trim_ids.add(trim.trim_id)
+                    continue
+                owners_by_trim_id[trim.trim_id] = (level, trim)
+        for trim_id in duplicate_trim_ids:
+            owners_by_trim_id.pop(trim_id, None)
+
+        bindings: dict[
+            tuple[int, str],
+            tuple[GeneratedObjectRecord, LevelData, ArchitecturalTrimData],
+        ] = {}
+        for assignment in self.surface_texture_generation.get_assignments():
+            source_record = self._linked_cornice_source_record(
+                assignment,
+                records_by_id,
+            )
+            if source_record is None:
+                continue
+            for surface_id in assignment.surface_ids:
+                parsed_surface_id = parse_architectural_trim_surface_id(surface_id)
+                if parsed_surface_id is None:
+                    continue
+                target_owner = owners_by_trim_id.get(parsed_surface_id[0])
+                if target_owner is None:
+                    continue
+                target_level, target_trim = target_owner
+                if (
+                    target_level.index not in included_level_indices
+                    or target_trim.kind != TRIM_KIND_CORNICE
+                ):
+                    continue
+                bindings[(target_level.index, target_trim.trim_id)] = (
+                    source_record,
+                    target_level,
+                    target_trim,
+                )
+        return bindings
+
+    @staticmethod
+    def _expand_connected_cornice_replacement_keys(
+        initial_trim_keys: set[tuple[int, str]],
+        *,
+        included_level_indices: set[int],
+        cornice_miters_by_trim_key: Mapping[
+            tuple[int, str],
+            ArchitecturalTrimCorniceMiterDescriptor,
+        ],
+    ) -> set[tuple[int, str]]:
+        """Promote whole joined runs so mixed corners retain both miter halves."""
+
+        expanded = {
+            key for key in initial_trim_keys if key[0] in included_level_indices
+        }
+        pending = list(expanded)
+        while pending:
+            trim_key = pending.pop()
+            descriptor = cornice_miters_by_trim_key.get(trim_key)
+            if descriptor is None:
+                continue
+            for endpoint in (descriptor.minimum_x, descriptor.maximum_x):
+                if endpoint.neighbor_trim_id is None:
+                    continue
+                neighbor_key = (
+                    descriptor.level_index,
+                    endpoint.neighbor_trim_id,
+                )
+                if (
+                    neighbor_key in expanded
+                    or neighbor_key not in cornice_miters_by_trim_key
+                    or neighbor_key[0] not in included_level_indices
+                ):
+                    continue
+                expanded.add(neighbor_key)
+                pending.append(neighbor_key)
+        return expanded
+
+    def _build_linked_cornice_component_models(
+        self,
+        bindings: Mapping[
+            tuple[int, str],
+            tuple[GeneratedObjectRecord, LevelData, ArchitecturalTrimData],
+        ],
+        *,
+        records_by_trim_key: Mapping[
+            tuple[int, str],
+            GeneratedObjectRecord,
+        ],
+        cornice_miters_by_trim_key: Mapping[
+            tuple[int, str],
+            ArchitecturalTrimCorniceMiterDescriptor,
+        ],
+        replacement_trim_keys: set[tuple[int, str]],
+    ) -> dict[tuple[int, str], PlacedGeneratedModel]:
+        """Reuse one authored cornice UV model on every assigned cornice."""
+
+        placements: dict[tuple[int, str], PlacedGeneratedModel] = {}
+        for target_key in sorted(bindings):
+            source_record, target_level, target_trim = bindings[target_key]
+            try:
+                frame = build_architectural_trim_component_frame(
+                    target_level,
+                    target_trim,
+                    self._get_architectural_trim_wall_surfaces(target_trim),
+                )
+                source_identity = get_architectural_trim_component_identity(
+                    source_record
+                )
+                model = (
+                    self.generation.get_generated_object_model(
+                        source_record.object_id
+                    )
+                    if source_identity == target_key
+                    else self.generation.build_architectural_trim_texture_transfer_model(
+                        source_record.object_id,
+                        frame.target_extents,
+                    )
+                )
+                if model is None:
+                    continue
+                target_record = records_by_trim_key.get(target_key)
+                target_object_id = (
+                    f"architectural-trim-{target_trim.trim_id}"
+                    if target_record is None
+                    else target_record.object_id
+                )
+                target_object_name = (
+                    f"Cornice {target_trim.trim_id[:8]}"
+                    if target_record is None
+                    else target_record.object_name
+                )
+                placements[target_key] = (
+                    build_architectural_trim_component_placement(
+                        model,
+                        frame,
+                        object_id=target_object_id,
+                        object_name=target_object_name,
+                        atlas_source_object_id=source_record.object_id,
+                        cornice_miter=self._cornice_miter_for_replaced_neighbors(
+                            cornice_miters_by_trim_key.get(target_key),
+                            replacement_trim_keys,
+                        ),
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        return placements
+
+    def _cornice_miter_for_replaced_neighbors(
+        self,
+        descriptor: ArchitecturalTrimCorniceMiterDescriptor | None,
+        replacement_trim_keys: set[tuple[int, str]],
+    ) -> ArchitecturalTrimCorniceMiterDescriptor | None:
+        """Keep a miter only when the matching neighbor is also replaced."""
+
+        if descriptor is None:
+            return None
+
+        def retain_replaced_neighbor(
+            endpoint: ArchitecturalTrimEndpointMiter,
+        ) -> ArchitecturalTrimEndpointMiter:
+            neighbor_trim_id = endpoint.neighbor_trim_id
+            if neighbor_trim_id is None or (
+                descriptor.level_index,
+                str(neighbor_trim_id),
+            ) in replacement_trim_keys:
+                return endpoint
+            return replace(
+                endpoint,
+                world_shift_per_depth=(0.0, 0.0, 0.0),
+                local_x_shift_per_depth=0.0,
+                neighbor_trim_id=None,
+            )
+
+        return replace(
+            descriptor,
+            minimum_x=retain_replaced_neighbor(descriptor.minimum_x),
+            maximum_x=retain_replaced_neighbor(descriptor.maximum_x),
+        )
 
     def _is_active_architectural_trim_component_record(
         self,
@@ -16307,11 +17230,22 @@ class BlueprintWorkspace(QWidget):
         self,
         assignment: object,
     ) -> None:
-        assignment_id = getattr(assignment, "assignment_id", None)
-        if isinstance(assignment_id, str) and assignment_id.strip():
-            self.texture_atlas_workspace.mark_sources_new(
-                (build_atlas_wall_texture_source_id(assignment_id),)
+        if isinstance(assignment, SurfaceTextureAssignment):
+            source_id = self._atlas_source_id_for_surface_assignment(assignment)
+        else:
+            assignment_id = getattr(assignment, "assignment_id", None)
+            source_object_id = getattr(assignment, "source_object_id", None)
+            source_id = (
+                str(source_object_id).strip()
+                if isinstance(source_object_id, str) and source_object_id.strip()
+                else (
+                    build_atlas_wall_texture_source_id(assignment_id)
+                    if isinstance(assignment_id, str) and assignment_id.strip()
+                    else None
+                )
             )
+        if source_id is not None:
+            self.texture_atlas_workspace.mark_sources_new((source_id,))
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_surface_texture_content_changed(self) -> None:
@@ -16399,6 +17333,7 @@ class BlueprintWorkspace(QWidget):
         if canvas_is_stale:
             if generated_model is None or not len(generated_model.mesh.faces):
                 self._set_canvas_viewer_targets(())
+                self._sync_viewer_architectural_trim_placed_object_bindings(None)
                 self._is_syncing_canvas_scene_selection = True
                 try:
                     self.viewer.clear_model()
@@ -16407,6 +17342,9 @@ class BlueprintWorkspace(QWidget):
             else:
                 self._set_canvas_viewer_targets(
                     tuple(build_fixed_surfaces(preview_levels))
+                )
+                self._sync_viewer_architectural_trim_placed_object_bindings(
+                    generated_model
                 )
                 self._is_syncing_canvas_scene_selection = True
                 try:
@@ -21345,6 +22283,8 @@ class BlueprintWorkspace(QWidget):
         self._atlas_source_content_revisions = None
         self._atlas_pending_source_content_refresh_ids.clear()
         self._atlas_wall_texture_source_ids.clear()
+        self._atlas_surface_assignment_id_by_source_id.clear()
+        self._architectural_trim_texture_targets_by_operation_id.clear()
         self._atlas_available_source_ids.clear()
         self._last_automatic_atlas_assignment_key = None
         self._clear_atlas_object_preview()
@@ -21415,6 +22355,8 @@ class BlueprintWorkspace(QWidget):
         self._atlas_source_content_revisions = None
         self._atlas_pending_source_content_refresh_ids.clear()
         self._atlas_wall_texture_source_ids.clear()
+        self._atlas_surface_assignment_id_by_source_id.clear()
+        self._architectural_trim_texture_targets_by_operation_id.clear()
         self._atlas_available_source_ids.clear()
         self._last_automatic_atlas_assignment_key = None
         self._sync_atlas_object_texture_sources()

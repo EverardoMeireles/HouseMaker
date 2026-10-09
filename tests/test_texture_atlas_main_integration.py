@@ -5881,6 +5881,94 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 (25, 190, 140, 255),
             )
 
+    def test_direct_object_base_texture_path_change_redraws_atlas_immediately(
+        self,
+    ) -> None:
+        asset_directory = self.settings.path.parent / "generated"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        glb_name = "base-path-refresh.glb"
+        first_texture_name = "base-path-refresh-a.png"
+        second_texture_name = "base-path-refresh-b.png"
+        (asset_directory / glb_name).write_bytes(b"available glb")
+        Image.new("RGBA", (512, 512), (40, 60, 80, 255)).save(
+            asset_directory / first_texture_name
+        )
+        Image.new("RGBA", (512, 512), (25, 190, 140, 255)).save(
+            asset_directory / second_texture_name
+        )
+        variant_metadata = {
+            "glb_asset_path": glb_name,
+            "texture_asset_path": first_texture_name,
+        }
+        record = GeneratedObjectRecord(
+            object_id="base-path-refresh",
+            frame_index=0,
+            object_name="Base path refresh",
+            pipeline={
+                "texture_variants": {"512": variant_metadata},
+                "selected_texture_resolution": 512,
+            },
+            provider_task_id="base-path-refresh-task",
+            asset_path=glb_name,
+        )
+        self.workspace.generation._data.generated_objects = [record]
+        self.workspace._atlas_generation_signature = None
+        self.workspace._atlas_source_content_paths = None
+        self.workspace._atlas_source_content_revisions = None
+        self.workspace._sync_atlas_object_texture_sources()
+
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[record.object_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Base path refresh",
+            2048,
+            atlas_id="base-path-refresh-atlas",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+
+        base_color_preview = atlas_workspace.map_previews[ATLAS_MAP_BASE_COLOR]
+        variant_metadata["texture_asset_path"] = second_texture_name
+        with patch.object(
+            base_color_preview,
+            "update",
+            wraps=base_color_preview.update,
+        ) as redraw_preview:
+            self.workspace._handle_generated_object_changed_for_atlases(
+                record,
+                object(),
+            )
+
+        updated_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated_atlas is not None
+        updated_placement = updated_atlas.placement_for_object(record.object_id)
+        assert updated_placement is not None
+        self.assertEqual(updated_placement.texture_path, second_texture_name)
+        with Image.open(atlas_path) as atlas_image:
+            self.assertEqual(
+                atlas_image.convert("RGBA").getpixel((256, 256)),
+                (25, 190, 140, 255),
+            )
+        redraw_preview.assert_called()
+        preview_image = base_color_preview._source_preview_images[record.object_id]
+        self.assertEqual(
+            preview_image.pixelColor(0, 0).getRgb(),
+            (25, 190, 140, 255),
+        )
+
     def test_fixed_wall_replacement_keeps_its_pinned_atlas_resolution(
         self,
     ) -> None:

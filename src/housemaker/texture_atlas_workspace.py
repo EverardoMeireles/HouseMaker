@@ -202,8 +202,8 @@ class AtlasSurfaceTextureEntry:
         display_name = str(self.display_name).strip()
         surface_type = str(self.surface_type).strip().lower()
         usage_count = self.surface_usage_count
-        if not source_id.startswith(WALL_TEXTURE_SOURCE_ID_PREFIX):
-            raise ValueError("Atlas surface entries require a reserved source ID.")
+        if not source_id:
+            raise ValueError("Atlas surface entry IDs cannot be empty.")
         if not display_name:
             raise ValueError("Atlas surface entry names cannot be empty.")
         if not surface_type:

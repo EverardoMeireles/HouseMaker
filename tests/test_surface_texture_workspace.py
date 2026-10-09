@@ -171,6 +171,22 @@ def _colored_texture_png(color: tuple[int, int, int, int]) -> bytes:
     return output.getvalue()
 
 
+def _square_texture_family(
+    color: tuple[int, int, int, int],
+) -> dict[int, bytes]:
+    """Build compact encoded fixtures at every supported resolution."""
+
+    family: dict[int, bytes] = {}
+    for resolution in SURFACE_TEXTURE_RESOLUTIONS:
+        output = io.BytesIO()
+        Image.new("RGBA", (resolution, resolution), color).save(
+            output,
+            format="PNG",
+        )
+        family[resolution] = output.getvalue()
+    return family
+
+
 def _horizontal_gradient_texture_png(size: int = 128) -> bytes:
     axis = np.linspace(20, 235, size, dtype=np.uint8)
     pixels = np.repeat(np.tile(axis, (size, 1))[:, :, None], 3, axis=2)
@@ -436,6 +452,117 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(data_changed.count(), 1)
         self.assertEqual(content_changed.count(), 1)
+
+    def test_external_texture_family_import_upserts_stable_assignment(
+        self,
+    ) -> None:
+        surface_id = "level:2/room:5/wall:1:2"
+        completed = QSignalSpy(self.workspace.generation_completed)
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+
+        first = self.workspace.import_external_texture_family(
+            assignment_id="cornice-surface-texture",
+            source_object_id="cornice-object-1",
+            surface_type="wall",
+            surface_ids=(surface_id,),
+            base_color_png_by_resolution=_square_texture_family(
+                (180, 120, 70, 255)
+            ),
+            pbr_png_by_map_and_resolution={
+                PBR_MAP_NORMAL: _square_texture_family(
+                    (128, 128, 255, 255)
+                ),
+            },
+            selected_resolution=512,
+            display_name="Cornice texture",
+            provider="meshy",
+            provider_task_id="texture-task-1",
+            provider_pbr_task_id="pbr-task-1",
+            enabled_pbr_maps=(PBR_MAP_NORMAL,),
+        )
+
+        first_paths = {
+            path
+            for variant in first.texture_variants
+            for path in variant.map_asset_paths.values()
+        }
+        self.assertEqual(first.assignment_id, "cornice-surface-texture")
+        self.assertEqual(first.source_object_id, "cornice-object-1")
+        self.assertEqual(first.surface_ids, (surface_id,))
+        self.assertEqual(first.selected_texture_resolution, 512)
+        self.assertEqual(first.available_pbr_maps, (PBR_MAP_NORMAL,))
+        self.assertTrue(
+            all(
+                (self._temporary_path / "surface_assets" / path).is_file()
+                for path in first_paths
+            )
+        )
+        self.assertEqual(completed.count(), 1)
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+
+        second = self.workspace.import_external_texture_family(
+            assignment_id="cornice-surface-texture",
+            source_object_id="cornice-object-1",
+            surface_type="wall",
+            surface_ids=(surface_id,),
+            base_color_png_by_resolution=_square_texture_family(
+                (60, 90, 150, 255)
+            ),
+            selected_resolution=1024,
+            display_name="Updated cornice",
+            provider="meshy",
+            provider_task_id="texture-task-2",
+        )
+
+        assignments = self.workspace.get_assignments()
+        second_paths = {
+            path
+            for variant in second.texture_variants
+            for path in variant.map_asset_paths.values()
+        }
+        self.assertEqual(assignments, (second,))
+        self.assertEqual(second.assignment_id, first.assignment_id)
+        self.assertEqual(second.selected_texture_resolution, 1024)
+        self.assertTrue(first_paths.isdisjoint(second_paths))
+        self.assertTrue(
+            all(
+                not (
+                    self._temporary_path / "surface_assets" / path
+                ).exists()
+                for path in first_paths
+            )
+        )
+        self.assertTrue(
+            all(
+                (self._temporary_path / "surface_assets" / path).is_file()
+                for path in second_paths
+            )
+        )
+        self.assertEqual(completed.count(), 2)
+        self.assertEqual(changed.count(), 2)
+        self.assertEqual(content_changed.count(), 2)
+
+    def test_external_texture_family_rejects_invalid_png_without_changes(
+        self,
+    ) -> None:
+        surface_id = "level:2/room:5/wall:1:2"
+        family = _square_texture_family((120, 100, 80, 255))
+        family[2048] = family[1024]
+
+        with self.assertRaisesRegex(ValueError, "must be 2048 x 2048"):
+            self.workspace.import_external_texture_family(
+                assignment_id="invalid-family",
+                source_object_id="cornice-object-2",
+                surface_type="wall",
+                surface_ids=(surface_id,),
+                base_color_png_by_resolution=family,
+            )
+
+        self.assertEqual(self.workspace.get_assignments(), ())
+        asset_directory = self._temporary_path / "surface_assets"
+        self.assertFalse(asset_directory.exists())
 
     def test_retired_surface_controls_are_absent(self) -> None:
         for attribute_name in (

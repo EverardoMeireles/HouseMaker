@@ -4235,6 +4235,10 @@ class GlbViewerWidget(QWidget):
         self._canvas_stair_preview_groups: list[_CanvasStairPreviewRenderGroup] = []
         self._canvas_stair_preview_phase = 0.0
         self._architectural_trim_parts: dict[str, ArchitecturalTrimPart] = {}
+        self._architectural_trim_placed_object_part_ids: dict[
+            str,
+            tuple[str, ...],
+        ] = {}
         self._selected_architectural_trim_part_ids: tuple[str, ...] = ()
         self._architectural_trim_selection_items: list[gl.GLLinePlotItem] = []
         self._highlighted_architectural_trim_part_ids: tuple[str, ...] = ()
@@ -6246,6 +6250,19 @@ class GlbViewerWidget(QWidget):
         ):
             self._cancel_architectural_trim_edit_drag()
         self._architectural_trim_parts = normalized
+        self._architectural_trim_placed_object_part_ids = {
+            object_id: retained_ids
+            for object_id, semantic_ids in (
+                self._architectural_trim_placed_object_part_ids.items()
+            )
+            if (
+                retained_ids := tuple(
+                    semantic_id
+                    for semantic_id in semantic_ids
+                    if semantic_id in normalized
+                )
+            )
+        }
         active_drag = self._architectural_trim_edit_drag
         if active_drag is not None:
             self.set_architectural_trim_edit_preview_parts(
@@ -6268,6 +6285,44 @@ class GlbViewerWidget(QWidget):
         self._refresh_architectural_trim_selection_outlines()
         self._refresh_atlas_architectural_trim_part_highlight_outlines()
         self._refresh_architectural_trim_gizmo_items()
+        return True
+
+    def set_architectural_trim_placed_object_bindings(
+        self,
+        bindings: Mapping[str, Sequence[str]],
+    ) -> bool:
+        """Route generated trim meshes through semantic trim selection."""
+
+        if not isinstance(bindings, Mapping):
+            raise TypeError("Architectural trim object bindings must be a mapping.")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for raw_object_id, raw_semantic_ids in bindings.items():
+            object_id = str(raw_object_id).strip()
+            if not object_id:
+                raise ValueError(
+                    "Architectural trim object binding IDs cannot be empty."
+                )
+            if isinstance(raw_semantic_ids, (str, bytes, bytearray)) or not isinstance(
+                raw_semantic_ids,
+                Sequence,
+            ):
+                raise TypeError(
+                    "Architectural trim object bindings require semantic-ID sequences."
+                )
+            semantic_ids = tuple(
+                dict.fromkeys(
+                    semantic_id
+                    for value in raw_semantic_ids
+                    if (
+                        semantic_id := str(value).strip()
+                    )
+                )
+            )
+            if semantic_ids:
+                normalized[object_id] = semantic_ids
+        if normalized == self._architectural_trim_placed_object_part_ids:
+            return False
+        self._architectural_trim_placed_object_part_ids = normalized
         return True
 
     def set_architectural_trim_edit_targets(
@@ -6483,6 +6538,52 @@ class GlbViewerWidget(QWidget):
         else:
             selected_ids = [normalized_id]
         return self.set_selected_architectural_trim_part_ids(selected_ids)
+
+    def _select_architectural_trim_placed_object(
+        self,
+        object_id: str,
+        *,
+        additive: bool,
+    ) -> bool:
+        """Select or toggle the complete trim represented by one placed mesh."""
+
+        semantic_ids = tuple(
+            semantic_id
+            for semantic_id in self._architectural_trim_placed_object_part_ids.get(
+                str(object_id).strip(),
+                (),
+            )
+            if (
+                (part := self._architectural_trim_parts.get(semantic_id)) is not None
+                and self._architectural_trim_part_is_visible(part)
+            )
+        )
+        if not semantic_ids:
+            return False
+        self._set_selected_placed_object(None)
+        if not additive:
+            next_ids = semantic_ids
+        elif all(
+            semantic_id in self._selected_architectural_trim_part_ids
+            for semantic_id in semantic_ids
+        ):
+            removed_ids = set(semantic_ids)
+            next_ids = tuple(
+                semantic_id
+                for semantic_id in self._selected_architectural_trim_part_ids
+                if semantic_id not in removed_ids
+            )
+        else:
+            next_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *self._selected_architectural_trim_part_ids,
+                        *semantic_ids,
+                    )
+                )
+            )
+        self.set_selected_architectural_trim_part_ids(next_ids)
+        return True
 
     def _architectural_trim_part_is_visible(
         self,
@@ -11712,6 +11813,11 @@ class GlbViewerWidget(QWidget):
             self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
+            if self._select_architectural_trim_placed_object(
+                object_id,
+                additive=additive,
+            ):
+                return
             if additive and object_id in self._selected_placed_object_ids:
                 next_ids = tuple(
                     selected_id
@@ -12476,6 +12582,32 @@ class GlbViewerWidget(QWidget):
                 if semantic_id in visible_trim_part_ids
             )
         )
+        mapped_trim_object_ids = {
+            object_id
+            for object_id in object_ids
+            if object_id in self._architectural_trim_placed_object_part_ids
+        }
+        ordinary_object_ids = tuple(
+            object_id
+            for object_id in object_ids
+            if object_id not in mapped_trim_object_ids
+        )
+        mapped_trim_part_ids = tuple(
+            dict.fromkeys(
+                semantic_id
+                for object_id in object_ids
+                for semantic_id in (
+                    self._architectural_trim_placed_object_part_ids.get(
+                        object_id,
+                        (),
+                    )
+                )
+                if semantic_id in visible_trim_part_ids
+            )
+        )
+        trim_part_ids = tuple(
+            dict.fromkeys((*trim_part_ids, *mapped_trim_part_ids))
+        )
         stair_part_ids = tuple(
             dict.fromkeys(
                 semantic_id
@@ -12494,17 +12626,21 @@ class GlbViewerWidget(QWidget):
                 )
             )
         )
-        if object_ids:
+        if ordinary_object_ids:
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
             next_object_ids = (
-                tuple(dict.fromkeys((*self._selected_placed_object_ids, *object_ids)))
+                tuple(
+                    dict.fromkeys(
+                        (*self._selected_placed_object_ids, *ordinary_object_ids)
+                    )
+                )
                 if result.additive
-                else object_ids
+                else ordinary_object_ids
             )
             self.set_selected_placed_object_ids(
                 next_object_ids,
-                active_object_id=object_ids[-1],
+                active_object_id=ordinary_object_ids[-1],
             )
             return
         if trim_part_ids:

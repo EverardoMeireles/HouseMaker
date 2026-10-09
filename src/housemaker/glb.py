@@ -306,6 +306,8 @@ class PlacedGeneratedModel:
 
     Symmetric preview fields also identify an authored half for GLB metadata;
     the fading mirrored geometry remains an interactive-preview concern only.
+    ``atlas_source_object_id`` may differ from the scene object identity when
+    several fitted meshes intentionally share one authored texture family.
     """
 
     object_id: str
@@ -318,6 +320,7 @@ class PlacedGeneratedModel:
     scale: float = 1.0
     axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
     source_object_id: str | None = None
+    atlas_source_object_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -347,9 +350,21 @@ class PlacedGeneratedModel:
         )
         if not normalized_source_object_id:
             raise ValueError("Placed source-object IDs cannot be empty.")
+        normalized_atlas_source_object_id = (
+            normalized_source_object_id
+            if self.atlas_source_object_id is None
+            else str(self.atlas_source_object_id).strip()
+        )
+        if not normalized_atlas_source_object_id:
+            raise ValueError("Placed Atlas source-object IDs cannot be empty.")
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(self, "object_name", normalized_object_name)
         object.__setattr__(self, "source_object_id", normalized_source_object_id)
+        object.__setattr__(
+            self,
+            "atlas_source_object_id",
+            normalized_atlas_source_object_id,
+        )
         object.__setattr__(self, "world_position", normalized_position)
         object.__setattr__(self, "rotation_degrees", normalized_rotation)
         object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
@@ -1999,7 +2014,9 @@ def _append_placed_half_model_meshes(
         copied_geometry.metadata = copy.deepcopy(
             dict(getattr(copied_geometry, "metadata", {}) or {})
         )
-        copied_geometry.metadata["housemaker_object_id"] = placement.object_id
+        copied_geometry.metadata["housemaker_object_id"] = (
+            placement.atlas_source_object_id
+        )
         _retarget_door_body_marker(
             copied_geometry.metadata,
             placement.object_id,
@@ -2101,7 +2118,9 @@ def _append_placed_model_scene(
         copied_geometry.metadata = copy.deepcopy(
             dict(getattr(copied_geometry, "metadata", {}) or {})
         )
-        copied_geometry.metadata["housemaker_object_id"] = placement.object_id
+        copied_geometry.metadata["housemaker_object_id"] = (
+            placement.atlas_source_object_id
+        )
         _retarget_door_body_marker(
             copied_geometry.metadata,
             placement.object_id,

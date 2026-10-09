@@ -16,6 +16,7 @@ from housemaker.architectural_trim import (
     build_architectural_trim_geometry,
     build_architectural_trim_placement_preview_meshes,
     build_architectural_trim_surface_id,
+    build_cornice_miter_descriptors,
     is_architectural_trim_surface_id,
     remove_architectural_trim,
     update_architectural_trim,
@@ -578,6 +579,155 @@ class ArchitecturalTrimGeometryTests(unittest.TestCase):
             _unique_cornice_slope_normals(committed),
         )
         np.testing.assert_allclose(preview.bounds, committed.bounds)
+
+    def test_compatible_cornices_report_matching_outer_corner_miters(
+        self,
+    ) -> None:
+        level, surfaces = _corner_level_and_surfaces()
+        depth = 0.12
+        first_id = "1" * 32
+        second_id = "2" * 32
+        level.architectural_trims.extend(
+            (
+                ArchitecturalTrimData(
+                    trim_id=first_id,
+                    kind=TRIM_KIND_CORNICE,
+                    wall_surface_ids=(surfaces[0].surface_id,),
+                    depth_meters=depth,
+                ),
+                ArchitecturalTrimData(
+                    trim_id=second_id,
+                    kind=TRIM_KIND_CORNICE,
+                    wall_surface_ids=(surfaces[1].surface_id,),
+                    depth_meters=depth,
+                ),
+            )
+        )
+
+        descriptors = {
+            descriptor.trim_id: descriptor
+            for descriptor in build_cornice_miter_descriptors([level], surfaces)
+        }
+        first_joined = tuple(
+            endpoint
+            for endpoint in (
+                descriptors[first_id].minimum_x,
+                descriptors[first_id].maximum_x,
+            )
+            if endpoint.is_joined
+        )
+        second_joined = tuple(
+            endpoint
+            for endpoint in (
+                descriptors[second_id].minimum_x,
+                descriptors[second_id].maximum_x,
+            )
+            if endpoint.is_joined
+        )
+
+        self.assertEqual(len(first_joined), 1)
+        self.assertEqual(len(second_joined), 1)
+        self.assertEqual(first_joined[0].neighbor_trim_id, second_id)
+        self.assertEqual(second_joined[0].neighbor_trim_id, first_id)
+        np.testing.assert_allclose(
+            first_joined[0].miter_point_world(depth),
+            second_joined[0].miter_point_world(depth),
+        )
+        np.testing.assert_allclose(
+            first_joined[0].world_shift_per_depth,
+            second_joined[0].world_shift_per_depth,
+        )
+        self.assertAlmostEqual(abs(first_joined[0].local_x_shift_per_depth), 1.0)
+        self.assertAlmostEqual(abs(second_joined[0].local_x_shift_per_depth), 1.0)
+
+    def test_reversed_outer_faces_report_matching_cornice_miters(self) -> None:
+        level, surfaces = _corner_level_and_surfaces()
+        reversed_surfaces = tuple(
+            _wall_surface(
+                surface.surface_id,
+                surface.wall_start_world,
+                surface.wall_end_world,
+                reverse_faces=True,
+            )
+            for surface in surfaces
+        )
+        first_id = "3" * 32
+        second_id = "4" * 32
+        level.architectural_trims.extend(
+            (
+                ArchitecturalTrimData(
+                    trim_id=first_id,
+                    kind=TRIM_KIND_CORNICE,
+                    wall_surface_ids=(reversed_surfaces[0].surface_id,),
+                ),
+                ArchitecturalTrimData(
+                    trim_id=second_id,
+                    kind=TRIM_KIND_CORNICE,
+                    wall_surface_ids=(reversed_surfaces[1].surface_id,),
+                ),
+            )
+        )
+
+        descriptors = {
+            descriptor.trim_id: descriptor
+            for descriptor in build_cornice_miter_descriptors(
+                [level],
+                reversed_surfaces,
+            )
+        }
+        joined = {
+            trim_id: next(
+                endpoint
+                for endpoint in (
+                    descriptor.minimum_x,
+                    descriptor.maximum_x,
+                )
+                if endpoint.is_joined
+            )
+            for trim_id, descriptor in descriptors.items()
+        }
+
+        self.assertEqual(joined[first_id].neighbor_trim_id, second_id)
+        self.assertEqual(joined[second_id].neighbor_trim_id, first_id)
+        np.testing.assert_allclose(
+            joined[first_id].miter_point_world(0.05),
+            joined[second_id].miter_point_world(0.05),
+        )
+        self.assertNotEqual(
+            joined[first_id].boundary,
+            joined[second_id].boundary,
+        )
+
+    def test_open_or_different_style_cornices_report_no_miter(self) -> None:
+        level, surfaces = _corner_level_and_surfaces()
+        level.architectural_trims.extend(
+            (
+                ArchitecturalTrimData(
+                    trim_id="5" * 32,
+                    kind=TRIM_KIND_CORNICE,
+                    wall_surface_ids=(surfaces[0].surface_id,),
+                ),
+                ArchitecturalTrimData(
+                    trim_id="6" * 32,
+                    kind=TRIM_KIND_CORNICE,
+                    wall_surface_ids=(surfaces[1].surface_id,),
+                    depth_meters=0.04,
+                ),
+            )
+        )
+
+        descriptors = build_cornice_miter_descriptors([level], surfaces)
+
+        self.assertEqual(len(descriptors), 2)
+        for descriptor in descriptors:
+            for endpoint in (descriptor.minimum_x, descriptor.maximum_x):
+                self.assertFalse(endpoint.is_joined)
+                self.assertIsNone(endpoint.neighbor_trim_id)
+                self.assertEqual(endpoint.local_x_shift_per_depth, 0.0)
+                self.assertEqual(
+                    endpoint.miter_point_world(0.25),
+                    endpoint.wall_point_world,
+                )
 
     def test_compatible_corner_components_form_one_watertight_mitered_run(
         self,

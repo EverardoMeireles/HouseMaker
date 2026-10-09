@@ -19,6 +19,13 @@ from PySide6.QtGui import QKeyEvent, QMatrix4x4
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from housemaker.architectural_trim import (
+    TRIM_PART_FRONT,
+    TRIM_PART_TOP,
+    TRIM_SURFACE_TYPE,
+    ArchitecturalTrimPart,
+    build_architectural_trim_surface_id,
+)
 from housemaker.glb import GeneratedModel, PreviewPlacedObject
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
@@ -90,6 +97,35 @@ def _build_placed_object(
         world_position=world_position,
         rotation_degrees=(0.0, 0.0, 0.0),
     )
+
+
+def _build_trim_parts(
+    trim_id: str,
+    *,
+    x: float,
+) -> tuple[ArchitecturalTrimPart, ...]:
+    """Build two semantic parts so component toggles exercise whole groups."""
+
+    parts: list[ArchitecturalTrimPart] = []
+    for part_index, part_kind in enumerate((TRIM_PART_FRONT, TRIM_PART_TOP)):
+        mesh = trimesh.creation.box(extents=(0.8, 0.2, 0.2))
+        mesh.apply_translation((x, 0.0, 0.2 + part_index * 0.2))
+        parts.append(
+            ArchitecturalTrimPart(
+                trim_id=trim_id,
+                run_id=trim_id,
+                semantic_id=build_architectural_trim_surface_id(
+                    trim_id,
+                    part_kind,
+                ),
+                part_kind=part_kind,
+                surface_type=TRIM_SURFACE_TYPE,
+                mesh=mesh,
+                level_index=0,
+                source_wall_surface_id="level:0/wall:1:2",
+            )
+        )
+    return tuple(parts)
 
 
 def _build_preview_model(
@@ -366,6 +402,53 @@ class CanvasBoxSelectionTests(unittest.TestCase):
             object_ids=object_ids,
             additive=additive,
         )
+
+    def _click_placed_object(
+        self,
+        viewer: GlbViewerWidget,
+        object_id: str,
+        *,
+        additive: bool,
+    ) -> None:
+        """Exercise the actual Canvas object-pick dispatch for one preview."""
+
+        assert viewer.model is not None
+        preview = next(
+            placed
+            for placed in viewer.model.preview_placed_objects
+            if placed.object_id == object_id
+        )
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_forward_ray(),
+            ),
+            patch(
+                "housemaker.viewer._get_nearest_canvas_opening_ray_hit",
+                return_value=None,
+            ),
+            patch(
+                "housemaker.viewer._get_nearest_preview_placed_object_ray_hit",
+                return_value=(preview, np.zeros(3, dtype=float), 1.0),
+            ),
+            patch(
+                "housemaker.viewer._get_nearest_fixed_surface_ray_hit",
+                return_value=None,
+            ),
+            patch(
+                "housemaker.viewer._get_nearest_preview_stair_part_ray_hit",
+                return_value=None,
+            ),
+            patch(
+                "housemaker.viewer._get_nearest_architectural_trim_part_ray_hit",
+                return_value=None,
+            ),
+        ):
+            viewer._handle_window_wall_pick_requested(
+                QPointF(20.0, 20.0),
+                additive=additive,
+            )
 
     def test_short_plain_gesture_delegates_to_existing_exact_click_picker(
         self,
@@ -695,6 +778,150 @@ class CanvasBoxSelectionTests(unittest.TestCase):
         )
         self.assertEqual(viewer.get_selected_placed_object_id(), "table")
         self.assertEqual(viewer.get_selected_canvas_surface_ids(), ())
+
+    def test_generated_trim_clicks_select_and_toggle_complete_components(
+        self,
+    ) -> None:
+        first_object_id = "generated-cornice-one"
+        second_object_id = "generated-cornice-two"
+        first_parts = _build_trim_parts("a" * 32, x=-1.0)
+        second_parts = _build_trim_parts("b" * 32, x=1.0)
+        first_ids = tuple(part.semantic_id for part in first_parts)
+        second_ids = tuple(part.semantic_id for part in second_parts)
+        viewer = self._build_viewer(
+            _build_placed_object(first_object_id),
+            _build_placed_object(second_object_id),
+        )
+
+        # Main publishes replacement bindings before semantic targets during
+        # the first preview load. The binding must survive that ordering.
+        viewer.set_architectural_trim_placed_object_bindings(
+            {
+                first_object_id: first_ids,
+                second_object_id: second_ids,
+            }
+        )
+        viewer.set_architectural_trim_parts((*first_parts, *second_parts))
+
+        self._click_placed_object(
+            viewer,
+            first_object_id,
+            additive=False,
+        )
+        self.assertEqual(
+            viewer.get_selected_architectural_trim_part_ids(),
+            first_ids,
+        )
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ())
+
+        self._click_placed_object(
+            viewer,
+            second_object_id,
+            additive=True,
+        )
+        self.assertEqual(
+            viewer.get_selected_architectural_trim_part_ids(),
+            (*first_ids, *second_ids),
+        )
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ())
+
+        # Shift-clicking any mesh of an already selected generated cornice
+        # removes the complete semantic component rather than one part.
+        self._click_placed_object(
+            viewer,
+            first_object_id,
+            additive=True,
+        )
+        self.assertEqual(
+            viewer.get_selected_architectural_trim_part_ids(),
+            second_ids,
+        )
+
+        # Reverse selection order must produce the same semantic union.
+        viewer.set_selected_architectural_trim_part_ids(())
+        self._click_placed_object(
+            viewer,
+            second_object_id,
+            additive=False,
+        )
+        self._click_placed_object(
+            viewer,
+            first_object_id,
+            additive=True,
+        )
+        self.assertEqual(
+            set(viewer.get_selected_architectural_trim_part_ids()),
+            {*first_ids, *second_ids},
+        )
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ())
+
+    def test_generated_only_box_selection_resolves_to_semantic_trim_parts(
+        self,
+    ) -> None:
+        first_object_id = "generated-cornice-one"
+        second_object_id = "generated-cornice-two"
+        first_parts = _build_trim_parts("c" * 32, x=-1.0)
+        second_parts = _build_trim_parts("d" * 32, x=1.0)
+        expected_ids = tuple(
+            part.semantic_id for part in (*first_parts, *second_parts)
+        )
+        viewer = self._build_viewer(
+            _build_placed_object(first_object_id),
+            _build_placed_object(second_object_id),
+        )
+        viewer.set_architectural_trim_parts((*first_parts, *second_parts))
+        viewer.set_architectural_trim_placed_object_bindings(
+            {
+                first_object_id: tuple(
+                    part.semantic_id for part in first_parts
+                ),
+                second_object_id: tuple(
+                    part.semantic_id for part in second_parts
+                ),
+            }
+        )
+
+        viewer._apply_canvas_rectangle_selection_result(
+            self._result(
+                viewer,
+                object_ids=(first_object_id, second_object_id),
+            )
+        )
+
+        self.assertEqual(
+            viewer.get_selected_architectural_trim_part_ids(),
+            expected_ids,
+        )
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ())
+
+    def test_ordinary_object_keeps_priority_over_mapped_trim_in_box_selection(
+        self,
+    ) -> None:
+        trim_object_id = "generated-cornice"
+        trim_parts = _build_trim_parts("e" * 32, x=-1.0)
+        viewer = self._build_viewer(
+            _build_placed_object(trim_object_id),
+            _build_placed_object("chair", world_position=(2.0, 0.0, 0.0)),
+        )
+        viewer.set_architectural_trim_parts(trim_parts)
+        viewer.set_architectural_trim_placed_object_bindings(
+            {
+                trim_object_id: tuple(
+                    part.semantic_id for part in trim_parts
+                ),
+            }
+        )
+
+        viewer._apply_canvas_rectangle_selection_result(
+            self._result(
+                viewer,
+                object_ids=(trim_object_id, "chair"),
+            )
+        )
+
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ("chair",))
+        self.assertEqual(viewer.get_selected_placed_object_id(), "chair")
+        self.assertEqual(viewer.get_selected_architectural_trim_part_ids(), ())
 
     def test_surface_results_replace_objects_when_no_object_pixel_is_visible(
         self,

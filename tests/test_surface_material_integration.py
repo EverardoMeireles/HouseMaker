@@ -298,7 +298,7 @@ def _triangle_uv_area(uv: np.ndarray) -> float:
 
 # ### Planar UV tests ###
 class SurfaceMaterialPlanarUvTests(unittest.TestCase):
-    def test_floor_typed_vertical_face_uses_wall_like_projection(self) -> None:
+    def test_sloped_face_projection_preserves_in_plane_texture_scale(self) -> None:
         face_vertices = np.asarray(
             (
                 (
@@ -320,7 +320,35 @@ class SurfaceMaterialPlanarUvTests(unittest.TestCase):
 
         self.assertGreater(_triangle_uv_area(uv), 0.0)
         np.testing.assert_allclose(uv[:, 0], (0.0, 2.0, 0.0))
-        np.testing.assert_allclose(uv[:, 1], (0.0, 0.0, 0.8))
+        np.testing.assert_allclose(uv[:, 1], (0.0, 0.0, 1.0))
+        world_edge_length = np.linalg.norm(
+            face_vertices[0, 2] - face_vertices[0, 0]
+        )
+        uv_edge_length = np.linalg.norm(uv[2] - uv[0])
+        self.assertAlmostEqual(float(uv_edge_length), float(world_edge_length))
+
+    def test_vertical_wall_keeps_horizontal_and_up_projection(self) -> None:
+        face_vertices = np.asarray(
+            (
+                (
+                    (0.0, 0.0, 0.0),
+                    (2.0, 0.0, 0.0),
+                    (0.0, 0.0, 3.0),
+                ),
+            ),
+            dtype=float,
+        )
+        face_normals = np.asarray(((0.0, -1.0, 0.0),), dtype=float)
+
+        uv = build_world_planar_face_uvs(
+            face_vertices,
+            face_normals,
+            SURFACE_TYPE_WALL,
+            texture_world_size_meters=1.0,
+        )[0]
+
+        np.testing.assert_allclose(uv[:, 0], (0.0, 2.0, 0.0))
+        np.testing.assert_allclose(uv[:, 1], (0.0, 0.0, 3.0))
 
     def test_wall_typed_horizontal_face_uses_horizontal_projection(self) -> None:
         face_vertices = np.asarray(

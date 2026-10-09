@@ -45,6 +45,14 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid as is_valid_qt_object
 
+from housemaker.architectural_trim_generation import (
+    ArchitecturalTrimRepeatLayout,
+    fit_architectural_trim_glb_to_dimensions,
+    prepare_architectural_trim_repeat_module,
+    repeat_architectural_trim_module_glb,
+    retarget_architectural_trim_repeat_module_glb,
+)
+from housemaker.architectural_trim_uv import build_cornice_segmented_uv_glb
 from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_BACK,
     DOOR_SIDE_DUPLICATION_FRONT,
@@ -92,6 +100,7 @@ from housemaker.meshy_generation import (
     request_image_to_3d_model,
     request_retextured_model,
 )
+from housemaker.models import ARCHITECTURAL_TRIM_KINDS, TRIM_KIND_CORNICE
 from housemaker.object_face_edit import (
     ObjectFaceAdditionResult,
     ObjectFaceDeletionResult,
@@ -235,6 +244,11 @@ SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY = "safe_duplicate_face_removal"
 EXTERNAL_GLB_IMPORT_PIPELINE_KEY = "external_glb_import"
 DOOR_COMPONENT_PIPELINE_KEY = "door_component"
 ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY = "architectural_trim_component"
+ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY = "architectural_trim_repeat"
+CORNICE_SEGMENTED_UV_PIPELINE_KEY = "cornice_segmented_uv"
+CORNICE_SEGMENTED_UV_PIPELINE_VERSION = 1
+CORNICE_MAXIMUM_MODULE_ASPECT_RATIO = 4.0
+MAX_ARCHITECTURAL_TRIM_TRANSFER_CACHE_ENTRIES = 128
 DOOR_SIDE_DUPLICATION_PIPELINE_KEY = "door_side_duplication"
 DOOR_BODY_DISPLACEMENT_PIPELINE_KEY = "door_body_displacement"
 DOOR_SIDE_DUPLICATION_AXIS = 1
@@ -601,6 +615,7 @@ def _apply_architectural_trim_pipeline_metadata(
     pipeline[ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY] = {
         "level_index": target.level_index,
         "trim_id": target.trim_id,
+        "trim_kind": target.trim_kind,
     }
 
 
@@ -816,6 +831,59 @@ def _normalize_door_body_fit_dimensions(
     return normalized[0], normalized[1], normalized[2]
 
 
+def _normalize_architectural_trim_fit_dimensions(
+    raw_dimensions: object,
+) -> tuple[float, float, float] | None:
+    """Validate one trim's width, depth, and height target."""
+
+    if raw_dimensions is None:
+        return None
+    if isinstance(raw_dimensions, (str, bytes, bytearray)):
+        raise TypeError(
+            "Architectural trim fit dimensions must be a numeric sequence."
+        )
+    try:
+        values = tuple(raw_dimensions)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "Architectural trim fit dimensions must be a numeric sequence."
+        ) from error
+    if len(values) != 3:
+        raise ValueError(
+            "Architectural trim fit dimensions require width, depth, and height."
+        )
+    normalized: list[float] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise TypeError("Architectural trim fit dimensions must be numbers.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "Architectural trim fit dimensions must be numbers."
+            ) from error
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(
+                "Architectural trim fit dimensions must be finite and greater "
+                "than zero."
+            )
+        normalized.append(number)
+    return normalized[0], normalized[1], normalized[2]
+
+
+def _normalize_architectural_trim_kind(raw_kind: object) -> str | None:
+    """Validate the optional trim kind carried through generation jobs."""
+
+    if raw_kind is None:
+        return None
+    if not isinstance(raw_kind, str):
+        raise TypeError("Architectural trim kinds must be strings.")
+    normalized = raw_kind.strip().lower()
+    if normalized not in ARCHITECTURAL_TRIM_KINDS:
+        raise ValueError("Unknown architectural trim kind.")
+    return normalized
+
+
 class GenerationRequest:
     """Owned selected-object input passed to Meshy Image-to-3D."""
 
@@ -835,6 +903,8 @@ class GenerationRequest:
         ),
         enabled_pbr_maps: Sequence[str] = (),
         ai_prompt: str = "",
+        architectural_trim_fit_dimensions: Sequence[float] | None = None,
+        architectural_trim_kind: str | None = None,
         door_body_fit_dimensions: Sequence[float] | None = None,
         door_side_duplication: DoorSideDuplication | None = None,
     ) -> None:
@@ -864,9 +934,32 @@ class GenerationRequest:
             enabled_pbr_maps
         )
         self.ai_prompt = normalize_image_to_3d_texture_prompt(ai_prompt)
+        self.architectural_trim_fit_dimensions = (
+            _normalize_architectural_trim_fit_dimensions(
+                architectural_trim_fit_dimensions
+            )
+        )
+        self.architectural_trim_kind = _normalize_architectural_trim_kind(
+            architectural_trim_kind
+        )
+        if (
+            self.architectural_trim_kind is not None
+            and self.architectural_trim_fit_dimensions is None
+        ):
+            raise ValueError(
+                "Architectural trim kinds require target fit dimensions."
+            )
         self.door_body_fit_dimensions = _normalize_door_body_fit_dimensions(
             door_body_fit_dimensions
         )
+        if (
+            self.architectural_trim_fit_dimensions is not None
+            and self.door_body_fit_dimensions is not None
+        ):
+            raise ValueError(
+                "A generation request cannot fit a door and an architectural "
+                "trim at the same time."
+            )
         self.door_side_duplication = _normalize_new_door_side_duplication(
             door_side_duplication,
             preserve_existing=False,
@@ -906,6 +999,8 @@ class TextureRegenerationRequest:
     glass_face_indices: tuple[int, ...] = ()
     glass_double_sided: bool | None = None
     preserve_existing_glass: bool = False
+    architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
+    architectural_trim_kind: str | None = None
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -1013,6 +1108,38 @@ class TextureRegenerationRequest:
                 "Existing glass texture regeneration must preserve original "
                 "UVs."
             )
+        if (
+            self.architectural_trim_repeat_layout is not None
+            and not isinstance(
+                self.architectural_trim_repeat_layout,
+                ArchitecturalTrimRepeatLayout,
+            )
+        ):
+            raise TypeError(
+                "Architectural trim texture generation requires a valid repeat "
+                "layout."
+            )
+        trim_kind = _normalize_architectural_trim_kind(
+            self.architectural_trim_kind
+        )
+        if trim_kind is not None and self.architectural_trim_repeat_layout is None:
+            raise ValueError(
+                "Architectural trim texture generation requires a repeat layout."
+            )
+        uses_segmented_cornice_uv = trim_kind == TRIM_KIND_CORNICE
+        if uses_segmented_cornice_uv and not self.enable_original_uv:
+            raise ValueError(
+                "Cornice texture generation must preserve its segmented UV layout."
+            )
+        if (
+            self.architectural_trim_repeat_layout is not None
+            and self.enable_original_uv
+            and not uses_segmented_cornice_uv
+        ):
+            raise ValueError(
+                "Architectural trim repeat generation must rebuild its UVs."
+            )
+        object.__setattr__(self, "architectural_trim_kind", trim_kind)
         object.__setattr__(self, "glass_face_indices", glass_faces)
         object.__setattr__(
             self,
@@ -1052,6 +1179,9 @@ class _TextureRegenerationPreflight:
     glass_face_indices: tuple[int, ...] = ()
     glass_double_sided: bool | None = None
     preserve_existing_glass: bool = False
+    architectural_trim_fit_dimensions: tuple[float, float, float] | None = None
+    architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
+    architectural_trim_kind: str | None = None
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -1179,6 +1309,53 @@ class _TextureRegenerationPreflight:
             "preserve_existing_glass",
             bool(self.preserve_existing_glass),
         )
+        trim_fit_dimensions = _normalize_architectural_trim_fit_dimensions(
+            self.architectural_trim_fit_dimensions
+        )
+        trim_kind = _normalize_architectural_trim_kind(
+            self.architectural_trim_kind
+        )
+        if trim_kind is not None and trim_fit_dimensions is None:
+            raise ValueError(
+                "Architectural trim kinds require target fit dimensions."
+            )
+        uses_segmented_cornice_uv = trim_kind == TRIM_KIND_CORNICE
+        if (
+            trim_fit_dimensions is not None
+            and self.enable_original_uv
+            and not uses_segmented_cornice_uv
+        ):
+            raise ValueError(
+                "Architectural trim fitting requires Meshy to rebuild its UVs."
+            )
+        if uses_segmented_cornice_uv and not self.enable_original_uv:
+            raise ValueError(
+                "Cornice texture generation must preserve its segmented UV layout."
+            )
+        object.__setattr__(
+            self,
+            "architectural_trim_fit_dimensions",
+            trim_fit_dimensions,
+        )
+        object.__setattr__(self, "architectural_trim_kind", trim_kind)
+        if (
+            self.architectural_trim_repeat_layout is not None
+            and not isinstance(
+                self.architectural_trim_repeat_layout,
+                ArchitecturalTrimRepeatLayout,
+            )
+        ):
+            raise TypeError(
+                "Architectural trim texture generation requires a valid repeat "
+                "layout."
+            )
+        if (
+            self.architectural_trim_repeat_layout is not None
+            and trim_fit_dimensions is None
+        ):
+            raise ValueError(
+                "Architectural trim repeat generation requires target dimensions."
+            )
 
 
 @dataclass(frozen=True)
@@ -1394,6 +1571,8 @@ class _ArchitecturalTrimEditingTarget:
     trim_id: str
     object_id: str
     object_name: str
+    fit_dimensions: tuple[float, float, float]
+    trim_kind: str | None = None
     generation_ready: bool = False
 
     def __post_init__(self) -> None:
@@ -1409,11 +1588,19 @@ class _ArchitecturalTrimEditingTarget:
         normalized_object_name = str(self.object_name).strip()
         if not normalized_object_id or not normalized_object_name:
             raise ValueError("Architectural trim component identities cannot be empty.")
+        fit_dimensions = _normalize_architectural_trim_fit_dimensions(
+            self.fit_dimensions
+        )
+        trim_kind = _normalize_architectural_trim_kind(self.trim_kind)
+        if fit_dimensions is None:
+            raise ValueError("Architectural trim fit dimensions are required.")
         if not isinstance(self.generation_ready, bool):
             raise TypeError("Architectural trim generation readiness must be boolean.")
         object.__setattr__(self, "trim_id", normalized_trim_id)
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(self, "object_name", normalized_object_name)
+        object.__setattr__(self, "fit_dimensions", fit_dimensions)
+        object.__setattr__(self, "trim_kind", trim_kind)
 
 
 @dataclass(frozen=True)
@@ -1507,6 +1694,8 @@ class StagedMeshyGenerationResult(SafeDuplicateProcessedMeshyGenerationResult):
     retexture_topology_changed: bool = False
     visibility_uv_stats: VisibilityUvUnwrapStats | None = None
     scan_projection_stats: ScanProjectionStats | None = None
+    architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
+    cornice_segmented_uv: bool = False
     geometry_only: bool = False
 
 
@@ -1741,6 +1930,7 @@ def _uses_weighted_camera_projection(request: GenerationRequest) -> bool:
     return bool(
         request.settings.use_uv_raycast_for_object_generation
         and not request.geometry_only
+        and request.architectural_trim_kind != TRIM_KIND_CORNICE
     )
 
 
@@ -1749,6 +1939,9 @@ def _texture_regeneration_scan_target(
     symmetry: ObjectSymmetricDivisionMetadata | None,
 ) -> str | None:
     """Return the safe atlas region for one regenerated object's new UVs."""
+
+    if request.architectural_trim_kind == TRIM_KIND_CORNICE:
+        return None
 
     if (
         not request.settings.use_uv_raycast_for_object_generation
@@ -2013,7 +2206,11 @@ class MeshyImagePlanner:
             if use_unused_face_removal
             else None
         )
-        if not request.geometry_only and not use_unused_face_removal:
+        if (
+            not request.geometry_only
+            and not use_unused_face_removal
+            and request.architectural_trim_fit_dimensions is None
+        ):
             _raise_if_generation_cancelled(cancel_event)
             provider_result = request_image_to_3d_model(
                 api_key=request.settings.meshy_api_key,
@@ -2113,10 +2310,55 @@ class MeshyImagePlanner:
             )
             stacked_face_removed_count = removed.stacked_face_removed_count
 
+        architectural_trim_repeat_layout = None
+        if request.architectural_trim_fit_dimensions is not None:
+            if progress_callback is not None:
+                progress_callback(
+                    "Preparing architectural trim repeat module before "
+                    "texturing..."
+                )
+            _raise_if_generation_cancelled(cancel_event)
+            (
+                processed_glb_bytes,
+                architectural_trim_repeat_layout,
+            ) = prepare_architectural_trim_repeat_module(
+                processed_glb_bytes,
+                request.architectural_trim_fit_dimensions,
+                maximum_module_aspect_ratio=(
+                    CORNICE_MAXIMUM_MODULE_ASPECT_RATIO
+                    if request.architectural_trim_kind == TRIM_KIND_CORNICE
+                    else None
+                ),
+            )
+            _raise_if_generation_cancelled(cancel_event)
+
+        uses_segmented_cornice_uv = bool(
+            architectural_trim_repeat_layout is not None
+            and request.architectural_trim_kind == TRIM_KIND_CORNICE
+            and not request.geometry_only
+        )
+        if uses_segmented_cornice_uv:
+            if progress_callback is not None:
+                progress_callback(
+                    "Building aspect-correct cornice texture strips..."
+                )
+            processed_glb_bytes = build_cornice_segmented_uv_glb(
+                processed_glb_bytes,
+                texture_resolution=TEXTURE_RESOLUTION_2048,
+            )
+            _raise_if_generation_cancelled(cancel_event)
+
         if request.geometry_only:
+            final_geometry_glb = processed_glb_bytes
+            if architectural_trim_repeat_layout is not None:
+                final_geometry_glb = repeat_architectural_trim_module_glb(
+                    processed_glb_bytes,
+                    architectural_trim_repeat_layout,
+                )
+                _raise_if_generation_cancelled(cancel_event)
             return StagedMeshyGenerationResult(
                 task_id=geometry_result.task_id,
-                glb_bytes=processed_glb_bytes,
+                glb_bytes=final_geometry_glb,
                 name=geometry_result.name,
                 geometry_task_id=geometry_result.task_id,
                 source_glb_bytes=geometry_result.glb_bytes,
@@ -2143,6 +2385,10 @@ class MeshyImagePlanner:
                 minimum_face_visibility_percentage=(
                     request.settings.minimum_face_visibility_percentage
                 ),
+                architectural_trim_repeat_layout=(
+                    architectural_trim_repeat_layout
+                ),
+                cornice_segmented_uv=uses_segmented_cornice_uv,
                 geometry_only=True,
             )
 
@@ -2166,57 +2412,94 @@ class MeshyImagePlanner:
             api_key=request.settings.meshy_api_key,
             model_glb=processed_glb_bytes,
             reference_images_png=(image_png,),
-            enable_original_uv=False,
+            enable_original_uv=uses_segmented_cornice_uv,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
             enable_pbr=bool(request.enabled_pbr_maps),
         )
         _raise_if_generation_cancelled(cancel_event)
-        textured_result, final_duplicate_cleanup = (
-            _remove_safe_duplicates_from_meshy_result(
-                textured_result,
-                progress_callback,
-                cancel_event,
+        final_duplicate_removed_face_count = 0
+        final_duplicate_group_count = 0
+        if uses_segmented_cornice_uv:
+            textured_result = MeshyGenerationResult(
+                task_id=textured_result.task_id,
+                glb_bytes=replace_object_base_color_texture_from_glb(
+                    processed_glb_bytes,
+                    textured_result.glb_bytes,
+                ),
+                name=textured_result.name,
             )
-        )
+        else:
+            textured_result, final_duplicate_cleanup = (
+                _remove_safe_duplicates_from_meshy_result(
+                    textured_result,
+                    progress_callback,
+                    cancel_event,
+                )
+            )
+            final_duplicate_removed_face_count = (
+                final_duplicate_cleanup.removed_face_count
+            )
+            final_duplicate_group_count = (
+                final_duplicate_cleanup.duplicate_group_count
+            )
         returned_geometry_fingerprint = _build_geometry_fingerprint(
             textured_result.glb_bytes
         )
         retexture_topology_changed = (
             submitted_geometry_fingerprint != returned_geometry_fingerprint
         )
-        if progress_callback is not None:
-            progress_callback("Verifying final textured face visibility...")
-        assert face_removal_options is not None
-        final_removed = remove_unused_faces_from_glb(
-            textured_result.glb_bytes,
-            options=face_removal_options,
-            cancel_requested=(
-                None if cancel_event is None else cancel_event.is_set
-            ),
-            progress_callback=lambda update: report_face_removal(
-                update,
-                final_texture=True,
-            ),
-        )
-        textured_result = MeshyGenerationResult(
-            task_id=textured_result.task_id,
-            glb_bytes=final_removed.glb_bytes,
-            name=textured_result.name,
-        )
+        final_removed = None
+        if use_unused_face_removal and not uses_segmented_cornice_uv:
+            if progress_callback is not None:
+                progress_callback("Verifying final textured face visibility...")
+            assert face_removal_options is not None
+            final_removed = remove_unused_faces_from_glb(
+                textured_result.glb_bytes,
+                options=face_removal_options,
+                cancel_requested=(
+                    None if cancel_event is None else cancel_event.is_set
+                ),
+                progress_callback=lambda update: report_face_removal(
+                    update,
+                    final_texture=True,
+                ),
+            )
+            textured_result = MeshyGenerationResult(
+                task_id=textured_result.task_id,
+                glb_bytes=final_removed.glb_bytes,
+                name=textured_result.name,
+            )
         final_result = _scan_project_provider_result(
             request,
             textured_result,
             progress_callback,
             cancel_event,
         )
+        final_module_glb = final_result.glb_bytes
+        final_glb = final_module_glb
+        if architectural_trim_repeat_layout is not None:
+            if progress_callback is not None:
+                progress_callback("Fitting textured architectural trim module...")
+            final_module_glb = fit_architectural_trim_glb_to_dimensions(
+                final_module_glb,
+                architectural_trim_repeat_layout.module_extents,
+            )
+            _raise_if_generation_cancelled(cancel_event)
+            if progress_callback is not None:
+                progress_callback("Repeating textured architectural trim module...")
+            final_glb = repeat_architectural_trim_module_glb(
+                final_module_glb,
+                architectural_trim_repeat_layout,
+            )
+            _raise_if_generation_cancelled(cancel_event)
         return StagedMeshyGenerationResult(
             task_id=final_result.task_id,
-            glb_bytes=final_result.glb_bytes,
+            glb_bytes=final_glb,
             name=final_result.name,
             geometry_task_id=geometry_result.task_id,
             source_glb_bytes=geometry_result.glb_bytes,
-            postprocessed_glb_bytes=processed_glb_bytes,
+            postprocessed_glb_bytes=final_module_glb,
             original_face_count=original_face_count,
             retained_face_count=retained_face_count,
             removed_face_count=removed_face_count,
@@ -2225,11 +2508,11 @@ class MeshyImagePlanner:
             stacked_face_removed_count=stacked_face_removed_count,
             safe_duplicate_removed_face_count=(
                 geometry_duplicate_cleanup.removed_face_count
-                + final_duplicate_cleanup.removed_face_count
+                + final_duplicate_removed_face_count
             ),
             safe_duplicate_group_count=(
                 geometry_duplicate_cleanup.duplicate_group_count
-                + final_duplicate_cleanup.duplicate_group_count
+                + final_duplicate_group_count
             ),
             geometry_safe_duplicate_removed_face_count=(
                 geometry_duplicate_cleanup.removed_face_count
@@ -2238,24 +2521,34 @@ class MeshyImagePlanner:
                 geometry_duplicate_cleanup.duplicate_group_count
             ),
             retextured_safe_duplicate_removed_face_count=(
-                final_duplicate_cleanup.removed_face_count
+                final_duplicate_removed_face_count
             ),
             retextured_safe_duplicate_group_count=(
-                final_duplicate_cleanup.duplicate_group_count
+                final_duplicate_group_count
             ),
             unused_face_removal_applied=use_unused_face_removal,
             minimum_face_visibility_percentage=(
                 request.settings.minimum_face_visibility_percentage
             ),
-            final_face_removal_applied=True,
-            final_original_face_count=final_removed.original_face_count,
-            final_retained_face_count=final_removed.retained_face_count,
-            final_removed_face_count=final_removed.removed_face_count,
+            final_face_removal_applied=final_removed is not None,
+            final_original_face_count=(
+                0 if final_removed is None else final_removed.original_face_count
+            ),
+            final_retained_face_count=(
+                0 if final_removed is None else final_removed.retained_face_count
+            ),
+            final_removed_face_count=(
+                0 if final_removed is None else final_removed.removed_face_count
+            ),
             final_visibility_removed_face_count=(
-                final_removed.visibility_removed_face_count
+                0
+                if final_removed is None
+                else final_removed.visibility_removed_face_count
             ),
             final_stacked_face_removed_count=(
-                final_removed.stacked_face_removed_count
+                0
+                if final_removed is None
+                else final_removed.stacked_face_removed_count
             ),
             retexture_topology_changed=retexture_topology_changed,
             scan_projection_stats=(
@@ -2265,6 +2558,12 @@ class MeshyImagePlanner:
                     ScanProjectedMeshyGenerationResult,
                 )
                 else None
+            ),
+            architectural_trim_repeat_layout=(
+                architectural_trim_repeat_layout
+            ),
+            cornice_segmented_uv=(
+                request.architectural_trim_kind == TRIM_KIND_CORNICE
             ),
         )
 
@@ -2602,6 +2901,7 @@ class _ObjectGenerationProgressMapper(_BoundedProgressMapper):
         self._uses_staged_pipeline = bool(
             request.geometry_only
             or request.settings.unused_face_removal
+            or request.architectural_trim_fit_dimensions is not None
         )
         self._geometry_only = request.geometry_only
         self._texture_phase = False
@@ -3678,6 +3978,7 @@ class GenerationWorkspace(QWidget):
     placement_requested = Signal(str)
     placement_request_finished = Signal(str)
     new_object_placement_requested = Signal()
+    operation_started = Signal(str, str, object)
     operation_finished = Signal(str)
     generation_batch_started = Signal(object)
     reference_edit_state_changed = Signal()
@@ -3753,6 +4054,10 @@ class GenerationWorkspace(QWidget):
             str,
             tuple[object, ...],
         ] = {}
+        self._architectural_trim_transfer_model_cache: dict[
+            tuple[object, ...],
+            GeneratedModel,
+        ] = {}
         self._object_face_geometry_cache: dict[
             tuple[object, ...],
             ObjectFaceGeometry,
@@ -3764,6 +4069,7 @@ class GenerationWorkspace(QWidget):
         self._active_generation_request: GenerationRequest | None = None
         self._active_object_operation: _ActiveObjectOperation | None = None
         self._shared_control_state_managed_externally = False
+        self._external_surface_generation_target_selected = False
         self._existing_object_placement_request: (
             _ExistingObjectPlacementRequest | None
         ) = None
@@ -4082,7 +4388,9 @@ class GenerationWorkspace(QWidget):
         trim_id: str,
         object_id: str,
         object_name: str,
+        fit_dimensions: Sequence[float],
         model: GeneratedModel,
+        trim_kind: str | None = None,
     ) -> GeneratedObjectRecord:
         """Persist one procedural trim model as a scene-bound source asset."""
 
@@ -4091,6 +4399,8 @@ class GenerationWorkspace(QWidget):
             trim_id=trim_id,
             object_id=object_id,
             object_name=object_name,
+            fit_dimensions=fit_dimensions,
+            trim_kind=trim_kind,
         )
         if self._find_generated_object_record(target.object_id) is not None:
             raise ValueError("The architectural trim object ID is already in use.")
@@ -4104,8 +4414,8 @@ class GenerationWorkspace(QWidget):
             f"architectural-trim-{asset_key}.glb",
             bytes(model.glb_bytes),
         )
-        # Procedural trim seeds intentionally have no UVs. Let Meshy unwrap the
-        # first texture generation instead of requesting original-UV retention.
+        # Procedural seeds remain UV-less until the worker resolves their final
+        # module dimensions. Cornices receive their strip layout at that point.
         pipeline: dict[str, object] = {}
         _apply_architectural_trim_pipeline_metadata(pipeline, target)
         record = GeneratedObjectRecord(
@@ -4218,6 +4528,8 @@ class GenerationWorkspace(QWidget):
         trim_id: str,
         object_id: str,
         object_name: str,
+        fit_dimensions: Sequence[float],
+        trim_kind: str | None = None,
         generation_ready: bool = True,
     ) -> bool:
         """Route Generation actions to one persistent architectural trim."""
@@ -4228,6 +4540,8 @@ class GenerationWorkspace(QWidget):
                 trim_id=trim_id,
                 object_id=object_id,
                 object_name=object_name,
+                fit_dimensions=fit_dimensions,
+                trim_kind=trim_kind,
                 generation_ready=bool(generation_ready),
             )
         except (TypeError, ValueError):
@@ -5065,6 +5379,7 @@ class GenerationWorkspace(QWidget):
             self.show_frame(self._data.current_frame_index)
         self._generated_model_cache.clear()
         self._generated_model_cache_revisions.clear()
+        self._architectural_trim_transfer_model_cache.clear()
         self._object_face_geometry_cache.clear()
         self._displayed_object_snapshot = None
         self._is_rebuilding_generation_data = True
@@ -5246,6 +5561,18 @@ class GenerationWorkspace(QWidget):
         self._shared_control_state_managed_externally = bool(enabled)
         self._sync_controls()
 
+    def set_external_surface_generation_target_selected(
+        self,
+        selected: bool,
+    ) -> None:
+        """Prevent object creation while a shared-scene surface is active."""
+
+        normalized = bool(selected)
+        if normalized == self._external_surface_generation_target_selected:
+            return
+        self._external_surface_generation_target_selected = normalized
+        self._sync_controls()
+
     def get_object_symmetric_division(
         self,
         object_id: str,
@@ -5288,6 +5615,94 @@ class GenerationWorkspace(QWidget):
             return self._load_generated_object_model(record)
         except Exception:
             return None
+
+    def build_architectural_trim_texture_transfer_model(
+        self,
+        object_id: str,
+        target_dimensions: Sequence[float],
+    ) -> GeneratedModel | None:
+        """Retarget one authored trim UV model without planar reprojection."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None or not is_architectural_trim_component_record(record):
+            return None
+        target_extents = _normalize_architectural_trim_fit_dimensions(
+            target_dimensions
+        )
+        if target_extents is None:
+            return None
+        source_layout = _get_architectural_trim_repeat_layout(record)
+        raw_module_path = record.pipeline.get("postprocessed_asset_path")
+        try:
+            if source_layout is not None and isinstance(raw_module_path, str):
+                module_path = self._resolve_meshy_asset_path(raw_module_path)
+                module_revision = _build_generation_asset_revision(
+                    self._asset_directory,
+                    raw_module_path,
+                )
+                cache_key: tuple[object, ...] = (
+                    record.object_id,
+                    "repeat-module",
+                    module_revision,
+                    source_layout.target_extents,
+                    source_layout.module_extents,
+                    source_layout.repeat_count,
+                    target_extents,
+                )
+                cached = self._architectural_trim_transfer_model_cache.get(
+                    cache_key
+                )
+                if cached is not None:
+                    return cached
+                transferred_glb, _target_layout = (
+                    retarget_architectural_trim_repeat_module_glb(
+                        module_path.read_bytes(),
+                        source_layout,
+                        target_extents,
+                    )
+                )
+            else:
+                source_model = self.get_generated_object_model(record.object_id)
+                if source_model is None or not source_model.glb_bytes:
+                    return None
+                active_variant = self.get_active_texture_variant(record.object_id)
+                active_revision = (
+                    None
+                    if active_variant is None
+                    else _build_generation_asset_revision(
+                        self._asset_directory,
+                        active_variant.glb_asset_relative_path,
+                    )
+                )
+                cache_key = (
+                    record.object_id,
+                    "complete-model",
+                    active_revision,
+                    target_extents,
+                )
+                cached = self._architectural_trim_transfer_model_cache.get(
+                    cache_key
+                )
+                if cached is not None:
+                    return cached
+                transferred_glb = fit_architectural_trim_glb_to_dimensions(
+                    source_model.glb_bytes,
+                    target_extents,
+                )
+            transferred_model = import_generated_glb(transferred_glb)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+
+        if (
+            len(self._architectural_trim_transfer_model_cache)
+            >= MAX_ARCHITECTURAL_TRIM_TRANSFER_CACHE_ENTRIES
+        ):
+            oldest_key = next(iter(self._architectural_trim_transfer_model_cache))
+            self._architectural_trim_transfer_model_cache.pop(oldest_key, None)
+        self._architectural_trim_transfer_model_cache[cache_key] = (
+            transferred_model
+        )
+        return transferred_model
 
     def get_active_texture_variant(
         self,
@@ -7091,6 +7506,11 @@ class GenerationWorkspace(QWidget):
         operation_id = runtime.operation_id
         self._object_job_runtimes[operation_id] = runtime
         self._set_legacy_active_job_runtime(runtime)
+        self.operation_started.emit(
+            operation_id,
+            runtime.operation.kind,
+            runtime.operation.target_object_id,
+        )
         manager = self._job_manager
         if manager is not None and runtime.managed_job_id is not None:
             manager.set_cancel_callback(
@@ -7884,6 +8304,7 @@ class GenerationWorkspace(QWidget):
             record,
             preview_model,
             preview_asset_revision=preview_asset_revision,
+            require_host_transition=is_architectural_trim_component_record(record),
         ):
             return False
 
@@ -8934,6 +9355,36 @@ class GenerationWorkspace(QWidget):
                 )
             symmetry = _get_object_symmetric_division_metadata(record)
             side_duplication = get_door_side_duplication_metadata(record)
+            trim_repeat_layout = request.architectural_trim_repeat_layout
+            module_texture_variants: ObjectTextureVariants | None = None
+            if trim_repeat_layout is not None:
+                if (
+                    symmetry is not None
+                    or request.new_symmetric_division_orientation is not None
+                    or side_duplication is not None
+                    or request.new_door_side_duplication is not None
+                ):
+                    raise ValueError(
+                        "Architectural trim repetition cannot be combined "
+                        "with object symmetry or door-side duplication."
+                    )
+                if not isinstance(texture_variants, ObjectTextureVariants):
+                    raise ValueError(
+                        "Architectural trim repetition requires ordinary "
+                        "texture variants."
+                    )
+                module_texture_variants = (
+                    _fit_architectural_trim_texture_variants(
+                        texture_variants,
+                        trim_repeat_layout,
+                    )
+                )
+                texture_variants = (
+                    _repeat_architectural_trim_texture_variants(
+                        module_texture_variants,
+                        trim_repeat_layout,
+                    )
+                )
             new_symmetry: ObjectSymmetricDivisionMetadata | None = None
             if symmetry is not None:
                 _validate_symmetric_texture_regeneration_uvs(
@@ -9020,6 +9471,19 @@ class GenerationWorkspace(QWidget):
             persisted_asset_paths.extend(
                 _iter_variant_metadata_asset_paths(variant_metadata)
             )
+            trim_module_asset_path = None
+            if module_texture_variants is not None:
+                trim_module_resolution = max(
+                    module_texture_variants.glb_by_resolution
+                )
+                trim_module_asset_path = self._persist_meshy_named_asset(
+                    f"{record.object_id}.repeat-module-"
+                    f"{uuid.uuid4().hex}.glb",
+                    module_texture_variants.glb_by_resolution[
+                        trim_module_resolution
+                    ],
+                )
+                persisted_asset_paths.append(trim_module_asset_path)
             selectable_resolutions = (
                 TEXTURE_RESOLUTIONS
                 if isinstance(texture_variants, ObjectTextureVariants)
@@ -9042,6 +9506,16 @@ class GenerationWorkspace(QWidget):
                     else None
                 ),
             )
+            if (
+                trim_repeat_layout is not None
+                and trim_module_asset_path is not None
+            ):
+                next_pipeline[ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY] = (
+                    trim_repeat_layout.to_pipeline_dict()
+                )
+                next_pipeline["postprocessed_asset_path"] = (
+                    trim_module_asset_path
+                )
             if new_symmetry is not None:
                 next_pipeline = _build_automatic_symmetric_generation_pipeline(
                     next_pipeline,
@@ -9080,6 +9554,7 @@ class GenerationWorkspace(QWidget):
             record,
             replacement,
             preview_model,
+            require_host_transition=True,
         ):
             self._remove_newly_persisted_assets(persisted_asset_paths)
             runtime = (
@@ -9226,6 +9701,7 @@ class GenerationWorkspace(QWidget):
             replacement,
             saved.preview_model,
             preview_asset_revision=saved.preview_asset_revision,
+            require_host_transition=True,
         ):
             status = self._format_object_job_status(
                 runtime,
@@ -9535,6 +10011,7 @@ class GenerationWorkspace(QWidget):
             return None
         self._store_current_frame_strokes()
         door_slot_target = self._door_slot_editing_target
+        architectural_trim_target = self._architectural_trim_editing_target
         rebuild_door_body = bool(
             door_slot_target is not None
             and is_door_body_slot(door_slot_target.slot_id)
@@ -9597,6 +10074,16 @@ class GenerationWorkspace(QWidget):
             ),
             enabled_pbr_maps=self._get_enabled_pbr_maps(),
             ai_prompt=self.ai_prompt_edit.text(),
+            architectural_trim_fit_dimensions=(
+                architectural_trim_target.fit_dimensions
+                if architectural_trim_target is not None
+                else None
+            ),
+            architectural_trim_kind=(
+                architectural_trim_target.trim_kind
+                if architectural_trim_target is not None
+                else None
+            ),
             door_body_fit_dimensions=(
                 door_slot_target.door_body_fit_dimensions
                 if door_slot_target is not None and rebuild_door_body
@@ -9646,6 +10133,10 @@ class GenerationWorkspace(QWidget):
                 ),
                 enabled_pbr_maps=template.enabled_pbr_maps,
                 ai_prompt=template.ai_prompt,
+                architectural_trim_fit_dimensions=(
+                    template.architectural_trim_fit_dimensions
+                ),
+                architectural_trim_kind=template.architectural_trim_kind,
                 door_body_fit_dimensions=(
                     template.door_body_fit_dimensions
                 ),
@@ -9761,12 +10252,49 @@ class GenerationWorkspace(QWidget):
             has_complete_texture_uvs = (
                 self._selected_object_has_complete_texture_uvs(record)
             )
+            trim_target = self._architectural_trim_editing_target
+            is_active_architectural_trim = bool(
+                trim_target is not None
+                and trim_target.object_id == record.object_id
+                and get_architectural_trim_component_identity(record)
+                == (trim_target.level_index, trim_target.trim_id)
+            )
+            if (
+                is_architectural_trim_component_record(record)
+                and not is_active_architectural_trim
+            ):
+                self.status_label.setText(
+                    "Select the architectural trim in the 3D scene before "
+                    "generating its texture."
+                )
+                return None
+            uses_segmented_cornice_uv = bool(
+                is_active_architectural_trim
+                and trim_target is not None
+                and trim_target.trim_kind == TRIM_KIND_CORNICE
+            )
             enable_original_uv = bool(
-                is_door_component
-                or preserve_symmetric_uvs
-                or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY)
-                or preserve_existing_glass
-                or (normalized_glass_faces and has_complete_texture_uvs)
+                uses_segmented_cornice_uv
+                or (
+                    not is_active_architectural_trim
+                    and (
+                        is_door_component
+                        or preserve_symmetric_uvs
+                        or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY)
+                        or preserve_existing_glass
+                        or (normalized_glass_faces and has_complete_texture_uvs)
+                    )
+                )
+            )
+            architectural_trim_fit_dimensions = (
+                trim_target.fit_dimensions
+                if is_active_architectural_trim and trim_target is not None
+                else None
+            )
+            architectural_trim_repeat_layout = (
+                _get_architectural_trim_repeat_layout(record)
+                if is_active_architectural_trim
+                else None
             )
             enabled_pbr_maps = (
                 PBR_MAP_TYPES
@@ -9805,6 +10333,17 @@ class GenerationWorkspace(QWidget):
                 glass_face_indices=normalized_glass_faces,
                 glass_double_sided=glass_double_sided,
                 preserve_existing_glass=preserve_existing_glass,
+                architectural_trim_fit_dimensions=(
+                    architectural_trim_fit_dimensions
+                ),
+                architectural_trim_repeat_layout=(
+                    architectural_trim_repeat_layout
+                ),
+                architectural_trim_kind=(
+                    trim_target.trim_kind
+                    if is_active_architectural_trim and trim_target is not None
+                    else None
+                ),
             )
         except Exception as error:
             self.status_label.setText(
@@ -9983,23 +10522,6 @@ class GenerationWorkspace(QWidget):
             or self.object_3d_panel.projection_camera_percentages_are_valid()
         )
         trim_target = self._architectural_trim_editing_target
-        architectural_trim_can_generate_geometry = bool(
-            trim_target is not None
-            and trim_target.generation_ready
-            and selected_record is not None
-            and selected_record.object_id == trim_target.object_id
-            and get_architectural_trim_component_identity(selected_record)
-            == (trim_target.level_index, trim_target.trim_id)
-            and not selected_object_is_busy
-            and not has_untracked_legacy_job
-            and has_reference_source
-            and has_generation_reference
-            and required_key_is_available
-        )
-        architectural_trim_can_generate_model = bool(
-            architectural_trim_can_generate_geometry
-            and projection_camera_percentages_are_valid
-        )
         architectural_trim_can_generate_texture = bool(
             trim_target is not None
             and trim_target.generation_ready
@@ -10082,8 +10604,11 @@ class GenerationWorkspace(QWidget):
             ordinary_geometry_generation_is_available
             and projection_camera_percentages_are_valid
         )
-        if architectural_trim_mode:
-            generate_is_available = architectural_trim_can_generate_model
+        if (
+            architectural_trim_mode
+            or self._external_surface_generation_target_selected
+        ):
+            generate_is_available = False
         elif door_slot_mode:
             generate_is_available = (
                 self._can_regenerate_object_texture(selected_record)
@@ -10099,9 +10624,9 @@ class GenerationWorkspace(QWidget):
             generate_is_available = ordinary_generation_is_available
         self.generate_button.setEnabled(generate_is_available)
         self.generate_geometry_button.setEnabled(
-            architectural_trim_can_generate_geometry
-            if architectural_trim_mode
-            else (
+            not architectural_trim_mode
+            and not self._external_surface_generation_target_selected
+            and (
                 not door_slot_mode
                 and ordinary_geometry_generation_is_available
                 and not self.symmetric_division_checkbox.isChecked()
@@ -11038,6 +11563,16 @@ def _build_staged_generation_pipeline_metadata(
         pipeline.update(
             _build_scan_projection_pipeline_metadata(scan_stats)
         )
+    repeat_layout = result.architectural_trim_repeat_layout
+    if repeat_layout is not None:
+        pipeline[ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY] = (
+            repeat_layout.to_pipeline_dict()
+        )
+    if result.cornice_segmented_uv:
+        pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY] = True
+        pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
+            "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+        }
     return pipeline
 
 
@@ -11047,6 +11582,9 @@ def _resolve_staged_postprocessed_asset_path(
     variant_metadata: Mapping[str, Mapping[str, str]] | None,
 ) -> str | None:
     """Reuse an authoritative saved UV GLB instead of writing a duplicate."""
+
+    if result.architectural_trim_repeat_layout is not None:
+        return None
 
     if not (
         _staged_result_used_visibility_uv(result)
@@ -11311,6 +11849,71 @@ def get_door_side_duplication_metadata(
         return DoorSideDuplicationMetadata.from_pipeline_dict(raw_metadata)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _get_architectural_trim_repeat_layout(
+    record: GeneratedObjectRecord | None,
+) -> ArchitecturalTrimRepeatLayout | None:
+    """Return validated repeat-module provenance for one generated trim."""
+
+    if record is None or not is_architectural_trim_component_record(record):
+        return None
+    raw_metadata = record.pipeline.get(
+        ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY
+    )
+    if raw_metadata is None:
+        return None
+    try:
+        return ArchitecturalTrimRepeatLayout.from_pipeline_dict(raw_metadata)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _repeat_architectural_trim_texture_variants(
+    variants: PersistableObjectTextureVariants,
+    layout: ArchitecturalTrimRepeatLayout,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> ObjectTextureVariants:
+    """Repeat each module GLB while retaining its shared texture images."""
+
+    if not isinstance(variants, ObjectTextureVariants):
+        raise TypeError(
+            "Architectural trim repetition requires ordinary texture variants."
+        )
+    repeated_glbs: dict[int, bytes] = {}
+    for resolution, module_glb in variants.glb_by_resolution.items():
+        _raise_if_generation_cancelled(cancel_event)
+        repeated_glbs[int(resolution)] = (
+            repeat_architectural_trim_module_glb(module_glb, layout)
+        )
+    _raise_if_generation_cancelled(cancel_event)
+    return replace(variants, glb_by_resolution=repeated_glbs)
+
+
+def _fit_architectural_trim_texture_variants(
+    variants: PersistableObjectTextureVariants,
+    layout: ArchitecturalTrimRepeatLayout,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> ObjectTextureVariants:
+    """Restore Meshy-returned trim modules to their authored local frame."""
+
+    if not isinstance(variants, ObjectTextureVariants):
+        raise TypeError(
+            "Architectural trim fitting requires ordinary texture variants."
+        )
+    fitted_glbs: dict[int, bytes] = {}
+    for resolution, module_glb in variants.glb_by_resolution.items():
+        _raise_if_generation_cancelled(cancel_event)
+        fitted_glbs[int(resolution)] = (
+            fit_architectural_trim_glb_to_dimensions(
+                module_glb,
+                layout.module_extents,
+            )
+        )
+    _raise_if_generation_cancelled(cancel_event)
+    return replace(variants, glb_by_resolution=fitted_glbs)
 
 
 def _fit_generated_door_body_texture_variants(
@@ -11920,6 +12523,21 @@ def _build_regenerated_texture_pipeline(
     pipeline.pop(FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY, None)
     for key in LAST_TEXTURE_FACE_REMOVAL_DETAIL_PIPELINE_KEYS:
         pipeline.pop(key, None)
+    if (
+        is_architectural_trim_component_record(record)
+        and not request.enable_original_uv
+    ):
+        pipeline.pop(LOCALLY_AUTHORED_UVS_PIPELINE_KEY, None)
+        pipeline.pop("postprocessed_asset_path", None)
+        for key in FACE_EDIT_INVALIDATED_UV_PROVENANCE_PIPELINE_KEYS:
+            pipeline.pop(key, None)
+    if request.architectural_trim_kind == TRIM_KIND_CORNICE:
+        pipeline.pop(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, None)
+        pipeline.pop(SCAN_PROJECTION_PIPELINE_KEY, None)
+        pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY] = True
+        pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
+            "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+        }
     selected_resolution = _get_selected_texture_resolution(record)
     if selected_resolution not in _selectable_texture_resolutions(record):
         selected_resolution = DEFAULT_TEXTURE_RESOLUTION
@@ -12112,7 +12730,7 @@ def _build_regenerated_texture_pipeline(
         )
     if (
         scan_projection_stats is not None
-        or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY) is True
+        or pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY) is True
     ):
         canonical_resolution = (
             _canonical_texture_resolution(record)
@@ -12612,11 +13230,12 @@ def _persist_object_texture_variants_to_directory(
     created_paths: list[str] = []
     persist = persist_asset
     if persist is None:
-        persist = lambda file_name, payload: _persist_generated_named_asset(
-            asset_directory,
-            file_name,
-            payload,
-        )
+        def persist(file_name: str, payload: bytes) -> str:
+            return _persist_generated_named_asset(
+                asset_directory,
+                file_name,
+                payload,
+            )
     try:
         for resolution in resolutions:
             _raise_if_generation_cancelled(cancel_event)
@@ -12755,6 +13374,45 @@ def _materialize_texture_regeneration_preflight(
             "The target object's source model changed while texture "
             "generation was starting."
         )
+    trim_repeat_layout = raw_request.architectural_trim_repeat_layout
+    trim_fit_dimensions = raw_request.architectural_trim_fit_dimensions
+    trim_kind = raw_request.architectural_trim_kind
+    uses_segmented_cornice_uv = trim_kind == TRIM_KIND_CORNICE
+    repeat_layout_is_too_long = bool(
+        uses_segmented_cornice_uv
+        and trim_repeat_layout is not None
+        and trim_repeat_layout.module_extents[0]
+        > (
+            max(trim_repeat_layout.module_extents[1:])
+            * CORNICE_MAXIMUM_MODULE_ASPECT_RATIO
+        )
+    )
+    if trim_fit_dimensions is not None and (
+        trim_repeat_layout is None
+        or repeat_layout_is_too_long
+        or not np.allclose(
+            trim_repeat_layout.target_extents,
+            trim_fit_dimensions,
+        )
+    ):
+        model_glb, trim_repeat_layout = (
+            prepare_architectural_trim_repeat_module(
+                model_glb,
+                trim_fit_dimensions,
+                maximum_module_aspect_ratio=(
+                    CORNICE_MAXIMUM_MODULE_ASPECT_RATIO
+                    if uses_segmented_cornice_uv
+                    else None
+                ),
+            )
+        )
+        _raise_if_generation_cancelled(cancel_event)
+    if uses_segmented_cornice_uv:
+        model_glb = build_cornice_segmented_uv_glb(
+            model_glb,
+            texture_resolution=TEXTURE_RESOLUTION_2048,
+        )
+        _raise_if_generation_cancelled(cancel_event)
     import_generated_glb(model_glb)
     submitted_fingerprint = (
         build_uv_fingerprint(model_glb)
@@ -12794,6 +13452,8 @@ def _materialize_texture_regeneration_preflight(
         glass_face_indices=raw_request.glass_face_indices,
         glass_double_sided=raw_request.glass_double_sided,
         preserve_existing_glass=raw_request.preserve_existing_glass,
+        architectural_trim_repeat_layout=trim_repeat_layout,
+        architectural_trim_kind=trim_kind,
     )
     return _MaterializedTextureRegeneration(
         request=request,
@@ -13064,6 +13724,37 @@ def _prepare_and_persist_texture_regeneration(
             raise ValueError(
                 "The regenerated model has no selectable texture variants."
             )
+        trim_repeat_layout = (
+            outcome.request.architectural_trim_repeat_layout
+        )
+        module_texture_variants: ObjectTextureVariants | None = None
+        if trim_repeat_layout is not None:
+            if (
+                symmetry is not None
+                or outcome.request.new_symmetric_division_orientation
+                is not None
+                or door_side_duplication is not None
+                or outcome.request.new_door_side_duplication is not None
+            ):
+                raise ValueError(
+                    "Architectural trim repetition cannot be combined with "
+                    "object symmetry or door-side duplication."
+                )
+            if not isinstance(texture_variants, ObjectTextureVariants):
+                raise ValueError(
+                    "Architectural trim repetition requires ordinary texture "
+                    "variants."
+                )
+            module_texture_variants = _fit_architectural_trim_texture_variants(
+                texture_variants,
+                trim_repeat_layout,
+                cancel_event=cancel_event,
+            )
+            texture_variants = _repeat_architectural_trim_texture_variants(
+                module_texture_variants,
+                trim_repeat_layout,
+                cancel_event=cancel_event,
+            )
         if symmetry is not None:
             _validate_symmetric_texture_regeneration_uvs(outcome, symmetry)
             canonical_provider_glb = texture_variants.glb_by_resolution[
@@ -13152,6 +13843,20 @@ def _prepare_and_persist_texture_regeneration(
         persisted_asset_paths.extend(
             _iter_variant_metadata_asset_paths(variant_metadata)
         )
+        trim_module_asset_path = None
+        if module_texture_variants is not None:
+            trim_module_resolution = max(
+                module_texture_variants.glb_by_resolution
+            )
+            trim_module_asset_path = _persist_generated_named_asset(
+                asset_directory,
+                f"{outcome.request.object_id}.repeat-module-"
+                f"{uuid.uuid4().hex}.glb",
+                module_texture_variants.glb_by_resolution[
+                    trim_module_resolution
+                ],
+            )
+            persisted_asset_paths.append(trim_module_asset_path)
         selectable_resolutions = (
             TEXTURE_RESOLUTIONS
             if isinstance(texture_variants, ObjectTextureVariants)
@@ -13173,6 +13878,16 @@ def _prepare_and_persist_texture_regeneration(
                 else None
             ),
         )
+        if (
+            trim_repeat_layout is not None
+            and trim_module_asset_path is not None
+        ):
+            next_pipeline[ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY] = (
+                trim_repeat_layout.to_pipeline_dict()
+            )
+            next_pipeline["postprocessed_asset_path"] = (
+                trim_module_asset_path
+            )
         if new_symmetry is not None:
             next_pipeline = _build_automatic_symmetric_generation_pipeline(
                 next_pipeline,

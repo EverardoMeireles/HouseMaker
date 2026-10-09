@@ -162,6 +162,41 @@ class ObjectReferenceEditingPipelineTests(unittest.TestCase):
         self.assertTrue(result.flags.owndata)
         self.assertTrue(result.flags.c_contiguous)
 
+    def test_opaque_scene_reference_is_not_described_as_an_isolated_mask(self) -> None:
+        source = _source_bgra()
+        source[:, :, 3] = 255
+        editor = RecordingEditor((205, 155, 105, 255))
+
+        edit_object_reference(
+            source,
+            "Extract and straighten the ornate cornice.",
+            api_key="test-key",
+            image_editor=editor,
+        )
+
+        prompt = " ".join(str(editor.calls[0]["prompt"]).lower().split())
+        self.assertIn("unmasked scene photograph", prompt)
+        self.assertIn("do not reproduce the room, walls, ceiling", prompt)
+        self.assertIn("extract and straighten the ornate cornice", prompt)
+
+    def test_qwen_opaque_scene_uses_scene_extraction_instructions(self) -> None:
+        source = _source_bgra()
+        source[:, :, 3] = 255
+        editor = RecordingEditor((205, 155, 105, 255))
+
+        edit_object_reference(
+            source,
+            "Extract one repeating cornice module.",
+            model="Qwen-Image-2.1",
+            api_key="",
+            image_editor=editor,
+        )
+
+        prompt = " ".join(str(editor.calls[0]["prompt"]).lower().split())
+        self.assertIn("unmasked scene photograph", prompt)
+        self.assertIn("one repeating cornice module", prompt)
+        self.assertNotIn("rgba image with transparency", prompt)
+
     def test_rejects_provider_output_that_is_not_1024_square(self) -> None:
         def wrong_size_editor(*_args: object, **_kwargs: object) -> bytes:
             return _png_bytes(np.full((512, 1024, 4), 101, dtype=np.uint8))

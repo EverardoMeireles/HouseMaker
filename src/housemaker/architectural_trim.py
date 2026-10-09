@@ -55,6 +55,14 @@ TRIM_ENDPOINT_TOLERANCE_METERS = 1e-5
 TRIM_GEOMETRY_EPSILON = 1e-8
 TRIM_ROUNDED_PROFILE_SEGMENTS = 8
 TRIM_CORNICE_ROUNDED_PROFILE_SEGMENTS = 16
+TRIM_MITER_BOUNDARY_MINIMUM_X = "minimum_x"
+TRIM_MITER_BOUNDARY_MAXIMUM_X = "maximum_x"
+TRIM_MITER_BOUNDARIES = frozenset(
+    {
+        TRIM_MITER_BOUNDARY_MINIMUM_X,
+        TRIM_MITER_BOUNDARY_MAXIMUM_X,
+    }
+)
 _TRIM_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TRIM_SURFACE_ID_PATTERN = re.compile(
     r"^trim:(?P<trim_id>[0-9a-f]{32})/"
@@ -65,13 +73,17 @@ __all__ = [
     "TRIM_KIND_CORNICE",
     "TRIM_KIND_EDGING_STRIP",
     "TRIM_KIND_SKIRTING_BOARD",
+    "TRIM_MITER_BOUNDARY_MAXIMUM_X",
+    "TRIM_MITER_BOUNDARY_MINIMUM_X",
     "TRIM_PART_BOTTOM",
     "TRIM_PART_FRONT",
     "TRIM_PART_KINDS",
     "TRIM_PART_SIDES",
     "TRIM_PART_TOP",
+    "ArchitecturalTrimCorniceMiterDescriptor",
     "ArchitecturalTrimEditHandle",
     "ArchitecturalTrimEditTarget",
+    "ArchitecturalTrimEndpointMiter",
     "ArchitecturalTrimGeometry",
     "ArchitecturalTrimPart",
     "ArchitecturalTrimPlacementRequest",
@@ -79,9 +91,10 @@ __all__ = [
     "add_architectural_trim",
     "build_architectural_trim_edit_targets",
     "build_architectural_trim_geometry",
-    "build_architectural_trim_placement_preview_meshes",
     "build_architectural_trim_parts",
+    "build_architectural_trim_placement_preview_meshes",
     "build_architectural_trim_surface_id",
+    "build_cornice_miter_descriptors",
     "get_architectural_trim",
     "is_architectural_trim_surface_id",
     "parse_architectural_trim_surface_id",
@@ -212,6 +225,83 @@ class ArchitecturalTrimGeometry:
     @property
     def parts(self) -> tuple[ArchitecturalTrimPart, ...]:
         return tuple(part for run in self.runs for part in run.parts)
+
+
+@dataclass(frozen=True)
+class ArchitecturalTrimEndpointMiter:
+    """One canonical local-X cornice boundary and its optional miter shear."""
+
+    boundary: str
+    wall_point_world: tuple[float, float, float]
+    world_shift_per_depth: tuple[float, float, float]
+    local_x_shift_per_depth: float
+    neighbor_trim_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.boundary not in TRIM_MITER_BOUNDARIES:
+            raise ValueError("Unknown architectural trim miter boundary.")
+        wall_point = _normalize_vector3(self.wall_point_world, "miter wall point")
+        world_shift = _normalize_vector3(
+            self.world_shift_per_depth,
+            "miter world shift",
+        )
+        local_shift = float(self.local_x_shift_per_depth)
+        if not math.isfinite(local_shift):
+            raise ValueError("Architectural trim miter shifts must be finite.")
+        neighbor_trim_id = (
+            None
+            if self.neighbor_trim_id is None
+            else str(self.neighbor_trim_id).strip().lower()
+        )
+        if neighbor_trim_id is not None and (
+            _TRIM_ID_PATTERN.fullmatch(neighbor_trim_id) is None
+        ):
+            raise ValueError("Architectural trim miter neighbors require valid IDs.")
+        if neighbor_trim_id is None and (
+            abs(local_shift) > TRIM_GEOMETRY_EPSILON
+            or np.linalg.norm(world_shift) > TRIM_GEOMETRY_EPSILON
+        ):
+            raise ValueError("Open architectural trim ends cannot have miter shifts.")
+        object.__setattr__(self, "wall_point_world", wall_point)
+        object.__setattr__(self, "world_shift_per_depth", world_shift)
+        object.__setattr__(self, "local_x_shift_per_depth", local_shift)
+        object.__setattr__(self, "neighbor_trim_id", neighbor_trim_id)
+
+    @property
+    def is_joined(self) -> bool:
+        return self.neighbor_trim_id is not None
+
+    def miter_point_world(self, profile_offset_meters: float) -> tuple[float, float, float]:
+        """Return the procedural miter point for one wall-normal profile offset."""
+
+        offset = float(profile_offset_meters)
+        if not math.isfinite(offset):
+            raise ValueError("Architectural trim profile offsets must be finite.")
+        point = np.asarray(self.wall_point_world, dtype=float) + (
+            np.asarray(self.world_shift_per_depth, dtype=float) * offset
+        )
+        return tuple(float(value) for value in point)
+
+
+@dataclass(frozen=True)
+class ArchitecturalTrimCorniceMiterDescriptor:
+    """Miter shears for both canonical local-X boundaries of one cornice."""
+
+    level_index: int
+    trim_id: str
+    minimum_x: ArchitecturalTrimEndpointMiter
+    maximum_x: ArchitecturalTrimEndpointMiter
+
+    def __post_init__(self) -> None:
+        normalized_id = str(self.trim_id).strip().lower()
+        if _TRIM_ID_PATTERN.fullmatch(normalized_id) is None:
+            raise ValueError("Architectural trim miter descriptors require valid IDs.")
+        if self.minimum_x.boundary != TRIM_MITER_BOUNDARY_MINIMUM_X:
+            raise ValueError("The minimum-X cornice miter is assigned incorrectly.")
+        if self.maximum_x.boundary != TRIM_MITER_BOUNDARY_MAXIMUM_X:
+            raise ValueError("The maximum-X cornice miter is assigned incorrectly.")
+        object.__setattr__(self, "level_index", int(self.level_index))
+        object.__setattr__(self, "trim_id", normalized_id)
 
 
 @dataclass(frozen=True)
@@ -483,6 +573,61 @@ def build_architectural_trim_parts(
     return build_architectural_trim_geometry(levels, wall_surfaces).parts
 
 
+def build_cornice_miter_descriptors(
+    levels: Sequence[LevelData],
+    wall_surfaces: Sequence[object] | None = None,
+) -> tuple[ArchitecturalTrimCorniceMiterDescriptor, ...]:
+    """Describe exact procedural corner miters in each cornice's local frame.
+
+    Generated cornices use X along their length and centered Y across their
+    depth. A consumer can shear either local-X boundary by
+    ``local_x_shift_per_depth * (y + depth / 2)``. Open ends report zero.
+    """
+
+    level_sequence = tuple(levels)
+    surface_by_id = _resolve_wall_surfaces(level_sequence, wall_surfaces)
+    descriptors: list[ArchitecturalTrimCorniceMiterDescriptor] = []
+    for level in level_sequence:
+        spans: list[_WallSpan] = []
+        descriptor_span_indices: list[int] = []
+        for trim in level.architectural_trims:
+            if trim.kind != TRIM_KIND_CORNICE:
+                continue
+            try:
+                validated = validate_architectural_trim_placement(
+                    level,
+                    trim,
+                    tuple(surface_by_id.values()),
+                )
+            except (TypeError, ValueError):
+                continue
+            trim_spans = tuple(
+                span
+                for surface_id in validated.wall_surface_ids
+                if (surface := surface_by_id.get(surface_id)) is not None
+                if (span := _build_wall_span(validated, surface)) is not None
+            )
+            if len(trim_spans) == 1:
+                descriptor_span_indices.append(len(spans))
+            spans.extend(trim_spans)
+        adjacency = _build_linear_span_adjacency(spans)
+        for span_index in descriptor_span_indices:
+            descriptors.append(
+                _build_cornice_miter_descriptor(
+                    level.index,
+                    span_index,
+                    spans,
+                    adjacency,
+                )
+            )
+    return tuple(
+        sorted(
+            descriptors,
+            key=lambda descriptor: (descriptor.level_index, descriptor.trim_id),
+        )
+    )
+
+
 def build_architectural_trim_placement_preview_meshes(
     request: ArchitecturalTrimPlacementRequest,
     wall_surfaces: Sequence[object],
@@ -662,25 +807,7 @@ def _build_linear_trim_runs(
     if not spans:
         return []
 
-    adjacency: dict[int, set[int]] = {index: set() for index in range(len(spans))}
-    grouped_by_style: dict[tuple[object, ...], list[int]] = defaultdict(list)
-    for index, span in enumerate(spans):
-        grouped_by_style[_trim_style_signature(span.trim)].append(index)
-    for indices in grouped_by_style.values():
-        endpoint_incidence: dict[tuple[int, int], list[int]] = defaultdict(list)
-        for index in indices:
-            span = spans[index]
-            endpoint_incidence[_point_key(span.start[:2])].append(index)
-            endpoint_incidence[_point_key(span.end[:2])].append(index)
-        for incident_indices in endpoint_incidence.values():
-            unique_indices = tuple(dict.fromkeys(incident_indices))
-            for first_index, second_index in _select_safe_incident_joins(
-                unique_indices,
-                spans,
-            ):
-                adjacency[first_index].add(second_index)
-                adjacency[second_index].add(first_index)
-
+    adjacency = _build_linear_span_adjacency(spans)
     runs: list[ArchitecturalTrimRun] = []
     unseen = set(range(len(spans)))
     while unseen:
@@ -702,6 +829,144 @@ def _build_linear_trim_runs(
         if run is not None:
             runs.append(run)
     return _merge_runs_with_shared_trim_owners(runs)
+
+
+def _build_linear_span_adjacency(
+    spans: Sequence[_WallSpan],
+) -> dict[int, set[int]]:
+    """Resolve the same safe, style-compatible joins used by procedural runs."""
+
+    adjacency: dict[int, set[int]] = {index: set() for index in range(len(spans))}
+    grouped_by_style: dict[tuple[object, ...], list[int]] = defaultdict(list)
+    for index, span in enumerate(spans):
+        grouped_by_style[_trim_style_signature(span.trim)].append(index)
+    for indices in grouped_by_style.values():
+        endpoint_incidence: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for index in indices:
+            span = spans[index]
+            endpoint_incidence[_point_key(span.start[:2])].append(index)
+            endpoint_incidence[_point_key(span.end[:2])].append(index)
+        for incident_indices in endpoint_incidence.values():
+            unique_indices = tuple(dict.fromkeys(incident_indices))
+            for first_index, second_index in _select_safe_incident_joins(
+                unique_indices,
+                spans,
+            ):
+                adjacency[first_index].add(second_index)
+                adjacency[second_index].add(first_index)
+    return adjacency
+
+
+def _build_cornice_miter_descriptor(
+    level_index: int,
+    span_index: int,
+    spans: Sequence[_WallSpan],
+    adjacency: Mapping[int, set[int]],
+) -> ArchitecturalTrimCorniceMiterDescriptor:
+    span = spans[span_index]
+    width_axis = np.cross(span.normal, np.asarray((0.0, 0.0, 1.0), dtype=float))
+    width_axis /= np.linalg.norm(width_axis)
+    ordered_endpoints = (span.start, span.end)
+    if float(np.dot(span.start[:2], width_axis[:2])) > float(
+        np.dot(span.end[:2], width_axis[:2])
+    ):
+        ordered_endpoints = tuple(reversed(ordered_endpoints))
+    endpoint_data = (
+        (ordered_endpoints[0], TRIM_MITER_BOUNDARY_MINIMUM_X),
+        (ordered_endpoints[1], TRIM_MITER_BOUNDARY_MAXIMUM_X),
+    )
+    endpoints = tuple(
+        _build_cornice_endpoint_miter(
+            span_index,
+            point,
+            boundary,
+            spans,
+            adjacency,
+            width_axis,
+        )
+        for point, boundary in endpoint_data
+    )
+    minimum_x, maximum_x = endpoints
+    return ArchitecturalTrimCorniceMiterDescriptor(
+        level_index=level_index,
+        trim_id=span.trim.trim_id,
+        minimum_x=minimum_x,
+        maximum_x=maximum_x,
+    )
+
+
+def _build_cornice_endpoint_miter(
+    span_index: int,
+    endpoint: np.ndarray,
+    boundary: str,
+    spans: Sequence[_WallSpan],
+    adjacency: Mapping[int, set[int]],
+    width_axis: np.ndarray,
+) -> ArchitecturalTrimEndpointMiter:
+    span = spans[span_index]
+    wall_point = np.asarray(
+        (endpoint[0], endpoint[1], span.maximum_z),
+        dtype=float,
+    )
+    joined_index = next(
+        (
+            candidate_index
+            for candidate_index in sorted(adjacency[span_index])
+            if (
+                shared_point := _shared_span_point(
+                    span,
+                    spans[candidate_index],
+                )
+            )
+            is not None
+            and np.linalg.norm(shared_point - endpoint[:2])
+            <= TRIM_ENDPOINT_TOLERANCE_METERS
+        ),
+        None,
+    )
+    if joined_index is None:
+        return ArchitecturalTrimEndpointMiter(
+            boundary=boundary,
+            wall_point_world=tuple(float(value) for value in wall_point),
+            world_shift_per_depth=(0.0, 0.0, 0.0),
+            local_x_shift_per_depth=0.0,
+        )
+
+    joined_span = spans[joined_index]
+    shared_point = _shared_span_point(span, joined_span)
+    assert shared_point is not None
+    unit_miter_point = _mitered_offset_point(
+        shared_point,
+        span,
+        joined_span,
+        1.0,
+    )
+    if unit_miter_point is None:
+        return ArchitecturalTrimEndpointMiter(
+            boundary=boundary,
+            wall_point_world=tuple(float(value) for value in wall_point),
+            world_shift_per_depth=(0.0, 0.0, 0.0),
+            local_x_shift_per_depth=0.0,
+        )
+    world_shift = np.asarray(
+        (
+            unit_miter_point[0] - shared_point[0],
+            unit_miter_point[1] - shared_point[1],
+            0.0,
+        ),
+        dtype=float,
+    )
+    return ArchitecturalTrimEndpointMiter(
+        boundary=boundary,
+        wall_point_world=(
+            float(shared_point[0]),
+            float(shared_point[1]),
+            float(span.maximum_z),
+        ),
+        world_shift_per_depth=tuple(float(value) for value in world_shift),
+        local_x_shift_per_depth=float(np.dot(world_shift, width_axis)),
+        neighbor_trim_id=joined_span.trim.trim_id,
+    )
 
 
 def _select_safe_incident_joins(

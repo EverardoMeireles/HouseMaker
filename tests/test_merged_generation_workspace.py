@@ -11,14 +11,16 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import numpy as np
+import trimesh
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QSignalSpy
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.ceiling_height_estimation import (
@@ -43,6 +45,7 @@ from housemaker.merged_generation_workspace import (
     MergedGenerationWorkspace,
 )
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.surface_geometry import FixedSurface
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import (
     SURFACE_TEXTURE_JOB_KIND,
@@ -420,7 +423,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
 
         controls_layout = self.workspace.controls_row.layout()
         self.assertGreaterEqual(
-            controls_layout.stretch(2),
+            controls_layout.stretch(1),
             controls_layout.stretch(0),
         )
 
@@ -477,7 +480,16 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertIs(
             actions_layout.itemAt(1).widget(),
+            self.workspace.generate_texture_stack,
+        )
+        self.assertEqual(self.workspace.generate_texture_stack.count(), 2)
+        self.assertIs(
+            self.workspace.generate_texture_stack.widget(0),
             self.objects.generate_texture_button,
+        )
+        self.assertIs(
+            self.workspace.generate_texture_stack.widget(1),
+            self.surfaces.generate_button,
         )
         settings_layout = generation_settings.layout()
         self.assertIs(
@@ -562,8 +574,76 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             )
         )
         self.assertIs(creation_layout.itemAt(1).widget(), generation_settings)
-        self.assertIs(creation_layout.itemAt(2).widget(), primary_actions)
-        self.assertIs(creation_layout.itemAt(3).widget(), generation_actions)
+        self.assertIs(
+            creation_layout.itemAt(2).widget(),
+            self.workspace.texture_provider_control,
+        )
+        self.assertIs(creation_layout.itemAt(3).widget(), primary_actions)
+        self.assertIs(creation_layout.itemAt(4).widget(), generation_actions)
+
+    def test_surface_controls_are_folded_into_contextual_object_actions(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            self.workspace.findChild(
+                QWidget,
+                "merged_generation_surface_controls",
+            )
+        )
+        self.assertTrue(
+            self.workspace.object_creation_section.isAncestorOf(
+                self.surfaces.surface_texture_provider_combo
+            )
+        )
+        provider_label = self.workspace.texture_provider_control.findChild(QLabel)
+        self.assertIsNotNone(provider_label)
+        assert provider_label is not None
+        self.assertEqual(provider_label.text(), "Texture provider")
+
+        reference = np.full((8, 8, 4), 255, dtype=np.uint8)
+        settings = replace(
+            self.objects.get_runtime_settings(),
+            meshy_api_key="meshy-test-key",
+        )
+        self.objects.set_runtime_settings(settings)
+        self.surfaces.set_runtime_settings(settings)
+        self.objects.set_temporary_object_reference(reference)
+        self.surfaces.set_temporary_reference(reference)
+        self.workspace.sync_shared_controls()
+        self.assertIs(
+            self.workspace.generate_texture_stack.currentWidget(),
+            self.objects.generate_texture_button,
+        )
+        self.assertTrue(self.objects.generate_button.isEnabled())
+        self.assertTrue(self.objects.generate_geometry_button.isEnabled())
+
+        mesh = trimesh.creation.box(extents=(1.0, 0.1, 1.0))
+        surface = FixedSurface(
+            surface_id="level:0/room:0/wall:1:2",
+            surface_type="wall",
+            level_index=0,
+            room_index=0,
+            mesh=mesh,
+            area_square_meters=float(mesh.area),
+        )
+        self.surfaces.set_scene_surface_selection((surface,))
+
+        self.assertIs(
+            self.workspace.generate_texture_stack.currentWidget(),
+            self.surfaces.generate_button,
+        )
+        self.assertTrue(self.surfaces.generate_button.isEnabled())
+        self.assertFalse(self.objects.generate_button.isEnabled())
+        self.assertFalse(self.objects.generate_geometry_button.isEnabled())
+
+        self.surfaces.set_scene_surface_selection(())
+
+        self.assertIs(
+            self.workspace.generate_texture_stack.currentWidget(),
+            self.objects.generate_texture_button,
+        )
+        self.assertTrue(self.objects.generate_button.isEnabled())
+        self.assertTrue(self.objects.generate_geometry_button.isEnabled())
 
     def test_material_controls_are_boxed_in_requested_order(self) -> None:
         material_section = self.workspace.findChild(

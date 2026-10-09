@@ -9,11 +9,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import cv2
 import numpy as np
+import trimesh
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
@@ -22,6 +24,7 @@ from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.generation_workspace import GenerationWorkspace
 from housemaker.merged_generation_workspace import MergedGenerationWorkspace
+from housemaker.surface_geometry import FixedSurface
 from housemaker.surface_texture_workspace import (
     SurfaceTextureGenerationWorkspace,
 )
@@ -71,6 +74,18 @@ def _reference_bgra() -> np.ndarray:
     image[:, :, 3] = 220
     image[:3, :4, 3] = 0
     return image
+
+
+def _selected_wall_surface() -> FixedSurface:
+    mesh = trimesh.creation.box(extents=(1.0, 0.1, 1.0))
+    return FixedSurface(
+        surface_id=f"trim:{'a' * 32}/part:front:wall",
+        surface_type="wall",
+        level_index=2,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=float(mesh.area),
+    )
 
 
 def _bgra_to_qimage(image_bgra: np.ndarray) -> QImage:
@@ -143,6 +158,17 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         _qt_application.clipboard().setImage(_bgra_to_qimage(image_bgra))
         self.workspace.sync_shared_controls()
         _qt_application.processEvents()
+
+    def _enable_surface_generation(self) -> FixedSurface:
+        surface = _selected_wall_surface()
+        self.surfaces.set_scene_surface_selection((surface,))
+        self.surfaces.set_runtime_settings(
+            replace(
+                self.surfaces.get_runtime_settings(),
+                meshy_api_key="surface-test-key",
+            )
+        )
+        return surface
 
     def test_reference_media_buttons_share_the_load_video_row(self) -> None:
         expected_buttons = (
@@ -264,6 +290,98 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         self.assertFalse(self.workspace.seekbar.isEnabled())
         self.assertFalse(self.workspace.paint_mask_button.isEnabled())
         self.assertFalse(self.workspace.erase_mask_button.isEnabled())
+        self.workspace.reference_edit_model_combo.setCurrentIndex(
+            self.workspace.reference_edit_model_combo.findData(
+                "Qwen-Image-2.1"
+            )
+        )
+        self.workspace.reference_edit_prompt.setText("Remove the cover.")
+        self.workspace.sync_shared_controls()
+        self.assertTrue(self.workspace.reference_edit_prompt.isEnabled())
+        self.assertTrue(self.workspace.edit_reference_button.isEnabled())
+
+    def test_pasted_reference_is_used_for_surface_generation(self) -> None:
+        surface = self._enable_surface_generation()
+        reference = _reference_bgra()
+        self._set_clipboard_reference(reference)
+
+        self.workspace.paste_inpaint_button.click()
+
+        self.assertTrue(self.surfaces.has_temporary_reference())
+        np.testing.assert_array_equal(
+            self.surfaces.get_temporary_reference(),
+            reference,
+        )
+        self.assertTrue(self.surfaces.generate_button.isEnabled())
+        request = self.surfaces._build_request()
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.surface_ids, (surface.surface_id,))
+        self.assertEqual(len(request.reference_pngs), 1)
+        decoded = cv2.imdecode(
+            np.frombuffer(request.reference_pngs[0], dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        np.testing.assert_array_equal(decoded, reference)
+
+    def test_loaded_reference_is_used_for_surface_generation(self) -> None:
+        surface = self._enable_surface_generation()
+        reference = _reference_bgra()
+        image_path = Path(self.temporary_directory.name) / "surface-reference.png"
+        self.assertTrue(cv2.imwrite(str(image_path), reference))
+
+        with patch(
+            "housemaker.merged_generation_workspace.QFileDialog.getOpenFileName",
+            return_value=(str(image_path), "Image files"),
+        ):
+            self.workspace.load_reference_image_button.click()
+
+        self.assertTrue(self.surfaces.has_temporary_reference())
+        np.testing.assert_array_equal(
+            self.surfaces.get_temporary_reference(),
+            reference,
+        )
+        self.assertTrue(self.surfaces.generate_button.isEnabled())
+        request = self.surfaces._build_request()
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.surface_ids, (surface.surface_id,))
+        self.assertEqual(len(request.reference_pngs), 1)
+        decoded = cv2.imdecode(
+            np.frombuffer(request.reference_pngs[0], dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        np.testing.assert_array_equal(decoded, reference)
+
+    def test_temporary_reference_survives_same_frame_backend_refreshes(
+        self,
+    ) -> None:
+        self._load_video()
+        reference = _reference_bgra()
+        self._set_clipboard_reference(reference)
+        self.workspace.paste_inpaint_button.click()
+
+        self.objects.show_frame(0)
+        _qt_application.processEvents()
+
+        self.assertTrue(self.objects.has_temporary_object_reference())
+        np.testing.assert_array_equal(
+            self.workspace.video_view.get_reference_preview_bgra(),
+            reference,
+        )
+        np.testing.assert_array_equal(
+            self.objects.get_current_object_generation_reference(),
+            reference,
+        )
+
+        self.surfaces.show_frame(0)
+        _qt_application.processEvents()
+
+        self.assertTrue(self.objects.has_temporary_object_reference())
+        np.testing.assert_array_equal(
+            self.workspace.video_view.get_reference_preview_bgra(),
+            reference,
+        )
 
 
 if __name__ == "__main__":

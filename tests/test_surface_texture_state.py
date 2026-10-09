@@ -318,6 +318,28 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
 
 # ### Assignment validation tests ###
 class SurfaceTextureAssignmentTests(unittest.TestCase):
+    def test_source_object_id_round_trips_and_defaults_for_legacy_data(
+        self,
+    ) -> None:
+        assignment = replace(
+            _assignment(),
+            source_object_id=" trim-cornice-1 ",
+        )
+
+        payload = assignment.to_dict()
+        self.assertEqual(payload["source_object_id"], "trim-cornice-1")
+        restored = SurfaceTextureAssignment.from_dict(payload)
+        payload.pop("source_object_id")
+        legacy = SurfaceTextureAssignment.from_dict(payload)
+
+        self.assertEqual(assignment.source_object_id, "trim-cornice-1")
+        self.assertEqual(restored, assignment)
+        self.assertIsNone(legacy.source_object_id)
+
+    def test_source_object_id_rejects_excessive_length(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source object ID is too long"):
+            replace(_assignment(), source_object_id="x" * 513)
+
     def test_tiling_fix_needed_round_trips_and_defaults_for_legacy_data(
         self,
     ) -> None:
@@ -442,7 +464,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 11)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 12)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,

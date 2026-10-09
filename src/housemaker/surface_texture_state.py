@@ -22,7 +22,7 @@ from housemaker.pbr_maps import (
 from housemaker.video_source import VideoMetadata
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 11
+SURFACE_TEXTURE_SCHEMA_VERSION = 12
 SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
@@ -61,6 +61,7 @@ MAX_PROVIDER_NAME_LENGTH = 128
 MAX_PROVIDER_TASK_ID_LENGTH = 512
 MAX_ASSET_PATH_LENGTH = 2_048
 MAX_ASSIGNMENT_DISPLAY_NAME_LENGTH = 256
+MAX_SOURCE_OBJECT_ID_LENGTH = 512
 MAX_AREA_DESCRIPTION_LENGTH = 4_096
 MAX_COMBINED_AREA_M2 = 1_000_000_000.0
 MAX_TEXTURE_DIMENSION_PIXELS = 16_384
@@ -182,6 +183,7 @@ class SurfaceTextureAssignment:
     tiling_seed: int = 0
     texture_repeat_size_m: float = DEFAULT_TEXTURE_REPEAT_SIZE_M
     tiling_fix_needed: bool = False
+    source_object_id: str | None = None
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -217,6 +219,11 @@ class SurfaceTextureAssignment:
             "Surface texture display name",
             MAX_ASSIGNMENT_DISPLAY_NAME_LENGTH,
         ) or ""
+        source_object_id = _normalize_optional_text(
+            self.source_object_id,
+            "Surface texture source object ID",
+            MAX_SOURCE_OBJECT_ID_LENGTH,
+        )
         combined_area_m2 = _normalize_combined_area(self.combined_area_m2)
         area_description = _normalize_optional_text(
             self.area_description,
@@ -309,6 +316,7 @@ class SurfaceTextureAssignment:
             provider_pbr_task_id,
         )
         object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(self, "source_object_id", source_object_id)
         object.__setattr__(self, "combined_area_m2", combined_area_m2)
         object.__setattr__(self, "area_description", area_description)
         object.__setattr__(
@@ -380,6 +388,7 @@ class SurfaceTextureAssignment:
             "tiling_seed": self.tiling_seed,
             "texture_repeat_size_m": self.texture_repeat_size_m,
             "tiling_fix_needed": self.tiling_fix_needed,
+            "source_object_id": self.source_object_id,
         }
 
     @classmethod
@@ -467,6 +476,7 @@ class SurfaceTextureAssignment:
                 DEFAULT_TEXTURE_REPEAT_SIZE_M,
             ),
             tiling_fix_needed=payload.get("tiling_fix_needed", False),
+            source_object_id=payload.get("source_object_id"),
         )
 
 

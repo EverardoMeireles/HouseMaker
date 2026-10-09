@@ -420,22 +420,23 @@ def build_world_planar_face_uvs(
     uv_coordinates = np.empty((len(vertices), 3, 2), dtype=float)
     for face_index, triangle_vertices in enumerate(vertices):
         normal = normals[face_index]
-        horizontal_normal_magnitude = float(
-            max(abs(normal[0]), abs(normal[1]))
-        )
-        if horizontal_normal_magnitude > abs(float(normal[2])):
-            tangent = np.array((-normal[1], normal[0], 0.0), dtype=float)
-            tangent_length = float(np.linalg.norm(tangent))
-            if tangent_length <= SURFACE_MATERIAL_EPSILON:
-                tangent = np.array((1.0, 0.0, 0.0), dtype=float)
-            else:
-                tangent /= tangent_length
+        normal_length = float(np.linalg.norm(normal))
+        tangent = np.array((-normal[1], normal[0], 0.0), dtype=float)
+        tangent_length = float(np.linalg.norm(tangent))
+        if (
+            normal_length > SURFACE_MATERIAL_EPSILON
+            and tangent_length > SURFACE_MATERIAL_EPSILON
+        ):
+            normal = normal / normal_length
+            tangent /= tangent_length
+            bitangent = np.cross(normal, tangent)
+            bitangent /= np.linalg.norm(bitangent)
             uv_coordinates[face_index, :, 0] = (
                 triangle_vertices @ tangent
             ) / tile_size
             uv_coordinates[face_index, :, 1] = (
-                triangle_vertices[:, 2] / tile_size
-            )
+                triangle_vertices @ bitangent
+            ) / tile_size
         else:
             uv_coordinates[face_index, :, 0] = (
                 triangle_vertices[:, 0] / tile_size

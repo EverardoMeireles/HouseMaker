@@ -22,6 +22,7 @@ from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.generation_workspace import GenerationWorkspace
 from housemaker.merged_generation_workspace import (
+    ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION,
     OBJECT_REFERENCE_EDIT_JOB_KIND,
     MergedGenerationWorkspace,
 )
@@ -55,6 +56,16 @@ def _reference_frame() -> np.ndarray:
     frame[:, :, 1] = np.arange(48, dtype=np.uint8)[:, None]
     frame[:, :, 2] = 180
     return frame
+
+
+def _temporary_reference() -> np.ndarray:
+    reference = np.empty((37, 53, 4), dtype=np.uint8)
+    reference[:, :, 0] = np.arange(53, dtype=np.uint8)[None, :]
+    reference[:, :, 1] = np.arange(37, dtype=np.uint8)[:, None]
+    reference[:, :, 2] = 210
+    reference[:, :, 3] = 255
+    reference[:5, :7, 3] = 0
+    return reference
 
 
 def _write_test_video(path: Path, *, frame_count: int = 1) -> None:
@@ -336,6 +347,67 @@ class ObjectReferenceEditUiWorkflowTests(unittest.TestCase):
             retried_request.selected_object_bgra,
             retried_preview,
         )
+
+    def test_temporary_reference_can_be_edited_and_retried_from_its_source(
+        self,
+    ) -> None:
+        source = _temporary_reference()
+        self.workspace._activate_temporary_object_reference(
+            source,
+            source_label="Loaded image",
+        )
+
+        self.assertTrue(self.workspace.edit_reference_button.isEnabled())
+        self.workspace.edit_reference_button.click()
+        self.assertTrue(
+            _wait_until(lambda: self.workspace._object_reference_edit_runtime is None)
+        )
+
+        self.assertEqual(len(self.editor_calls), 1)
+        np.testing.assert_array_equal(self.editor_calls[0][0], source)
+        self.assertTrue(self.objects.has_temporary_object_reference())
+        self.assertFalse(self.objects.has_current_accepted_object_reference())
+        first_result = self.objects.get_temporary_object_reference()
+        self.assertIsNotNone(first_result)
+        np.testing.assert_array_equal(
+            self.workspace.video_view.get_reference_preview_bgra(),
+            first_result,
+        )
+        np.testing.assert_array_equal(
+            self.objects._build_generation_requests()[0].selected_object_bgra,
+            first_result,
+        )
+
+        self.workspace.edit_reference_button.click()
+        self.assertTrue(
+            _wait_until(lambda: self.workspace._object_reference_edit_runtime is None)
+        )
+
+        self.assertEqual(len(self.editor_calls), 2)
+        np.testing.assert_array_equal(self.editor_calls[1][0], source)
+        second_result = self.objects.get_temporary_object_reference()
+        self.assertIsNotNone(second_result)
+        self.assertFalse(np.array_equal(first_result, second_result))
+        np.testing.assert_array_equal(
+            self.workspace.video_view.get_reference_preview_bgra(),
+            second_result,
+        )
+
+    def test_trim_selection_prefills_only_an_empty_edit_instruction(self) -> None:
+        self.workspace.reference_edit_prompt.clear()
+
+        self.objects.architectural_trim_editing_changed.emit(True)
+
+        self.assertEqual(
+            self.workspace.reference_edit_prompt.text(),
+            ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION,
+        )
+
+        custom_prompt = "Keep this custom cornice instruction."
+        self.workspace.reference_edit_prompt.setText(custom_prompt)
+        self.objects.architectural_trim_editing_changed.emit(True)
+
+        self.assertEqual(self.workspace.reference_edit_prompt.text(), custom_prompt)
 
     def test_manual_reference_edit_buttons_are_removed(self) -> None:
         old_button_names = (

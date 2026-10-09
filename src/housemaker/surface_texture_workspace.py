@@ -104,6 +104,7 @@ SHUTDOWN_WAIT_MILLISECONDS = 250
 SURFACE_TEXTURE_JOB_KIND = "Surface texture"
 _PROGRESS_PERCENT_PATTERN = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
 TILING_PREVIEW_TILE_EDGE_PIXELS = 180
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 # ### Level synchronization helpers ###
@@ -721,6 +722,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._shared_scene_selected_surface_ids: tuple[str, ...] = ()
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
+        self._temporary_reference_bgra: np.ndarray | None = None
         self._is_syncing_seekbar = False
         self._generation_threads: dict[str, QThread] = {}
         self._generation_workers: dict[str, SurfaceTextureWorker] = {}
@@ -812,6 +814,282 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._emit_data_changed()
         self.surface_content_changed.emit()
         return renamed
+
+    # ### External texture family API ###
+    def import_external_texture_family(
+        self,
+        *,
+        assignment_id: str,
+        source_object_id: str | None,
+        surface_type: str,
+        surface_ids: Sequence[str],
+        base_color_png_by_resolution: Mapping[int, bytes],
+        pbr_png_by_map_and_resolution: (
+            Mapping[str, Mapping[int, bytes]] | None
+        ) = None,
+        selected_resolution: int = DEFAULT_SURFACE_TEXTURE_RESOLUTION,
+        display_name: str = "",
+        provider: str = "external-object-generation",
+        provider_task_id: str | None = None,
+        provider_pbr_task_id: str | None = None,
+        enabled_pbr_maps: Sequence[str] | None = None,
+        tiling_fix_needed: bool = False,
+    ) -> SurfaceTextureAssignment:
+        """Transactionally import one externally generated texture family.
+
+        The caller retains ownership of every input buffer.  This workspace
+        validates and copies the complete 512/1024/2048 family into uniquely
+        named files below its own asset root before changing project state.
+        Reusing ``assignment_id`` replaces that assignment while preserving
+        the stable ID observed by Atlas and undo integrations.
+        """
+
+        if isinstance(surface_ids, str | bytes | bytearray):
+            raise TypeError("Surface texture targets must contain a sequence.")
+        normalized_surface_type = str(surface_type).strip().lower()
+        normalized_surface_ids = tuple(
+            dict.fromkeys(normalize_surface_id(value) for value in surface_ids)
+        )
+        if any(
+            get_surface_type_for_id(surface_id) != normalized_surface_type
+            for surface_id in normalized_surface_ids
+        ):
+            raise ValueError(
+                "External texture targets must match their surface type."
+            )
+
+        surfaces_by_id = self._all_existing_surfaces_by_id()
+        if any(
+            (surface := surfaces_by_id.get(surface_id)) is None
+            or surface.surface_type != normalized_surface_type
+            for surface_id in normalized_surface_ids
+        ):
+            raise ValueError(
+                "External texture targets must be current semantic surfaces."
+            )
+
+        normalized_assignment_id = str(assignment_id).strip()
+        existing_assignment = self._assignment_by_id(normalized_assignment_id)
+        if (
+            existing_assignment is not None
+            and self._assignment_is_reserved(existing_assignment)
+        ) or self._surface_targets_are_reserved(normalized_surface_ids):
+            raise RuntimeError(
+                "The external Surface texture target is currently busy."
+            )
+
+        try:
+            raw_pbr_family = dict(pbr_png_by_map_and_resolution or {})
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "External PBR textures must contain a mapping."
+            ) from error
+        normalized_pbr_family: dict[str, dict[int, bytes]] = {}
+        for raw_map_type, raw_resolution_map in raw_pbr_family.items():
+            map_type = str(raw_map_type).strip().lower()
+            if map_type in normalized_pbr_family:
+                raise ValueError(
+                    "External PBR textures contain duplicate map IDs."
+                )
+            if not isinstance(raw_resolution_map, Mapping):
+                raise TypeError(
+                    "Each external PBR texture must contain a resolution mapping."
+                )
+            normalized_pbr_family[map_type] = dict(raw_resolution_map)
+        normalize_pbr_map_types(
+            tuple(normalized_pbr_family),
+            label="External surface texture PBR maps",
+        )
+
+        texture_family = SurfaceTextureVariants(
+            texture_png_by_resolution=dict(base_color_png_by_resolution),
+            map_png_by_resolution=normalized_pbr_family,
+            tiling_fix_needed=tiling_fix_needed,
+        )
+        _validate_external_surface_texture_family(texture_family)
+        if (
+            isinstance(selected_resolution, bool)
+            or not isinstance(selected_resolution, int)
+            or selected_resolution not in SURFACE_TEXTURE_RESOLUTIONS
+        ):
+            raise ValueError(
+                "The selected external texture resolution must be 512, "
+                "1024 or 2048."
+            )
+
+        available_pbr_maps = tuple(
+            map_type
+            for map_type in PBR_MAP_TYPES
+            if map_type in (texture_family.map_png_by_resolution or {})
+        )
+        normalized_enabled_maps = (
+            available_pbr_maps
+            if enabled_pbr_maps is None
+            else normalize_pbr_map_types(
+                enabled_pbr_maps,
+                label="Enabled external surface texture PBR maps",
+            )
+        )
+        if any(
+            map_type not in available_pbr_maps
+            for map_type in normalized_enabled_maps
+        ):
+            raise ValueError(
+                "Enabled external PBR maps must have imported texture files."
+            )
+
+        asset_token = f"surface-import-{uuid.uuid4().hex}"
+        try:
+            saved_output = self._persist_texture_variants(
+                normalized_surface_ids,
+                asset_token,
+                texture_family,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"The external Surface texture could not be saved: {error}"
+            ) from error
+
+        try:
+            active_variant = next(
+                variant
+                for variant in saved_output.variants
+                if variant.resolution == selected_resolution
+            )
+            area_m2 = float(
+                sum(
+                    surfaces_by_id[surface_id].area_square_meters
+                    for surface_id in normalized_surface_ids
+                )
+            )
+            imported_assignment = SurfaceTextureAssignment(
+                assignment_id=normalized_assignment_id,
+                surface_type=normalized_surface_type,
+                surface_ids=normalized_surface_ids,
+                provider=provider,
+                provider_task_id=provider_task_id,
+                provider_pbr_task_id=provider_pbr_task_id,
+                asset_path=active_variant.asset_path,
+                combined_area_m2=area_m2,
+                area_description=_build_surface_area_description(
+                    normalized_surface_type,
+                    normalized_surface_ids,
+                    area_m2,
+                ),
+                texture_width=selected_resolution,
+                texture_height=selected_resolution,
+                texture_variants=saved_output.variants,
+                selected_texture_resolution=selected_resolution,
+                display_name=display_name,
+                enabled_pbr_maps=normalized_enabled_maps,
+                available_pbr_maps=available_pbr_maps,
+                pbr_alignment_version=SURFACE_PBR_ALIGNMENT_VERSION,
+                tiling_fix_needed=saved_output.tiling_fix_needed,
+                source_object_id=source_object_id,
+            )
+        except (OSError, TypeError, ValueError):
+            self._discard_saved_outputs((saved_output,))
+            raise
+
+        previous_assignments = list(self._data.assignments)
+        replaced_assignments = tuple(
+            assignment
+            for assignment in previous_assignments
+            if assignment.assignment_id == normalized_assignment_id
+        )
+        retained_assignments = [
+            assignment
+            for assignment in self._replace_assignments_for_surfaces(
+                (imported_assignment,),
+                surface_areas={
+                    surface_id: float(surface.area_square_meters)
+                    for surface_id, surface in surfaces_by_id.items()
+                },
+            )
+            if assignment.assignment_id != normalized_assignment_id
+        ]
+        self._data.assignments = [
+            *retained_assignments,
+            imported_assignment,
+        ]
+        self._invalidate_assignment_caches()
+        try:
+            self._restore_assignment_textures()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._data.assignments = previous_assignments
+            self._invalidate_assignment_caches()
+            try:
+                self._restore_assignment_textures()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+            self._discard_saved_outputs((saved_output,))
+            raise
+
+        cleanup_failure_count = self._delete_orphaned_assignment_assets(
+            replaced_assignments
+        )
+        status = (
+            f"Imported {display_name!r} as a Surface texture."
+            if str(display_name).strip()
+            else "Imported the generated texture as a Surface texture."
+        )
+        if cleanup_failure_count:
+            status += (
+                f" {cleanup_failure_count} replaced texture file(s) could "
+                "not be deleted."
+            )
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.generation_completed.emit(imported_assignment)
+        self.surface_content_changed.emit()
+        self._sync_controls()
+        return imported_assignment
+
+    # ### Temporary reference API ###
+    def set_temporary_reference(
+        self,
+        reference_bgra: np.ndarray,
+    ) -> None:
+        """Use an external BGRA image instead of the painted video masks."""
+
+        reference = np.asarray(reference_bgra)
+        if (
+            reference.ndim != 3
+            or reference.shape[2] != 4
+            or reference.size == 0
+        ):
+            raise ValueError(
+                "The surface reference must be a non-empty BGRA image."
+            )
+        if reference.dtype != np.uint8:
+            reference = np.clip(reference, 0, 255).astype(np.uint8)
+        if not np.any(reference[:, :, 3] > 0):
+            raise ValueError("The surface reference is fully transparent.")
+
+        self._temporary_reference_bgra = (
+            np.ascontiguousarray(reference).copy()
+        )
+        self._sync_controls()
+
+    def clear_temporary_reference(self) -> bool:
+        """Discard the external image while preserving video and mask data."""
+
+        if self._temporary_reference_bgra is None:
+            return False
+        self._temporary_reference_bgra = None
+        self._sync_controls()
+        return True
+
+    def get_temporary_reference(self) -> np.ndarray | None:
+        """Return a defensive copy of the active external reference image."""
+
+        reference = self._temporary_reference_bgra
+        return None if reference is None else reference.copy()
+
+    def has_temporary_reference(self) -> bool:
+        """Report whether an external image overrides painted video masks."""
+
+        return self._temporary_reference_bgra is not None
 
     # ### Shared scene selection API ###
     def set_scene_surface_selection(
@@ -950,6 +1228,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             Path | dict[str, Path] | SurfaceMaterialSourceSpec,
         ] = {}
         for assignment in self._data.assignments:
+            if assignment.source_object_id is not None:
+                # Object-backed cornice atlases require their authored mesh
+                # UVs. Applying them through the generic planar Surface path
+                # samples unrelated atlas fragments on every other cornice.
+                continue
             map_paths = self.get_assignment_map_asset_paths(
                 assignment.assignment_id,
                 assignment.selected_texture_resolution,
@@ -2410,6 +2693,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             raise RuntimeError(
                 "Cannot replace surface texture data while generating."
             )
+        self._temporary_reference_bgra = None
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = SurfaceTextureData() if data is None else data.clone()
@@ -2661,6 +2945,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def load_video(self, video_path: str) -> None:
         metadata = probe_video(video_path)
         next_source = VideoFrameSource(metadata.path)
+        self._temporary_reference_bgra = None
         self._close_video_source()
         self._displayed_frame_index = None
         self._video_source = next_source
@@ -2686,6 +2971,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         except (IndexError, ValueError) as error:
             self.status_label.setText(str(error))
             return
+        if (
+            self._displayed_frame_index is not None
+            and safe_index != self._displayed_frame_index
+        ):
+            self._temporary_reference_bgra = None
         self._data.current_frame_index = safe_index
         self._displayed_frame_index = safe_index
         self.video_view.set_frame(
@@ -2701,9 +2991,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         if request is None:
             return
-        reference_input = self._build_reference_input(request)
-        if reference_input is None:
-            return
+        reference_input = None
+        if not request.reference_pngs:
+            reference_input = self._build_reference_input(request)
+            if reference_input is None:
+                return
         self._start_generation(request, reference_input=reference_input)
 
     def shutdown(self) -> None:
@@ -2749,6 +3041,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_surface_targets.clear()
         self._generation_submission_order.clear()
         self._latest_applied_generation_order.clear()
+        self._temporary_reference_bgra = None
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -3004,8 +3297,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if not selection.is_valid or surface_type is None:
             self.status_label.setText("Select at least one fixed surface first.")
             return None
+        temporary_reference = self.get_temporary_reference()
         frame_indices = tuple(sorted(self._data.frame_strokes))
-        if not frame_indices:
+        if temporary_reference is None and not frame_indices:
             self.status_label.setText(
                 "Paint at least one material reference in the video."
             )
@@ -3019,7 +3313,16 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 f"Configure the {provider_name} API key in Settings."
             )
             return None
-        if defer_reference_preparation:
+        if temporary_reference is not None:
+            try:
+                reference_pngs = (
+                    _encode_provider_reference_png(temporary_reference),
+                )
+            except ValueError as error:
+                self.status_label.setText(str(error))
+                return None
+            used_frame_indices = (int(self._data.current_frame_index),)
+        elif defer_reference_preparation:
             reference_pngs = ()
             used_frame_indices = frame_indices
         else:
@@ -3984,6 +4287,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _sync_controls(self) -> None:
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
+        has_reference = self.has_temporary_reference() or (
+            has_video and has_mask
+        )
         selection = self._get_surface_selection_snapshot()
         has_surface = selection.is_valid
         has_key = bool(self._settings.surface_texture_api_key)
@@ -4003,8 +4309,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.video_view.set_interaction_enabled(has_video)
         self.surface_texture_provider_combo.setEnabled(True)
         self.generate_button.setEnabled(
-            has_video
-            and has_mask
+            has_reference
             and has_surface
             and has_key
         )
@@ -4016,6 +4321,31 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self._video_source is not None:
             self._video_source.close()
         self._video_source = None
+
+
+# ### External texture family helpers ###
+def _validate_external_surface_texture_family(
+    texture_family: SurfaceTextureVariants,
+) -> None:
+    """Require real square PNGs matching every declared resolution."""
+
+    map_families = texture_family.map_png_by_resolution or {}
+    for map_type, png_by_resolution in map_families.items():
+        for resolution in SURFACE_TEXTURE_RESOLUTIONS:
+            texture_png = png_by_resolution[resolution]
+            if not bytes(texture_png).startswith(PNG_SIGNATURE):
+                raise ValueError(
+                    f"The external {map_type} {resolution} texture must be PNG."
+                )
+            decoded = _decode_png_rgba(
+                texture_png,
+                f"External {map_type} {resolution} texture",
+            )
+            if decoded.shape[:2] != (resolution, resolution):
+                raise ValueError(
+                    f"The external {map_type} texture declared as "
+                    f"{resolution} must be {resolution} x {resolution}."
+                )
 
 
 # ### Worker helpers ###

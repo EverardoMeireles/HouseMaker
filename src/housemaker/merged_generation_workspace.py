@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -73,6 +74,7 @@ from housemaker.generation_workspace import (
     GENERATION_JOB_KIND_TEXTURE,
     GenerationWorkspace,
 )
+from housemaker.models import TRIM_KIND_CORNICE
 from housemaker.object_reference_editing import (
     DEFAULT_OBJECT_REFERENCE_EDIT_MODEL,
     OBJECT_REFERENCE_EDIT_MODEL_OPTIONS,
@@ -108,6 +110,14 @@ DOOR_SLOT_GENERATION_HIDDEN_STYLE = (
 )
 OBJECT_REFERENCE_EDIT_STATUS_EMPTY = (
     "Select one object, describe the change, then click Edit reference."
+)
+OBJECT_REFERENCE_EDIT_SOURCE_MASK = "mask"
+OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY = "temporary"
+ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION = (
+    "Isolate one complete repeating cornice or moulding module. Straighten it "
+    "into an orthographic horizontal view. Remove the wall, ceiling, room, "
+    "scenery, and perspective distortion. Preserve the module's relief, "
+    "profile, proportions, material, and surface detail."
 )
 OBJECT_REFERENCE_EDIT_PROMPT_PRESETS = (
     "show me a front of it",
@@ -272,6 +282,7 @@ class _ObjectReferenceEditRuntime:
     """GUI-owned lifecycle and stale-input guard for one reference edit."""
 
     signature: tuple[object, ...]
+    source_kind: str
     model: str
     prompt: str
     job_id: str
@@ -279,27 +290,37 @@ class _ObjectReferenceEditRuntime:
     cancel_requested: bool = False
 
 
+@dataclass
+class _TemporaryObjectReferenceSession:
+    """Keep one external reference coherent across same-frame refreshes."""
+
+    source_bgra: np.ndarray
+    active_bgra: np.ndarray
+    source_label: str
+    revision: int
+    generation_data_identity: int
+    video_source: object | None
+    frame_index: int | None
+
+
 # ### Overlapping workflow outlines ###
 class _WorkflowControlsRow(QWidget):
-    """Draw overlapping Surface and Object bounds around one shared section."""
+    """Draw Surface and Object workflow bounds around two visible columns."""
 
     def __init__(
         self,
-        surface_controls: QWidget,
         shared_controls: QWidget,
         object_controls: QWidget,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("merged_generation_controls_row")
-        self._surface_controls = surface_controls
         self._shared_controls = shared_controls
         self._object_controls = object_controls
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(WORKFLOW_SECTION_SPACING)
-        layout.addWidget(surface_controls, 1)
         layout.addWidget(shared_controls, 1)
         layout.addWidget(object_controls, 2)
 
@@ -309,10 +330,7 @@ class _WorkflowControlsRow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
-        blue_bounds = _combined_widget_bounds(
-            self._surface_controls,
-            self._shared_controls,
-        ).adjusted(
+        blue_bounds = self._shared_controls.geometry().adjusted(
             -WORKFLOW_OUTLINE_INSET,
             -WORKFLOW_OUTLINE_INSET,
             WORKFLOW_OUTLINE_INSET,
@@ -371,6 +389,10 @@ class MergedGenerationWorkspace(QWidget):
         self._object_reference_edit_runtime: (
             _ObjectReferenceEditRuntime | None
         ) = None
+        self._temporary_object_reference_session: (
+            _TemporaryObjectReferenceSession | None
+        ) = None
+        self._temporary_object_reference_revision = 0
         self._door_slot_editing_active = False
         self._door_slot_generation_name = ""
         self._door_slot_generation_blink_visible = True
@@ -581,11 +603,9 @@ class MergedGenerationWorkspace(QWidget):
         root_layout.addWidget(self.views_splitter, 1)
         root_layout.addWidget(self.seekbar)
 
-        self.surface_controls = self._build_surface_controls()
         self.shared_controls = self._build_shared_controls()
         self.object_controls = self._build_object_controls()
         self.controls_row = _WorkflowControlsRow(
-            self.surface_controls,
             self.shared_controls,
             self.object_controls,
         )
@@ -609,27 +629,6 @@ class MergedGenerationWorkspace(QWidget):
             + self.controls_scroll.horizontalScrollBar().sizeHint().height()
         )
         root_layout.addWidget(self.controls_scroll)
-
-    def _build_surface_controls(self) -> QWidget:
-        surface = self.surface_workspace
-        section, layout = _build_controls_section(
-            "Surface texture",
-            "surface",
-        )
-        layout.addWidget(surface.painted_frames_label, 0, 0)
-        layout.addWidget(surface.selection_label, 1, 0)
-        layout.addWidget(
-            _build_labeled_inline_control(
-                "Provider",
-                surface.surface_texture_provider_combo,
-            ),
-            2,
-            0,
-        )
-        surface.generate_button.setText("Generate surface texture")
-        layout.addWidget(surface.generate_button, 3, 0)
-        layout.setRowStretch(4, 1)
-        return section
 
     def _build_shared_controls(self) -> QWidget:
         section, layout = _build_controls_section("Shared", "shared")
@@ -907,13 +906,32 @@ class MergedGenerationWorkspace(QWidget):
         generation_settings_layout.addWidget(objects.meshy_target_polycount_control)
         creation_layout.addWidget(generation_settings)
 
+        self.texture_provider_control = _build_labeled_inline_control(
+            "Texture provider",
+            self.surface_workspace.surface_texture_provider_combo,
+        )
+        self.texture_provider_control.setObjectName(
+            "merged_generation_texture_provider_control"
+        )
+        creation_layout.addWidget(self.texture_provider_control)
+
         primary_actions = QWidget()
         primary_actions.setObjectName("merged_generation_primary_object_actions")
         primary_actions_layout = QHBoxLayout(primary_actions)
         primary_actions_layout.setContentsMargins(0, 0, 0, 0)
         primary_actions_layout.setSpacing(0)
         primary_actions_layout.addWidget(objects.generate_geometry_button)
-        primary_actions_layout.addWidget(objects.generate_texture_button)
+        self.generate_texture_stack = QStackedWidget()
+        self.generate_texture_stack.setObjectName(
+            "merged_generation_texture_action_stack"
+        )
+        objects.generate_texture_button.setText("Generate texture")
+        self.surface_workspace.generate_button.setText("Generate texture")
+        self.generate_texture_stack.addWidget(objects.generate_texture_button)
+        self.generate_texture_stack.addWidget(
+            self.surface_workspace.generate_button
+        )
+        primary_actions_layout.addWidget(self.generate_texture_stack)
         creation_layout.addWidget(primary_actions)
 
         generation_actions = QWidget()
@@ -986,9 +1004,17 @@ class MergedGenerationWorkspace(QWidget):
             self._handle_reference_edit_inputs_changed
         )
         self.video_view.frame_changed.connect(self._handle_video_frame_changed)
-        objects.reference_edit_state_changed.connect(self.sync_shared_controls)
+        objects.reference_edit_state_changed.connect(
+            self._handle_object_reference_state_changed
+        )
         objects.door_slot_editing_changed.connect(
             self._handle_door_slot_editing_changed
+        )
+        objects.architectural_trim_editing_changed.connect(
+            self._handle_architectural_trim_editing_changed
+        )
+        surface.data_changed.connect(
+            self._handle_surface_generation_context_changed
         )
         objects.door_slot_generation_status_changed.connect(
             self._handle_door_slot_generation_status_changed
@@ -1012,12 +1038,62 @@ class MergedGenerationWorkspace(QWidget):
 
         objects._sync_controls()
         surface._sync_controls()
+        self._sync_generation_texture_context()
 
     @Slot(bool)
     def _handle_door_slot_editing_changed(self, active: bool) -> None:
         """Keep shared analysis controls out of the door-slot workflow."""
 
         self._door_slot_editing_active = bool(active)
+        self.sync_shared_controls()
+
+    @Slot(bool)
+    def _handle_architectural_trim_editing_changed(self, active: bool) -> None:
+        """Offer a repeat-module edit instruction without replacing user text."""
+
+        if bool(active) and not self.reference_edit_prompt.text().strip():
+            self.reference_edit_prompt.setText(
+                ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION
+            )
+        self._sync_generation_texture_context()
+
+    @Slot(object)
+    def _handle_surface_generation_context_changed(self, _data: object) -> None:
+        """Follow shared-scene surface selection without duplicating its state."""
+
+        self._sync_generation_texture_context()
+
+    def _sync_generation_texture_context(self) -> None:
+        """Show the texture action belonging to the active semantic target."""
+
+        trim_is_selected = bool(
+            self.object_workspace._architectural_trim_editing_target is not None
+        )
+        trim_target = self.object_workspace._architectural_trim_editing_target
+        cornice_is_selected = bool(
+            trim_target is not None and trim_target.trim_kind == TRIM_KIND_CORNICE
+        )
+        surface_is_selected = bool(
+            self.surface_workspace.get_selected_surface_ids()
+        )
+        use_surface_texture_pipeline = bool(
+            surface_is_selected and (not trim_is_selected or not cornice_is_selected)
+        )
+        self.object_workspace.set_external_surface_generation_target_selected(
+            use_surface_texture_pipeline
+        )
+        target_button = (
+            self.surface_workspace.generate_button
+            if use_surface_texture_pipeline
+            else self.object_workspace.generate_texture_button
+        )
+        self.generate_texture_stack.setCurrentWidget(target_button)
+
+    @Slot()
+    def _handle_object_reference_state_changed(self) -> None:
+        """Keep the visible preview identical to the active generation input."""
+
+        self._sync_object_reference_preview()
         self.sync_shared_controls()
 
     @Slot(str)
@@ -1061,9 +1137,17 @@ class MergedGenerationWorkspace(QWidget):
     def _handle_video_frame_changed(self) -> None:
         """Invalidate estimates and preserve external current-frame updates."""
 
+        self._restore_temporary_reference_after_same_frame_refresh()
+        self._sync_object_reference_preview()
         self._ceiling_height_frame_revision += 1
         reference_runtime = self._object_reference_edit_runtime
-        if reference_runtime is not None:
+        if (
+            reference_runtime is not None
+            and self._get_current_reference_edit_signature(
+                reference_runtime.source_kind
+            )
+            != reference_runtime.signature
+        ):
             reference_runtime.cancel_requested = True
             if not self.job_manager.cancel_job(reference_runtime.job_id):
                 reference_runtime.thread.requestInterruption()
@@ -1075,11 +1159,7 @@ class MergedGenerationWorkspace(QWidget):
         self.ceiling_height_result_label.setText(
             CEILING_HEIGHT_NOT_ESTIMATED_TEXT
         )
-        self.reference_edit_status_label.setText(
-            "Accepted edit active for this frame."
-            if self.object_workspace.has_current_accepted_object_reference()
-            else OBJECT_REFERENCE_EDIT_STATUS_EMPTY
-        )
+        self._sync_object_reference_status()
         self.current_video_frame_changed.emit()
         self.sync_shared_controls()
 
@@ -1216,6 +1296,161 @@ class MergedGenerationWorkspace(QWidget):
             thread.deleteLater()
 
     # ### Object-reference editing ###
+    def _remember_temporary_object_reference(
+        self,
+        reference_bgra: np.ndarray,
+        *,
+        source_label: str,
+    ) -> _TemporaryObjectReferenceSession:
+        """Start one external-reference session bound to the current frame."""
+
+        reference = np.ascontiguousarray(reference_bgra).copy()
+        self._temporary_object_reference_revision += 1
+        objects = self.object_workspace
+        session = _TemporaryObjectReferenceSession(
+            source_bgra=reference.copy(),
+            active_bgra=reference,
+            source_label=str(source_label).strip() or "Temporary image",
+            revision=self._temporary_object_reference_revision,
+            generation_data_identity=id(objects._data),
+            video_source=objects._video_source,
+            frame_index=(
+                None
+                if objects._video_source is None
+                else objects._displayed_frame_index
+            ),
+        )
+        self._temporary_object_reference_session = session
+        return session
+
+    def _clear_temporary_object_reference_session(self) -> None:
+        """Forget retry input after the user leaves its owning frame or source."""
+
+        self._temporary_object_reference_session = None
+
+    def _temporary_reference_session_matches_context(
+        self,
+        session: _TemporaryObjectReferenceSession,
+    ) -> bool:
+        """Return whether a cached external image still belongs to this frame."""
+
+        objects = self.object_workspace
+        return bool(
+            session.generation_data_identity == id(objects._data)
+            and session.video_source is objects._video_source
+            and (
+                session.video_source is None
+                or session.frame_index == objects._displayed_frame_index
+            )
+        )
+
+    def _adopt_untracked_temporary_reference(
+        self,
+    ) -> _TemporaryObjectReferenceSession | None:
+        """Mirror an externally assigned temporary reference into shared state."""
+
+        reference = self.object_workspace.get_temporary_object_reference()
+        if reference is None:
+            return None
+        session = self._temporary_object_reference_session
+        if (
+            session is None
+            or not self._temporary_reference_session_matches_context(session)
+            or not np.array_equal(reference, session.active_bgra)
+        ):
+            session = self._remember_temporary_object_reference(
+                reference,
+                source_label="Temporary image",
+            )
+        return session
+
+    def _restore_temporary_reference_after_same_frame_refresh(self) -> None:
+        """Repair shared backend state after a non-navigating frame refresh."""
+
+        session = self._temporary_object_reference_session
+        if session is None:
+            return
+        if not self._temporary_reference_session_matches_context(session):
+            self._clear_temporary_object_reference_session()
+            return
+        if not self.object_workspace.has_temporary_object_reference():
+            self.object_workspace.set_temporary_object_reference(
+                session.active_bgra
+            )
+        surface_reference = self.surface_workspace.get_temporary_reference()
+        if (
+            surface_reference is None
+            or not np.array_equal(surface_reference, session.active_bgra)
+        ):
+            self.surface_workspace.set_temporary_reference(
+                session.active_bgra
+            )
+
+    def _sync_object_reference_preview(self) -> None:
+        """Render the authoritative override, or restore the ordinary frame."""
+
+        temporary_reference = (
+            self.object_workspace.get_temporary_object_reference()
+        )
+        if temporary_reference is not None:
+            self._adopt_untracked_temporary_reference()
+            self.video_view.set_reference_preview_bgra(temporary_reference)
+            return
+        accepted_reference = (
+            self.object_workspace.get_current_accepted_object_reference()
+        )
+        if accepted_reference is not None:
+            self.video_view.set_reference_preview_bgra(accepted_reference)
+            return
+        self.video_view.clear_reference_preview()
+
+    def _sync_object_reference_status(self) -> None:
+        """Describe the same reference source shown by the shared preview."""
+
+        if self.object_workspace.has_temporary_object_reference():
+            session = self._adopt_untracked_temporary_reference()
+            source_label = (
+                "Temporary image" if session is None else session.source_label
+            )
+            self.reference_edit_status_label.setText(
+                f"{source_label} is active for Object and Surface generation."
+            )
+            return
+        if self.object_workspace.has_current_accepted_object_reference():
+            self.reference_edit_status_label.setText(
+                "Accepted edit active for this frame."
+            )
+            return
+        self.reference_edit_status_label.setText(
+            OBJECT_REFERENCE_EDIT_STATUS_EMPTY
+        )
+
+    def _build_temporary_reference_edit_inputs(
+        self,
+    ) -> tuple[np.ndarray, tuple[object, ...]] | None:
+        """Return the original external image so Edit remains a true retry."""
+
+        session = self._adopt_untracked_temporary_reference()
+        if session is None or not self._temporary_reference_session_matches_context(
+            session
+        ):
+            return None
+        return session.source_bgra.copy(), (
+            OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY,
+            session.revision,
+        )
+
+    def _get_current_reference_edit_signature(
+        self,
+        source_kind: str,
+    ) -> tuple[object, ...] | None:
+        """Resolve the current signature through the runtime's source path."""
+
+        if source_kind == OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY:
+            inputs = self._build_temporary_reference_edit_inputs()
+            return None if inputs is None else inputs[1]
+        return self.object_workspace.get_current_object_reference_edit_signature()
+
     @Slot(int)
     def _append_reference_edit_prompt_preset(self, index: int) -> None:
         """Append one reusable view phrase without turning it into state."""
@@ -1242,12 +1477,20 @@ class MergedGenerationWorkspace(QWidget):
     def _handle_reference_edit_inputs_changed(self, _value: object) -> None:
         """Cancel stale work without discarding an accepted frame edit."""
 
-        self.reference_edit_status_label.setText(
-            "Edited reference remains active. Click Edit reference to replace "
-            "it, or move the frame slider to undo."
-            if self.object_workspace.has_current_accepted_object_reference()
-            else OBJECT_REFERENCE_EDIT_STATUS_EMPTY
-        )
+        if self.object_workspace.has_current_accepted_object_reference():
+            self.reference_edit_status_label.setText(
+                "Edited reference remains active. Click Edit reference to replace "
+                "it, or move the frame slider to undo."
+            )
+        elif self.object_workspace.has_temporary_object_reference():
+            self.reference_edit_status_label.setText(
+                "Temporary reference remains active. Click Edit reference to "
+                "replace its edited result."
+            )
+        else:
+            self.reference_edit_status_label.setText(
+                OBJECT_REFERENCE_EDIT_STATUS_EMPTY
+            )
         runtime = self._object_reference_edit_runtime
         if runtime is not None:
             runtime.cancel_requested = True
@@ -1281,13 +1524,19 @@ class MergedGenerationWorkspace(QWidget):
                 "Add an OpenAI API key in Settings before editing a reference."
             )
             return
-        try:
-            source_bgra, signature = (
-                self.object_workspace.build_object_reference_edit_inputs()
-            )
-        except ValueError as error:
-            self.reference_edit_status_label.setText(str(error))
-            return
+        temporary_inputs = self._build_temporary_reference_edit_inputs()
+        if temporary_inputs is None:
+            source_kind = OBJECT_REFERENCE_EDIT_SOURCE_MASK
+            try:
+                source_bgra, signature = (
+                    self.object_workspace.build_object_reference_edit_inputs()
+                )
+            except ValueError as error:
+                self.reference_edit_status_label.setText(str(error))
+                return
+        else:
+            source_kind = OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY
+            source_bgra, signature = temporary_inputs
 
         thread = _ObjectReferenceEditThread(
             source_bgra,
@@ -1305,6 +1554,7 @@ class MergedGenerationWorkspace(QWidget):
         )
         runtime = _ObjectReferenceEditRuntime(
             signature=signature,
+            source_kind=source_kind,
             model=model,
             prompt=prompt,
             job_id=job.job_id,
@@ -1357,8 +1607,8 @@ class MergedGenerationWorkspace(QWidget):
             ):
                 return
             self.job_manager.set_cancel_callback(job_id, None)
-            current_signature = (
-                self.object_workspace.get_current_object_reference_edit_signature()
+            current_signature = self._get_current_reference_edit_signature(
+                runtime.source_kind
             )
             is_stale = (
                 current_signature != runtime.signature
@@ -1390,10 +1640,27 @@ class MergedGenerationWorkspace(QWidget):
                 )
                 return
 
-            if not self.object_workspace.accept_object_reference_edit(
-                runtime.signature,
-                thread.result,
-            ):
+            if runtime.source_kind == OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY:
+                session = self._temporary_object_reference_session
+                if session is None:
+                    accepted = False
+                else:
+                    session.active_bgra = np.ascontiguousarray(
+                        thread.result
+                    ).copy()
+                    self.object_workspace.set_temporary_object_reference(
+                        session.active_bgra
+                    )
+                    self.surface_workspace.set_temporary_reference(
+                        session.active_bgra
+                    )
+                    accepted = True
+            else:
+                accepted = self.object_workspace.accept_object_reference_edit(
+                    runtime.signature,
+                    thread.result,
+                )
+            if not accepted:
                 message = (
                     "The selected object changed before the edited reference "
                     "could be applied."
@@ -1429,6 +1696,7 @@ class MergedGenerationWorkspace(QWidget):
             return
         try:
             probe_video(file_path)
+            self._clear_temporary_object_reference_session()
             self.object_workspace.load_video(file_path)
             self.surface_workspace.load_video(file_path)
             self.sync_shared_controls()
@@ -1464,7 +1732,7 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_paste_inpaint_clicked(self) -> None:
-        """Use the clipboard image as a non-destructive Object reference."""
+        """Use the clipboard image as a shared generation reference."""
 
         image = _read_clipboard_image()
         if image is None:
@@ -1481,7 +1749,7 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_load_reference_image_clicked(self) -> None:
-        """Load a temporary Object reference without replacing the video."""
+        """Load a shared temporary reference without replacing the video."""
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1510,22 +1778,42 @@ class MergedGenerationWorkspace(QWidget):
         *,
         source_label: str,
     ) -> None:
-        """Display and bind one temporary reference to Object generation."""
+        """Display and bind one temporary reference to both generators."""
 
         try:
             self.object_workspace.set_temporary_object_reference(
                 reference_bgra
             )
+            self.surface_workspace.set_temporary_reference(reference_bgra)
         except ValueError as error:
+            self.object_workspace.clear_temporary_object_reference()
+            self.surface_workspace.clear_temporary_reference()
             QMessageBox.critical(self, "Reference image failed", str(error))
             return
-        self.video_view.set_reference_preview_bgra(reference_bgra)
+        active_reference = (
+            self.object_workspace.get_temporary_object_reference()
+        )
+        if active_reference is None:
+            return
+        self._remember_temporary_object_reference(
+            active_reference,
+            source_label=source_label,
+        )
+        self._sync_object_reference_preview()
         message = (
-            f"{source_label} is active for Object generation. Move the "
+            f"{source_label} is active for Object and Surface generation. Move the "
             "video seekbar to return to the video."
             if self.object_workspace._video_source is not None
-            else f"{source_label} is active for Object generation."
+            else f"{source_label} is active for Object and Surface generation."
         )
+        if (
+            self.object_workspace._architectural_trim_editing_target is not None
+            and np.all(active_reference[:, :, 3] == 255)
+        ):
+            message += (
+                " This is an unmasked scene image; click Edit reference first "
+                "to isolate and straighten one repeating trim module."
+            )
         self.object_workspace.status_label.setText(message)
         self.reference_edit_status_label.setText(message)
         self.sync_shared_controls()
@@ -1562,7 +1850,15 @@ class MergedGenerationWorkspace(QWidget):
         target_strokes = objects._data.strokes_for_frame(safe_index)
         if not target_strokes:
             target_strokes = surface._data.strokes_for_frame(safe_index)
-        objects.discard_object_reference_before_frame_change(safe_index)
+        current_object_frame_index = objects._displayed_frame_index
+        object_frame_is_changing = (
+            current_object_frame_index is None
+            or int(current_object_frame_index) != safe_index
+        )
+        if object_frame_is_changing:
+            self._clear_temporary_object_reference_session()
+            objects.discard_object_reference_before_frame_change(safe_index)
+            surface.clear_temporary_reference()
         for workspace in (objects, surface):
             workspace._data.current_frame_index = safe_index
             workspace._displayed_frame_index = safe_index
@@ -1589,10 +1885,11 @@ class MergedGenerationWorkspace(QWidget):
             objects._generation_thread is not None and not objects._object_job_runtimes
         )
         reference_edit_is_running = self._object_reference_edit_runtime is not None
-        editor_is_available = (
-            has_video
-            and not has_untracked_object_job
-            and not reference_edit_is_running
+        shared_reference_controls_are_available = (
+            not has_untracked_object_job and not reference_edit_is_running
+        )
+        video_editor_is_available = (
+            has_video and shared_reference_controls_are_available
         )
         accepted_edit_is_available = (
             objects.has_current_accepted_object_reference()
@@ -1601,7 +1898,7 @@ class MergedGenerationWorkspace(QWidget):
             objects.has_temporary_object_reference()
         )
         inpainting_is_available = (
-            editor_is_available
+            video_editor_is_available
             and not accepted_edit_is_available
             and not temporary_reference_is_available
         )
@@ -1621,7 +1918,7 @@ class MergedGenerationWorkspace(QWidget):
             or accepted_edit_is_available
             or self.video_view.has_selection()
         )
-        self.seekbar.setEnabled(editor_is_available)
+        self.seekbar.setEnabled(video_editor_is_available)
         self.paint_mask_button.setEnabled(inpainting_is_available)
         self.erase_mask_button.setEnabled(inpainting_is_available)
         self.brush_size_spinbox.setEnabled(inpainting_is_available)
@@ -1649,14 +1946,14 @@ class MergedGenerationWorkspace(QWidget):
             )
         )
         self.edit_reference_button.setEnabled(
-            editor_is_available
-            and not temporary_reference_is_available
-            and has_object_mask
+            shared_reference_controls_are_available
+            and (temporary_reference_is_available or has_object_mask)
             and has_edit_prompt
             and has_reference_edit_credentials
         )
         reference_edit_inputs_are_available = (
-            editor_is_available and not temporary_reference_is_available
+            shared_reference_controls_are_available
+            and (has_video or temporary_reference_is_available)
         )
         self.reference_edit_prompt.setEnabled(
             reference_edit_inputs_are_available
@@ -1679,6 +1976,7 @@ class MergedGenerationWorkspace(QWidget):
             if ceiling_inference_is_running
             else "Infer ceiling height"
         )
+        self._sync_generation_texture_context()
         self._sync_cancel_button()
 
     @Slot()

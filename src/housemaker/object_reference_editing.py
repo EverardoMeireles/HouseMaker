@@ -86,6 +86,18 @@ reconstruct any object surface hidden by the removed or changed item. Transparen
 source pixels are background, not an edit boundary. Center the complete object and
 keep it fully inside the square. Return one isolated object on a transparent
 background, with no text, border, scenery, or additional object."""
+OBJECT_REFERENCE_SCENE_GENERATION_INSTRUCTION = """The supplied image is an unmasked scene photograph, not an isolated object.
+Identify the single subject described by the user's request and use only that subject
+as the visual reference. Generate a complete new 1024x1024 image that applies this
+requested semantic change: {request}
+
+Preserve the subject's distinctive geometry, proportions, relief, material, and fine
+details unless the request explicitly changes them. Use surrounding pixels only to
+understand the subject; do not reproduce the room, walls, ceiling, floor, shadows,
+labels, or other scenery. Correct photographic perspective when the request asks for
+an orthographic or straightened view. Center the complete subject, keep it fully
+inside the square, and return one isolated object on a transparent background with
+no text, border, scenery, or additional object."""
 OPENAI_RESPONSES_OBJECT_REFERENCE_GENERATION_INSTRUCTION = """The supplied image contains one foreground object isolated with the user's mask.
 Use that object as the visual reference and generate a complete new 1024x1024 image
 that applies this requested semantic change: {request}
@@ -96,6 +108,18 @@ reconstruct any object surface hidden by the removed or changed item. Transparen
 source pixels are background, not an edit boundary. Center the complete object and
 keep it fully inside the square. Return one isolated object on a plain neutral
 opaque background, with no text, border, scenery, or additional object."""
+OPENAI_RESPONSES_OBJECT_REFERENCE_SCENE_GENERATION_INSTRUCTION = """The supplied image is an unmasked scene photograph, not an isolated object.
+Identify the single subject described by the user's request and use only that subject
+as the visual reference. Generate a complete new 1024x1024 image that applies this
+requested semantic change: {request}
+
+Preserve the subject's distinctive geometry, proportions, relief, material, and fine
+details unless the request explicitly changes them. Use surrounding pixels only to
+understand the subject; do not reproduce the room, walls, ceiling, floor, shadows,
+labels, or other scenery. Correct photographic perspective when the request asks for
+an orthographic or straightened view. Center the complete subject, keep it fully
+inside the square, and return one isolated object on a plain neutral opaque
+background with no text, border, scenery, or additional object."""
 QWEN_OBJECT_REFERENCE_GENERATION_INSTRUCTION = """This is an RGBA image with transparency.
 The non-transparent pixels are a user selection and may show only one visible
 surface or part of an object. Treat that selection as visual evidence, not as the
@@ -108,6 +132,18 @@ Generate a genuinely new 1024x1024 composition rather than returning the selecte
 fragment. Center the complete object, keep every part fully visible, and leave
 comfortable transparent space around it. The image has an alpha channel and the
 background is transparent."""
+QWEN_OBJECT_REFERENCE_SCENE_GENERATION_INSTRUCTION = """This is an unmasked scene photograph rather than an isolated object.
+Identify the single subject described by the user's request and use only that subject
+as visual evidence. Apply these instructions:
+
+{request}
+
+Generate a genuinely new 1024x1024 composition of the complete subject. Preserve
+its distinctive geometry, proportions, relief, material, and fine details unless
+the request explicitly changes them. Do not reproduce the room, walls, ceiling,
+floor, shadows, labels, or other scenery. Correct photographic perspective when the
+request asks for an orthographic or straightened view. Center the complete subject,
+keep every part fully visible, and leave comfortable transparent space around it."""
 
 
 # ### Public exceptions ###
@@ -150,7 +186,7 @@ def edit_object_reference(
     cancellation_check: CancellationCheck | None = None,
     image_editor: ObjectReferenceImageEditor | None = None,
 ) -> np.ndarray:
-    """Generate one square reference from the object isolated by source alpha."""
+    """Generate one square subject reference from a cutout or scene image."""
 
     normalized_model = _normalize_model(model)
     source, normalized_prompt, key = _validate_edit_request(
@@ -176,10 +212,9 @@ def edit_object_reference(
     _raise_if_cancelled(cancellation_check)
 
     editor = image_editor or _default_image_editor(normalized_model)
-    prompt_template = (
-        OPENAI_RESPONSES_OBJECT_REFERENCE_GENERATION_INSTRUCTION
-        if normalized_model in OPENAI_RESPONSES_REFERENCE_EDIT_MODELS
-        else OBJECT_REFERENCE_GENERATION_INSTRUCTION
+    prompt_template = _select_reference_generation_instruction(
+        source,
+        normalized_model,
     )
     provider_prompt = prompt_template.format(
         request=normalized_prompt,
@@ -226,6 +261,33 @@ def edit_object_reference(
     )
     _raise_if_cancelled(cancellation_check)
     return np.ascontiguousarray(provider_canvas.copy())
+
+
+# ### Prompt helpers ###
+def _select_reference_generation_instruction(
+    source_bgra: np.ndarray,
+    model: str,
+) -> str:
+    """Describe a masked cutout and an opaque scene photograph accurately."""
+
+    is_unmasked_scene = bool(np.all(source_bgra[:, :, 3] == 255))
+    if model == OBJECT_REFERENCE_EDIT_MODEL_QWEN_IMAGE_2_1:
+        return (
+            QWEN_OBJECT_REFERENCE_SCENE_GENERATION_INSTRUCTION
+            if is_unmasked_scene
+            else QWEN_OBJECT_REFERENCE_GENERATION_INSTRUCTION
+        )
+    if model in OPENAI_RESPONSES_REFERENCE_EDIT_MODELS:
+        return (
+            OPENAI_RESPONSES_OBJECT_REFERENCE_SCENE_GENERATION_INSTRUCTION
+            if is_unmasked_scene
+            else OPENAI_RESPONSES_OBJECT_REFERENCE_GENERATION_INSTRUCTION
+        )
+    return (
+        OBJECT_REFERENCE_SCENE_GENERATION_INSTRUCTION
+        if is_unmasked_scene
+        else OBJECT_REFERENCE_GENERATION_INSTRUCTION
+    )
 
 
 def object_reference_edit_model_requires_api_key(model: str) -> bool:

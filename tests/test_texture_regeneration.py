@@ -14,6 +14,7 @@ import unittest
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 from unittest.mock import Mock, patch
 
 import cv2
@@ -2761,9 +2762,8 @@ class TextureRegenerationUiTests(unittest.TestCase):
         self.assertFalse(
             hasattr(self.workspace, "set_external_3d_viewer_active")
         )
-        self.assertGreaterEqual(
-            self.workspace.object_3d_panel.details_panel.geometry().top(),
-            self.workspace.result_view.geometry().bottom(),
+        self.assertTrue(
+            self.workspace.object_3d_panel.details_panel.isHidden()
         )
         self.assertTrue(
             self.workspace.regenerate_texture_button.isVisibleTo(
@@ -4298,6 +4298,22 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         )
         self.workspace.set_texture_regenerator(regenerator)
         self.workspace.set_meshy_executor(executor)
+        packing_transitions: list[
+            tuple[GeneratedObjectRecord, GeneratedObjectRecord]
+        ] = []
+
+        def commit_packing_transition(
+            old_record: GeneratedObjectRecord,
+            replacement_record: GeneratedObjectRecord,
+            _preview_model: GeneratedModel,
+            commit_callback: Callable[[], bool],
+        ) -> bool:
+            packing_transitions.append((old_record, replacement_record))
+            return commit_callback()
+
+        self.workspace.set_object_packing_change_handler(
+            commit_packing_transition
+        )
         self.workspace.wireframe_checkbox.setChecked(True)
         changed = QSignalSpy(self.workspace.data_changed)
         completed = QSignalSpy(
@@ -4389,6 +4405,11 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertEqual(changed.count(), 2)
         self.assertEqual(completed.count(), 2)
         self.assertEqual(generated.count(), 0)
+        self.assertEqual(len(packing_transitions), 2)
+        self.assertEqual(packing_transitions[0][0], original)
+        self.assertEqual(packing_transitions[0][1], first_record)
+        self.assertEqual(packing_transitions[1][0], first_record)
+        self.assertEqual(packing_transitions[1][1], second_record)
 
         saved = self.workspace.get_data()
         self.workspace.set_data(saved)

@@ -478,6 +478,46 @@ class HalfMeshGlbSerializationTests(unittest.TestCase):
 
 # ### Composition tests ###
 class PlacedGeneratedModelCompositionTests(unittest.TestCase):
+    def test_atlas_source_id_keys_placed_authored_uv_geometry(self) -> None:
+        object_model = _single_mesh_model(
+            _textured_quad((45, 110, 175, 255)),
+        )
+        source_geometry = next(iter(object_model.scene.geometry.values()))
+
+        composed = compose_placed_generated_models(
+            _base_box_model(),
+            (
+                PlacedGeneratedModel(
+                    object_id="target-cornice",
+                    source_object_id="target-cornice",
+                    atlas_source_object_id="source-cornice",
+                    model=object_model,
+                    world_position=(1.0, 2.0, 3.0),
+                ),
+            ),
+        )
+
+        placed_geometries = tuple(
+            geometry
+            for geometry_name, geometry in composed.scene.geometry.items()
+            if str(geometry_name).startswith("placed_")
+        )
+        self.assertEqual(len(placed_geometries), 1)
+        placed_geometry = placed_geometries[0]
+        self.assertEqual(
+            placed_geometry.metadata["housemaker_object_id"],
+            "source-cornice",
+        )
+        self.assertIsInstance(placed_geometry.visual, TextureVisuals)
+        np.testing.assert_allclose(
+            placed_geometry.visual.uv,
+            source_geometry.visual.uv,
+        )
+        self.assertEqual(
+            composed.preview_placed_objects[0].object_id,
+            "target-cornice",
+        )
+
     def test_rotation_keeps_the_source_bottom_center_on_the_world_anchor(
         self,
     ) -> None:
