@@ -2382,25 +2382,36 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             None,
         )
         if source_assignment is None:
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture no longer exists."
+            )
         if self._assignment_is_reserved(source_assignment):
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture is currently busy."
+            )
         try:
             target_resolution = int(resolution)
         except (TypeError, ValueError, OverflowError):
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture resolution is invalid."
+            )
         variant = source_assignment.texture_variant_for_resolution(
             target_resolution
         )
         if variant is None:
-            return False
+            return self._reject_assignment_texture_application(
+                f"The selected Surface texture has no {target_resolution} x "
+                f"{target_resolution} variant."
+            )
         map_paths = self.get_assignment_map_asset_paths(
             source_assignment.assignment_id,
             target_resolution,
         )
         texture_path = map_paths.get(ATLAS_MAP_BASE_COLOR)
         if texture_path is None:
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture is missing its base-color file."
+            )
         try:
             texture_png = texture_path.read_bytes()
             map_pngs = {
@@ -2412,13 +2423,21 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 texture_png,
                 "Surface texture variant",
             )
-        except (OSError, ValueError):
-            return False
+        except (OSError, ValueError) as error:
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture could not be read: "
+                f"{error}"
+            )
         if texture_rgba.shape[:2] != (
             target_resolution,
             target_resolution,
         ):
-            return False
+            actual_height, actual_width = texture_rgba.shape[:2]
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture declared "
+                f"{target_resolution} x {target_resolution}, but its file is "
+                f"{actual_width} x {actual_height}."
+            )
         selected_assignment = replace(
             source_assignment,
             asset_path=variant.asset_path,
@@ -2444,9 +2463,32 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         source_assignment = self._assignment_by_id(assignment_id)
         if source_assignment is None:
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture no longer exists."
+            )
         if self._assignment_is_reserved(source_assignment):
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture is currently busy."
+            )
+        if source_assignment.source_object_id is not None:
+            # Object-backed cornices keep authored UVs and sample their Atlas
+            # source directly. Assign only their semantic bindings; rereading
+            # the copied PNG here adds failure modes without installing pixels.
+            texture_resolution = (
+                source_assignment.selected_texture_resolution
+                or source_assignment.texture_width
+                or source_assignment.texture_height
+                or 0
+            )
+            texture_width = source_assignment.texture_width or texture_resolution
+            texture_height = source_assignment.texture_height or texture_resolution
+            return self._apply_assignment_texture_to_surfaces(
+                source_assignment,
+                source_assignment,
+                b"",
+                target_surface_ids,
+                texture_size=(texture_width, texture_height),
+            )
         selected_resolution = source_assignment.selected_texture_resolution
         if selected_resolution is not None:
             return self.select_assignment_texture_resolution(
@@ -2455,20 +2497,27 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 target_surface_ids,
             )
         if source_assignment.texture_variants:
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture has no active resolution."
+            )
         texture_path = self.get_assignment_asset_path(
             source_assignment.assignment_id
         )
         if texture_path is None:
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture is missing its base-color file."
+            )
         try:
             texture_png = texture_path.read_bytes()
             texture_rgba = _decode_png_rgba(
                 texture_png,
                 "Surface texture",
             )
-        except (OSError, ValueError):
-            return False
+        except (OSError, ValueError) as error:
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture could not be read: "
+                f"{error}"
+            )
         height, width = texture_rgba.shape[:2]
         return self._apply_assignment_texture_to_surfaces(
             source_assignment,
@@ -2594,7 +2643,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self._assignment_is_reserved(
             source_assignment
         ) or self._surface_targets_are_reserved(normalized_targets):
-            return False
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture or target surface is currently busy."
+            )
         surface_by_id = self._all_existing_surfaces_by_id()
         if normalized_targets:
             if any(
@@ -2602,7 +2653,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 or surface.surface_type != source_assignment.surface_type
                 for surface_id in normalized_targets
             ):
-                return False
+                return self._reject_assignment_texture_application(
+                    "One or more selected surfaces no longer exist or have a "
+                    "different surface type."
+                )
         else:
             normalized_targets = tuple(
                 surface_id
@@ -2619,63 +2673,76 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         ):
             return True
 
-        previous_assignments = list(self._data.assignments)
-        source_surface_ids = tuple(
-            surface_id
-            for surface_id in dict.fromkeys(
-                (*source_assignment.surface_ids, *normalized_targets)
-            )
-            if surface_id in surface_by_id
-        )
-        retained_assignments: list[SurfaceTextureAssignment] = []
-        target_set = set(normalized_targets)
-        for assignment in self._data.assignments:
-            if assignment.assignment_id == source_assignment.assignment_id:
-                continue
-            remaining_ids = tuple(
-                surface_id
-                for surface_id in assignment.surface_ids
-                if surface_id not in target_set
-            )
-            if remaining_ids == assignment.surface_ids:
-                retained_assignments.append(assignment)
-            elif not remaining_ids:
-                retained_assignments.append(
-                    self._assignment_with_surfaces(
-                        assignment,
-                        (),
-                        surface_areas=surface_areas,
-                    )
-                )
-            else:
-                retained_assignments.append(
-                    self._assignment_with_surfaces(
-                        assignment,
-                        remaining_ids,
-                        surface_areas=surface_areas,
-                    )
-                )
-        selected_assignment = self._assignment_with_surfaces(
-            applied_assignment,
-            source_surface_ids,
-            surface_areas=surface_areas,
-        )
-        next_assignments = [*retained_assignments, selected_assignment]
         try:
-            self._set_surface_view_texture(
-                selected_assignment.surface_ids,
-                texture_png,
-                map_texture_pngs,
+            source_surface_ids = tuple(
+                surface_id
+                for surface_id in dict.fromkeys(
+                    (*source_assignment.surface_ids, *normalized_targets)
+                )
+                if surface_id in surface_by_id
             )
-            self._data.assignments = next_assignments
-            # The caller supplied bytes read before this commit.  Do not bind
-            # them to a file revision sampled afterward: the backing PNG may
-            # have been replaced between the read and this installation.
-            self._restored_assignment_texture_signature = None
-        except (OSError, TypeError, ValueError):
-            self._data.assignments = previous_assignments
-            self._restore_assignment_textures()
-            return False
+            retained_assignments: list[SurfaceTextureAssignment] = []
+            target_set = set(normalized_targets)
+            for assignment in self._data.assignments:
+                if assignment.assignment_id == source_assignment.assignment_id:
+                    continue
+                remaining_ids = tuple(
+                    surface_id
+                    for surface_id in assignment.surface_ids
+                    if surface_id not in target_set
+                )
+                if remaining_ids == assignment.surface_ids:
+                    retained_assignments.append(assignment)
+                elif not remaining_ids:
+                    retained_assignments.append(
+                        self._assignment_with_surfaces(
+                            assignment,
+                            (),
+                            surface_areas=surface_areas,
+                        )
+                    )
+                else:
+                    retained_assignments.append(
+                        self._assignment_with_surfaces(
+                            assignment,
+                            remaining_ids,
+                            surface_areas=surface_areas,
+                        )
+                    )
+            selected_assignment = self._assignment_with_surfaces(
+                applied_assignment,
+                source_surface_ids,
+                surface_areas=surface_areas,
+            )
+            next_assignments = [*retained_assignments, selected_assignment]
+        except (TypeError, ValueError) as error:
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture binding could not be prepared: "
+                f"{error}"
+            )
+
+        try:
+            if selected_assignment.source_object_id is None:
+                self._set_surface_view_texture(
+                    selected_assignment.surface_ids,
+                    texture_png,
+                    map_texture_pngs,
+                )
+        except (OSError, TypeError, ValueError) as error:
+            try:
+                self._restore_assignment_textures()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+            return self._reject_assignment_texture_application(
+                "The selected Surface texture could not be installed: "
+                f"{error}"
+            )
+
+        self._data.assignments = next_assignments
+        # The caller supplied bytes read before this commit.  Do not bind
+        # them to a file revision sampled afterward: the backing PNG may
+        # have been replaced between the read and this installation.
+        self._restored_assignment_texture_signature = None
 
         texture_width, texture_height = texture_size
         self.status_label.setText(
@@ -2687,6 +2754,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_content_changed.emit()
         self._sync_controls()
         return True
+
+    def _reject_assignment_texture_application(self, message: str) -> bool:
+        """Publish one precise Assign rejection and return its false result."""
+
+        self.status_label.setText(str(message).strip())
+        return False
 
     def set_data(self, data: SurfaceTextureData | None) -> None:
         if self.is_generating:
@@ -4132,6 +4205,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         restore_succeeded = True
         self.surface_view.clear_surface_textures()
         for assignment in self._data.assignments:
+            if assignment.source_object_id is not None:
+                # Linked cornices are rebuilt from their authored object UVs.
+                # Installing their image as a generic planar Surface texture
+                # would both reject trim-only semantic IDs and use the wrong
+                # UV mapping.
+                continue
             map_paths = self.get_assignment_map_asset_paths(
                 assignment.assignment_id,
                 assignment.selected_texture_resolution,

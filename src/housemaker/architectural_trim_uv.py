@@ -20,6 +20,14 @@ CORNICE_UV_MAX_SEGMENT_COUNT = 64
 CORNICE_UV_GUTTER_PIXELS = 8
 CORNICE_UV_MIN_TEXTURE_RESOLUTION = 64
 CORNICE_UV_MAX_TEXTURE_RESOLUTION = 16_384
+CORNICE_UV_TEXTURE_DOMAIN_FULL = "full"
+CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF = "left_half"
+CORNICE_UV_TEXTURE_DOMAINS = frozenset(
+    {
+        CORNICE_UV_TEXTURE_DOMAIN_FULL,
+        CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    }
+)
 _GEOMETRY_EPSILON = 1e-10
 _UV_EPSILON = 1e-8
 _PACKING_BINARY_SEARCH_STEPS = 28
@@ -129,7 +137,7 @@ class _SegmentMeshBuilder:
 
     def _add_vertex(self, point: np.ndarray) -> int:
         key = tuple(
-            int(round(float(value) / self._weld_tolerance))
+            round(float(value) / self._weld_tolerance)
             for value in point
         )
         existing = self._vertex_by_key.get(key)
@@ -146,16 +154,20 @@ def build_cornice_segmented_uv_glb(
     glb_bytes: bytes,
     *,
     texture_resolution: int = 2048,
+    texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL,
 ) -> bytes:
-    """Build a true-aspect, horizontal-strip UV atlas for a cornice GLB.
+    """Build a true-aspect, maximally scaled UV atlas for a cornice GLB.
 
     Long X-axis geometry is divided before unwrapping so a full cornice cannot
     consume the atlas as one extremely thin chart. Xatlas parameterizes all
-    pieces together, after which every chart is packed with one shared scale.
-    Consequently no chart is independently stretched to fill its row.
+    pieces together, after which every chart is packed with one shared U/V
+    scale. This uniform diagonal scale preserves the old face proportions and
+    maximizes either the full square or its left half without stretching an
+    individual chart.
     """
 
     resolution = _normalize_texture_resolution(texture_resolution)
+    normalized_texture_domain = _normalize_texture_domain(texture_domain)
     source_model = import_generated_glb(glb_bytes)
     clear_scan_projection_layout_metadata(source_model.scene)
     prepare_uv_rewrite_material_textures(
@@ -176,6 +188,7 @@ def build_cornice_segmented_uv_glb(
         outputs,
         charts,
         texture_resolution=resolution,
+        texture_domain=normalized_texture_domain,
     )
     output_scene = _build_output_scene(outputs, final_uvs)
     exported = output_scene.export(file_type="glb")
@@ -184,6 +197,7 @@ def build_cornice_segmented_uv_glb(
     _validate_uv_glb(
         exported,
         expected_bounds=np.asarray(source_model.mesh.bounds, dtype=np.float64),
+        texture_domain=normalized_texture_domain,
     )
     return exported
 
@@ -205,6 +219,17 @@ def _normalize_texture_resolution(texture_resolution: object) -> int:
             f"{CORNICE_UV_MAX_TEXTURE_RESOLUTION}."
         )
     return resolution
+
+
+def _normalize_texture_domain(texture_domain: object) -> str:
+    """Validate the square region available to the cornice UV charts."""
+
+    if not isinstance(texture_domain, str):
+        raise TypeError("Cornice UV texture domain must be a string.")
+    normalized = texture_domain.strip().lower()
+    if normalized not in CORNICE_UV_TEXTURE_DOMAINS:
+        raise ValueError("Unknown cornice UV texture domain.")
+    return normalized
 
 
 def _collect_source_primitives(scene: trimesh.Scene) -> tuple[_SourcePrimitive, ...]:
@@ -266,11 +291,9 @@ def _choose_segment_count(bounds: np.ndarray, *, resolution: int) -> int:
     cross_section_extent = min(float(extents[1]), float(extents[2]))
     requested_count = max(
         1,
-        int(
-            math.ceil(
-                float(extents[0])
-                / (CORNICE_UV_MAX_STRIP_ASPECT * cross_section_extent)
-            )
+        math.ceil(
+            float(extents[0])
+            / (CORNICE_UV_MAX_STRIP_ASPECT * cross_section_extent)
         ),
     )
     resolution_limit = max(1, resolution // 32)
@@ -363,18 +386,20 @@ def _triangle_segment_indices(
     face_minimum = float(np.min(triangle[:, 0]))
     face_maximum = float(np.max(triangle[:, 0]))
     if face_maximum - face_minimum <= _GEOMETRY_EPSILON:
-        segment_index = int(math.floor((face_minimum - minimum_x) / segment_width))
+        segment_index = math.floor(
+            (face_minimum - minimum_x) / segment_width
+        )
         segment_index = min(max(segment_index, 0), segment_count - 1)
         return range(segment_index, segment_index + 1)
     inset = min(
         (face_maximum - face_minimum) * 0.25,
         segment_width * 1e-9,
     )
-    first_index = int(
-        math.floor((face_minimum + inset - minimum_x) / segment_width)
+    first_index = math.floor(
+        (face_minimum + inset - minimum_x) / segment_width
     )
-    last_index = int(
-        math.floor((face_maximum - inset - minimum_x) / segment_width)
+    last_index = math.floor(
+        (face_maximum - inset - minimum_x) / segment_width
     )
     first_index = min(max(first_index, 0), segment_count - 1)
     last_index = min(max(last_index, first_index), segment_count - 1)
@@ -790,7 +815,14 @@ def _pack_charts_into_horizontal_rows(
     charts: tuple[_UvChart, ...],
     *,
     texture_resolution: int,
+    texture_domain: str,
 ) -> tuple[np.ndarray, ...]:
+    """Pack every chart with one maximal, proportion-preserving U/V scale."""
+
+    domain_width, domain_height = _texture_domain_pixel_size(
+        texture_resolution,
+        texture_domain,
+    )
     requested_gutter = min(
         CORNICE_UV_GUTTER_PIXELS,
         max(1, texture_resolution // 32),
@@ -799,7 +831,8 @@ def _pack_charts_into_horizontal_rows(
     for gutter in _gutter_candidates(requested_gutter):
         packed = _find_largest_row_packing(
             charts,
-            texture_resolution=texture_resolution,
+            domain_width=domain_width,
+            domain_height=domain_height,
             gutter_pixels=float(gutter),
         )
         if packed is not None:
@@ -821,19 +854,59 @@ def _pack_charts_into_horizontal_rows(
             packed_points / float(texture_resolution)
         )
     for output_uvs in final_uvs:
+        maximum_u = (
+            0.5
+            if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+            else 1.0
+        )
         if (
             not np.all(np.isfinite(output_uvs))
             or np.any(output_uvs < -_UV_EPSILON)
-            or np.any(output_uvs > 1.0 + _UV_EPSILON)
+            or np.any(output_uvs[:, 0] > maximum_u + _UV_EPSILON)
+            or np.any(output_uvs[:, 1] > 1.0 + _UV_EPSILON)
         ):
             raise ValueError("The packed cornice UVs leave the texture atlas.")
-    clipped_uvs = tuple(np.clip(uvs, 0.0, 1.0) for uvs in final_uvs)
-    return _stabilize_uv_faces_for_float32(outputs, clipped_uvs)
+    maximum_u = (
+        0.5
+        if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+        else 1.0
+    )
+    clipped_uvs = tuple(
+        np.clip(uvs, (0.0, 0.0), (maximum_u, 1.0))
+        for uvs in final_uvs
+    )
+    stabilized_uvs = _stabilize_uv_faces_for_float32(
+        outputs,
+        clipped_uvs,
+        maximum_u=maximum_u,
+    )
+    if any(
+        np.any(uvs[:, 0] > maximum_u + _UV_EPSILON)
+        or np.any(uvs[:, 1] > 1.0 + _UV_EPSILON)
+        or np.any(uvs < -_UV_EPSILON)
+        for uvs in stabilized_uvs
+    ):
+        raise ValueError("The stabilized cornice UVs leave the texture atlas.")
+    return stabilized_uvs
+
+
+def _texture_domain_pixel_size(
+    texture_resolution: int,
+    texture_domain: str,
+) -> tuple[float, float]:
+    """Return the physical pixel rectangle available to the UV packer."""
+
+    width = float(texture_resolution)
+    if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF:
+        width *= 0.5
+    return width, float(texture_resolution)
 
 
 def _stabilize_uv_faces_for_float32(
     outputs: tuple[_UvOutput, ...],
     final_uvs: tuple[np.ndarray, ...],
+    *,
+    maximum_u: float,
 ) -> tuple[np.ndarray, ...]:
     """Keep subpixel fallback triangles measurable after GLB float32 storage."""
 
@@ -849,9 +922,15 @@ def _stabilize_uv_faces_for_float32(
             for vertex_index in (int(value) for value in face):
                 for axis in range(2):
                     current = stabilized[vertex_index, axis]
-                    for target in (np.float32(0.0), np.float32(1.0)):
+                    axis_maximum = maximum_u if axis == 0 else 1.0
+                    for target in (
+                        np.float32(0.0),
+                        np.float32(axis_maximum),
+                    ):
                         candidate_value = np.nextafter(current, target)
                         if candidate_value == current:
+                            continue
+                        if not 0.0 <= float(candidate_value) <= axis_maximum:
                             continue
                         candidate_triangle = stabilized[face].copy()
                         local_index = int(np.flatnonzero(face == vertex_index)[0])
@@ -888,19 +967,23 @@ def _gutter_candidates(requested_gutter: int) -> tuple[int, ...]:
 def _find_largest_row_packing(
     charts: tuple[_UvChart, ...],
     *,
-    texture_resolution: int,
+    domain_width: float,
+    domain_height: float,
     gutter_pixels: float,
 ) -> tuple[float, tuple[_ChartPlacement, ...]] | None:
-    content_size = float(texture_resolution) - 2.0 * gutter_pixels
-    if content_size <= 0.0:
+    """Find the largest shared diagonal scale fitting one texture domain."""
+
+    content_width = float(domain_width) - 2.0 * gutter_pixels
+    content_height = float(domain_height) - 2.0 * gutter_pixels
+    if content_width <= 0.0 or content_height <= 0.0:
         return None
     total_area = sum(chart.width * chart.height for chart in charts)
     maximum_width = max(chart.width for chart in charts)
     maximum_height = max(chart.height for chart in charts)
     upper = min(
-        content_size / maximum_width,
-        content_size / maximum_height,
-        math.sqrt((content_size * content_size) / total_area),
+        content_width / maximum_width,
+        content_height / maximum_height,
+        math.sqrt((content_width * content_height) / total_area),
     )
     lower = 0.0
     best: tuple[_ChartPlacement, ...] | None = None
@@ -909,7 +992,8 @@ def _find_largest_row_packing(
         placements = _try_pack_horizontal_rows(
             charts,
             scale=scale,
-            texture_resolution=float(texture_resolution),
+            domain_width=float(domain_width),
+            domain_height=float(domain_height),
             gutter_pixels=gutter_pixels,
         )
         if placements is None:
@@ -926,7 +1010,8 @@ def _try_pack_horizontal_rows(
     charts: tuple[_UvChart, ...],
     *,
     scale: float,
-    texture_resolution: float,
+    domain_width: float,
+    domain_height: float,
     gutter_pixels: float,
 ) -> tuple[_ChartPlacement, ...] | None:
     ordered_indices = sorted(
@@ -942,19 +1027,23 @@ def _try_pack_horizontal_rows(
     cursor_x = gutter_pixels
     cursor_y = gutter_pixels
     row_height = 0.0
-    content_limit = texture_resolution - gutter_pixels
+    horizontal_limit = domain_width - gutter_pixels
+    vertical_limit = domain_height - gutter_pixels
 
     for chart_index in ordered_indices:
         chart = charts[chart_index]
         width = chart.width * scale
         height = chart.height * scale
-        if width > content_limit - gutter_pixels + _UV_EPSILON:
+        if width > horizontal_limit - gutter_pixels + _UV_EPSILON:
             return None
-        if cursor_x > gutter_pixels and cursor_x + width > content_limit + _UV_EPSILON:
+        if (
+            cursor_x > gutter_pixels
+            and cursor_x + width > horizontal_limit + _UV_EPSILON
+        ):
             cursor_x = gutter_pixels
             cursor_y += row_height + gutter_pixels
             row_height = 0.0
-        if cursor_y + height > content_limit + _UV_EPSILON:
+        if cursor_y + height > vertical_limit + _UV_EPSILON:
             return None
         placements[chart_index] = _ChartPlacement(x=cursor_x, y=cursor_y)
         cursor_x += width + gutter_pixels
@@ -1011,7 +1100,12 @@ def _build_output_scene(
     return scene
 
 
-def _validate_uv_glb(exported: bytes, *, expected_bounds: np.ndarray) -> None:
+def _validate_uv_glb(
+    exported: bytes,
+    *,
+    expected_bounds: np.ndarray,
+    texture_domain: str,
+) -> None:
     model = import_generated_glb(exported)
     actual_bounds = np.asarray(model.mesh.bounds, dtype=np.float64)
     scale = max(float(np.ptp(expected_bounds, axis=0).max()), 1.0)
@@ -1026,10 +1120,16 @@ def _validate_uv_glb(exported: bytes, *, expected_bounds: np.ndarray) -> None:
         if not isinstance(geometry, trimesh.Trimesh) or not len(geometry.faces):
             continue
         uvs = np.asarray(getattr(geometry.visual, "uv", None), dtype=np.float64)
+        maximum_u = (
+            0.5
+            if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+            else 1.0
+        )
         if (
             uvs.shape != (len(geometry.vertices), 2)
             or not np.all(np.isfinite(uvs))
             or np.any(uvs < -_UV_EPSILON)
-            or np.any(uvs > 1.0 + _UV_EPSILON)
+            or np.any(uvs[:, 0] > maximum_u + _UV_EPSILON)
+            or np.any(uvs[:, 1] > 1.0 + _UV_EPSILON)
         ):
             raise ValueError("The serialized cornice GLB contains invalid UVs.")

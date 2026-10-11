@@ -107,6 +107,7 @@ from housemaker.texture_atlas_state import (
     TextureAtlasData,
     TextureAtlasPlacement,
     TextureAtlasRecord,
+    atlas_packing_modes_can_share_slot,
     write_texture_atlas_png,
 )
 from housemaker.texture_color_balance import (
@@ -358,6 +359,14 @@ class AtlasObjectTextureSource:
                 raise ValueError(
                     "Full Atlas sources cannot define a symmetric preview."
                 )
+        elif (
+            packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_HALF
+            and orientation is None
+            and plane_coordinate is None
+        ):
+            # Texture-only half packing reuses the legacy 512/1024/2048
+            # layout without declaring mirrored geometry.
+            pass
         else:
             if orientation not in {"vertical", "horizontal"}:
                 raise ValueError(
@@ -1746,8 +1755,12 @@ class TextureAtlasPreview(QWidget):
                 visited_slots.add(slot_key)
                 if (
                     placement.object_id == object_id
-                    or placement.packing_mode != source.packing_mode
+                    or not atlas_packing_modes_can_share_slot(
+                        placement.packing_mode,
+                        source.packing_mode,
+                    )
                     or placement.texture_resolution != source.texture_resolution
+                    or placement.size != slot_size
                     or not (
                         placement.x <= atlas_x < placement.x + placement.size
                         and placement.y <= atlas_y < placement.y + placement.size
@@ -2563,12 +2576,14 @@ class TextureAtlasWorkspace(QWidget):
         """Pack every currently-unpacked source into an appropriate Atlas.
 
         By default this preserves selected-Atlas behavior. Half-mesh routing
-        takes precedence over PBR sorting and sends symmetric sources to a
-        ``[HALF]`` Atlas. PBR sorting sends other base-color-only sources to an
-        Atlas whose exact sources own no PBR maps. Missing auxiliary Atlases
-        are created as needed. When generic Atlas creation is enabled, a full
-        selected Atlas overflows into uniquely named Atlases of the same size.
-        The successful subset is published as one Atlas/PNG transaction.
+        takes precedence over PBR sorting and sends sources with mirrored
+        geometry previews to a ``[HALF]`` Atlas. Texture-only half-packed
+        sources remain in ordinary Atlases. PBR sorting sends other
+        base-color-only sources to an Atlas whose exact sources own no PBR
+        maps. Missing auxiliary Atlases are created as needed. When generic
+        Atlas creation is enabled, a full selected Atlas overflows into
+        uniquely named Atlases of the same size. The successful subset is
+        published as one Atlas/PNG transaction.
         """
 
         selected_atlas = self.selected_atlas
@@ -2731,6 +2746,7 @@ class TextureAtlasWorkspace(QWidget):
         if (
             use_half_mesh_texture_prefix
             and source.packing_mode != ATLAS_PACKING_MODE_FULL
+            and source.symmetric_preview_orientation is not None
         ):
             return self._assign_half_mesh_source(
                 data,
@@ -3199,7 +3215,7 @@ class TextureAtlasWorkspace(QWidget):
         self,
         source_ids: tuple[str, ...] | list[str],
     ) -> bool:
-        """Atomically rewrite atlases whose source pixels changed in place."""
+        """Atomically reconcile source pixels, paths, and packing layouts."""
 
         normalized_ids = tuple(
             dict.fromkeys(
@@ -3226,13 +3242,54 @@ class TextureAtlasWorkspace(QWidget):
         next_data = self._data.clone()
         previous_lazy_error = self._lazy_materialization_error
         affected_atlas_ids = tuple(atlas.atlas_id for atlas in affected_atlases)
+        source_overrides: dict[
+            tuple[str, int],
+            AtlasObjectTextureSource,
+        ] = {}
+        placement_changed = False
         png_snapshots: dict[Path, bytes | None] = {}
         try:
+            for original_atlas in affected_atlases:
+                for placement in original_atlas.placements:
+                    if placement.object_id not in source_id_lookup:
+                        continue
+                    source = self._resolve_current_object_texture_source(
+                        placement.object_id,
+                        placement.texture_resolution,
+                    )
+                    if source is None:
+                        raise ValueError(
+                            "The refreshed texture source is missing its exact "
+                            f"{placement.texture_resolution} x "
+                            f"{placement.texture_resolution} variant."
+                        )
+                    source_overrides[
+                        (placement.object_id, placement.texture_resolution)
+                    ] = source
+                    if (
+                        source.texture_path == placement.texture_path
+                        and source.packing_mode == placement.packing_mode
+                    ):
+                        continue
+                    next_data.assign_object(
+                        original_atlas.atlas_id,
+                        source.object_id,
+                        source.texture_path,
+                        source.texture_resolution,
+                        source.packing_mode,
+                    )
+                    placement_changed = True
             png_snapshots = self._snapshot_atlas_pngs(affected_atlas_ids)
             for atlas_id in affected_atlas_ids:
                 next_atlas = next_data.atlas_by_id(atlas_id)
                 assert next_atlas is not None
-                self._materialize_atlas(next_atlas)
+                if placement_changed:
+                    self._materialize_atlas(
+                        next_atlas,
+                        source_overrides=source_overrides,
+                    )
+                else:
+                    self._materialize_atlas(next_atlas)
             self._remove_invalidated_surface_ao_images(
                 self._data,
                 next_data,
@@ -3260,7 +3317,9 @@ class TextureAtlasWorkspace(QWidget):
         self._emit_data_changed()
         atlas_count = len(affected_atlases)
         self.status_label.setText(
-            f"Refreshed source pixels in {atlas_count} texture atlas"
+            "Refreshed source pixels"
+            + (" and placement packing" if placement_changed else "")
+            + f" in {atlas_count} texture atlas"
             f"{'es' if atlas_count != 1 else ''}."
         )
         return True
@@ -7299,7 +7358,7 @@ def _ordered_placements_for_atlas_repack(
     """Keep established shared-slot members adjacent during a compact repack."""
 
     grouped: dict[
-        tuple[int, int, int, int, str],
+        tuple[int, int, int, int],
         list[TextureAtlasPlacement],
     ] = {}
     for placement in placements:
@@ -7308,7 +7367,6 @@ def _ordered_placements_for_atlas_repack(
             placement.y,
             placement.size,
             placement.texture_resolution,
-            placement.packing_mode,
         )
         grouped.setdefault(group_key, []).append(placement)
 
@@ -7329,7 +7387,7 @@ def _ordered_placements_for_atlas_repack(
     ordered: list[TextureAtlasPlacement] = []
     for group_key in sorted(
         grouped,
-        key=lambda key: (-key[2], key[1], key[0], key[4]),
+        key=lambda key: (-key[2], key[1], key[0], key[3]),
     ):
         ordered.extend(sorted(grouped[group_key], key=member_key))
     return tuple(ordered)

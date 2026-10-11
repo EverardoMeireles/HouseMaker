@@ -12,6 +12,8 @@ from unittest.mock import patch
 import numpy as np
 import trimesh
 from PIL import Image
+from trimesh.visual.material import PBRMaterial
+from trimesh.visual.texture import TextureVisuals
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -22,10 +24,18 @@ from PySide6.QtWidgets import QApplication
 from housemaker.architectural_trim_generation import (
     prepare_architectural_trim_repeat_module,
 )
+from housemaker.architectural_trim_uv import (
+    CORNICE_UV_TEXTURE_DOMAIN_FULL,
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    build_cornice_segmented_uv_glb,
+)
 from housemaker.generation_workspace import (
     ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY,
+    CORNICE_SEGMENTED_UV_PIPELINE_KEY,
+    CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
     LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
     OBJECT_OPERATION_GENERATE_MODEL,
+    SYMMETRIC_DIVISION_PIPELINE_KEY,
     GenerationRequest,
     GenerationWorkspace,
     MeshyImagePlanner,
@@ -43,11 +53,13 @@ from housemaker.models import (
     TRIM_KIND_EDGING_STRIP,
     TRIM_KIND_SKIRTING_BOARD,
 )
+from housemaker.object_symmetry import build_symmetric_half_texture_variants
 from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.uv_integrity import build_uv_fingerprint
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -66,6 +78,7 @@ def _trim_generation_request(
     geometry_only: bool,
     fit_dimensions: tuple[float, float, float],
     trim_kind: str | None = None,
+    cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL,
 ) -> GenerationRequest:
     reference = np.zeros((16, 16, 4), dtype=np.uint8)
     reference[:, :, 3] = 255
@@ -76,6 +89,7 @@ def _trim_generation_request(
         geometry_only=geometry_only,
         architectural_trim_fit_dimensions=fit_dimensions,
         architectural_trim_kind=trim_kind,
+        cornice_uv_texture_domain=cornice_uv_texture_domain,
     )
 
 
@@ -99,8 +113,47 @@ def _module_texture_variants(module_glb: bytes) -> ObjectTextureVariants:
     )
 
 
+def _left_packed_textured_cornice_glb() -> bytes:
+    """Build one real 2048 texture source for half-packing persistence."""
+
+    mesh = trimesh.creation.box(extents=(1.0, 0.1, 0.2))
+    texture = np.full((2048, 2048, 4), (96, 144, 208, 255), dtype=np.uint8)
+    mesh.visual = TextureVisuals(
+        uv=np.zeros((len(mesh.vertices), 2), dtype=np.float64),
+        material=PBRMaterial(
+            baseColorTexture=Image.fromarray(texture, mode="RGBA")
+        ),
+    )
+    source = bytes(trimesh.Scene(mesh).export(file_type="glb"))
+    return build_cornice_segmented_uv_glb(
+        source,
+        texture_resolution=2048,
+        texture_domain=CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    )
+
+
 # ### Architectural-trim planner tests ###
 class ArchitecturalTrimPlannerTests(unittest.TestCase):
+    def test_half_texture_domain_is_exclusive_to_textured_cornices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a cornice"):
+            _trim_generation_request(
+                geometry_only=False,
+                fit_dimensions=(1.0, 0.1, 0.2),
+                trim_kind=TRIM_KIND_SKIRTING_BOARD,
+                cornice_uv_texture_domain=(
+                    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "Geometry-only"):
+            _trim_generation_request(
+                geometry_only=True,
+                fit_dimensions=(1.0, 0.1, 0.2),
+                trim_kind=TRIM_KIND_CORNICE,
+                cornice_uv_texture_domain=(
+                    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+                ),
+            )
+
     def test_textured_generation_retextures_one_module_then_repeats_it(self) -> None:
         source_glb = _trim_component_model().glb_bytes
         fit_dimensions = (6.0, 0.2, 0.4)
@@ -292,6 +345,68 @@ class ArchitecturalTrimPlannerTests(unittest.TestCase):
             result.postprocessed_glb_bytes,
         )
 
+    def test_cornice_half_texture_uses_left_domain_without_clipping(self) -> None:
+        source_glb = _trim_component_model().glb_bytes
+        fit_dimensions = (6.0, 0.2, 0.4)
+        request = _trim_generation_request(
+            geometry_only=False,
+            fit_dimensions=fit_dimensions,
+            trim_kind=TRIM_KIND_CORNICE,
+            cornice_uv_texture_domain=(
+                CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+            ),
+        )
+        self.assertFalse(request.symmetric_division_enabled)
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=MeshyGenerationResult(
+                    task_id="cornice-half-geometry-task",
+                    glb_bytes=source_glb,
+                    name="Generated cornice",
+                ),
+            ),
+            patch(
+                "housemaker.generation_workspace.request_retextured_model",
+                return_value=MeshyGenerationResult(
+                    task_id="cornice-half-texture-task",
+                    glb_bytes=source_glb,
+                    name="Textured cornice",
+                ),
+            ),
+            patch(
+                "housemaker.generation_workspace."
+                "replace_object_base_color_texture_from_glb",
+                side_effect=lambda model_glb, _texture_glb: model_glb,
+            ),
+            patch(
+                "housemaker.generation_workspace."
+                "build_cornice_segmented_uv_glb",
+                wraps=build_cornice_segmented_uv_glb,
+            ) as build_segmented_uv,
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertTrue(result.cornice_segmented_uv)
+        self.assertEqual(
+            result.cornice_uv_texture_domain,
+            CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        )
+        self.assertEqual(
+            build_segmented_uv.call_args.kwargs["texture_domain"],
+            CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        )
+        for geometry in import_generated_glb(
+            result.postprocessed_glb_bytes
+        ).scene.geometry.values():
+            uvs = np.asarray(geometry.visual.uv, dtype=np.float64)
+            self.assertLessEqual(float(np.max(uvs[:, 0])), 0.5 + 1e-7)
+        np.testing.assert_allclose(
+            import_generated_glb(result.glb_bytes).mesh.extents,
+            fit_dimensions,
+        )
+
 
 # ### Architectural-trim generation routing tests ###
 class ArchitecturalTrimGenerationWorkspaceTests(unittest.TestCase):
@@ -362,6 +477,77 @@ class ArchitecturalTrimGenerationWorkspaceTests(unittest.TestCase):
                 self.assertTrue(
                     self.workspace.generate_texture_button.isEnabled()
                 )
+
+    def test_symmetric_division_is_available_only_for_cornice_trims(
+        self,
+    ) -> None:
+        for trim_kind, expected_enabled in (
+            (TRIM_KIND_CORNICE, True),
+            (TRIM_KIND_SKIRTING_BOARD, False),
+            (TRIM_KIND_EDGING_STRIP, False),
+        ):
+            with self.subTest(trim_kind=trim_kind):
+                self.assertTrue(
+                    self.workspace.set_architectural_trim_editing_target(
+                        level_index=2,
+                        trim_id=self.trim_id,
+                        object_id=self.object_id,
+                        object_name="Trim",
+                        fit_dimensions=self.fit_dimensions,
+                        trim_kind=trim_kind,
+                    )
+                )
+                with patch.object(
+                    self.workspace,
+                    "_can_regenerate_object_texture",
+                    return_value=True,
+                ):
+                    self.workspace._sync_controls()
+                self.assertEqual(
+                    self.workspace.symmetric_division_checkbox.isEnabled(),
+                    expected_enabled,
+                )
+
+    def test_selecting_cornice_restores_its_saved_texture_domain(self) -> None:
+        self.record.pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
+            "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+            "texture_domain": CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        }
+        self.workspace.symmetric_division_checkbox.setChecked(False)
+
+        self.assertTrue(
+            self.workspace.set_architectural_trim_editing_target(
+                level_index=2,
+                trim_id=self.trim_id,
+                object_id=self.object_id,
+                object_name="Cornice",
+                fit_dimensions=self.fit_dimensions,
+                trim_kind=TRIM_KIND_CORNICE,
+            )
+        )
+        self.assertTrue(
+            self.workspace.symmetric_division_checkbox.isChecked()
+        )
+
+        self.record.pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
+            "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+            "texture_domain": CORNICE_UV_TEXTURE_DOMAIN_FULL,
+        }
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+
+        self.assertTrue(
+            self.workspace.set_architectural_trim_editing_target(
+                level_index=2,
+                trim_id=self.trim_id,
+                object_id=self.object_id,
+                object_name="Cornice",
+                fit_dimensions=self.fit_dimensions,
+                trim_kind=TRIM_KIND_CORNICE,
+            )
+        )
+        self.assertFalse(
+            self.workspace.symmetric_division_checkbox.isChecked()
+        )
 
     def test_generate_geometry_replaces_selected_trim_component(self) -> None:
         generation_request = object()
@@ -477,6 +663,57 @@ class ArchitecturalTrimGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertIsNotNone(materialized.request.submitted_uv_fingerprint)
 
+    def test_cornice_symmetric_option_builds_texture_only_half_preflight(
+        self,
+    ) -> None:
+        reference_bgra = np.zeros((16, 16, 4), dtype=np.uint8)
+        reference_bgra[:, :, 3] = 255
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+        with (
+            patch.object(
+                self.workspace,
+                "_can_regenerate_object_texture",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace,
+                "_build_current_object_generation_reference",
+                return_value=reference_bgra,
+            ),
+        ):
+            preflight = self.workspace._build_texture_regeneration_request()
+
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertEqual(
+            preflight.cornice_uv_texture_domain,
+            CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        )
+        self.assertFalse(preflight.preserve_symmetric_uvs)
+        self.assertIsNone(preflight.new_symmetric_division_orientation)
+        with patch(
+            "housemaker.generation_workspace.build_cornice_segmented_uv_glb",
+            wraps=build_cornice_segmented_uv_glb,
+        ) as build_segmented_uv:
+            materialized = _materialize_texture_regeneration_preflight(
+                preflight,
+                self.workspace._asset_directory,
+            )
+
+        self.assertEqual(
+            materialized.request.cornice_uv_texture_domain,
+            CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        )
+        self.assertEqual(
+            build_segmented_uv.call_args.kwargs["texture_domain"],
+            CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        )
+        for geometry in import_generated_glb(
+            materialized.request.model_glb
+        ).scene.geometry.values():
+            uvs = np.asarray(geometry.visual.uv, dtype=np.float64)
+            self.assertLessEqual(float(np.max(uvs[:, 0])), 0.5 + 1e-7)
+
     def test_trim_texture_regeneration_requires_scene_trim_target(self) -> None:
         reference_bgra = np.zeros((16, 16, 4), dtype=np.uint8)
         reference_bgra[:, :, 3] = 255
@@ -574,6 +811,108 @@ class ArchitecturalTrimGenerationWorkspaceTests(unittest.TestCase):
                 import_generated_glb(repeated_asset.read_bytes()).mesh.extents,
                 self.fit_dimensions,
             )
+        np.testing.assert_allclose(
+            saved.preview_model.mesh.extents,
+            self.fit_dimensions,
+        )
+
+    def test_cornice_half_texture_persistence_keeps_full_geometry(self) -> None:
+        textured_glb = _left_packed_textured_cornice_glb()
+        module_glb, repeat_layout = prepare_architectural_trim_repeat_module(
+            textured_glb,
+            self.fit_dimensions,
+        )
+        variants = _module_texture_variants(module_glb)
+        generated_model = import_generated_glb(module_glb)
+        generated_model.object_texture_variants = variants
+        reference = np.zeros((16, 16, 4), dtype=np.uint8)
+        reference[:, :, 3] = 255
+        fingerprint = build_uv_fingerprint(module_glb)
+        request = TextureRegenerationRequest(
+            object_id=self.object_id,
+            reference_frame_index=0,
+            reference_image_bgra=reference,
+            model_glb=module_glb,
+            settings=GenerationServiceSettings(),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+            architectural_trim_repeat_layout=repeat_layout,
+            architectural_trim_kind=TRIM_KIND_CORNICE,
+            cornice_uv_texture_domain=(
+                CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+            ),
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult(
+                task_id="cornice-half-texture-task",
+                glb_bytes=module_glb,
+            ),
+            final_uv_fingerprint=fingerprint,
+        )
+
+        with patch(
+            "housemaker.generation_workspace."
+            "build_symmetric_half_texture_variants",
+            wraps=build_symmetric_half_texture_variants,
+        ) as build_half_variants:
+            saved = _prepare_and_persist_texture_regeneration(
+                self.workspace._asset_directory,
+                outcome,
+                generated_model,
+                None,
+                1024,
+                self.record,
+            )
+
+        build_half_variants.assert_called_once()
+        self.assertTrue(
+            build_half_variants.call_args.kwargs["uvs_already_left_packed"]
+        )
+        self.assertEqual(
+            saved.next_pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY],
+            {
+                "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+                "texture_domain": CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+            },
+        )
+        self.assertNotIn(
+            SYMMETRIC_DIVISION_PIPELINE_KEY,
+            saved.next_pipeline,
+        )
+        variant_metadata = saved.next_pipeline["texture_variants"]
+        self.assertEqual(set(variant_metadata), {"512", "1024", "2048"})
+        for raw_resolution, variant in variant_metadata.items():
+            resolution = int(raw_resolution)
+            texture_path = self.workspace._asset_directory.joinpath(
+                variant["texture_asset_path"]
+            )
+            with Image.open(texture_path) as texture_image:
+                pixels = np.asarray(texture_image.convert("RGBA"))
+            self.assertEqual(pixels.shape, (resolution, resolution, 4))
+            self.assertTrue(
+                np.all(
+                    pixels[:, resolution // 2 :]
+                    == np.asarray((0, 0, 0, 255), dtype=np.uint8)
+                )
+            )
+            self.assertTrue(
+                np.any(pixels[:, : resolution // 2, :3] != 0)
+            )
+            model_path = self.workspace._asset_directory.joinpath(
+                variant["glb_asset_path"]
+            )
+            model = import_generated_glb(model_path.read_bytes())
+            np.testing.assert_allclose(
+                model.mesh.extents,
+                self.fit_dimensions,
+            )
+            for geometry in model.scene.geometry.values():
+                uvs = np.asarray(geometry.visual.uv, dtype=np.float64)
+                self.assertLessEqual(
+                    float(np.max(uvs[:, 0])),
+                    0.5 + 1e-7,
+                )
         np.testing.assert_allclose(
             saved.preview_model.mesh.extents,
             self.fit_dimensions,

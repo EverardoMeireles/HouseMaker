@@ -52,7 +52,12 @@ from housemaker.architectural_trim_generation import (
     repeat_architectural_trim_module_glb,
     retarget_architectural_trim_repeat_module_glb,
 )
-from housemaker.architectural_trim_uv import build_cornice_segmented_uv_glb
+from housemaker.architectural_trim_uv import (
+    CORNICE_UV_TEXTURE_DOMAIN_FULL,
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    CORNICE_UV_TEXTURE_DOMAINS,
+    build_cornice_segmented_uv_glb,
+)
 from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_BACK,
     DOOR_SIDE_DUPLICATION_FRONT,
@@ -246,7 +251,7 @@ DOOR_COMPONENT_PIPELINE_KEY = "door_component"
 ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY = "architectural_trim_component"
 ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY = "architectural_trim_repeat"
 CORNICE_SEGMENTED_UV_PIPELINE_KEY = "cornice_segmented_uv"
-CORNICE_SEGMENTED_UV_PIPELINE_VERSION = 1
+CORNICE_SEGMENTED_UV_PIPELINE_VERSION = 2
 CORNICE_MAXIMUM_MODULE_ASPECT_RATIO = 4.0
 MAX_ARCHITECTURAL_TRIM_TRANSFER_CACHE_ENTRIES = 128
 DOOR_SIDE_DUPLICATION_PIPELINE_KEY = "door_side_duplication"
@@ -884,6 +889,39 @@ def _normalize_architectural_trim_kind(raw_kind: object) -> str | None:
     return normalized
 
 
+def _normalize_cornice_uv_texture_domain(raw_domain: object) -> str:
+    """Validate the texture rectangle used by a cornice UV layout."""
+
+    if not isinstance(raw_domain, str):
+        raise TypeError("Cornice UV texture domains must be strings.")
+    normalized = raw_domain.strip().lower()
+    if normalized not in CORNICE_UV_TEXTURE_DOMAINS:
+        raise ValueError("Unknown cornice UV texture domain.")
+    return normalized
+
+
+def _validate_cornice_uv_texture_domain(
+    raw_domain: object,
+    *,
+    trim_kind: str | None,
+    geometry_only: bool = False,
+) -> str:
+    """Keep half-texture packing exclusive to textured cornices."""
+
+    texture_domain = _normalize_cornice_uv_texture_domain(raw_domain)
+    if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF:
+        if trim_kind != TRIM_KIND_CORNICE:
+            raise ValueError(
+                "Left-half cornice UV packing requires a cornice target."
+            )
+        if geometry_only:
+            raise ValueError(
+                "Geometry-only cornice generation cannot use half-texture "
+                "packing."
+            )
+    return texture_domain
+
+
 class GenerationRequest:
     """Owned selected-object input passed to Meshy Image-to-3D."""
 
@@ -905,6 +943,7 @@ class GenerationRequest:
         ai_prompt: str = "",
         architectural_trim_fit_dimensions: Sequence[float] | None = None,
         architectural_trim_kind: str | None = None,
+        cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL,
         door_body_fit_dimensions: Sequence[float] | None = None,
         door_side_duplication: DoorSideDuplication | None = None,
     ) -> None:
@@ -941,6 +980,11 @@ class GenerationRequest:
         )
         self.architectural_trim_kind = _normalize_architectural_trim_kind(
             architectural_trim_kind
+        )
+        self.cornice_uv_texture_domain = _validate_cornice_uv_texture_domain(
+            cornice_uv_texture_domain,
+            trim_kind=self.architectural_trim_kind,
+            geometry_only=self.geometry_only,
         )
         if (
             self.architectural_trim_kind is not None
@@ -1001,6 +1045,7 @@ class TextureRegenerationRequest:
     preserve_existing_glass: bool = False
     architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
     architectural_trim_kind: str | None = None
+    cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -1122,6 +1167,10 @@ class TextureRegenerationRequest:
         trim_kind = _normalize_architectural_trim_kind(
             self.architectural_trim_kind
         )
+        cornice_uv_texture_domain = _validate_cornice_uv_texture_domain(
+            self.cornice_uv_texture_domain,
+            trim_kind=trim_kind,
+        )
         if trim_kind is not None and self.architectural_trim_repeat_layout is None:
             raise ValueError(
                 "Architectural trim texture generation requires a repeat layout."
@@ -1140,6 +1189,11 @@ class TextureRegenerationRequest:
                 "Architectural trim repeat generation must rebuild its UVs."
             )
         object.__setattr__(self, "architectural_trim_kind", trim_kind)
+        object.__setattr__(
+            self,
+            "cornice_uv_texture_domain",
+            cornice_uv_texture_domain,
+        )
         object.__setattr__(self, "glass_face_indices", glass_faces)
         object.__setattr__(
             self,
@@ -1182,6 +1236,7 @@ class _TextureRegenerationPreflight:
     architectural_trim_fit_dimensions: tuple[float, float, float] | None = None
     architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
     architectural_trim_kind: str | None = None
+    cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -1315,6 +1370,10 @@ class _TextureRegenerationPreflight:
         trim_kind = _normalize_architectural_trim_kind(
             self.architectural_trim_kind
         )
+        cornice_uv_texture_domain = _validate_cornice_uv_texture_domain(
+            self.cornice_uv_texture_domain,
+            trim_kind=trim_kind,
+        )
         if trim_kind is not None and trim_fit_dimensions is None:
             raise ValueError(
                 "Architectural trim kinds require target fit dimensions."
@@ -1338,6 +1397,11 @@ class _TextureRegenerationPreflight:
             trim_fit_dimensions,
         )
         object.__setattr__(self, "architectural_trim_kind", trim_kind)
+        object.__setattr__(
+            self,
+            "cornice_uv_texture_domain",
+            cornice_uv_texture_domain,
+        )
         if (
             self.architectural_trim_repeat_layout is not None
             and not isinstance(
@@ -1696,6 +1760,7 @@ class StagedMeshyGenerationResult(SafeDuplicateProcessedMeshyGenerationResult):
     scan_projection_stats: ScanProjectionStats | None = None
     architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
     cornice_segmented_uv: bool = False
+    cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL
     geometry_only: bool = False
 
 
@@ -2345,6 +2410,7 @@ class MeshyImagePlanner:
             processed_glb_bytes = build_cornice_segmented_uv_glb(
                 processed_glb_bytes,
                 texture_resolution=TEXTURE_RESOLUTION_2048,
+                texture_domain=request.cornice_uv_texture_domain,
             )
             _raise_if_generation_cancelled(cancel_event)
 
@@ -2389,6 +2455,9 @@ class MeshyImagePlanner:
                     architectural_trim_repeat_layout
                 ),
                 cornice_segmented_uv=uses_segmented_cornice_uv,
+                cornice_uv_texture_domain=(
+                    request.cornice_uv_texture_domain
+                ),
                 geometry_only=True,
             )
 
@@ -2565,6 +2634,7 @@ class MeshyImagePlanner:
             cornice_segmented_uv=(
                 request.architectural_trim_kind == TRIM_KIND_CORNICE
             ),
+            cornice_uv_texture_domain=request.cornice_uv_texture_domain,
         )
 
 
@@ -4556,6 +4626,15 @@ class GenerationWorkspace(QWidget):
         if self._door_slot_editing_target is not None:
             self.clear_door_slot_editing_target()
         self._architectural_trim_editing_target = target
+        symmetric_division_blocker = QSignalBlocker(
+            self.symmetric_division_checkbox
+        )
+        self.symmetric_division_checkbox.setChecked(
+            target.trim_kind == TRIM_KIND_CORNICE
+            and get_cornice_uv_texture_domain(record)
+            == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+        )
+        del symmetric_division_blocker
         self.result_view.cancel_transient_pointer_interactions()
         self.result_view.set_face_editing_enabled(False)
         self.result_view.set_selected_placed_object_ids(())
@@ -7956,7 +8035,8 @@ class GenerationWorkspace(QWidget):
             "Automatically keep the generated model half with fewer "
             "triangles and pack its texture into one atlas half. This only "
             "applies to a brand-new Generate request or the first texture "
-            "generation for a door body."
+            "generation for a door body. For cornices, the full geometry is "
+            "kept and only its texture is packed into the left atlas half."
         )
         self.symmetric_division_checkbox.toggled.connect(self._sync_controls)
         buttons_layout.addWidget(self.symmetric_division_checkbox)
@@ -8897,6 +8977,16 @@ class GenerationWorkspace(QWidget):
                     texture_variants,
                     generation_request.door_body_fit_dimensions,
                 )
+            if (
+                generation_request is not None
+                and generation_request.architectural_trim_kind
+                == TRIM_KIND_CORNICE
+                and texture_variants is not None
+            ):
+                texture_variants = _pack_cornice_texture_variants(
+                    texture_variants,
+                    generation_request.cornice_uv_texture_domain,
+                )
             symmetric_division_was_requested = bool(
                 generation_request is not None
                 and generation_request.symmetric_division_enabled
@@ -9379,6 +9469,13 @@ class GenerationWorkspace(QWidget):
                         trim_repeat_layout,
                     )
                 )
+                if request.architectural_trim_kind == TRIM_KIND_CORNICE:
+                    module_texture_variants = (
+                        _pack_cornice_texture_variants(
+                            module_texture_variants,
+                            request.cornice_uv_texture_domain,
+                        )
+                    )
                 texture_variants = (
                     _repeat_architectural_trim_texture_variants(
                         module_texture_variants,
@@ -10031,6 +10128,16 @@ class GenerationWorkspace(QWidget):
                 or is_door_body_slot(door_slot_target.slot_id)
             )
         )
+        cornice_uv_texture_domain = (
+            CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+            if (
+                not geometry_only
+                and architectural_trim_target is not None
+                and architectural_trim_target.trim_kind == TRIM_KIND_CORNICE
+                and self.symmetric_division_checkbox.isChecked()
+            )
+            else CORNICE_UV_TEXTURE_DOMAIN_FULL
+        )
         projection_camera_percentages = (
             DEFAULT_PROJECTION_CAMERA_PERCENTAGES
             if door_slot_target is not None
@@ -10084,6 +10191,7 @@ class GenerationWorkspace(QWidget):
                 if architectural_trim_target is not None
                 else None
             ),
+            cornice_uv_texture_domain=cornice_uv_texture_domain,
             door_body_fit_dimensions=(
                 door_slot_target.door_body_fit_dimensions
                 if door_slot_target is not None and rebuild_door_body
@@ -10137,6 +10245,9 @@ class GenerationWorkspace(QWidget):
                     template.architectural_trim_fit_dimensions
                 ),
                 architectural_trim_kind=template.architectural_trim_kind,
+                cornice_uv_texture_domain=(
+                    template.cornice_uv_texture_domain
+                ),
                 door_body_fit_dimensions=(
                     template.door_body_fit_dimensions
                 ),
@@ -10343,6 +10454,14 @@ class GenerationWorkspace(QWidget):
                     trim_target.trim_kind
                     if is_active_architectural_trim and trim_target is not None
                     else None
+                ),
+                cornice_uv_texture_domain=(
+                    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+                    if (
+                        uses_segmented_cornice_uv
+                        and self.symmetric_division_checkbox.isChecked()
+                    )
+                    else CORNICE_UV_TEXTURE_DOMAIN_FULL
                 ),
             )
         except Exception as error:
@@ -10588,7 +10707,14 @@ class GenerationWorkspace(QWidget):
                 and not self._active_object_operation.cancel_requested
             )
         self.symmetric_division_checkbox.setEnabled(
-            not architectural_trim_mode
+            (
+                not architectural_trim_mode
+                or (
+                    trim_target is not None
+                    and trim_target.trim_kind == TRIM_KIND_CORNICE
+                    and architectural_trim_can_generate_texture
+                )
+            )
             and (not door_slot_mode or door_body_slot_mode)
             and not has_untracked_legacy_job
         )
@@ -11467,6 +11593,19 @@ def _build_safe_duplicate_removal_pipeline_metadata(
     }
 
 
+def _build_cornice_segmented_uv_pipeline_metadata(
+    texture_domain: object,
+) -> dict[str, object]:
+    """Build the UV-only cornice texture-packing contract."""
+
+    return {
+        "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+        "texture_domain": _normalize_cornice_uv_texture_domain(
+            texture_domain
+        ),
+    }
+
+
 def _build_staged_generation_pipeline_metadata(
     result: StagedMeshyGenerationResult,
     source_asset_path: str,
@@ -11570,9 +11709,11 @@ def _build_staged_generation_pipeline_metadata(
         )
     if result.cornice_segmented_uv:
         pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY] = True
-        pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
-            "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
-        }
+        pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = (
+            _build_cornice_segmented_uv_pipeline_metadata(
+                result.cornice_uv_texture_domain
+            )
+        )
     return pipeline
 
 
@@ -11914,6 +12055,30 @@ def _fit_architectural_trim_texture_variants(
         )
     _raise_if_generation_cancelled(cancel_event)
     return replace(variants, glb_by_resolution=fitted_glbs)
+
+
+def _pack_cornice_texture_variants(
+    variants: PersistableObjectTextureVariants,
+    texture_domain: object,
+) -> ObjectTextureVariants:
+    """Mask unused cornice pixels without changing its complete geometry."""
+
+    normalized_domain = _normalize_cornice_uv_texture_domain(texture_domain)
+    if not isinstance(variants, ObjectTextureVariants):
+        raise TypeError(
+            "Cornice half-texture packing requires ordinary texture variants."
+        )
+    if normalized_domain == CORNICE_UV_TEXTURE_DOMAIN_FULL:
+        return variants
+    canonical_glb = variants.glb_by_resolution.get(TEXTURE_RESOLUTION_2048)
+    if canonical_glb is None:
+        raise ValueError(
+            "Cornice half-texture packing requires its 2048 texture variant."
+        )
+    return build_symmetric_half_texture_variants(
+        canonical_glb,
+        uvs_already_left_packed=True,
+    )
 
 
 def _fit_generated_door_body_texture_variants(
@@ -12460,6 +12625,34 @@ def is_architectural_trim_component_record(record: object) -> bool:
     return get_architectural_trim_component_identity(record) is not None
 
 
+def get_cornice_uv_texture_domain(record: object) -> str:
+    """Return a persisted cornice's validated texture-only packing domain."""
+
+    if not isinstance(record, GeneratedObjectRecord):
+        return CORNICE_UV_TEXTURE_DOMAIN_FULL
+    component_metadata = record.pipeline.get(
+        ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY
+    )
+    if (
+        not isinstance(component_metadata, Mapping)
+        or component_metadata.get("trim_kind") != TRIM_KIND_CORNICE
+    ):
+        return CORNICE_UV_TEXTURE_DOMAIN_FULL
+    raw_metadata = record.pipeline.get(CORNICE_SEGMENTED_UV_PIPELINE_KEY)
+    if (
+        not isinstance(raw_metadata, Mapping)
+        or raw_metadata.get("version")
+        != CORNICE_SEGMENTED_UV_PIPELINE_VERSION
+    ):
+        return CORNICE_UV_TEXTURE_DOMAIN_FULL
+    try:
+        return _normalize_cornice_uv_texture_domain(
+            raw_metadata.get("texture_domain")
+        )
+    except (TypeError, ValueError):
+        return CORNICE_UV_TEXTURE_DOMAIN_FULL
+
+
 # ### Texture-regeneration helpers ###
 def is_door_component_record(record: object) -> bool:
     """Return whether a persisted generated asset belongs to the Doors editor."""
@@ -12535,9 +12728,11 @@ def _build_regenerated_texture_pipeline(
         pipeline.pop(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, None)
         pipeline.pop(SCAN_PROJECTION_PIPELINE_KEY, None)
         pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY] = True
-        pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
-            "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
-        }
+        pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = (
+            _build_cornice_segmented_uv_pipeline_metadata(
+                request.cornice_uv_texture_domain
+            )
+        )
     selected_resolution = _get_selected_texture_resolution(record)
     if selected_resolution not in _selectable_texture_resolutions(record):
         selected_resolution = DEFAULT_TEXTURE_RESOLUTION
@@ -13411,6 +13606,7 @@ def _materialize_texture_regeneration_preflight(
         model_glb = build_cornice_segmented_uv_glb(
             model_glb,
             texture_resolution=TEXTURE_RESOLUTION_2048,
+            texture_domain=raw_request.cornice_uv_texture_domain,
         )
         _raise_if_generation_cancelled(cancel_event)
     import_generated_glb(model_glb)
@@ -13454,6 +13650,9 @@ def _materialize_texture_regeneration_preflight(
         preserve_existing_glass=raw_request.preserve_existing_glass,
         architectural_trim_repeat_layout=trim_repeat_layout,
         architectural_trim_kind=trim_kind,
+        cornice_uv_texture_domain=(
+            raw_request.cornice_uv_texture_domain
+        ),
     )
     return _MaterializedTextureRegeneration(
         request=request,
@@ -13517,6 +13716,15 @@ def _prepare_and_persist_object_generation(
                 texture_variants,
                 request.door_body_fit_dimensions,
                 cancel_event=cancel_event,
+            )
+            _raise_if_generation_cancelled(cancel_event)
+        if (
+            request.architectural_trim_kind == TRIM_KIND_CORNICE
+            and texture_variants is not None
+        ):
+            texture_variants = _pack_cornice_texture_variants(
+                texture_variants,
+                request.cornice_uv_texture_domain,
             )
             _raise_if_generation_cancelled(cancel_event)
         if request.symmetric_division_enabled:
@@ -13750,6 +13958,11 @@ def _prepare_and_persist_texture_regeneration(
                 trim_repeat_layout,
                 cancel_event=cancel_event,
             )
+            if outcome.request.architectural_trim_kind == TRIM_KIND_CORNICE:
+                module_texture_variants = _pack_cornice_texture_variants(
+                    module_texture_variants,
+                    outcome.request.cornice_uv_texture_domain,
+                )
             texture_variants = _repeat_architectural_trim_texture_variants(
                 module_texture_variants,
                 trim_repeat_layout,

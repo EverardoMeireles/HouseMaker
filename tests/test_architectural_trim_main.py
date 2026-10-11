@@ -27,7 +27,12 @@ from housemaker.architectural_trim import (
     ArchitecturalTrimPlacementRequest,
 )
 from housemaker.generation_state import MESHY_GENERATION_PROVIDER
-from housemaker.generation_workspace import OBJECT_OPERATION_GENERATE_TEXTURE
+from housemaker.generation_workspace import (
+    CORNICE_SEGMENTED_UV_PIPELINE_KEY,
+    CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    OBJECT_OPERATION_GENERATE_TEXTURE,
+)
 from housemaker.glb import (
     GeneratedModel,
     build_placed_generated_model_transform,
@@ -91,7 +96,11 @@ def _wall_surface_id(start_id: int, end_id: int) -> str:
     return f"level:2/room:5/wall:{start_id}:{end_id}"
 
 
-def _build_authored_uv_glb(model: GeneratedModel) -> bytes:
+def _build_authored_uv_glb(
+    model: GeneratedModel,
+    *,
+    left_half: bool = False,
+) -> bytes:
     """Attach a distinctive authored UV layout to every fixture primitive."""
 
     scene = import_generated_glb(model.glb_bytes).scene
@@ -107,6 +116,8 @@ def _build_authored_uv_glb(model: GeneratedModel) -> bytes:
                 + 0.1,
             )
         )
+        if left_half:
+            uv[:, 0] *= 0.5
         geometry.visual = TextureVisuals(
             uv=uv,
             material=PBRMaterial(
@@ -184,6 +195,7 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         *,
         color: tuple[int, int, int, int],
         task_id: str,
+        half_texture: bool = False,
     ):
         """Persist one exact object-texture family on a procedural trim."""
 
@@ -198,7 +210,10 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         model = generation.get_generated_object_model(object_id)
         self.assertIsNotNone(model)
         assert model is not None
-        authored_uv_glb = _build_authored_uv_glb(model)
+        authored_uv_glb = _build_authored_uv_glb(
+            model,
+            left_half=half_texture,
+        )
         authored_uv_model = import_generated_glb(authored_uv_glb)
 
         variants: dict[str, dict[str, object]] = {}
@@ -208,11 +223,22 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             base_color_name = f"{stem}.png"
             normal_name = f"{stem}.normal.png"
             (generation._asset_directory / glb_name).write_bytes(authored_uv_glb)
-            Image.new("RGBA", (resolution, resolution), color).save(
+            base_color = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+            base_color[:, :, 3] = 255
+            base_color[:, : (resolution // 2 if half_texture else resolution)] = color
+            Image.fromarray(base_color, mode="RGBA").save(
                 generation._asset_directory / base_color_name,
                 format="PNG",
             )
-            Image.new("RGBA", (resolution, resolution), (128, 128, 255, 255)).save(
+            normal = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+            normal[:, :, 3] = 255
+            normal[:, : (resolution // 2 if half_texture else resolution)] = (
+                128,
+                128,
+                255,
+                255,
+            )
+            Image.fromarray(normal, mode="RGBA").save(
                 generation._asset_directory / normal_name,
                 format="PNG",
             )
@@ -228,6 +254,11 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         updated_pipeline = dict(record.pipeline)
         updated_pipeline["texture_variants"] = variants
         updated_pipeline["selected_texture_resolution"] = 512
+        if half_texture:
+            updated_pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
+                "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+                "texture_domain": CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+            }
         updated_record = replace(
             record,
             pipeline=updated_pipeline,
@@ -732,6 +763,72 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         self.assertIsNotNone(refreshed_atlas_path)
         assert refreshed_atlas_path is not None
         self.assertNotEqual(refreshed_atlas_path.read_bytes(), first_atlas_png)
+
+    def test_half_packed_cornice_texture_is_assignable(self) -> None:
+        source_trim_id = "1" * 32
+        target_trim_id = "2" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_cornice(source_trim_id, _wall_surface_id(1, 2))
+            source_target = self.workspace.generation._architectural_trim_editing_target
+            self.assertIsNotNone(source_target)
+            assert source_target is not None
+            source_object_id = source_target.object_id
+            self._place_cornice(target_trim_id, _wall_surface_id(2, 3))
+
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Cornices", 2048, atlas_id="cornices")
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        generated_record, generated_model = self._install_trim_texture_family(
+            source_object_id,
+            color=(170, 80, 30, 255),
+            task_id="half-cornice-texture",
+            half_texture=True,
+        )
+        self.workspace.generation.texture_regeneration_completed.emit(
+            generated_record,
+            generated_model,
+        )
+        self.workspace.generation.generated_object_changed.emit(
+            generated_record,
+            generated_model,
+        )
+        _qt_application.processEvents()
+
+        assignment = next(
+            assignment
+            for assignment in self.workspace.surface_texture_generation.get_assignments()
+            if assignment.source_object_id == source_object_id
+        )
+        original_ids = set(assignment.surface_ids)
+        target_front_id = next(
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == target_trim_id and part.part_kind == "front"
+        )
+        expected_target_ids = {
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == target_trim_id
+        }
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (target_front_id,)
+        )
+
+        self.workspace._handle_atlas_surface_assign_requested(source_object_id)
+
+        applied = self.workspace.surface_texture_generation.get_assignment(
+            assignment.assignment_id
+        )
+        self.assertIsNotNone(applied)
+        assert applied is not None
+        self.assertEqual(
+            set(applied.surface_ids),
+            original_ids | expected_target_ids,
+        )
+        self.assertNotEqual(
+            self.workspace.texture_atlas_workspace.status_label.text(),
+            "The texture could not be assigned to the selected surfaces.",
+        )
 
         self.workspace._handle_atlas_object_texture_resolution_changed(
             source_object_id,

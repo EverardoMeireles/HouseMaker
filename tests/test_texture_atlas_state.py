@@ -1103,16 +1103,162 @@ class TextureAtlasStateTests(unittest.TestCase):
             ],
         )
 
-    def test_square_pair_never_cross_pairs_with_legacy_modes(self) -> None:
+    def test_texture_half_and_square_pair_share_one_slot_in_either_order(
+        self,
+    ) -> None:
+        insertion_orders = (
+            (
+                ("cornice", ATLAS_PACKING_MODE_SYMMETRIC_HALF),
+                ("half-mesh", ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR),
+            ),
+            (
+                ("half-mesh", ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR),
+                ("cornice", ATLAS_PACKING_MODE_SYMMETRIC_HALF),
+            ),
+        )
+
+        for insertion_order in insertion_orders:
+            with self.subTest(first=insertion_order[0][0]):
+                data = TextureAtlasData()
+                atlas = data.create_atlas(
+                    "Mixed square halves",
+                    2048,
+                    atlas_id="atlas-a",
+                )
+                placements = [
+                    data.assign_object(
+                        atlas.atlas_id,
+                        object_id,
+                        f"textures/{object_id}.png",
+                        512,
+                        packing_mode,
+                    )
+                    for object_id, packing_mode in insertion_order
+                ]
+
+                self.assertEqual(
+                    {
+                        (placement.x, placement.y, placement.size)
+                        for placement in placements
+                    },
+                    {(0, 0, 512)},
+                )
+                self.assertEqual(
+                    [placement.slot_half for placement in placements],
+                    [ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT],
+                )
+                self.assertEqual(
+                    [placement.packing_mode for placement in placements],
+                    [packing_mode for _object_id, packing_mode in insertion_order],
+                )
+
+    def test_exact_placement_shares_mixed_square_half_slot_in_either_order(
+        self,
+    ) -> None:
+        insertion_orders = (
+            (
+                ("cornice", ATLAS_PACKING_MODE_SYMMETRIC_HALF),
+                ("half-mesh", ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR),
+            ),
+            (
+                ("half-mesh", ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR),
+                ("cornice", ATLAS_PACKING_MODE_SYMMETRIC_HALF),
+            ),
+        )
+
+        for insertion_order in insertion_orders:
+            with self.subTest(first=insertion_order[0][0]):
+                data = TextureAtlasData()
+                atlas = data.create_atlas(
+                    "Mixed exact placement",
+                    2048,
+                    atlas_id="atlas-a",
+                )
+                placements = [
+                    data.place_object_at(
+                        atlas.atlas_id,
+                        object_id,
+                        f"textures/{object_id}.png",
+                        512,
+                        512,
+                        1024,
+                        packing_mode,
+                    )
+                    for object_id, packing_mode in insertion_order
+                ]
+
+                self.assertEqual(
+                    {
+                        (placement.x, placement.y, placement.size)
+                        for placement in placements
+                    },
+                    {(512, 1024, 512)},
+                )
+                self.assertEqual(
+                    [placement.slot_half for placement in placements],
+                    [ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT],
+                )
+                self.assertEqual(
+                    [placement.packing_mode for placement in placements],
+                    [packing_mode for _object_id, packing_mode in insertion_order],
+                )
+
+    def test_mixed_square_half_compositor_uses_each_authored_left_half(
+        self,
+    ) -> None:
         data = TextureAtlasData()
-        atlas = data.create_atlas("Distinct pairs", 2048, atlas_id="atlas-a")
-        legacy_half = data.assign_object(
+        atlas = data.create_atlas("Mixed pixels", 2048, atlas_id="atlas-a")
+        cornice = data.assign_object(
             atlas.atlas_id,
-            "legacy-half",
-            "textures/legacy-half.png",
+            "cornice",
+            "textures/cornice.png",
             512,
             ATLAS_PACKING_MODE_SYMMETRIC_HALF,
         )
+        data.assign_object(
+            atlas.atlas_id,
+            "half-mesh",
+            "textures/half-mesh.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+
+        def load_source(placement):
+            source = np.full(
+                (512, 512, 4),
+                (200, 210, 220, 3),
+                dtype=np.uint8,
+            )
+            source[:, :256] = (
+                (10, 20, 30, 255)
+                if placement.object_id == "cornice"
+                else (40, 50, 60, 255)
+            )
+            return source
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "mixed-square-halves.png"
+            write_texture_atlas_png(
+                atlas,
+                output_path,
+                source_loader=load_source,
+            )
+            image = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(
+            tuple(image[cornice.y + 500, cornice.x + 10]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[cornice.y + 500, cornice.x + 300]),
+            (40, 50, 60, 255),
+        )
+
+    def test_square_pair_never_cross_pairs_with_legacy_symmetric_pair(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Distinct pairs", 2048, atlas_id="atlas-a")
         legacy_pair = data.assign_object(
             atlas.atlas_id,
             "legacy-pair",
@@ -1130,13 +1276,67 @@ class TextureAtlasStateTests(unittest.TestCase):
 
         self.assertNotEqual(
             (square_pair.x, square_pair.y, square_pair.size),
-            (legacy_half.x, legacy_half.y, legacy_half.size),
-        )
-        self.assertNotEqual(
-            (square_pair.x, square_pair.y, square_pair.size),
             (legacy_pair.x, legacy_pair.y, legacy_pair.size),
         )
+        self.assertEqual(legacy_pair.slot_half, ATLAS_SLOT_HALF_LEFT)
         self.assertEqual(square_pair.slot_half, ATLAS_SLOT_HALF_LEFT)
+
+    def test_repack_and_serialization_preserve_mixed_square_half_pair(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Mixed repack", 2048, atlas_id="atlas-a")
+        cornice = data.assign_object(
+            atlas.atlas_id,
+            "cornice",
+            "textures/cornice.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            allow_pairing=False,
+        )
+        half_mesh = data.assign_object(
+            atlas.atlas_id,
+            "half-mesh",
+            "textures/half-mesh.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            allow_pairing=False,
+        )
+        self.assertNotEqual(
+            (cornice.x, cornice.y, cornice.size),
+            (half_mesh.x, half_mesh.y, half_mesh.size),
+        )
+
+        data.repack_atlas(atlas.atlas_id)
+        restored = TextureAtlasData.from_dict(data.to_dict())
+        restored_atlas = restored.atlases[0]
+        restored_cornice = restored_atlas.placement_for_object("cornice")
+        restored_half_mesh = restored_atlas.placement_for_object("half-mesh")
+        assert restored_cornice is not None
+        assert restored_half_mesh is not None
+
+        self.assertEqual(
+            (
+                restored_cornice.x,
+                restored_cornice.y,
+                restored_cornice.size,
+            ),
+            (
+                restored_half_mesh.x,
+                restored_half_mesh.y,
+                restored_half_mesh.size,
+            ),
+        )
+        self.assertEqual(restored_cornice.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertEqual(restored_half_mesh.slot_half, ATLAS_SLOT_HALF_RIGHT)
+        self.assertEqual(
+            restored_cornice.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        self.assertEqual(
+            restored_half_mesh.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
 
     def test_square_pair_compositor_uses_only_each_full_height_left_half(
         self,

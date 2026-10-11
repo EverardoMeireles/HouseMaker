@@ -2923,6 +2923,79 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             )
         )
 
+    def test_object_backed_assignment_rebind_skips_planar_install(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        object_source = "level:2/room:5/wall:1:2"
+        object_target = "level:2/room:5/wall:2:3"
+        ordinary_source = "level:2/room:5/wall:3:4"
+        ordinary_target = "level:2/room:5/wall:1:4"
+        object_assignment_payload = _surface_assignment_with_variants(
+            asset_directory,
+            "linked-cornice",
+            (object_source,),
+        ).to_dict()
+        object_assignment_payload["source_object_id"] = "cornice-object-1"
+        object_assignment = SurfaceTextureAssignment.from_dict(
+            object_assignment_payload
+        )
+        ordinary_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "ordinary-wall",
+            (ordinary_source,),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[object_assignment, ordinary_assignment]
+            )
+        )
+        (asset_directory / object_assignment.asset_path).unlink()
+
+        with patch.object(
+            self.workspace,
+            "_set_surface_view_texture",
+            wraps=self.workspace._set_surface_view_texture,
+        ) as install_planar_texture:
+            self.assertTrue(
+                self.workspace.assignment_targets_are_valid(
+                    "linked-cornice",
+                    (object_target,),
+                )
+            )
+            self.assertTrue(
+                self.workspace.apply_assignment_texture(
+                    "linked-cornice",
+                    (object_target,),
+                )
+            )
+            install_planar_texture.assert_not_called()
+
+            self.assertTrue(
+                self.workspace.apply_assignment_texture(
+                    "ordinary-wall",
+                    (ordinary_target,),
+                )
+            )
+
+        assignments = {
+            assignment.assignment_id: assignment
+            for assignment in self.workspace.get_assignments()
+        }
+        self.assertEqual(
+            assignments["linked-cornice"].surface_ids,
+            (object_source, object_target),
+        )
+        self.assertEqual(
+            assignments["ordinary-wall"].surface_ids,
+            (ordinary_source, ordinary_target),
+        )
+        install_planar_texture.assert_called_once()
+        self.assertEqual(
+            tuple(install_planar_texture.call_args.args[0]),
+            (ordinary_source, ordinary_target),
+        )
+
     def test_apply_legacy_texture_preserves_fixed_asset_metadata(
         self,
     ) -> None:

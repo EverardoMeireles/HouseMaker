@@ -179,12 +179,14 @@ from housemaker.generation_state import (
     GenerationData,
 )
 from housemaker.generation_workspace import (
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
     OBJECT_OPERATION_GENERATE_TEXTURE,
     PBR_MAPS_ENABLED_PIPELINE_KEY,
     GenerationWorkspace,
     ObjectTextureImageVariant,
     get_architectural_trim_component_identity,
+    get_cornice_uv_texture_domain,
     is_architectural_trim_component_record,
     is_door_component_record,
 )
@@ -12310,6 +12312,31 @@ class BlueprintWorkspace(QWidget):
             return source_object_id
         return build_atlas_wall_texture_source_id(assignment.assignment_id)
 
+    def _atlas_packing_mode_for_surface_assignment(
+        self,
+        assignment: SurfaceTextureAssignment,
+    ) -> str:
+        """Resolve UV-only cornice packing without declaring half geometry."""
+
+        source_object_id = str(assignment.source_object_id or "").strip()
+        if not source_object_id:
+            return ATLAS_PACKING_MODE_FULL
+        source_record = next(
+            (
+                record
+                for record in self.generation.get_data().generated_objects
+                if record.object_id == source_object_id
+            ),
+            None,
+        )
+        if (
+            source_record is not None
+            and get_cornice_uv_texture_domain(source_record)
+            == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+        ):
+            return ATLAS_PACKING_MODE_SYMMETRIC_HALF
+        return ATLAS_PACKING_MODE_FULL
+
     def _atlas_surface_assignment_id_for_source(
         self,
         source_id: object,
@@ -13614,6 +13641,12 @@ class BlueprintWorkspace(QWidget):
             assignment.assignment_id,
             target_surface_ids,
         )
+        atlas_status_before = (
+            self.texture_atlas_workspace.status_label.text().strip()
+        )
+        surface_status_before = (
+            self.surface_texture_generation.status_label.text().strip()
+        )
 
         def commit_surface_assignment() -> bool:
             self._is_assigning_surface_texture_from_atlas = True
@@ -13663,9 +13696,23 @@ class BlueprintWorkspace(QWidget):
             )
 
         if not assigned:
-            self.texture_atlas_workspace.status_label.setText(
-                "The texture could not be assigned to the selected surfaces."
+            surface_status_after = (
+                self.surface_texture_generation.status_label.text().strip()
             )
+            atlas_status_after = (
+                self.texture_atlas_workspace.status_label.text().strip()
+            )
+            if (
+                surface_status_after
+                and surface_status_after != surface_status_before
+            ):
+                self.texture_atlas_workspace.status_label.setText(
+                    surface_status_after
+                )
+            elif not atlas_status_after or atlas_status_after == atlas_status_before:
+                self.texture_atlas_workspace.status_label.setText(
+                    "The texture could not be assigned to the selected surfaces."
+                )
             return
         self._atlas_surface_assignment_target_ids = ()
         self._atlas_generation_signature = None
@@ -14317,6 +14364,22 @@ class BlueprintWorkspace(QWidget):
         symmetry = self.generation.resolve_symmetric_division_for_record(
             replacement_record
         )
+        old_cornice_texture_domain = get_cornice_uv_texture_domain(old_record)
+        replacement_cornice_texture_domain = get_cornice_uv_texture_domain(
+            replacement_record
+        )
+        texture_only_packing_mode: str | None = None
+        if CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF in (
+            old_cornice_texture_domain,
+            replacement_cornice_texture_domain,
+        ):
+            symmetry = None
+            texture_only_packing_mode = (
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF
+                if replacement_cornice_texture_domain
+                == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+                else ATLAS_PACKING_MODE_FULL
+            )
         resolve_variant = self.generation.resolve_atlas_texture_image_variant_for_record
         candidate_sources: list[AtlasObjectTextureSource] = []
         for resolution in sorted(OBJECT_TEXTURE_RESOLUTIONS):
@@ -14326,10 +14389,17 @@ class BlueprintWorkspace(QWidget):
             )
             if variant is None:
                 continue
-            source = self._build_atlas_object_texture_source(
-                variant,
-                symmetry,
-            )
+            if texture_only_packing_mode is None:
+                source = self._build_atlas_object_texture_source(
+                    variant,
+                    symmetry,
+                )
+            else:
+                source = self._build_atlas_object_texture_source(
+                    variant,
+                    symmetry,
+                    texture_only_packing_mode=texture_only_packing_mode,
+                )
             if source is None:
                 return False
             candidate_sources.append(source)
@@ -14930,6 +15000,9 @@ class BlueprintWorkspace(QWidget):
                     assignment.texture_repeat_size_m,
                     assignment.tiling_fix_needed,
                     assignment.source_object_id,
+                    self._atlas_packing_mode_for_surface_assignment(
+                        assignment
+                    ),
                     tuple(variant_signature),
                 )
             )
@@ -15071,12 +15144,52 @@ class BlueprintWorkspace(QWidget):
             surface_sources[source.object_id] = source
             surface_assignments_by_source_id[source.object_id] = assignment
 
+        placement_refresh_source_ids: list[str] = []
+        resolved_surface_sources: dict[
+            tuple[str, int],
+            AtlasObjectTextureSource | None,
+        ] = {}
+        for atlas in self.texture_atlas_workspace.get_data().atlases:
+            for placement in atlas.placements:
+                assignment = surface_assignments_by_source_id.get(
+                    placement.object_id
+                )
+                if assignment is None:
+                    continue
+                source_key = (
+                    placement.object_id,
+                    placement.texture_resolution,
+                )
+                if source_key not in resolved_surface_sources:
+                    active_source = surface_sources.get(placement.object_id)
+                    resolved_surface_sources[source_key] = (
+                        active_source
+                        if active_source is not None
+                        and active_source.texture_resolution
+                        == placement.texture_resolution
+                        else self._build_atlas_wall_texture_source(
+                            assignment,
+                            placement.texture_resolution,
+                        )
+                    )
+                placement_source = resolved_surface_sources[source_key]
+                if placement_source is None:
+                    source_build_failed = True
+                    failed_source_ids.add(placement.object_id)
+                    continue
+                if (
+                    placement_source.texture_path != placement.texture_path
+                    or placement_source.packing_mode != placement.packing_mode
+                ):
+                    placement_refresh_source_ids.append(placement.object_id)
+
         self._atlas_pending_source_content_refresh_ids.update(failed_source_ids)
         refreshable_source_ids = tuple(
             source_id
             for source_id in dict.fromkeys(
                 (
                     *changed_source_ids,
+                    *placement_refresh_source_ids,
                     *self._atlas_pending_source_content_refresh_ids,
                 )
             )
@@ -15211,6 +15324,8 @@ class BlueprintWorkspace(QWidget):
     def _build_atlas_object_texture_source(
         variant: object,
         symmetry: object | None = None,
+        *,
+        texture_only_packing_mode: str | None = None,
     ) -> AtlasObjectTextureSource | None:
         """Adapt one public Generation variant while tolerating missing assets."""
 
@@ -15218,7 +15333,14 @@ class BlueprintWorkspace(QWidget):
             return None
         try:
             packing_mode = ATLAS_PACKING_MODE_FULL
-            if symmetry is not None:
+            if texture_only_packing_mode is not None:
+                if texture_only_packing_mode not in (
+                    ATLAS_PACKING_MODE_FULL,
+                    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                ):
+                    raise ValueError("Unknown texture-only packing mode.")
+                packing_mode = texture_only_packing_mode
+            elif symmetry is not None:
                 symmetry_version = getattr(symmetry, "version", None)
                 is_legacy_pair = (
                     isinstance(symmetry_version, int)
@@ -15280,11 +15402,13 @@ class BlueprintWorkspace(QWidget):
                 ),
                 packing_mode=packing_mode,
                 symmetric_preview_orientation=(
-                    None if symmetry is None else str(getattr(symmetry, "orientation"))
+                    None
+                    if symmetry is None or texture_only_packing_mode is not None
+                    else str(getattr(symmetry, "orientation"))
                 ),
                 symmetric_preview_plane_coordinate=(
                     None
-                    if symmetry is None
+                    if symmetry is None or texture_only_packing_mode is not None
                     else float(getattr(symmetry, "plane_coordinate"))
                 ),
             )
@@ -15296,7 +15420,19 @@ class BlueprintWorkspace(QWidget):
         assignment: SurfaceTextureAssignment,
         resolution: int | None = None,
     ) -> AtlasObjectTextureSource | None:
-        """Adapt one generated surface texture and its exact active variant."""
+        """Adapt a Surface texture while tolerating unavailable asset files."""
+
+        try:
+            return self._load_atlas_wall_texture_source(assignment, resolution)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    def _load_atlas_wall_texture_source(
+        self,
+        assignment: SurfaceTextureAssignment,
+        resolution: int | None = None,
+    ) -> AtlasObjectTextureSource:
+        """Load one exact Surface source or expose its validation failure."""
 
         supports_resolution_changes = bool(assignment.texture_variants)
         requested_resolution = resolution
@@ -15307,7 +15443,9 @@ class BlueprintWorkspace(QWidget):
                 else int(requested_resolution)
             )
             if requested_resolution is None:
-                return None
+                raise ValueError(
+                    "The Surface texture family has no active resolution."
+                )
         physical_map_paths = (
             self.surface_texture_generation.get_assignment_map_asset_paths(
                 assignment.assignment_id,
@@ -15316,7 +15454,9 @@ class BlueprintWorkspace(QWidget):
         )
         physical_path = physical_map_paths.get(ATLAS_MAP_BASE_COLOR)
         if physical_path is None:
-            return None
+            raise ValueError(
+                "The Surface texture is missing its base-color asset."
+            )
         legacy_logical_map_paths = {ATLAS_MAP_BASE_COLOR: assignment.asset_path}
         logical_map_paths = legacy_logical_map_paths
         if supports_resolution_changes:
@@ -15338,50 +15478,53 @@ class BlueprintWorkspace(QWidget):
         atlas_physical_map_paths = {
             map_type: physical_map_paths[map_type] for map_type in live_map_types
         }
-        try:
-            if supports_resolution_changes:
-                texture_resolution = int(requested_resolution)
-                fit_to_square = False
-                variant = assignment.texture_variant_for_resolution(texture_resolution)
-                if variant is None:
-                    return None
-                asset_path = variant.asset_path
-            else:
-                with Image.open(physical_path) as image:
-                    natural_resolution = choose_atlas_texture_resolution(
-                        image.width, image.height
-                    )
-                texture_resolution = (
-                    natural_resolution if resolution is None else int(resolution)
+        if supports_resolution_changes:
+            texture_resolution = int(requested_resolution)
+            fit_to_square = False
+            variant = assignment.texture_variant_for_resolution(texture_resolution)
+            if variant is None:
+                raise ValueError(
+                    "The Surface texture family is missing its "
+                    f"{texture_resolution} x {texture_resolution} variant."
                 )
-                fit_to_square = True
-                asset_path = assignment.asset_path
-            surface_count = len(assignment.surface_ids)
-            return load_atlas_object_texture_source(
-                object_id=self._atlas_source_id_for_surface_assignment(assignment),
-                object_name=(
-                    assignment.display_name
-                    or f"{assignment.surface_type.title()} texture"
-                ),
-                texture_path=f"surface_textures/{asset_path}",
-                texture_resolution=texture_resolution,
-                physical_texture_path=physical_path,
-                map_texture_paths=atlas_logical_map_paths,
-                physical_map_texture_paths=atlas_physical_map_paths,
-                fallback_map_rgba={
-                    PBR_MAP_ROUGHNESS: (
-                        SURFACE_ATLAS_ROUGHNESS_BYTE,
-                        SURFACE_ATLAS_ROUGHNESS_BYTE,
-                        SURFACE_ATLAS_ROUGHNESS_BYTE,
-                        255,
-                    )
-                },
-                fit_to_square=fit_to_square,
-                supports_resolution_changes=supports_resolution_changes,
-                surface_usage_count=surface_count,
+            asset_path = variant.asset_path
+        else:
+            with Image.open(physical_path) as image:
+                natural_resolution = choose_atlas_texture_resolution(
+                    image.width, image.height
+                )
+            texture_resolution = (
+                natural_resolution if resolution is None else int(resolution)
             )
-        except (AttributeError, OSError, TypeError, ValueError):
-            return None
+            fit_to_square = True
+            asset_path = assignment.asset_path
+        surface_count = len(assignment.surface_ids)
+        return load_atlas_object_texture_source(
+            object_id=self._atlas_source_id_for_surface_assignment(assignment),
+            object_name=(
+                assignment.display_name
+                or f"{assignment.surface_type.title()} texture"
+            ),
+            texture_path=f"surface_textures/{asset_path}",
+            texture_resolution=texture_resolution,
+            physical_texture_path=physical_path,
+            map_texture_paths=atlas_logical_map_paths,
+            physical_map_texture_paths=atlas_physical_map_paths,
+            fallback_map_rgba={
+                PBR_MAP_ROUGHNESS: (
+                    SURFACE_ATLAS_ROUGHNESS_BYTE,
+                    SURFACE_ATLAS_ROUGHNESS_BYTE,
+                    SURFACE_ATLAS_ROUGHNESS_BYTE,
+                    255,
+                )
+            },
+            fit_to_square=fit_to_square,
+            supports_resolution_changes=supports_resolution_changes,
+            packing_mode=(
+                self._atlas_packing_mode_for_surface_assignment(assignment)
+            ),
+            surface_usage_count=surface_count,
+        )
 
     def _handle_external_scene_3d_window_closed(self) -> None:
         """Return the shared scene to its tab and clear its display setting."""

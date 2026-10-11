@@ -375,6 +375,44 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIsNone(get_atlas_wall_texture_assignment_id("chair"))
         self.assertIsNone(get_atlas_wall_texture_assignment_id("surface-wall-texture:"))
 
+    def test_texture_only_legacy_half_has_no_geometric_preview_contract(
+        self,
+    ) -> None:
+        texture_only = _source(
+            "cornice",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+
+        self.assertEqual(
+            texture_only.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        self.assertIsNone(texture_only.symmetric_preview_orientation)
+        self.assertIsNone(texture_only.symmetric_preview_plane_coordinate)
+        with self.assertRaisesRegex(ValueError, "finite preview plane"):
+            _source(
+                "invalid-cornice",
+                directory=self._temporary_directory.name,
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                symmetric_orientation="vertical",
+            )
+        for packing_mode in (
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        ):
+            with self.subTest(packing_mode=packing_mode), self.assertRaisesRegex(
+                ValueError,
+                "preview orientation",
+            ):
+                _source(
+                    f"invalid-{packing_mode}",
+                    directory=self._temporary_directory.name,
+                    packing_mode=packing_mode,
+                )
+
     def test_color_balance_sliders_preview_base_color_without_committing(
         self,
     ) -> None:
@@ -7371,46 +7409,119 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                 source.object_id,
             )
 
-    def test_square_pair_drag_does_not_snap_into_a_legacy_half_slot(self) -> None:
-        data = TextureAtlasData()
-        atlas = data.create_atlas("Distinct drag modes", 2048, atlas_id="atlas-a")
-        legacy = _source(
-            "legacy",
-            directory=self._temporary_directory.name,
-            symmetric_orientation="vertical",
-            symmetric_plane_coordinate=0.0,
-        )
-        square = _source(
-            "square",
-            directory=self._temporary_directory.name,
-            symmetric_orientation="vertical",
-            symmetric_plane_coordinate=0.0,
-            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
-        )
-        data.assign_object(
-            atlas.atlas_id,
-            legacy.object_id,
-            legacy.texture_path,
-            legacy.texture_resolution,
-            legacy.packing_mode,
-        )
-        self.workspace.set_data(data)
-        self.workspace.set_object_texture_sources([legacy, square])
-        hover_point = _atlas_preview_point(
-            self.workspace.preview,
-            atlas.resolution,
-            384,
-            256,
-        )
+    def test_square_pair_and_texture_only_half_share_slot_in_either_order(
+        self,
+    ) -> None:
+        """Equal square halves are compatible despite distinct mesh semantics."""
 
-        preview = self.workspace.preview._drag_slot_preview_at(
-            square.object_id,
-            hover_point,
-        )
+        for source_order in (
+            ("placeable-half", "cornice-half"),
+            ("cornice-half", "placeable-half"),
+        ):
+            with self.subTest(source_order=source_order):
+                placeable_half = _source(
+                    "placeable-half",
+                    directory=self._temporary_directory.name,
+                    symmetric_orientation="vertical",
+                    symmetric_plane_coordinate=1.25,
+                    packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+                )
+                cornice_half = _source(
+                    "cornice-half",
+                    directory=self._temporary_directory.name,
+                    packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                )
+                sources_by_id = {
+                    source.object_id: source
+                    for source in (placeable_half, cornice_half)
+                }
+                data = TextureAtlasData()
+                atlas = data.create_atlas(
+                    "Mixed halves",
+                    2048,
+                    atlas_id="atlas-a",
+                )
 
-        assert preview is not None
-        self.assertFalse(preview.is_valid)
-        self.assertEqual(preview.slot_half, ATLAS_SLOT_HALF_LEFT)
+                first_source = sources_by_id[source_order[0]]
+                second_source = sources_by_id[source_order[1]]
+                data.assign_object(
+                    atlas.atlas_id,
+                    first_source.object_id,
+                    first_source.texture_path,
+                    first_source.texture_resolution,
+                    first_source.packing_mode,
+                )
+                self.workspace.set_data(data)
+                self.workspace.set_object_texture_sources(
+                    tuple(sources_by_id.values())
+                )
+                right_half_point = _atlas_preview_point(
+                    self.workspace.preview,
+                    atlas.resolution,
+                    384,
+                    256,
+                )
+
+                preview = self.workspace.preview._drag_slot_preview_at(
+                    second_source.object_id,
+                    right_half_point,
+                )
+
+                assert preview is not None
+                self.assertTrue(preview.is_valid)
+                self.assertEqual(
+                    (preview.x, preview.y, preview.size),
+                    (0, 0, 512),
+                )
+                self.assertEqual(preview.slot_half, ATLAS_SLOT_HALF_RIGHT)
+                data.assign_object(
+                    atlas.atlas_id,
+                    second_source.object_id,
+                    second_source.texture_path,
+                    second_source.texture_resolution,
+                    second_source.packing_mode,
+                )
+                data.repack_atlas(atlas.atlas_id)
+
+                placements = {
+                    placement.object_id: placement
+                    for placement in atlas.placements
+                }
+                self.assertEqual(set(placements), set(source_order))
+                self.assertEqual(
+                    {
+                        (placement.x, placement.y, placement.size)
+                        for placement in placements.values()
+                    },
+                    {(0, 0, 512)},
+                )
+                self.assertEqual(
+                    {
+                        placement.slot_half
+                        for placement in placements.values()
+                    },
+                    {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
+                )
+                self.assertEqual(
+                    placements[placeable_half.object_id].packing_mode,
+                    ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+                )
+                self.assertEqual(
+                    placements[cornice_half.object_id].packing_mode,
+                    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                )
+                self.assertEqual(
+                    placeable_half.symmetric_preview_orientation,
+                    "vertical",
+                )
+                self.assertEqual(
+                    placeable_half.symmetric_preview_plane_coordinate,
+                    1.25,
+                )
+                self.assertIsNone(cornice_half.symmetric_preview_orientation)
+                self.assertIsNone(
+                    cornice_half.symmetric_preview_plane_coordinate
+                )
 
     def test_square_pair_resolution_change_splits_and_rebuilds_black_halves(
         self,
@@ -7667,6 +7778,67 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(changes.call_count, 1)
         self.assertEqual(self.workspace.get_unpacked_scene_texture_source_ids(), ())
+
+    def test_texture_only_2048_halves_pair_without_half_mesh_routing(
+        self,
+    ) -> None:
+        sources = tuple(
+            _source(
+                object_id,
+                directory=self._temporary_directory.name,
+                resolution=2048,
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            )
+            for object_id in ("cornice-a", "cornice-b")
+        )
+        data = TextureAtlasData()
+        ordinary_atlas = data.create_atlas(
+            "Cornices",
+            4096,
+            atlas_id="cornices",
+        )
+        half_mesh_atlas = data.create_atlas(
+            "[HALF] Geometry",
+            4096,
+            atlas_id="half-geometry",
+        )
+        data.select_atlas(ordinary_atlas.atlas_id)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            sources,
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids(
+            tuple(source.object_id for source in sources)
+        )
+
+        with patch.object(self.workspace, "_materialize_atlas"):
+            assigned = self.workspace.auto_assign_scene_texture_sources(
+                2048,
+                use_half_mesh_texture_prefix=True,
+            )
+
+        self.assertEqual(
+            assigned,
+            tuple(source.object_id for source in sources),
+        )
+        packed = self.workspace.get_data()
+        ordinary = packed.atlas_by_id(ordinary_atlas.atlas_id)
+        half_mesh = packed.atlas_by_id(half_mesh_atlas.atlas_id)
+        assert ordinary is not None and half_mesh is not None
+        self.assertEqual(half_mesh.placements, [])
+        self.assertEqual(len(ordinary.placements), 2)
+        self.assertEqual(
+            {
+                (placement.x, placement.y, placement.size)
+                for placement in ordinary.placements
+            },
+            {(0, 0, 2048)},
+        )
+        self.assertEqual(
+            {placement.slot_half for placement in ordinary.placements},
+            {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
+        )
 
     def test_half_prefix_routing_reuses_prefixed_atlas_and_preserves_selection(
         self,

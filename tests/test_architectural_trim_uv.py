@@ -11,7 +11,9 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.architectural_trim_uv import (
+    CORNICE_UV_GUTTER_PIXELS,
     CORNICE_UV_MAX_STRIP_ASPECT,
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
     build_cornice_segmented_uv_glb,
 )
 from housemaker.glb import (
@@ -161,6 +163,20 @@ def _triangle_uv_area(triangle: np.ndarray) -> float:
     )
 
 
+def _normalized_face_uv_areas(model: object) -> np.ndarray:
+    """Return deterministic face-area proportions across every UV primitive."""
+
+    areas: list[float] = []
+    for _name, geometry in sorted(model.scene.geometry.items()):
+        uvs = np.asarray(geometry.visual.uv, dtype=np.float64)
+        faces = np.asarray(geometry.faces, dtype=np.int64)
+        areas.extend(_triangle_uv_area(uvs[face]) for face in faces)
+    result = np.asarray(areas, dtype=np.float64)
+    if not len(result) or np.any(result <= 0.0):
+        raise AssertionError("The cornice fixture must have measurable UV faces.")
+    return result / float(np.sum(result))
+
+
 # ### Segmented cornice UV tests ###
 class ArchitecturalTrimUvTests(unittest.TestCase):
     def test_long_cornice_is_split_without_changing_geometry_or_material(self) -> None:
@@ -195,10 +211,11 @@ class ArchitecturalTrimUvTests(unittest.TestCase):
             self.assertIsNotNone(material.baseColorTexture)
 
     def test_uvs_use_one_density_and_pack_charts_horizontally(self) -> None:
+        texture_resolution = 512
         result = import_generated_glb(
             build_cornice_segmented_uv_glb(
                 _long_textured_box_glb(),
-                texture_resolution=512,
+                texture_resolution=texture_resolution,
             )
         )
 
@@ -222,6 +239,69 @@ class ArchitecturalTrimUvTests(unittest.TestCase):
         self.assertLess(
             float(np.max(density_scales) / np.min(density_scales)),
             1.01,
+        )
+        all_uvs = np.vstack(
+            [
+                np.asarray(geometry.visual.uv, dtype=np.float64)
+                for geometry in result.scene.geometry.values()
+            ]
+        )
+        safe_span = (
+            texture_resolution - 2 * CORNICE_UV_GUTTER_PIXELS
+        ) / texture_resolution
+        self.assertGreaterEqual(
+            float(np.max(np.ptp(all_uvs, axis=0))),
+            safe_span - 1.0 / texture_resolution,
+        )
+
+    def test_left_half_preserves_face_proportions_and_maximizes_its_domain(
+        self,
+    ) -> None:
+        texture_resolution = 512
+        source = _long_textured_box_glb()
+        full = import_generated_glb(
+            build_cornice_segmented_uv_glb(
+                source,
+                texture_resolution=texture_resolution,
+            )
+        )
+        left_half = import_generated_glb(
+            build_cornice_segmented_uv_glb(
+                source,
+                texture_resolution=texture_resolution,
+                texture_domain=CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+            )
+        )
+
+        np.testing.assert_allclose(
+            _normalized_face_uv_areas(left_half),
+            _normalized_face_uv_areas(full),
+            rtol=1e-5,
+            atol=1e-8,
+        )
+        density_scales = _uv_density_scales(left_half)
+        self.assertLess(
+            float(np.max(density_scales) / np.min(density_scales)),
+            1.01,
+        )
+        all_uvs = np.vstack(
+            [
+                np.asarray(geometry.visual.uv, dtype=np.float64)
+                for geometry in left_half.scene.geometry.values()
+            ]
+        )
+        gutter = CORNICE_UV_GUTTER_PIXELS / texture_resolution
+        self.assertGreaterEqual(float(np.min(all_uvs[:, 0])), gutter - 1e-7)
+        self.assertLessEqual(float(np.max(all_uvs[:, 0])), 0.5 - gutter + 1e-7)
+        self.assertGreaterEqual(float(np.min(all_uvs[:, 1])), gutter - 1e-7)
+        self.assertLessEqual(float(np.max(all_uvs[:, 1])), 1.0 - gutter + 1e-7)
+        expected_span = np.asarray(
+            (0.5 - 2.0 * gutter, 1.0 - 2.0 * gutter),
+            dtype=np.float64,
+        )
+        np.testing.assert_array_less(
+            expected_span - 1.0 / texture_resolution,
+            np.ptp(all_uvs, axis=0),
         )
 
     def test_triangle_soup_is_welded_and_unwrapped_reliably(self) -> None:
@@ -343,6 +423,8 @@ class ArchitecturalTrimUvTests(unittest.TestCase):
             build_cornice_segmented_uv_glb(source, texture_resolution=True)
         with self.assertRaisesRegex(ValueError, "must be between"):
             build_cornice_segmented_uv_glb(source, texture_resolution=32)
+        with self.assertRaisesRegex(ValueError, "Unknown cornice UV texture domain"):
+            build_cornice_segmented_uv_glb(source, texture_domain="right_half")
 
 
 # ### Test entry point ###

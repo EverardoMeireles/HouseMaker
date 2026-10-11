@@ -25,16 +25,26 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.architectural_trim_uv import (
+    CORNICE_UV_TEXTURE_DOMAIN_FULL,
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+)
 from housemaker.generation_state import (
     GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
 )
+from housemaker.generation_workspace import (
+    ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY,
+    CORNICE_SEGMENTED_UV_PIPELINE_KEY,
+    CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+)
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace, _build_surface_ao_pre_atlas_scene
 from housemaker.models import (
     GROUND_LEVEL_INDEX,
+    TRIM_KIND_CORNICE,
     LevelData,
     RoomData,
     VertexData,
@@ -66,10 +76,13 @@ from housemaker.surface_texture_workspace import (
     _build_surface_asset_revision,
 )
 from housemaker.texture_atlas_state import (
+    ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
     ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    ATLAS_SLOT_HALF_LEFT,
+    ATLAS_SLOT_HALF_RIGHT,
     TextureAtlasData,
 )
 from housemaker.texture_atlas_workspace import (
@@ -2121,6 +2134,54 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.workspace.texture_atlas_workspace.status_label.text(),
         )
 
+    def test_atlas_assign_preserves_surface_rejection_reason(self) -> None:
+        wall_id = _add_square_room_to_level(self.workspace.current_level)
+        surfaces = tuple(build_fixed_surfaces(self.workspace.levels))
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_levels(self.workspace.levels)
+        self.workspace._set_canvas_viewer_targets(surfaces)
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="rejected-assignment",
+            surface_ids=(),
+        )
+        surface_workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Assignment rejection", 2048)
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        self.assertTrue(
+            self.workspace.texture_atlas_workspace
+            .assign_source_to_selected_atlas(source_id)
+        )
+        self.workspace._atlas_surface_assignment_target_ids = (wall_id,)
+
+        def reject_assignment(*_args: object, **_kwargs: object) -> bool:
+            surface_workspace.status_label.setText(
+                "The selected Surface texture file is unavailable."
+            )
+            return False
+
+        with patch.object(
+            surface_workspace,
+            "apply_assignment_texture",
+            side_effect=reject_assignment,
+        ):
+            self.workspace._handle_atlas_surface_assign_requested(source_id)
+
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace.status_label.text(),
+            "The selected Surface texture file is unavailable.",
+        )
+
     def test_failed_unused_surface_atlas_cleanup_is_retried(self) -> None:
         assignment = _wall_texture_assignment(
             self.settings.path.parent / "surface_textures",
@@ -4135,6 +4196,142 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         with Image.open(atlas_png) as image:
             self.assertEqual(image.getpixel((256, 256)), (170, 70, 25, 255))
 
+    def test_left_half_cornice_sources_repack_and_pair_without_mirror_metadata(
+        self,
+    ) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignments = tuple(
+            replace(
+                _wall_texture_assignment_with_variants(
+                    surface_asset_directory,
+                    assignment_id=f"{object_id}-surface",
+                    surface_ids=(surface_id,),
+                ),
+                source_object_id=object_id,
+            )
+            for object_id, surface_id in (
+                ("cornice-a", "level:2/wall:1:2"),
+                ("cornice-b", "level:2/wall:2:3"),
+            )
+        )
+
+        def cornice_record(
+            object_id: str,
+            trim_id: str,
+            texture_domain: str,
+        ) -> GeneratedObjectRecord:
+            return GeneratedObjectRecord(
+                object_id=object_id,
+                frame_index=0,
+                object_name=object_id.title(),
+                pipeline={
+                    ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY: {
+                        "level_index": GROUND_LEVEL_INDEX,
+                        "trim_id": trim_id,
+                        "trim_kind": TRIM_KIND_CORNICE,
+                    },
+                    CORNICE_SEGMENTED_UV_PIPELINE_KEY: {
+                        "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+                        "texture_domain": texture_domain,
+                    },
+                },
+                provider_task_id=f"{object_id}-task",
+                asset_path=f"{object_id}.glb",
+            )
+
+        full_records = tuple(
+            cornice_record(object_id, trim_id, CORNICE_UV_TEXTURE_DOMAIN_FULL)
+            for object_id, trim_id in (
+                ("cornice-a", "a" * 32),
+                ("cornice-b", "b" * 32),
+            )
+        )
+        self.workspace.generation._data.generated_objects = list(full_records)
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=list(assignments))
+        )
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources()
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        full_sources = tuple(
+            atlas_workspace._sources_by_object_id[record.object_id]
+            for record in full_records
+        )
+        self.assertEqual(
+            {source.packing_mode for source in full_sources},
+            {ATLAS_PACKING_MODE_FULL},
+        )
+
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas("Cornices", 2048, atlas_id="cornices")
+        for source in full_sources:
+            atlas_data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+            )
+        atlas_workspace.set_data(atlas_data)
+        half_records = tuple(
+            cornice_record(
+                object_id,
+                trim_id,
+                CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+            )
+            for object_id, trim_id in (
+                ("cornice-a", "a" * 32),
+                ("cornice-b", "b" * 32),
+            )
+        )
+        self.workspace.generation._data.generated_objects = list(half_records)
+
+        with patch.object(
+            atlas_workspace,
+            "refresh_texture_source_content",
+            wraps=atlas_workspace.refresh_texture_source_content,
+        ) as refresh_content:
+            self.workspace._sync_atlas_object_texture_sources()
+
+        refresh_content.assert_called_once_with(("cornice-a", "cornice-b"))
+        half_sources = tuple(
+            atlas_workspace._sources_by_object_id[record.object_id]
+            for record in half_records
+        )
+        self.assertEqual(
+            {source.packing_mode for source in half_sources},
+            {ATLAS_PACKING_MODE_SYMMETRIC_HALF},
+        )
+        self.assertTrue(
+            all(
+                source.symmetric_preview_orientation is None
+                and source.symmetric_preview_plane_coordinate is None
+                for source in half_sources
+            )
+        )
+        refreshed_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        self.assertIsNotNone(refreshed_atlas)
+        assert refreshed_atlas is not None
+        self.assertIsNotNone(refreshed_atlas.image_path)
+        self.assertEqual(len(refreshed_atlas.placements), 2)
+        self.assertEqual(
+            {
+                (placement.x, placement.y, placement.size)
+                for placement in refreshed_atlas.placements
+            },
+            {(0, 0, 512)},
+        )
+        self.assertEqual(
+            {placement.slot_half for placement in refreshed_atlas.placements},
+            {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
+        )
+        self.assertTrue(
+            (
+                atlas_workspace._asset_directory
+                / str(refreshed_atlas.image_path)
+            ).is_file()
+        )
+
     def test_generation_packing_callback_routes_candidate_sources_to_atlas(
         self,
     ) -> None:
@@ -4205,6 +4402,105 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             [sources[512], sources[1024], sources[2048]],
             commit_callback=commit,
         )
+
+    def test_cornice_packing_callback_uses_unpublished_replacement_domain(
+        self,
+    ) -> None:
+        texture_path = Path(self._temporary_directory.name) / "cornice-512.png"
+        Image.new("RGBA", (512, 512), (90, 120, 150, 255)).save(texture_path)
+        variant = SimpleNamespace(
+            object_id="cornice-transition",
+            object_name="Cornice",
+            texture_asset_relative_path=texture_path.name,
+            texture_asset_path=texture_path,
+            resolution=512,
+        )
+        stale_symmetry = SimpleNamespace(
+            version=1,
+            orientation="vertical",
+            plane_coordinate=0.0,
+        )
+
+        def cornice_record(texture_domain: str) -> GeneratedObjectRecord:
+            return GeneratedObjectRecord(
+                object_id="cornice-transition",
+                frame_index=0,
+                object_name="Cornice",
+                pipeline={
+                    ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY: {
+                        "trim_kind": TRIM_KIND_CORNICE,
+                    },
+                    CORNICE_SEGMENTED_UV_PIPELINE_KEY: {
+                        "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+                        "texture_domain": texture_domain,
+                    },
+                },
+                provider_task_id="task-cornice",
+                asset_path="cornice.glb",
+            )
+
+        for old_domain, replacement_domain, expected_packing_mode in (
+            (
+                CORNICE_UV_TEXTURE_DOMAIN_FULL,
+                CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            ),
+            (
+                CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+                CORNICE_UV_TEXTURE_DOMAIN_FULL,
+                ATLAS_PACKING_MODE_FULL,
+            ),
+        ):
+            with self.subTest(
+                old_domain=old_domain,
+                replacement_domain=replacement_domain,
+            ):
+                candidate_sources = []
+                commit = Mock(return_value=True)
+
+                def transition(
+                    object_id,
+                    sources,
+                    *,
+                    commit_callback,
+                    candidate_sources=candidate_sources,
+                ) -> bool:
+                    self.assertEqual(object_id, "cornice-transition")
+                    candidate_sources.extend(sources)
+                    return commit_callback()
+
+                with patch.object(
+                    self.workspace.generation,
+                    "resolve_symmetric_division_for_record",
+                    return_value=stale_symmetry,
+                ), patch.object(
+                    self.workspace.generation,
+                    "resolve_atlas_texture_image_variant_for_record",
+                    side_effect=lambda _record, resolution: (
+                        variant if resolution == 512 else None
+                    ),
+                ), patch.object(
+                    self.workspace.texture_atlas_workspace,
+                    "transition_object_packing",
+                    side_effect=transition,
+                ):
+                    accepted = (
+                        self.workspace
+                        ._handle_generation_object_packing_change_requested(
+                            cornice_record(old_domain),
+                            cornice_record(replacement_domain),
+                            _generated_box_model(),
+                            commit,
+                        )
+                    )
+
+                self.assertTrue(accepted)
+                commit.assert_called_once_with()
+                self.assertEqual(len(candidate_sources), 1)
+                source = candidate_sources[0]
+                self.assertEqual(source.packing_mode, expected_packing_mode)
+                self.assertIsNone(source.symmetric_preview_orientation)
+                self.assertIsNone(source.symmetric_preview_plane_coordinate)
 
     def test_face_edit_keeps_pinned_atlas_texture_pixels_and_path(
         self,

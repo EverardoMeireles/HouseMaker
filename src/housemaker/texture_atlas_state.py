@@ -84,10 +84,42 @@ ATLAS_HALF_SLOT_PACKING_MODES = frozenset(
         ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     }
 )
+ATLAS_SQUARE_HALF_SLOT_PACKING_MODES = frozenset(
+    {
+        ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    }
+)
 MAX_SURFACE_AO_GEOMETRY_SIGNATURE_LENGTH = 256
 MIN_SURFACE_AO_INTENSITY = 0.0
 MAX_SURFACE_AO_INTENSITY = 1.0
 ATLAS_TEXTURE_GUARD_DIVISOR = 64
+
+
+# ### Packing compatibility helpers ###
+def atlas_packing_modes_can_share_slot(
+    first_mode: str,
+    second_mode: str,
+) -> bool:
+    """Return whether two source layouts may occupy one logical Atlas slot."""
+
+    normalized_first = str(first_mode)
+    normalized_second = str(second_mode)
+    if normalized_first == normalized_second:
+        return True
+    return {
+        normalized_first,
+        normalized_second,
+    } <= ATLAS_SQUARE_HALF_SLOT_PACKING_MODES
+
+
+def atlas_packing_slot_family(packing_mode: str) -> str:
+    """Return the physical slot family used for compatible half pairing."""
+
+    normalized_mode = str(packing_mode)
+    if normalized_mode in ATLAS_SQUARE_HALF_SLOT_PACKING_MODES:
+        return ATLAS_PACKING_MODE_SYMMETRIC_HALF
+    return normalized_mode
 
 
 # ### Public data models ###
@@ -717,9 +749,17 @@ class TextureAtlasData:
                 (
                     candidate
                     for candidate in placements
-                    if candidate.packing_mode == normalized_packing_mode
+                    if atlas_packing_modes_can_share_slot(
+                        candidate.packing_mode,
+                        normalized_packing_mode,
+                    )
                     and candidate.slot_half == ATLAS_SLOT_HALF_LEFT
                     and candidate.texture_resolution == normalized_resolution
+                    and candidate.size
+                    == _logical_slot_size(
+                        normalized_packing_mode,
+                        normalized_resolution,
+                    )
                     and candidate.x == normalized_x
                     and candidate.y == normalized_y
                 ),
@@ -1055,7 +1095,7 @@ def _pack_placements(
     _validate_placements_fit(atlas_resolution, placements)
     placements = _normalize_partial_slot_placements(placements)
     logical_units: list[list[TextureAtlasPlacement]] = []
-    unpaired_half_slots_by_mode_and_resolution: dict[
+    unpaired_half_slots_by_family_and_resolution: dict[
         tuple[str, int],
         list[TextureAtlasPlacement],
     ] = {}
@@ -1073,8 +1113,11 @@ def _pack_placements(
                 logical_units.append(slot_group)
             else:
                 placement = slot_group[0]
-                unpaired_half_slots_by_mode_and_resolution.setdefault(
-                    (packing_mode, placement.texture_resolution),
+                unpaired_half_slots_by_family_and_resolution.setdefault(
+                    (
+                        atlas_packing_slot_family(packing_mode),
+                        placement.texture_resolution,
+                    ),
                     [],
                 ).append(placement)
             continue
@@ -1087,12 +1130,14 @@ def _pack_placements(
             [],
         ).append(placement)
 
-    for mode_and_resolution in sorted(
-        unpaired_half_slots_by_mode_and_resolution,
+    for family_and_resolution in sorted(
+        unpaired_half_slots_by_family_and_resolution,
         key=lambda item: (item[0], -item[1]),
     ):
         unpaired = sorted(
-            unpaired_half_slots_by_mode_and_resolution[mode_and_resolution],
+            unpaired_half_slots_by_family_and_resolution[
+                family_and_resolution
+            ],
             key=lambda placement: placement.object_id,
         )
         for index in range(0, len(unpaired), 2):
@@ -1419,9 +1464,14 @@ def _find_compatible_unpaired_half_slot(
             continue
         placement = slot_group[0]
         if (
-            placement.packing_mode == packing_mode
+            atlas_packing_modes_can_share_slot(
+                placement.packing_mode,
+                packing_mode,
+            )
             and placement.slot_half == ATLAS_SLOT_HALF_LEFT
             and placement.texture_resolution == int(texture_resolution)
+            and placement.size
+            == _logical_slot_size(packing_mode, int(texture_resolution))
         ):
             return placement
     return None
@@ -1625,7 +1675,10 @@ def _validate_placements_fit(
     for slot_group in slot_groups:
         first = slot_group[0]
         if any(
-            placement.packing_mode != first.packing_mode
+            not atlas_packing_modes_can_share_slot(
+                placement.packing_mode,
+                first.packing_mode,
+            )
             or placement.texture_resolution != first.texture_resolution
             or placement.size != first.size
             for placement in slot_group[1:]
