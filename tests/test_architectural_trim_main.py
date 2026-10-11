@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -26,15 +27,26 @@ from housemaker.architectural_trim import (
     TRIM_HANDLE_HEIGHT,
     ArchitecturalTrimPlacementRequest,
 )
+from housemaker.architectural_trim_generation import (
+    build_architectural_trim_component_frame,
+)
+from housemaker.architectural_trim_uv import (
+    ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+)
 from housemaker.generation_state import MESHY_GENERATION_PROVIDER
 from housemaker.generation_workspace import (
+    ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY,
+    ARCHITECTURAL_TRIM_SEGMENTED_UV_PIPELINE_KEY,
+    ARCHITECTURAL_TRIM_SEGMENTED_UV_PIPELINE_VERSION,
     CORNICE_SEGMENTED_UV_PIPELINE_KEY,
     CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
-    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
     OBJECT_OPERATION_GENERATE_TEXTURE,
+    get_architectural_trim_uv_texture_domain,
 )
 from housemaker.glb import (
     GeneratedModel,
+    PlacedGeneratedModel,
     build_placed_generated_model_transform,
     convert_to_glb,
     import_generated_glb,
@@ -43,6 +55,7 @@ from housemaker.main import BlueprintWorkspace
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.models import (
     TRIM_KIND_CORNICE,
+    TRIM_KIND_EDGING_STRIP,
     TRIM_KIND_SKIRTING_BOARD,
     LevelData,
     RoomData,
@@ -50,7 +63,10 @@ from housemaker.models import (
 )
 from housemaker.pbr_maps import ATLAS_MAP_BASE_COLOR, PBR_MAP_NORMAL
 from housemaker.surface_geometry import build_fixed_surfaces
-from housemaker.texture_atlas_state import TextureAtlasData
+from housemaker.texture_atlas_state import (
+    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+    TextureAtlasData,
+)
 from housemaker.viewer import ArchitecturalTrimDimensionEdit
 
 # ### Module state ###
@@ -135,6 +151,31 @@ def _build_authored_uv_glb(
     return exported
 
 
+def _merge_world_placement_meshes(
+    placements: Sequence[PlacedGeneratedModel],
+) -> trimesh.Trimesh:
+    """Bake and merge placed trim meshes for seam-integrity assertions."""
+
+    vertex_blocks: list[np.ndarray] = []
+    face_blocks: list[np.ndarray] = []
+    vertex_offset = 0
+    for placement in placements:
+        world_mesh = placement.model.mesh.copy()
+        world_mesh.apply_transform(
+            build_placed_generated_model_transform(placement)
+        )
+        vertex_blocks.append(np.asarray(world_mesh.vertices, dtype=float))
+        face_blocks.append(
+            np.asarray(world_mesh.faces, dtype=np.int64) + vertex_offset
+        )
+        vertex_offset += len(world_mesh.vertices)
+    return trimesh.Trimesh(
+        vertices=np.vstack(vertex_blocks),
+        faces=np.vstack(face_blocks),
+        process=True,
+    )
+
+
 # ### Main integration tests ###
 class ArchitecturalTrimMainTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -172,6 +213,27 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
                 trim_id=trim_id,
                 kind=TRIM_KIND_CORNICE,
                 wall_surface_ids=(wall_surface_id,),
+            )
+        )
+
+    def _place_edging(
+        self,
+        trim_id: str,
+        first_wall_surface_id: str,
+        second_wall_surface_id: str,
+        corner_vertex_id: int,
+    ) -> None:
+        """Place one edging strip at a known square-room corner."""
+
+        self.workspace._handle_architectural_trim_placement_requested(
+            ArchitecturalTrimPlacementRequest(
+                trim_id=trim_id,
+                kind=TRIM_KIND_EDGING_STRIP,
+                wall_surface_ids=(
+                    first_wall_surface_id,
+                    second_wall_surface_id,
+                ),
+                corner_vertex_id=corner_vertex_id,
             )
         )
 
@@ -255,10 +317,30 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         updated_pipeline["texture_variants"] = variants
         updated_pipeline["selected_texture_resolution"] = 512
         if half_texture:
-            updated_pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
-                "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
-                "texture_domain": CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
-            }
+            component_metadata = updated_pipeline.get(
+                ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY
+            )
+            trim_kind = (
+                component_metadata.get("trim_kind")
+                if isinstance(component_metadata, dict)
+                else None
+            )
+            if trim_kind == TRIM_KIND_CORNICE:
+                # Keep covering the legacy cornice contract loaded by older
+                # saved projects while new trim kinds use generic metadata.
+                updated_pipeline[CORNICE_SEGMENTED_UV_PIPELINE_KEY] = {
+                    "version": CORNICE_SEGMENTED_UV_PIPELINE_VERSION,
+                    "texture_domain": CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+                }
+            else:
+                updated_pipeline[
+                    ARCHITECTURAL_TRIM_SEGMENTED_UV_PIPELINE_KEY
+                ] = {
+                    "version": ARCHITECTURAL_TRIM_SEGMENTED_UV_PIPELINE_VERSION,
+                    "texture_domain": (
+                        ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
+                    ),
+                }
         updated_record = replace(
             record,
             pipeline=updated_pipeline,
@@ -268,6 +350,217 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         )
         records[record_index] = updated_record
         return updated_record, authored_uv_model
+
+    def _place_half_texture_test_trim(
+        self,
+        trim_kind: str,
+        trim_id: str,
+        location_index: int,
+    ) -> None:
+        """Place one deterministic same-kind source or assignment target."""
+
+        if trim_kind == TRIM_KIND_SKIRTING_BOARD:
+            wall_vertices = ((1, 2), (2, 3), (1, 4))[location_index]
+            self._place_skirting(trim_id, _wall_surface_id(*wall_vertices))
+            return
+        if trim_kind == TRIM_KIND_EDGING_STRIP:
+            first, second, corner = (
+                ((1, 2), (2, 3), 2),
+                ((2, 3), (3, 4), 3),
+                ((3, 4), (1, 4), 4),
+            )[location_index]
+            self._place_edging(
+                trim_id,
+                _wall_surface_id(*first),
+                _wall_surface_id(*second),
+                corner,
+            )
+            return
+        raise ValueError("Unsupported architectural-trim test kind.")
+
+    def _assert_half_texture_trim_publication_and_assignment(
+        self,
+        trim_kind: str,
+    ) -> None:
+        """Exercise the Surface-list and Atlas contract for one trim kind."""
+
+        source_trim_id = "a" * 32
+        same_kind_trim_id = "b" * 32
+        other_kind_trim_id = "c" * 32
+        other_kind = (
+            TRIM_KIND_EDGING_STRIP
+            if trim_kind == TRIM_KIND_SKIRTING_BOARD
+            else TRIM_KIND_SKIRTING_BOARD
+        )
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_half_texture_test_trim(
+                trim_kind,
+                source_trim_id,
+                0,
+            )
+            source_target = (
+                self.workspace.generation._architectural_trim_editing_target
+            )
+            self.assertIsNotNone(source_target)
+            assert source_target is not None
+            source_object_id = source_target.object_id
+            self._place_half_texture_test_trim(
+                trim_kind,
+                same_kind_trim_id,
+                1,
+            )
+            self._place_half_texture_test_trim(
+                other_kind,
+                other_kind_trim_id,
+                2,
+            )
+
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Trim halves", 2048, atlas_id="trim-halves")
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(atlas_data)
+        generated_record, generated_model = self._install_trim_texture_family(
+            source_object_id,
+            color=(145, 85, 35, 255),
+            task_id=f"half-{trim_kind}-texture",
+            half_texture=True,
+        )
+        self.assertEqual(
+            get_architectural_trim_uv_texture_domain(generated_record),
+            ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        )
+
+        self.workspace.generation.texture_regeneration_completed.emit(
+            generated_record,
+            generated_model,
+        )
+        self.workspace.generation.generated_object_changed.emit(
+            generated_record,
+            generated_model,
+        )
+        _qt_application.processEvents()
+
+        assignment = next(
+            assignment
+            for assignment in (
+                self.workspace.surface_texture_generation.get_assignments()
+            )
+            if assignment.source_object_id == source_object_id
+        )
+        self.assertIn(
+            source_object_id,
+            atlas_workspace._surface_texture_entries_by_id,
+        )
+        listed_surface_ids = {
+            atlas_workspace.surface_list.item(row).data(
+                Qt.ItemDataRole.UserRole
+            )
+            for row in range(atlas_workspace.surface_list.count())
+        }
+        listed_object_ids = {
+            atlas_workspace.object_list.item(row).data(
+                Qt.ItemDataRole.UserRole
+            )
+            for row in range(atlas_workspace.object_list.count())
+        }
+        self.assertIn(source_object_id, listed_surface_ids)
+        self.assertNotIn(source_object_id, listed_object_ids)
+        atlas_source = atlas_workspace._sources_by_object_id[source_object_id]
+        self.assertEqual(
+            atlas_source.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        self.assertIsNone(atlas_source.symmetric_preview_orientation)
+        self.assertIsNone(atlas_source.symmetric_preview_plane_coordinate)
+
+        same_kind_part_ids = tuple(
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == same_kind_trim_id
+        )
+        self.assertGreater(len(same_kind_part_ids), 1)
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (same_kind_part_ids[0],)
+        )
+        self.workspace._handle_atlas_surface_assign_requested(source_object_id)
+        applied = self.workspace.surface_texture_generation.get_assignment(
+            assignment.assignment_id
+        )
+        self.assertIsNotNone(applied)
+        assert applied is not None
+        self.assertTrue(set(same_kind_part_ids).issubset(applied.surface_ids))
+
+        accepted_surface_ids = applied.surface_ids
+        other_kind_part_id = next(
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == other_kind_trim_id
+        )
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (other_kind_part_id,)
+        )
+        self.workspace._handle_atlas_surface_assign_requested(source_object_id)
+        rejected = self.workspace.surface_texture_generation.get_assignment(
+            assignment.assignment_id
+        )
+        self.assertIsNotNone(rejected)
+        assert rejected is not None
+        self.assertEqual(rejected.surface_ids, accepted_surface_ids)
+        self.assertEqual(
+            atlas_workspace.status_label.text(),
+            "Generated architectural-trim textures can only be assigned "
+            "to complete components of the same trim type.",
+        )
+
+    def _publish_authored_trim_texture(
+        self,
+        source_object_id: str,
+        *,
+        task_id: str,
+    ):
+        """Publish one authored trim model through its Surface-list bridge."""
+
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        if not atlas_workspace.get_data().atlases:
+            atlas_data = TextureAtlasData()
+            atlas_data.create_atlas("Architectural trims", 2048)
+            atlas_workspace.set_data(atlas_data)
+        record, model = self._install_trim_texture_family(
+            source_object_id,
+            color=(145, 85, 35, 255),
+            task_id=task_id,
+        )
+        self.workspace.generation.texture_regeneration_completed.emit(
+            record,
+            model,
+        )
+        self.workspace.generation.generated_object_changed.emit(record, model)
+        _qt_application.processEvents()
+        assignment = next(
+            assignment
+            for assignment in self.workspace.surface_texture_generation.get_assignments()
+            if assignment.source_object_id == source_object_id
+        )
+        return record, model, assignment
+
+    def _assign_authored_trim_to_component(
+        self,
+        source_object_id: str,
+        target_trim_id: str,
+    ) -> tuple[str, ...]:
+        """Assign one linked texture to every semantic part of a target trim."""
+
+        target_part_ids = tuple(
+            part.semantic_id
+            for part in self.workspace._canvas_architectural_trim_parts_by_id.values()
+            if part.trim_id == target_trim_id
+        )
+        self.assertTrue(target_part_ids)
+        self.workspace._handle_architectural_trim_part_selection_changed(
+            (target_part_ids[0],)
+        )
+        self.workspace._handle_atlas_surface_assign_requested(source_object_id)
+        return target_part_ids
 
     def test_placement_selects_semantic_parts_and_undo_removes_component(
         self,
@@ -384,7 +677,7 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             self.workspace.generation.generate_texture_button,
         )
 
-    def test_selected_skirting_uses_surface_texture_pipeline(self) -> None:
+    def test_selected_skirting_uses_object_retexture_only(self) -> None:
         trim_id = "e" * 32
         with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
             self._place_skirting(trim_id, _wall_surface_id(1, 2))
@@ -396,7 +689,266 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         self.assertIs(
             self.workspace.merged_generation_workspace
             .generate_texture_stack.currentWidget(),
-            self.workspace.surface_texture_generation.generate_button,
+            self.workspace.generation.generate_texture_button,
+        )
+
+    def test_half_packed_skirting_texture_uses_surface_atlas_contract(
+        self,
+    ) -> None:
+        self._assert_half_texture_trim_publication_and_assignment(
+            TRIM_KIND_SKIRTING_BOARD
+        )
+
+    def test_half_packed_edging_texture_uses_surface_atlas_contract(
+        self,
+    ) -> None:
+        self._assert_half_texture_trim_publication_and_assignment(
+            TRIM_KIND_EDGING_STRIP
+        )
+
+    def test_authored_skirting_replacements_keep_joined_corner_watertight(
+        self,
+    ) -> None:
+        source_trim_id = "1" * 32
+        target_trim_id = "2" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_skirting(source_trim_id, _wall_surface_id(1, 2))
+            source_target = (
+                self.workspace.generation._architectural_trim_editing_target
+            )
+            self.assertIsNotNone(source_target)
+            assert source_target is not None
+            self._place_skirting(target_trim_id, _wall_surface_id(2, 3))
+
+        self._publish_authored_trim_texture(
+            source_target.object_id,
+            task_id="joined-skirting-texture",
+        )
+        self._assign_authored_trim_to_component(
+            source_target.object_id,
+            target_trim_id,
+        )
+
+        placements, replaced_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+
+        self.assertEqual(
+            replaced_keys,
+            ((2, source_trim_id), (2, target_trim_id)),
+        )
+        self.assertEqual(len(placements), 2)
+        joined_corner = _merge_world_placement_meshes(placements)
+        self.assertTrue(joined_corner.is_watertight)
+        self.assertTrue(joined_corner.is_winding_consistent)
+
+    def test_authored_edging_assignment_keeps_l_shaped_replacement(self) -> None:
+        source_trim_id = "3" * 32
+        target_trim_id = "4" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_edging(
+                source_trim_id,
+                _wall_surface_id(1, 2),
+                _wall_surface_id(2, 3),
+                2,
+            )
+            source_target = (
+                self.workspace.generation._architectural_trim_editing_target
+            )
+            self.assertIsNotNone(source_target)
+            assert source_target is not None
+            self._place_edging(
+                target_trim_id,
+                _wall_surface_id(2, 3),
+                _wall_surface_id(3, 4),
+                3,
+            )
+
+        _record, source_model, _assignment = (
+            self._publish_authored_trim_texture(
+                source_target.object_id,
+                task_id="edging-transfer-texture",
+            )
+        )
+        self._assign_authored_trim_to_component(
+            source_target.object_id,
+            target_trim_id,
+        )
+
+        placements, replaced_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+        self.assertEqual(
+            replaced_keys,
+            ((2, source_trim_id), (2, target_trim_id)),
+        )
+        target_placement = next(
+            placement
+            for placement in placements
+            if placement.atlas_source_object_id == source_target.object_id
+            and placement.object_id != source_target.object_id
+        )
+        target_mesh = target_placement.model.mesh
+        self.assertTrue(target_mesh.is_winding_consistent)
+        self.assertGreater(len(target_mesh.faces), 12)
+        bounding_box_volume = float(np.prod(target_mesh.extents))
+        self.assertGreater(target_mesh.volume, 0.0)
+        self.assertLess(
+            target_mesh.volume,
+            bounding_box_volume * 0.75,
+        )
+        np.testing.assert_allclose(
+            target_mesh.extents,
+            source_model.mesh.extents,
+            rtol=1e-5,
+            atol=1e-7,
+        )
+        self.assertEqual(len(target_mesh.faces), len(source_model.mesh.faces))
+
+    def test_deleting_authored_trim_source_keeps_assigned_target_active(
+        self,
+    ) -> None:
+        source_trim_id = "5" * 32
+        target_trim_id = "6" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_skirting(source_trim_id, _wall_surface_id(1, 2))
+            source_target = (
+                self.workspace.generation._architectural_trim_editing_target
+            )
+            self.assertIsNotNone(source_target)
+            assert source_target is not None
+            self._place_skirting(target_trim_id, _wall_surface_id(3, 4))
+
+        _record, _model, assignment = self._publish_authored_trim_texture(
+            source_target.object_id,
+            task_id="retained-skirting-source",
+        )
+        target_part_ids = self._assign_authored_trim_to_component(
+            source_target.object_id,
+            target_trim_id,
+        )
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self.workspace._handle_architectural_trim_deletion_requested(
+                (source_trim_id,)
+            )
+
+        retained_assignment = (
+            self.workspace.surface_texture_generation.get_assignment(
+                assignment.assignment_id
+            )
+        )
+        self.assertIsNotNone(retained_assignment)
+        assert retained_assignment is not None
+        self.assertEqual(set(retained_assignment.surface_ids), set(target_part_ids))
+        placements, replaced_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+        self.assertEqual(replaced_keys, ((2, target_trim_id),))
+        self.assertEqual(len(placements), 1)
+        self.assertEqual(
+            placements[0].atlas_source_object_id,
+            source_target.object_id,
+        )
+
+    def test_clearing_authored_trim_assignment_restores_procedural_trim(
+        self,
+    ) -> None:
+        trim_id = "7" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_skirting(trim_id, _wall_surface_id(1, 2))
+        target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+        _record, _model, assignment = self._publish_authored_trim_texture(
+            target.object_id,
+            task_id="cleared-skirting-texture",
+        )
+        active_models, active_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+        self.assertEqual(active_keys, ((2, trim_id),))
+        self.assertEqual(len(active_models), 1)
+
+        self.assertTrue(
+            self.workspace.surface_texture_generation.clear_assignment_surfaces(
+                assignment.assignment_id
+            )
+        )
+
+        cleared_models, cleared_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+        self.assertEqual(cleared_models, ())
+        self.assertEqual(cleared_keys, ())
+        preview = self.workspace._build_viewer_preview_model(None)
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertTrue(
+            any(
+                part.trim_id == trim_id
+                for part in preview.preview_architectural_trim_parts
+            )
+        )
+
+    def test_changed_authored_trim_dimensions_use_texture_transfer(self) -> None:
+        trim_id = "8" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_skirting(trim_id, _wall_surface_id(1, 2))
+        target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+        self._publish_authored_trim_texture(
+            target.object_id,
+            task_id="resized-skirting-texture",
+        )
+        original_trim = self.level.architectural_trims[0]
+        resized_trim = replace(
+            original_trim,
+            height_meters=original_trim.height_meters * 1.75,
+        )
+        self.level.architectural_trims[0] = resized_trim
+        expected_frame = build_architectural_trim_component_frame(
+            self.level,
+            resized_trim,
+            self.workspace._get_architectural_trim_wall_surfaces(resized_trim),
+        )
+
+        transfer_method = (
+            self.workspace.generation
+            .build_architectural_trim_texture_transfer_model
+        )
+        with patch.object(
+            self.workspace.generation,
+            "build_architectural_trim_texture_transfer_model",
+            wraps=transfer_method,
+        ) as transfer:
+            placements, replaced_keys = (
+                self.workspace._build_active_architectural_trim_component_models(
+                    include_excluded_levels=True,
+                )
+            )
+
+        self.assertEqual(replaced_keys, ((2, trim_id),))
+        self.assertEqual(len(placements), 1)
+        transfer.assert_called_once_with(
+            target.object_id,
+            expected_frame.target_extents,
+        )
+        np.testing.assert_allclose(
+            placements[0].model.mesh.extents,
+            expected_frame.target_extents,
+            rtol=1e-5,
+            atol=1e-7,
         )
 
     def test_generated_cornice_surface_texture_is_listed_and_assignable(
@@ -1162,8 +1714,8 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
         self.assertEqual(rejected.surface_ids, original_surface_ids)
         self.assertEqual(
             self.workspace.texture_atlas_workspace.status_label.text(),
-            "Generated cornice textures can only be assigned to complete "
-            "cornice components.",
+            "Generated architectural-trim textures can only be assigned "
+            "to complete components of the same trim type.",
         )
 
     def test_reselecting_cornice_reuses_its_generation_component(self) -> None:

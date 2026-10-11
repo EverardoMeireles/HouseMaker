@@ -10,10 +10,13 @@ import trimesh
 
 from housemaker.architectural_trim import (
     TRIM_PART_FRONT,
+    ArchitecturalTrimCorniceMiterDescriptor,
+    ArchitecturalTrimMiterDescriptor,
     ArchitecturalTrimPlacementRequest,
     add_architectural_trim,
     build_architectural_trim_edit_targets,
     build_architectural_trim_geometry,
+    build_architectural_trim_miter_descriptors,
     build_architectural_trim_placement_preview_meshes,
     build_architectural_trim_surface_id,
     build_cornice_miter_descriptors,
@@ -639,6 +642,66 @@ class ArchitecturalTrimGeometryTests(unittest.TestCase):
         )
         self.assertAlmostEqual(abs(first_joined[0].local_x_shift_per_depth), 1.0)
         self.assertAlmostEqual(abs(second_joined[0].local_x_shift_per_depth), 1.0)
+
+    def test_generic_miter_descriptors_include_skirting_but_not_edging(
+        self,
+    ) -> None:
+        level, surfaces = _corner_level_and_surfaces()
+        first_id = "a" * 32
+        second_id = "b" * 32
+        edging_id = "c" * 32
+        corner_id = int(str(surfaces[0].wall_key).split(":")[1])
+        level.architectural_trims.extend(
+            (
+                ArchitecturalTrimData(
+                    trim_id=first_id,
+                    kind=TRIM_KIND_SKIRTING_BOARD,
+                    wall_surface_ids=(surfaces[0].surface_id,),
+                ),
+                ArchitecturalTrimData(
+                    trim_id=second_id,
+                    kind=TRIM_KIND_SKIRTING_BOARD,
+                    wall_surface_ids=(surfaces[1].surface_id,),
+                ),
+                ArchitecturalTrimData(
+                    trim_id=edging_id,
+                    kind=TRIM_KIND_EDGING_STRIP,
+                    wall_surface_ids=tuple(
+                        surface.surface_id for surface in surfaces
+                    ),
+                    corner_vertex_id=corner_id,
+                ),
+            )
+        )
+
+        descriptors = {
+            descriptor.trim_id: descriptor
+            for descriptor in build_architectural_trim_miter_descriptors(
+                [level],
+                surfaces,
+            )
+        }
+
+        self.assertIs(
+            ArchitecturalTrimCorniceMiterDescriptor,
+            ArchitecturalTrimMiterDescriptor,
+        )
+        self.assertEqual(set(descriptors), {first_id, second_id})
+        for trim_id, neighbor_id in (
+            (first_id, second_id),
+            (second_id, first_id),
+        ):
+            joined = tuple(
+                endpoint
+                for endpoint in (
+                    descriptors[trim_id].minimum_x,
+                    descriptors[trim_id].maximum_x,
+                )
+                if endpoint.is_joined
+            )
+            self.assertEqual(len(joined), 1)
+            self.assertEqual(joined[0].neighbor_trim_id, neighbor_id)
+        self.assertEqual(build_cornice_miter_descriptors([level], surfaces), ())
 
     def test_reversed_outer_faces_report_matching_cornice_miters(self) -> None:
         level, surfaces = _corner_level_and_surfaces()

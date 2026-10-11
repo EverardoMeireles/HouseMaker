@@ -7409,16 +7409,27 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                 source.object_id,
             )
 
-    def test_square_pair_and_texture_only_half_share_slot_in_either_order(
+    def test_square_pair_and_architectural_trim_halves_share_slot_in_either_order(
         self,
     ) -> None:
-        """Equal square halves are compatible despite distinct mesh semantics."""
+        """Every texture-only trim half can pair with one half-mesh source."""
 
-        for source_order in (
-            ("placeable-half", "cornice-half"),
-            ("cornice-half", "placeable-half"),
+        for trim_source_id, source_order in (
+            (candidate_trim_source_id, candidate_source_order)
+            for candidate_trim_source_id in (
+                "cornice-half",
+                "skirting-board-half",
+                "edging-strip-half",
+            )
+            for candidate_source_order in (
+                ("placeable-half", candidate_trim_source_id),
+                (candidate_trim_source_id, "placeable-half"),
+            )
         ):
-            with self.subTest(source_order=source_order):
+            with self.subTest(
+                trim_source_id=trim_source_id,
+                source_order=source_order,
+            ):
                 placeable_half = _source(
                     "placeable-half",
                     directory=self._temporary_directory.name,
@@ -7426,14 +7437,14 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                     symmetric_plane_coordinate=1.25,
                     packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
                 )
-                cornice_half = _source(
-                    "cornice-half",
+                trim_half = _source(
+                    trim_source_id,
                     directory=self._temporary_directory.name,
                     packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
                 )
                 sources_by_id = {
                     source.object_id: source
-                    for source in (placeable_half, cornice_half)
+                    for source in (placeable_half, trim_half)
                 }
                 data = TextureAtlasData()
                 atlas = data.create_atlas(
@@ -7507,7 +7518,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
                 )
                 self.assertEqual(
-                    placements[cornice_half.object_id].packing_mode,
+                    placements[trim_half.object_id].packing_mode,
                     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
                 )
                 self.assertEqual(
@@ -7518,9 +7529,9 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                     placeable_half.symmetric_preview_plane_coordinate,
                     1.25,
                 )
-                self.assertIsNone(cornice_half.symmetric_preview_orientation)
+                self.assertIsNone(trim_half.symmetric_preview_orientation)
                 self.assertIsNone(
-                    cornice_half.symmetric_preview_plane_coordinate
+                    trim_half.symmetric_preview_plane_coordinate
                 )
 
     def test_square_pair_resolution_change_splits_and_rebuilds_black_halves(

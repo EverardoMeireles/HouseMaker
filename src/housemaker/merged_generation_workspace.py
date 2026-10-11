@@ -74,7 +74,6 @@ from housemaker.generation_workspace import (
     GENERATION_JOB_KIND_TEXTURE,
     GenerationWorkspace,
 )
-from housemaker.models import TRIM_KIND_CORNICE
 from housemaker.object_reference_editing import (
     DEFAULT_OBJECT_REFERENCE_EDIT_MODEL,
     OBJECT_REFERENCE_EDIT_MODEL_OPTIONS,
@@ -114,9 +113,9 @@ OBJECT_REFERENCE_EDIT_STATUS_EMPTY = (
 OBJECT_REFERENCE_EDIT_SOURCE_MASK = "mask"
 OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY = "temporary"
 ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION = (
-    "Isolate one complete repeating cornice or moulding module. Straighten it "
-    "into an orthographic horizontal view. Remove the wall, ceiling, room, "
-    "scenery, and perspective distortion. Preserve the module's relief, "
+    "Isolate the complete architectural trim component. Show it in a clean "
+    "orthographic view aligned to its longest dimension. Remove the wall, "
+    "ceiling, room, scenery, and perspective distortion. Preserve its relief, "
     "profile, proportions, material, and surface detail."
 )
 OBJECT_REFERENCE_EDIT_PROMPT_PRESETS = (
@@ -1069,15 +1068,11 @@ class MergedGenerationWorkspace(QWidget):
         trim_is_selected = bool(
             self.object_workspace._architectural_trim_editing_target is not None
         )
-        trim_target = self.object_workspace._architectural_trim_editing_target
-        cornice_is_selected = bool(
-            trim_target is not None and trim_target.trim_kind == TRIM_KIND_CORNICE
-        )
         surface_is_selected = bool(
             self.surface_workspace.get_selected_surface_ids()
         )
         use_surface_texture_pipeline = bool(
-            surface_is_selected and (not trim_is_selected or not cornice_is_selected)
+            surface_is_selected and not trim_is_selected
         )
         self.object_workspace.set_external_surface_generation_target_selected(
             use_surface_texture_pipeline

@@ -10,21 +10,36 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.architectural_trim_generation import (
+    build_architectural_trim_component_seed_model,
+)
 from housemaker.architectural_trim_uv import (
+    ARCHITECTURAL_TRIM_UV_GUTTER_PIXELS,
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Z,
+    ARCHITECTURAL_TRIM_UV_MAX_STRIP_ASPECT,
+    ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF,
     CORNICE_UV_GUTTER_PIXELS,
     CORNICE_UV_MAX_STRIP_ASPECT,
     CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    build_architectural_trim_segmented_uv_glb,
     build_cornice_segmented_uv_glb,
 )
 from housemaker.glb import (
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     import_generated_glb,
 )
+from housemaker.models import (
+    TRIM_KIND_EDGING_STRIP,
+    ArchitecturalTrimData,
+    LevelData,
+    VertexData,
+)
 from housemaker.scan_projection_layout import (
     SCAN_PROJECTION_LAYOUT_METADATA_KEY,
     build_scan_projection_layout_metadata,
     remap_scan_projection_scene_uvs,
 )
+from housemaker.surface_geometry import FixedSurface
 
 
 # ### Fixture helpers ###
@@ -61,6 +76,83 @@ def _long_textured_box_glb(*, triangle_soup: bool = False) -> bytes:
     if not isinstance(exported, bytes):
         raise TypeError("The cornice UV test fixture could not be serialized.")
     return exported
+
+
+def _edging_wall_surface(
+    surface_id: str,
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+) -> FixedSurface:
+    """Build one host wall for a real procedural edging-strip seed."""
+
+    start_vertex = np.asarray(start, dtype=np.float64)
+    end_vertex = np.asarray(end, dtype=np.float64)
+    top_offset = np.asarray((0.0, 0.0, 2.5), dtype=np.float64)
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            (
+                start_vertex,
+                end_vertex,
+                end_vertex + top_offset,
+                start_vertex + top_offset,
+            ),
+            dtype=np.float64,
+        ),
+        faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64),
+        process=False,
+        validate=False,
+    )
+    return FixedSurface(
+        surface_id=surface_id,
+        surface_type="wall",
+        level_index=2,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=float(mesh.area),
+        wall_key=surface_id.rsplit("wall:", 1)[1],
+        wall_start_world=start,
+        wall_end_world=end,
+        wall_height_meters=2.5,
+    )
+
+
+def _real_edging_strip_seed_glb() -> bytes:
+    """Build the actual L-profile seed used by the edging-strip workflow."""
+
+    vertices = VertexData()
+    first_id = vertices.add_vertex(0.0, 0.0).id
+    corner_id = vertices.add_vertex(100.0, 0.0).id
+    last_id = vertices.add_vertex(100.0, 100.0).id
+    vertices.add_edge(first_id, corner_id)
+    vertices.add_edge(corner_id, last_id)
+    level = LevelData(index=2, name="Ground", vertex_data=vertices)
+    surfaces = (
+        _edging_wall_surface(
+            f"level:2/wall:{first_id}:{corner_id}",
+            (0.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+        ),
+        _edging_wall_surface(
+            f"level:2/wall:{corner_id}:{last_id}",
+            (2.0, 0.0, 0.0),
+            (2.0, 2.0, 0.0),
+        ),
+    )
+    trim = ArchitecturalTrimData(
+        trim_id="e" * 32,
+        kind=TRIM_KIND_EDGING_STRIP,
+        wall_surface_ids=tuple(surface.surface_id for surface in surfaces),
+        corner_vertex_id=corner_id,
+        width_meters=0.25,
+        height_meters=2.5,
+        depth_meters=0.05,
+    )
+    model, _frame = build_architectural_trim_component_seed_model(
+        level,
+        trim,
+        surfaces,
+    )
+    return model.glb_bytes
 
 
 def _box_with_thin_detached_triangle_glb() -> bytes:
@@ -177,7 +269,7 @@ def _normalized_face_uv_areas(model: object) -> np.ndarray:
     return result / float(np.sum(result))
 
 
-# ### Segmented cornice UV tests ###
+# ### Architectural-trim UV tests ###
 class ArchitecturalTrimUvTests(unittest.TestCase):
     def test_long_cornice_is_split_without_changing_geometry_or_material(self) -> None:
         source = import_generated_glb(_long_textured_box_glb())
@@ -304,6 +396,88 @@ class ArchitecturalTrimUvTests(unittest.TestCase):
             np.ptp(all_uvs, axis=0),
         )
 
+    def test_real_edging_uses_z_axis_and_fills_its_left_half_domain(
+        self,
+    ) -> None:
+        texture_resolution = 512
+        source = import_generated_glb(_real_edging_strip_seed_glb())
+
+        result = import_generated_glb(
+            build_architectural_trim_segmented_uv_glb(
+                source.glb_bytes,
+                texture_resolution=texture_resolution,
+                texture_domain=(
+                    ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
+                ),
+                longitudinal_axis=(
+                    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Z
+                ),
+            )
+        )
+        inferred_axis_result = import_generated_glb(
+            build_architectural_trim_segmented_uv_glb(
+                source.glb_bytes,
+                texture_resolution=texture_resolution,
+                texture_domain=(
+                    ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
+                ),
+            )
+        )
+
+        np.testing.assert_allclose(
+            result.mesh.bounds,
+            source.mesh.bounds,
+            rtol=0.0,
+            atol=1e-6,
+        )
+        self.assertGreater(len(result.scene.geometry), 1)
+        self.assertEqual(
+            len(inferred_axis_result.scene.geometry),
+            len(result.scene.geometry),
+        )
+        np.testing.assert_allclose(
+            _normalized_face_uv_areas(inferred_axis_result),
+            _normalized_face_uv_areas(result),
+            rtol=1e-6,
+            atol=1e-9,
+        )
+        maximum_segment_height = (
+            ARCHITECTURAL_TRIM_UV_MAX_STRIP_ASPECT
+            * min(float(source.mesh.extents[0]), float(source.mesh.extents[1]))
+        )
+        for geometry in result.scene.geometry.values():
+            self.assertLessEqual(
+                float(np.ptp(geometry.vertices[:, 1])),
+                maximum_segment_height + 1e-6,
+            )
+
+        all_uvs = np.vstack(
+            [
+                np.asarray(geometry.visual.uv, dtype=np.float64)
+                for geometry in result.scene.geometry.values()
+            ]
+        )
+        gutter = (
+            ARCHITECTURAL_TRIM_UV_GUTTER_PIXELS / texture_resolution
+        )
+        self.assertGreaterEqual(float(np.min(all_uvs[:, 0])), gutter - 1e-7)
+        self.assertLessEqual(float(np.max(all_uvs[:, 0])), 0.5 - gutter + 1e-7)
+        self.assertGreaterEqual(float(np.min(all_uvs[:, 1])), gutter - 1e-7)
+        self.assertLessEqual(float(np.max(all_uvs[:, 1])), 1.0 - gutter + 1e-7)
+
+        occupied_area = 0.0
+        for geometry in result.scene.geometry.values():
+            uvs = np.asarray(geometry.visual.uv, dtype=np.float64)
+            faces = np.asarray(geometry.faces, dtype=np.int64)
+            occupied_area += sum(
+                _triangle_uv_area(uvs[face]) for face in faces
+            )
+        self.assertGreater(occupied_area / 0.5, 0.35)
+        self.assertGreater(
+            float(np.median(_uv_density_scales(result))),
+            0.25,
+        )
+
     def test_triangle_soup_is_welded_and_unwrapped_reliably(self) -> None:
         result = import_generated_glb(
             build_cornice_segmented_uv_glb(
@@ -358,7 +532,10 @@ class ArchitecturalTrimUvTests(unittest.TestCase):
             build_cornice_segmented_uv_glb(source, texture_resolution=256)
         )
 
-        first_geometries = sorted(first.scene.geometry.items(), key=lambda item: item[0])
+        first_geometries = sorted(
+            first.scene.geometry.items(),
+            key=lambda item: item[0],
+        )
         second_geometries = sorted(
             second.scene.geometry.items(),
             key=lambda item: item[0],
@@ -423,7 +600,10 @@ class ArchitecturalTrimUvTests(unittest.TestCase):
             build_cornice_segmented_uv_glb(source, texture_resolution=True)
         with self.assertRaisesRegex(ValueError, "must be between"):
             build_cornice_segmented_uv_glb(source, texture_resolution=32)
-        with self.assertRaisesRegex(ValueError, "Unknown cornice UV texture domain"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Unknown architectural-trim UV texture domain",
+        ):
             build_cornice_segmented_uv_glb(source, texture_domain="right_half")
 
 

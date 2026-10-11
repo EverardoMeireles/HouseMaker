@@ -340,7 +340,7 @@ def retarget_architectural_trim_repeat_module_glb(
     The nearest supported repeat count keeps each target module as close as
     possible to the source module's authored length. Fitting changes only the
     vertex positions, so the persisted UV topology and motif layout remain
-    shared by every retargeted cornice.
+    shared by every retargeted horizontal trim.
     """
 
     if not isinstance(source_layout, ArchitecturalTrimRepeatLayout):

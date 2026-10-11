@@ -63,6 +63,12 @@ TRIM_MITER_BOUNDARIES = frozenset(
         TRIM_MITER_BOUNDARY_MAXIMUM_X,
     }
 )
+TRIM_MITER_KINDS = frozenset(
+    {
+        TRIM_KIND_CORNICE,
+        TRIM_KIND_SKIRTING_BOARD,
+    }
+)
 _TRIM_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TRIM_SURFACE_ID_PATTERN = re.compile(
     r"^trim:(?P<trim_id>[0-9a-f]{32})/"
@@ -85,12 +91,14 @@ __all__ = [
     "ArchitecturalTrimEditTarget",
     "ArchitecturalTrimEndpointMiter",
     "ArchitecturalTrimGeometry",
+    "ArchitecturalTrimMiterDescriptor",
     "ArchitecturalTrimPart",
     "ArchitecturalTrimPlacementRequest",
     "ArchitecturalTrimRun",
     "add_architectural_trim",
     "build_architectural_trim_edit_targets",
     "build_architectural_trim_geometry",
+    "build_architectural_trim_miter_descriptors",
     "build_architectural_trim_parts",
     "build_architectural_trim_placement_preview_meshes",
     "build_architectural_trim_surface_id",
@@ -229,7 +237,7 @@ class ArchitecturalTrimGeometry:
 
 @dataclass(frozen=True)
 class ArchitecturalTrimEndpointMiter:
-    """One canonical local-X cornice boundary and its optional miter shear."""
+    """One canonical local-X trim boundary and its optional miter shear."""
 
     boundary: str
     wall_point_world: tuple[float, float, float]
@@ -284,8 +292,8 @@ class ArchitecturalTrimEndpointMiter:
 
 
 @dataclass(frozen=True)
-class ArchitecturalTrimCorniceMiterDescriptor:
-    """Miter shears for both canonical local-X boundaries of one cornice."""
+class ArchitecturalTrimMiterDescriptor:
+    """Miter shears for both canonical local-X boundaries of one linear trim."""
 
     level_index: int
     trim_id: str
@@ -297,11 +305,15 @@ class ArchitecturalTrimCorniceMiterDescriptor:
         if _TRIM_ID_PATTERN.fullmatch(normalized_id) is None:
             raise ValueError("Architectural trim miter descriptors require valid IDs.")
         if self.minimum_x.boundary != TRIM_MITER_BOUNDARY_MINIMUM_X:
-            raise ValueError("The minimum-X cornice miter is assigned incorrectly.")
+            raise ValueError("The minimum-X trim miter is assigned incorrectly.")
         if self.maximum_x.boundary != TRIM_MITER_BOUNDARY_MAXIMUM_X:
-            raise ValueError("The maximum-X cornice miter is assigned incorrectly.")
+            raise ValueError("The maximum-X trim miter is assigned incorrectly.")
         object.__setattr__(self, "level_index", int(self.level_index))
         object.__setattr__(self, "trim_id", normalized_id)
+
+
+# Public compatibility alias retained for saved integrations and imports.
+ArchitecturalTrimCorniceMiterDescriptor = ArchitecturalTrimMiterDescriptor
 
 
 @dataclass(frozen=True)
@@ -573,25 +585,53 @@ def build_architectural_trim_parts(
     return build_architectural_trim_geometry(levels, wall_surfaces).parts
 
 
+def build_architectural_trim_miter_descriptors(
+    levels: Sequence[LevelData],
+    wall_surfaces: Sequence[object] | None = None,
+) -> tuple[ArchitecturalTrimMiterDescriptor, ...]:
+    """Describe procedural corner miters for cornices and skirting boards.
+
+    Generated linear trims use X along their length and centered Y across
+    their depth. A consumer can shear either local-X boundary by
+    ``local_x_shift_per_depth * (y + depth / 2)``. Open ends report zero.
+    Edging strips are excluded because each component already spans its
+    complete L-shaped corner.
+    """
+
+    return _build_architectural_trim_miter_descriptors(
+        levels,
+        wall_surfaces,
+        trim_kinds=TRIM_MITER_KINDS,
+    )
+
+
 def build_cornice_miter_descriptors(
     levels: Sequence[LevelData],
     wall_surfaces: Sequence[object] | None = None,
 ) -> tuple[ArchitecturalTrimCorniceMiterDescriptor, ...]:
-    """Describe exact procedural corner miters in each cornice's local frame.
+    """Compatibility wrapper returning descriptors for cornices only."""
 
-    Generated cornices use X along their length and centered Y across their
-    depth. A consumer can shear either local-X boundary by
-    ``local_x_shift_per_depth * (y + depth / 2)``. Open ends report zero.
-    """
+    return _build_architectural_trim_miter_descriptors(
+        levels,
+        wall_surfaces,
+        trim_kinds=frozenset({TRIM_KIND_CORNICE}),
+    )
 
+
+def _build_architectural_trim_miter_descriptors(
+    levels: Sequence[LevelData],
+    wall_surfaces: Sequence[object] | None,
+    *,
+    trim_kinds: frozenset[str],
+) -> tuple[ArchitecturalTrimMiterDescriptor, ...]:
     level_sequence = tuple(levels)
     surface_by_id = _resolve_wall_surfaces(level_sequence, wall_surfaces)
-    descriptors: list[ArchitecturalTrimCorniceMiterDescriptor] = []
+    descriptors: list[ArchitecturalTrimMiterDescriptor] = []
     for level in level_sequence:
         spans: list[_WallSpan] = []
         descriptor_span_indices: list[int] = []
         for trim in level.architectural_trims:
-            if trim.kind != TRIM_KIND_CORNICE:
+            if trim.kind not in trim_kinds:
                 continue
             try:
                 validated = validate_architectural_trim_placement(
@@ -613,7 +653,7 @@ def build_cornice_miter_descriptors(
         adjacency = _build_linear_span_adjacency(spans)
         for span_index in descriptor_span_indices:
             descriptors.append(
-                _build_cornice_miter_descriptor(
+                _build_architectural_trim_miter_descriptor(
                     level.index,
                     span_index,
                     spans,
@@ -857,12 +897,12 @@ def _build_linear_span_adjacency(
     return adjacency
 
 
-def _build_cornice_miter_descriptor(
+def _build_architectural_trim_miter_descriptor(
     level_index: int,
     span_index: int,
     spans: Sequence[_WallSpan],
     adjacency: Mapping[int, set[int]],
-) -> ArchitecturalTrimCorniceMiterDescriptor:
+) -> ArchitecturalTrimMiterDescriptor:
     span = spans[span_index]
     width_axis = np.cross(span.normal, np.asarray((0.0, 0.0, 1.0), dtype=float))
     width_axis /= np.linalg.norm(width_axis)
@@ -876,7 +916,7 @@ def _build_cornice_miter_descriptor(
         (ordered_endpoints[1], TRIM_MITER_BOUNDARY_MAXIMUM_X),
     )
     endpoints = tuple(
-        _build_cornice_endpoint_miter(
+        _build_architectural_trim_endpoint_miter(
             span_index,
             point,
             boundary,
@@ -887,7 +927,7 @@ def _build_cornice_miter_descriptor(
         for point, boundary in endpoint_data
     )
     minimum_x, maximum_x = endpoints
-    return ArchitecturalTrimCorniceMiterDescriptor(
+    return ArchitecturalTrimMiterDescriptor(
         level_index=level_index,
         trim_id=span.trim.trim_id,
         minimum_x=minimum_x,
@@ -895,7 +935,7 @@ def _build_cornice_miter_descriptor(
     )
 
 
-def _build_cornice_endpoint_miter(
+def _build_architectural_trim_endpoint_miter(
     span_index: int,
     endpoint: np.ndarray,
     boundary: str,
@@ -904,8 +944,13 @@ def _build_cornice_endpoint_miter(
     width_axis: np.ndarray,
 ) -> ArchitecturalTrimEndpointMiter:
     span = spans[span_index]
+    anchor_z = (
+        span.maximum_z
+        if span.trim.kind == TRIM_KIND_CORNICE
+        else span.minimum_z
+    )
     wall_point = np.asarray(
-        (endpoint[0], endpoint[1], span.maximum_z),
+        (endpoint[0], endpoint[1], anchor_z),
         dtype=float,
     )
     joined_index = next(
@@ -961,7 +1006,7 @@ def _build_cornice_endpoint_miter(
         wall_point_world=(
             float(shared_point[0]),
             float(shared_point[1]),
-            float(span.maximum_z),
+            float(anchor_z),
         ),
         world_shift_per_depth=tuple(float(value) for value in world_shift),
         local_x_shift_per_depth=float(np.dot(world_shift, width_axis)),

@@ -70,7 +70,7 @@ from housemaker.architectural_trim import (
     TRIM_HANDLE_DEPTH,
     TRIM_HANDLE_HEIGHT,
     TRIM_HANDLE_WIDTH,
-    ArchitecturalTrimCorniceMiterDescriptor,
+    ArchitecturalTrimMiterDescriptor,
     ArchitecturalTrimEditTarget,
     ArchitecturalTrimEndpointMiter,
     ArchitecturalTrimPart,
@@ -78,7 +78,7 @@ from housemaker.architectural_trim import (
     add_architectural_trim,
     build_architectural_trim_edit_targets,
     build_architectural_trim_geometry,
-    build_cornice_miter_descriptors,
+    build_architectural_trim_miter_descriptors,
     is_architectural_trim_surface_id,
     parse_architectural_trim_surface_id,
     remove_architectural_trim,
@@ -179,14 +179,15 @@ from housemaker.generation_state import (
     GenerationData,
 )
 from housemaker.generation_workspace import (
-    CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+    ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF,
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
     OBJECT_OPERATION_GENERATE_TEXTURE,
     PBR_MAPS_ENABLED_PIPELINE_KEY,
     GenerationWorkspace,
     ObjectTextureImageVariant,
     get_architectural_trim_component_identity,
-    get_cornice_uv_texture_domain,
+    get_architectural_trim_component_kind,
+    get_architectural_trim_uv_texture_domain,
     is_architectural_trim_component_record,
     is_door_component_record,
 )
@@ -272,6 +273,7 @@ from housemaker.models import (
     STAIR_TYPE_FLOATING,
     STAIR_TYPE_SUPPORTED,
     TRIM_KIND_CORNICE,
+    TRIM_KIND_SKIRTING_BOARD,
     ArchitecturalTrimData,
     DoorwayData,
     DoorwayPreset,
@@ -10967,7 +10969,7 @@ class BlueprintWorkspace(QWidget):
         operation_kind: str,
         raw_object_id: object,
     ) -> None:
-        """Snapshot every selected cornice before an asynchronous retexture."""
+        """Snapshot every compatible selected trim before an async retexture."""
 
         if str(operation_kind) != OBJECT_OPERATION_GENERATE_TEXTURE:
             return
@@ -10990,10 +10992,11 @@ class BlueprintWorkspace(QWidget):
         if component_identity is None:
             return
         owner = self._get_architectural_trim_owner(*component_identity)
-        if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+        if owner is None:
             return
-        target_surface_ids = self._expand_cornice_surface_targets(
-            self._desired_canvas_architectural_trim_part_ids
+        target_surface_ids = self._expand_architectural_trim_surface_targets(
+            self._desired_canvas_architectural_trim_part_ids,
+            expected_trim_kind=owner[1].kind,
         )
         if target_surface_ids is None:
             return
@@ -11017,7 +11020,7 @@ class BlueprintWorkspace(QWidget):
         self,
         object_id: str,
     ) -> tuple[str, ...]:
-        """Return the immutable selected-cornice snapshot for one live job."""
+        """Return the immutable selected-trim snapshot for one live job."""
 
         normalized_object_id = str(object_id).strip()
         return next(
@@ -12316,7 +12319,7 @@ class BlueprintWorkspace(QWidget):
         self,
         assignment: SurfaceTextureAssignment,
     ) -> str:
-        """Resolve UV-only cornice packing without declaring half geometry."""
+        """Resolve UV-only trim packing without declaring half geometry."""
 
         source_object_id = str(assignment.source_object_id or "").strip()
         if not source_object_id:
@@ -12331,8 +12334,8 @@ class BlueprintWorkspace(QWidget):
         )
         if (
             source_record is not None
-            and get_cornice_uv_texture_domain(source_record)
-            == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+            and get_architectural_trim_uv_texture_domain(source_record)
+            == ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
         ):
             return ATLAS_PACKING_MODE_SYMMETRIC_HALF
         return ATLAS_PACKING_MODE_FULL
@@ -13153,9 +13156,15 @@ class BlueprintWorkspace(QWidget):
         if self.surface_texture_generation.delete_assignment_texture(
             assignment.assignment_id
         ):
-            self.texture_atlas_workspace.status_label.setText(
-                self.surface_texture_generation.status_label.text()
-            )
+            status = self.surface_texture_generation.status_label.text()
+            source_object_id = str(assignment.source_object_id or "").strip()
+            if source_object_id:
+                deleted_source = self.generation.delete_generated_object(
+                    source_object_id
+                )
+                if not deleted_source:
+                    status += " The hidden generated source could not be deleted."
+            self.texture_atlas_workspace.status_label.setText(status)
             return
         self.texture_atlas_workspace.status_label.setText(
             "The selected Surface texture is busy or could not be deleted."
@@ -13613,14 +13622,14 @@ class BlueprintWorkspace(QWidget):
         if assignment is None:
             return
         target_surface_ids = self._atlas_surface_assignment_targets(assignment)
-        target_surface_ids = self._expand_linked_cornice_assignment_targets(
+        target_surface_ids = self._expand_linked_architectural_trim_assignment_targets(
             assignment,
             target_surface_ids,
         )
         if target_surface_ids is None:
             self.texture_atlas_workspace.status_label.setText(
-                "Generated cornice textures can only be assigned to complete "
-                "cornice components."
+                "Generated architectural-trim textures can only be assigned "
+                "to complete components of the same trim type."
             )
             return
         if not target_surface_ids:
@@ -13755,12 +13764,12 @@ class BlueprintWorkspace(QWidget):
             return selected_stair_ids
         return self.viewer.get_selected_architectural_trim_part_ids()
 
-    def _linked_cornice_source_record(
+    def _linked_architectural_trim_source_record(
         self,
         assignment: SurfaceTextureAssignment,
         records_by_id: Mapping[str, GeneratedObjectRecord] | None = None,
     ) -> GeneratedObjectRecord | None:
-        """Resolve a valid generated cornice behind one Surface-list entry."""
+        """Resolve a generated trim behind one Surface-list texture entry."""
 
         source_object_id = str(assignment.source_object_id or "").strip()
         if not source_object_id:
@@ -13774,40 +13783,48 @@ class BlueprintWorkspace(QWidget):
             else records_by_id
         )
         record = record_lookup.get(source_object_id)
-        if record is None or not self._is_active_architectural_trim_component_record(
-            record
+        if (
+            record is None
+            or get_architectural_trim_component_identity(record) is None
+            or get_architectural_trim_component_kind(record) is None
+            or not self.generation.has_generated_object_texture_variants(
+                record.object_id
+            )
         ):
-            return None
-        identity = get_architectural_trim_component_identity(record)
-        if identity is None:
-            return None
-        owner = self._get_architectural_trim_owner(*identity)
-        if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
             return None
         return record
 
-    def _expand_linked_cornice_assignment_targets(
+    def _expand_linked_architectural_trim_assignment_targets(
         self,
         assignment: SurfaceTextureAssignment,
         target_surface_ids: Sequence[str],
     ) -> tuple[str, ...] | None:
-        """Bind an object UV atlas to whole cornices, never planar fragments."""
+        """Bind an authored trim UV atlas to whole compatible components."""
 
         normalized_targets = tuple(
             dict.fromkeys(str(surface_id).strip() for surface_id in target_surface_ids)
         )
         if assignment.source_object_id is None:
             return normalized_targets
-        if self._linked_cornice_source_record(assignment) is None:
+        source_record = self._linked_architectural_trim_source_record(assignment)
+        if source_record is None:
+            return None
+        source_trim_kind = get_architectural_trim_component_kind(source_record)
+        if source_trim_kind is None:
             return None
 
-        return self._expand_cornice_surface_targets(normalized_targets)
+        return self._expand_architectural_trim_surface_targets(
+            normalized_targets,
+            expected_trim_kind=source_trim_kind,
+        )
 
-    def _expand_cornice_surface_targets(
+    def _expand_architectural_trim_surface_targets(
         self,
         target_surface_ids: Sequence[str],
+        *,
+        expected_trim_kind: str,
     ) -> tuple[str, ...] | None:
-        """Expand selected semantic parts into complete cornice components."""
+        """Expand selected semantic parts into complete same-kind trims."""
 
         target_trim_keys: set[tuple[int, str]] = set()
         for surface_id in target_surface_ids:
@@ -13818,7 +13835,7 @@ class BlueprintWorkspace(QWidget):
                 part.level_index,
                 part.trim_id,
             )
-            if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+            if owner is None or owner[1].kind != expected_trim_kind:
                 return None
             target_trim_keys.add((part.level_index, part.trim_id))
         return tuple(
@@ -13867,7 +13884,7 @@ class BlueprintWorkspace(QWidget):
         if component_identity is None:
             return None
         owner = self._get_architectural_trim_owner(*component_identity)
-        if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+        if owner is None:
             return None
 
         variants_by_resolution: dict[int, ObjectTextureImageVariant] = {}
@@ -14364,20 +14381,22 @@ class BlueprintWorkspace(QWidget):
         symmetry = self.generation.resolve_symmetric_division_for_record(
             replacement_record
         )
-        old_cornice_texture_domain = get_cornice_uv_texture_domain(old_record)
-        replacement_cornice_texture_domain = get_cornice_uv_texture_domain(
+        old_trim_texture_domain = get_architectural_trim_uv_texture_domain(
+            old_record
+        )
+        replacement_trim_texture_domain = get_architectural_trim_uv_texture_domain(
             replacement_record
         )
         texture_only_packing_mode: str | None = None
-        if CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF in (
-            old_cornice_texture_domain,
-            replacement_cornice_texture_domain,
+        if ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF in (
+            old_trim_texture_domain,
+            replacement_trim_texture_domain,
         ):
             symmetry = None
             texture_only_packing_mode = (
                 ATLAS_PACKING_MODE_SYMMETRIC_HALF
-                if replacement_cornice_texture_domain
-                == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
+                if replacement_trim_texture_domain
+                == ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
                 else ATLAS_PACKING_MODE_FULL
             )
         resolve_variant = self.generation.resolve_atlas_texture_image_variant_for_record
@@ -14796,6 +14815,11 @@ class BlueprintWorkspace(QWidget):
         )
         generated_object_ids = self.generation.get_generated_object_ids()
         generated_object_id_lookup = set(generated_object_ids)
+        architectural_trim_object_ids = {
+            record.object_id
+            for record in self.generation.get_data().generated_objects
+            if is_architectural_trim_component_record(record)
+        }
         surface_assignments = list(self.surface_texture_generation.get_assignments())
         self._atlas_surface_assignment_id_by_source_id = {}
         for assignment in surface_assignments:
@@ -14810,6 +14834,13 @@ class BlueprintWorkspace(QWidget):
             if assignment.source_object_id is not None
             and assignment.source_object_id in generated_object_id_lookup
         }
+        scene_bound_object_backed_surface_source_ids = {
+            assignment.source_object_id
+            for assignment in surface_assignments
+            if assignment.surface_ids
+            and assignment.source_object_id is not None
+            and assignment.source_object_id in generated_object_id_lookup
+        }
         scene_bound_source_ids = list(
             self.generation.get_scene_bound_placeable_object_ids()
         )
@@ -14817,7 +14848,7 @@ class BlueprintWorkspace(QWidget):
             record.object_id
             for record in self.generation.get_data().generated_objects
             if self._is_active_architectural_trim_component_record(record)
-            and record.object_id in object_backed_surface_source_ids
+            and record.object_id in scene_bound_object_backed_surface_source_ids
             and self.generation.get_active_texture_variant(record.object_id)
             is not None
         )
@@ -15090,7 +15121,10 @@ class BlueprintWorkspace(QWidget):
         source_build_failed = False
         for variant, symmetry in active_variants:
             variant_object_id = str(getattr(variant, "object_id"))
-            if variant_object_id in object_backed_surface_source_ids:
+            if (
+                variant_object_id in object_backed_surface_source_ids
+                or variant_object_id in architectural_trim_object_ids
+            ):
                 continue
             source = self._build_atlas_object_texture_source(
                 variant,
@@ -16676,9 +16710,21 @@ class BlueprintWorkspace(QWidget):
             if (identity := get_architectural_trim_component_identity(record))
             is not None
         }
-        cornice_miters_by_trim_key = {
+        trim_miters_by_trim_key = {
             (descriptor.level_index, descriptor.trim_id): descriptor
-            for descriptor in build_cornice_miter_descriptors(self.levels)
+            for descriptor in build_architectural_trim_miter_descriptors(
+                self.levels
+            )
+        }
+        linked_bindings = (
+            self._collect_linked_architectural_trim_component_bindings(
+                included_level_indices,
+                records_by_id=records_by_id,
+            )
+        )
+        linked_source_object_ids = {
+            source_record.object_id
+            for source_record, _level, _trim in linked_bindings.values()
         }
         active_record_trim_keys = {
             identity
@@ -16687,20 +16733,22 @@ class BlueprintWorkspace(QWidget):
             is not None
             and identity[0] in included_level_indices
             and self._is_active_architectural_trim_component_record(record)
+            and (
+                not self.generation.has_generated_object_texture_variants(
+                    record.object_id
+                )
+                or record.object_id in linked_source_object_ids
+            )
         }
-        linked_bindings = self._collect_linked_cornice_component_bindings(
-            included_level_indices,
-            records_by_id=records_by_id,
-        )
-        replacement_trim_keys = self._expand_connected_cornice_replacement_keys(
+        replacement_trim_keys = self._expand_connected_linear_trim_replacement_keys(
             active_record_trim_keys | set(linked_bindings),
             included_level_indices=included_level_indices,
-            cornice_miters_by_trim_key=cornice_miters_by_trim_key,
+            trim_miters_by_trim_key=trim_miters_by_trim_key,
         )
-        linked_models = self._build_linked_cornice_component_models(
+        linked_models = self._build_linked_architectural_trim_component_models(
             linked_bindings,
             records_by_trim_key=records_by_trim_key,
-            cornice_miters_by_trim_key=cornice_miters_by_trim_key,
+            trim_miters_by_trim_key=trim_miters_by_trim_key,
             replacement_trim_keys=replacement_trim_keys,
         )
         placements_by_trim_key = dict(linked_models)
@@ -16711,6 +16759,12 @@ class BlueprintWorkspace(QWidget):
                 or identity[0] not in included_level_indices
                 or identity in placements_by_trim_key
                 or not self._is_active_architectural_trim_component_record(record)
+                or (
+                    self.generation.has_generated_object_texture_variants(
+                        record.object_id
+                    )
+                    and record.object_id not in linked_source_object_ids
+                )
             ):
                 continue
             owner = self._get_architectural_trim_owner(*identity)
@@ -16731,8 +16785,8 @@ class BlueprintWorkspace(QWidget):
                     frame,
                     object_id=record.object_id,
                     object_name=record.object_name,
-                    cornice_miter=self._cornice_miter_for_replaced_neighbors(
-                        cornice_miters_by_trim_key.get(identity),
+                    cornice_miter=self._trim_miter_for_replaced_neighbors(
+                        trim_miters_by_trim_key.get(identity),
                         replacement_trim_keys,
                     ),
                 )
@@ -16748,7 +16802,10 @@ class BlueprintWorkspace(QWidget):
             if identity in placements_by_trim_key:
                 continue
             owner = self._get_architectural_trim_owner(*identity)
-            if owner is None or owner[1].kind != TRIM_KIND_CORNICE:
+            if owner is None or owner[1].kind not in {
+                TRIM_KIND_CORNICE,
+                TRIM_KIND_SKIRTING_BOARD,
+            }:
                 continue
             level, trim = owner
             try:
@@ -16764,7 +16821,7 @@ class BlueprintWorkspace(QWidget):
                     else record.object_id
                 )
                 object_name = (
-                    f"Cornice {trim.trim_id[:8]}"
+                    f"{trim.kind.replace('_', ' ').title()} {trim.trim_id[:8]}"
                     if record is None
                     else record.object_name
                 )
@@ -16774,8 +16831,8 @@ class BlueprintWorkspace(QWidget):
                         frame,
                         object_id=object_id,
                         object_name=object_name,
-                        cornice_miter=self._cornice_miter_for_replaced_neighbors(
-                            cornice_miters_by_trim_key.get(identity),
+                        cornice_miter=self._trim_miter_for_replaced_neighbors(
+                            trim_miters_by_trim_key.get(identity),
                             replacement_trim_keys,
                         ),
                     )
@@ -16789,7 +16846,7 @@ class BlueprintWorkspace(QWidget):
             ordered_trim_keys,
         )
 
-    def _collect_linked_cornice_component_bindings(
+    def _collect_linked_architectural_trim_component_bindings(
         self,
         included_level_indices: set[int],
         *,
@@ -16798,7 +16855,7 @@ class BlueprintWorkspace(QWidget):
         tuple[int, str],
         tuple[GeneratedObjectRecord, LevelData, ArchitecturalTrimData],
     ]:
-        """Resolve every cornice surface assignment before fitting models."""
+        """Resolve every authored trim assignment before fitting models."""
 
         owners_by_trim_id: dict[
             str,
@@ -16819,11 +16876,16 @@ class BlueprintWorkspace(QWidget):
             tuple[GeneratedObjectRecord, LevelData, ArchitecturalTrimData],
         ] = {}
         for assignment in self.surface_texture_generation.get_assignments():
-            source_record = self._linked_cornice_source_record(
+            source_record = self._linked_architectural_trim_source_record(
                 assignment,
                 records_by_id,
             )
             if source_record is None:
+                continue
+            source_trim_kind = get_architectural_trim_component_kind(
+                source_record
+            )
+            if source_trim_kind is None:
                 continue
             for surface_id in assignment.surface_ids:
                 parsed_surface_id = parse_architectural_trim_surface_id(surface_id)
@@ -16835,7 +16897,7 @@ class BlueprintWorkspace(QWidget):
                 target_level, target_trim = target_owner
                 if (
                     target_level.index not in included_level_indices
-                    or target_trim.kind != TRIM_KIND_CORNICE
+                    or target_trim.kind != source_trim_kind
                 ):
                     continue
                 bindings[(target_level.index, target_trim.trim_id)] = (
@@ -16846,16 +16908,16 @@ class BlueprintWorkspace(QWidget):
         return bindings
 
     @staticmethod
-    def _expand_connected_cornice_replacement_keys(
+    def _expand_connected_linear_trim_replacement_keys(
         initial_trim_keys: set[tuple[int, str]],
         *,
         included_level_indices: set[int],
-        cornice_miters_by_trim_key: Mapping[
+        trim_miters_by_trim_key: Mapping[
             tuple[int, str],
-            ArchitecturalTrimCorniceMiterDescriptor,
+            ArchitecturalTrimMiterDescriptor,
         ],
     ) -> set[tuple[int, str]]:
-        """Promote whole joined runs so mixed corners retain both miter halves."""
+        """Promote whole joined runs so replacement corners retain both halves."""
 
         expanded = {
             key for key in initial_trim_keys if key[0] in included_level_indices
@@ -16863,7 +16925,7 @@ class BlueprintWorkspace(QWidget):
         pending = list(expanded)
         while pending:
             trim_key = pending.pop()
-            descriptor = cornice_miters_by_trim_key.get(trim_key)
+            descriptor = trim_miters_by_trim_key.get(trim_key)
             if descriptor is None:
                 continue
             for endpoint in (descriptor.minimum_x, descriptor.maximum_x):
@@ -16875,7 +16937,7 @@ class BlueprintWorkspace(QWidget):
                 )
                 if (
                     neighbor_key in expanded
-                    or neighbor_key not in cornice_miters_by_trim_key
+                    or neighbor_key not in trim_miters_by_trim_key
                     or neighbor_key[0] not in included_level_indices
                 ):
                     continue
@@ -16883,7 +16945,7 @@ class BlueprintWorkspace(QWidget):
                 pending.append(neighbor_key)
         return expanded
 
-    def _build_linked_cornice_component_models(
+    def _build_linked_architectural_trim_component_models(
         self,
         bindings: Mapping[
             tuple[int, str],
@@ -16894,13 +16956,13 @@ class BlueprintWorkspace(QWidget):
             tuple[int, str],
             GeneratedObjectRecord,
         ],
-        cornice_miters_by_trim_key: Mapping[
+        trim_miters_by_trim_key: Mapping[
             tuple[int, str],
-            ArchitecturalTrimCorniceMiterDescriptor,
+            ArchitecturalTrimMiterDescriptor,
         ],
         replacement_trim_keys: set[tuple[int, str]],
     ) -> dict[tuple[int, str], PlacedGeneratedModel]:
-        """Reuse one authored cornice UV model on every assigned cornice."""
+        """Reuse one authored trim UV model on every compatible component."""
 
         placements: dict[tuple[int, str], PlacedGeneratedModel] = {}
         for target_key in sorted(bindings):
@@ -16911,15 +16973,8 @@ class BlueprintWorkspace(QWidget):
                     target_trim,
                     self._get_architectural_trim_wall_surfaces(target_trim),
                 )
-                source_identity = get_architectural_trim_component_identity(
-                    source_record
-                )
                 model = (
-                    self.generation.get_generated_object_model(
-                        source_record.object_id
-                    )
-                    if source_identity == target_key
-                    else self.generation.build_architectural_trim_texture_transfer_model(
+                    self.generation.build_architectural_trim_texture_transfer_model(
                         source_record.object_id,
                         frame.target_extents,
                     )
@@ -16933,7 +16988,8 @@ class BlueprintWorkspace(QWidget):
                     else target_record.object_id
                 )
                 target_object_name = (
-                    f"Cornice {target_trim.trim_id[:8]}"
+                    f"{target_trim.kind.replace('_', ' ').title()} "
+                    f"{target_trim.trim_id[:8]}"
                     if target_record is None
                     else target_record.object_name
                 )
@@ -16944,8 +17000,8 @@ class BlueprintWorkspace(QWidget):
                         object_id=target_object_id,
                         object_name=target_object_name,
                         atlas_source_object_id=source_record.object_id,
-                        cornice_miter=self._cornice_miter_for_replaced_neighbors(
-                            cornice_miters_by_trim_key.get(target_key),
+                        cornice_miter=self._trim_miter_for_replaced_neighbors(
+                            trim_miters_by_trim_key.get(target_key),
                             replacement_trim_keys,
                         ),
                     )
@@ -16954,11 +17010,11 @@ class BlueprintWorkspace(QWidget):
                 continue
         return placements
 
-    def _cornice_miter_for_replaced_neighbors(
+    def _trim_miter_for_replaced_neighbors(
         self,
-        descriptor: ArchitecturalTrimCorniceMiterDescriptor | None,
+        descriptor: ArchitecturalTrimMiterDescriptor | None,
         replacement_trim_keys: set[tuple[int, str]],
-    ) -> ArchitecturalTrimCorniceMiterDescriptor | None:
+    ) -> ArchitecturalTrimMiterDescriptor | None:
         """Keep a miter only when the matching neighbor is also replaced."""
 
         if descriptor is None:

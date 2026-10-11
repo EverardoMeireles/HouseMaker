@@ -15,19 +15,48 @@ from housemaker.object_texture_variants import prepare_uv_rewrite_material_textu
 from housemaker.scan_projection_layout import clear_scan_projection_layout_metadata
 
 # ### Constants ###
-CORNICE_UV_MAX_STRIP_ASPECT = 4.0
-CORNICE_UV_MAX_SEGMENT_COUNT = 64
-CORNICE_UV_GUTTER_PIXELS = 8
-CORNICE_UV_MIN_TEXTURE_RESOLUTION = 64
-CORNICE_UV_MAX_TEXTURE_RESOLUTION = 16_384
-CORNICE_UV_TEXTURE_DOMAIN_FULL = "full"
-CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF = "left_half"
-CORNICE_UV_TEXTURE_DOMAINS = frozenset(
+ARCHITECTURAL_TRIM_UV_MAX_STRIP_ASPECT = 4.0
+ARCHITECTURAL_TRIM_UV_MAX_SEGMENT_COUNT = 64
+ARCHITECTURAL_TRIM_UV_GUTTER_PIXELS = 8
+ARCHITECTURAL_TRIM_UV_MIN_TEXTURE_RESOLUTION = 64
+ARCHITECTURAL_TRIM_UV_MAX_TEXTURE_RESOLUTION = 16_384
+ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_FULL = "full"
+ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF = "left_half"
+ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAINS = frozenset(
     {
-        CORNICE_UV_TEXTURE_DOMAIN_FULL,
-        CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF,
+        ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_FULL,
+        ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF,
     }
 )
+ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_X = "x"
+ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Y = "y"
+ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Z = "z"
+ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXES = (
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_X,
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Y,
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Z,
+)
+_GLTF_VERTEX_AXIS_BY_Z_UP_AXIS = {
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_X: 0,
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Y: 2,
+    ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_Z: 1,
+}
+
+# Legacy public names retained for saved-project and extension compatibility.
+CORNICE_UV_MAX_STRIP_ASPECT = ARCHITECTURAL_TRIM_UV_MAX_STRIP_ASPECT
+CORNICE_UV_MAX_SEGMENT_COUNT = ARCHITECTURAL_TRIM_UV_MAX_SEGMENT_COUNT
+CORNICE_UV_GUTTER_PIXELS = ARCHITECTURAL_TRIM_UV_GUTTER_PIXELS
+CORNICE_UV_MIN_TEXTURE_RESOLUTION = (
+    ARCHITECTURAL_TRIM_UV_MIN_TEXTURE_RESOLUTION
+)
+CORNICE_UV_MAX_TEXTURE_RESOLUTION = (
+    ARCHITECTURAL_TRIM_UV_MAX_TEXTURE_RESOLUTION
+)
+CORNICE_UV_TEXTURE_DOMAIN_FULL = ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_FULL
+CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF = (
+    ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
+)
+CORNICE_UV_TEXTURE_DOMAINS = ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAINS
 _GEOMETRY_EPSILON = 1e-10
 _UV_EPSILON = 1e-8
 _PACKING_BINARY_SEARCH_STEPS = 28
@@ -150,20 +179,22 @@ class _SegmentMeshBuilder:
 
 
 # ### Public API ###
-def build_cornice_segmented_uv_glb(
+def build_architectural_trim_segmented_uv_glb(
     glb_bytes: bytes,
     *,
     texture_resolution: int = 2048,
-    texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL,
+    texture_domain: str = ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_FULL,
+    longitudinal_axis: str | None = None,
 ) -> bytes:
-    """Build a true-aspect, maximally scaled UV atlas for a cornice GLB.
+    """Build a true-aspect, maximally scaled UV atlas for a trim GLB.
 
-    Long X-axis geometry is divided before unwrapping so a full cornice cannot
-    consume the atlas as one extremely thin chart. Xatlas parameterizes all
-    pieces together, after which every chart is packed with one shared U/V
-    scale. This uniform diagonal scale preserves the old face proportions and
-    maximizes either the full square or its left half without stretching an
-    individual chart.
+    Geometry is divided along its semantic Z-up longitudinal axis before
+    unwrapping so a full trim cannot consume the atlas as one extremely thin
+    chart. If no axis is declared, the largest Z-up extent is selected with
+    stable X/Y/Z tie-breaking. Xatlas parameterizes all pieces together, after
+    which every chart is packed with one shared U/V scale. This uniform
+    diagonal scale preserves the old face proportions and maximizes either the
+    full square or its left half without stretching an individual chart.
     """
 
     resolution = _normalize_texture_resolution(texture_resolution)
@@ -172,15 +203,24 @@ def build_cornice_segmented_uv_glb(
     clear_scan_projection_layout_metadata(source_model.scene)
     prepare_uv_rewrite_material_textures(
         source_model.scene,
-        operation_name="Cornice segmented UV layout",
+        operation_name="Architectural-trim segmented UV layout",
     )
     source_primitives = _collect_source_primitives(source_model.scene)
     global_bounds = _primitive_bounds(source_primitives)
-    segment_count = _choose_segment_count(global_bounds, resolution=resolution)
+    vertex_axis = _resolve_longitudinal_vertex_axis(
+        longitudinal_axis,
+        z_up_bounds=np.asarray(source_model.mesh.bounds, dtype=np.float64),
+    )
+    segment_count = _choose_segment_count(
+        global_bounds,
+        resolution=resolution,
+        vertex_axis=vertex_axis,
+    )
     submissions = _split_primitives_into_segments(
         source_primitives,
         global_bounds=global_bounds,
         segment_count=segment_count,
+        vertex_axis=vertex_axis,
     )
     outputs = _unwrap_submissions(submissions, resolution=resolution)
     charts = _collect_oriented_charts(outputs)
@@ -193,7 +233,9 @@ def build_cornice_segmented_uv_glb(
     output_scene = _build_output_scene(outputs, final_uvs)
     exported = output_scene.export(file_type="glb")
     if not isinstance(exported, bytes) or not exported:
-        raise ValueError("The cornice UV layout could not be serialized.")
+        raise ValueError(
+            "The architectural-trim UV layout could not be serialized."
+        )
     _validate_uv_glb(
         exported,
         expected_bounds=np.asarray(source_model.mesh.bounds, dtype=np.float64),
@@ -202,34 +244,89 @@ def build_cornice_segmented_uv_glb(
     return exported
 
 
+def build_cornice_segmented_uv_glb(
+    glb_bytes: bytes,
+    *,
+    texture_resolution: int = 2048,
+    texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL,
+) -> bytes:
+    """Compatibility wrapper retaining the cornice's X-axis behavior."""
+
+    return build_architectural_trim_segmented_uv_glb(
+        glb_bytes,
+        texture_resolution=texture_resolution,
+        texture_domain=texture_domain,
+        longitudinal_axis=ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_X,
+    )
+
+
 # ### Input helpers ###
 def _normalize_texture_resolution(texture_resolution: object) -> int:
     if isinstance(texture_resolution, (bool, np.bool_)) or not isinstance(
         texture_resolution,
         (int, np.integer),
     ):
-        raise TypeError("Cornice texture resolution must be an integer.")
+        raise TypeError(
+            "Architectural-trim texture resolution must be an integer."
+        )
     resolution = int(texture_resolution)
-    if not CORNICE_UV_MIN_TEXTURE_RESOLUTION <= resolution <= (
-        CORNICE_UV_MAX_TEXTURE_RESOLUTION
+    if not ARCHITECTURAL_TRIM_UV_MIN_TEXTURE_RESOLUTION <= resolution <= (
+        ARCHITECTURAL_TRIM_UV_MAX_TEXTURE_RESOLUTION
     ):
         raise ValueError(
-            "Cornice texture resolution must be between "
-            f"{CORNICE_UV_MIN_TEXTURE_RESOLUTION} and "
-            f"{CORNICE_UV_MAX_TEXTURE_RESOLUTION}."
+            "Architectural-trim texture resolution must be between "
+            f"{ARCHITECTURAL_TRIM_UV_MIN_TEXTURE_RESOLUTION} and "
+            f"{ARCHITECTURAL_TRIM_UV_MAX_TEXTURE_RESOLUTION}."
         )
     return resolution
 
 
 def _normalize_texture_domain(texture_domain: object) -> str:
-    """Validate the square region available to the cornice UV charts."""
+    """Validate the square region available to the trim UV charts."""
 
     if not isinstance(texture_domain, str):
-        raise TypeError("Cornice UV texture domain must be a string.")
+        raise TypeError(
+            "Architectural-trim UV texture domain must be a string."
+        )
     normalized = texture_domain.strip().lower()
-    if normalized not in CORNICE_UV_TEXTURE_DOMAINS:
-        raise ValueError("Unknown cornice UV texture domain.")
+    if normalized not in ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAINS:
+        raise ValueError("Unknown architectural-trim UV texture domain.")
     return normalized
+
+
+def _resolve_longitudinal_vertex_axis(
+    longitudinal_axis: object,
+    *,
+    z_up_bounds: np.ndarray,
+) -> int:
+    """Resolve one semantic Z-up trim axis to its raw glTF vertex axis."""
+
+    bounds = np.asarray(z_up_bounds, dtype=np.float64)
+    if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+        raise ValueError(
+            "The architectural-trim GLB has invalid Z-up bounds."
+        )
+    extents = bounds[1] - bounds[0]
+    if np.any(extents <= _GEOMETRY_EPSILON):
+        raise ValueError(
+            "The architectural-trim GLB must have measurable size on every "
+            "axis."
+        )
+    if longitudinal_axis is None:
+        semantic_axis = ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXES[
+            int(np.argmax(extents))
+        ]
+    else:
+        if not isinstance(longitudinal_axis, str):
+            raise TypeError(
+                "Architectural-trim longitudinal axes must be strings."
+            )
+        semantic_axis = longitudinal_axis.strip().lower()
+        if semantic_axis not in ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXES:
+            raise ValueError(
+                "Unknown architectural-trim longitudinal axis."
+            )
+    return _GLTF_VERTEX_AXIS_BY_Z_UP_AXIS[semantic_axis]
 
 
 def _collect_source_primitives(scene: trimesh.Scene) -> tuple[_SourcePrimitive, ...]:
@@ -242,7 +339,10 @@ def _collect_source_primitives(scene: trimesh.Scene) -> tuple[_SourcePrimitive, 
         mesh = copy.deepcopy(source_mesh)
         node_transform = np.asarray(transform, dtype=np.float64)
         if node_transform.shape != (4, 4) or not np.all(np.isfinite(node_transform)):
-            raise ValueError("The cornice GLB contains an invalid node transform.")
+            raise ValueError(
+                "The architectural-trim GLB contains an invalid node "
+                "transform."
+            )
         mesh.apply_transform(node_transform)
         vertices = np.asarray(mesh.vertices, dtype=np.float64)
         faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -255,7 +355,10 @@ def _collect_source_primitives(scene: trimesh.Scene) -> tuple[_SourcePrimitive, 
             or np.any(faces < 0)
             or np.any(faces >= len(vertices))
         ):
-            raise ValueError("The cornice GLB contains invalid triangle geometry.")
+            raise ValueError(
+                "The architectural-trim GLB contains invalid triangle "
+                "geometry."
+            )
         primitives.append(
             _SourcePrimitive(
                 node_name=str(node_name),
@@ -263,7 +366,9 @@ def _collect_source_primitives(scene: trimesh.Scene) -> tuple[_SourcePrimitive, 
             )
         )
     if not primitives:
-        raise ValueError("The cornice GLB contains no triangle geometry.")
+        raise ValueError(
+            "The architectural-trim GLB contains no triangle geometry."
+        )
     return tuple(primitives)
 
 
@@ -281,25 +386,37 @@ def _primitive_bounds(primitives: tuple[_SourcePrimitive, ...]) -> np.ndarray:
         or not np.all(np.isfinite(bounds))
         or np.any(extents <= _GEOMETRY_EPSILON)
     ):
-        raise ValueError("The cornice GLB must have measurable size on every axis.")
+        raise ValueError(
+            "The architectural-trim GLB must have measurable size on every "
+            "axis."
+        )
     return bounds
 
 
 # ### Geometry segmentation ###
-def _choose_segment_count(bounds: np.ndarray, *, resolution: int) -> int:
+def _choose_segment_count(
+    bounds: np.ndarray,
+    *,
+    resolution: int,
+    vertex_axis: int,
+) -> int:
     extents = np.asarray(bounds[1] - bounds[0], dtype=np.float64)
-    cross_section_extent = min(float(extents[1]), float(extents[2]))
+    cross_section_extents = np.delete(extents, vertex_axis)
+    cross_section_extent = float(np.min(cross_section_extents))
     requested_count = max(
         1,
         math.ceil(
-            float(extents[0])
-            / (CORNICE_UV_MAX_STRIP_ASPECT * cross_section_extent)
+            float(extents[vertex_axis])
+            / (
+                ARCHITECTURAL_TRIM_UV_MAX_STRIP_ASPECT
+                * cross_section_extent
+            )
         ),
     )
     resolution_limit = max(1, resolution // 32)
     return min(
         requested_count,
-        CORNICE_UV_MAX_SEGMENT_COUNT,
+        ARCHITECTURAL_TRIM_UV_MAX_SEGMENT_COUNT,
         resolution_limit,
     )
 
@@ -309,10 +426,13 @@ def _split_primitives_into_segments(
     *,
     global_bounds: np.ndarray,
     segment_count: int,
+    vertex_axis: int,
 ) -> tuple[_UvSubmission, ...]:
-    minimum_x = float(global_bounds[0, 0])
-    maximum_x = float(global_bounds[1, 0])
-    segment_width = (maximum_x - minimum_x) / float(segment_count)
+    minimum_coordinate = float(global_bounds[0, vertex_axis])
+    maximum_coordinate = float(global_bounds[1, vertex_axis])
+    segment_width = (
+        maximum_coordinate - minimum_coordinate
+    ) / float(segment_count)
     scene_scale = max(float(np.ptp(global_bounds, axis=0).max()), 1.0)
     weld_tolerance = scene_scale * 1e-9
     area_epsilon = weld_tolerance * weld_tolerance
@@ -341,16 +461,20 @@ def _split_primitives_into_segments(
             triangle = vertices[face]
             for segment_index in _triangle_segment_indices(
                 triangle,
-                minimum_x=minimum_x,
+                vertex_axis=vertex_axis,
+                minimum_coordinate=minimum_coordinate,
                 segment_width=segment_width,
                 segment_count=segment_count,
             ):
-                lower_x = minimum_x + segment_index * segment_width
-                upper_x = lower_x + segment_width
-                clipped = _clip_polygon_to_x_interval(
+                lower_coordinate = (
+                    minimum_coordinate + segment_index * segment_width
+                )
+                upper_coordinate = lower_coordinate + segment_width
+                clipped = _clip_polygon_to_axis_interval(
                     triangle,
-                    lower_x=lower_x,
-                    upper_x=upper_x,
+                    vertex_axis=vertex_axis,
+                    lower_coordinate=lower_coordinate,
+                    upper_coordinate=upper_coordinate,
                 )
                 for clipped_triangle in _triangulate_polygon(clipped):
                     builders[segment_index].add_triangle(
@@ -372,22 +496,26 @@ def _split_primitives_into_segments(
             )
 
     if not submissions:
-        raise ValueError("The cornice GLB contains no nondegenerate triangle faces.")
+        raise ValueError(
+            "The architectural-trim GLB contains no nondegenerate triangle "
+            "faces."
+        )
     return tuple(submissions)
 
 
 def _triangle_segment_indices(
     triangle: np.ndarray,
     *,
-    minimum_x: float,
+    vertex_axis: int,
+    minimum_coordinate: float,
     segment_width: float,
     segment_count: int,
 ) -> range:
-    face_minimum = float(np.min(triangle[:, 0]))
-    face_maximum = float(np.max(triangle[:, 0]))
+    face_minimum = float(np.min(triangle[:, vertex_axis]))
+    face_maximum = float(np.max(triangle[:, vertex_axis]))
     if face_maximum - face_minimum <= _GEOMETRY_EPSILON:
         segment_index = math.floor(
-            (face_minimum - minimum_x) / segment_width
+            (face_minimum - minimum_coordinate) / segment_width
         )
         segment_index = min(max(segment_index, 0), segment_count - 1)
         return range(segment_index, segment_index + 1)
@@ -396,31 +524,34 @@ def _triangle_segment_indices(
         segment_width * 1e-9,
     )
     first_index = math.floor(
-        (face_minimum + inset - minimum_x) / segment_width
+        (face_minimum + inset - minimum_coordinate) / segment_width
     )
     last_index = math.floor(
-        (face_maximum - inset - minimum_x) / segment_width
+        (face_maximum - inset - minimum_coordinate) / segment_width
     )
     first_index = min(max(first_index, 0), segment_count - 1)
     last_index = min(max(last_index, first_index), segment_count - 1)
     return range(first_index, last_index + 1)
 
 
-def _clip_polygon_to_x_interval(
+def _clip_polygon_to_axis_interval(
     triangle: np.ndarray,
     *,
-    lower_x: float,
-    upper_x: float,
+    vertex_axis: int,
+    lower_coordinate: float,
+    upper_coordinate: float,
 ) -> np.ndarray:
     polygon = [np.asarray(point, dtype=np.float64) for point in triangle]
-    polygon = _clip_polygon_to_x_plane(
+    polygon = _clip_polygon_to_axis_plane(
         polygon,
-        boundary=lower_x,
+        vertex_axis=vertex_axis,
+        boundary=lower_coordinate,
         keep_greater=True,
     )
-    polygon = _clip_polygon_to_x_plane(
+    polygon = _clip_polygon_to_axis_plane(
         polygon,
-        boundary=upper_x,
+        vertex_axis=vertex_axis,
+        boundary=upper_coordinate,
         keep_greater=False,
     )
     if len(polygon) < 3:
@@ -445,9 +576,10 @@ def _clip_polygon_to_x_interval(
     return np.asarray(cleaned, dtype=np.float64)
 
 
-def _clip_polygon_to_x_plane(
+def _clip_polygon_to_axis_plane(
     polygon: list[np.ndarray],
     *,
+    vertex_axis: int,
     boundary: float,
     keep_greater: bool,
 ) -> list[np.ndarray]:
@@ -456,8 +588,10 @@ def _clip_polygon_to_x_plane(
 
     def inside(point: np.ndarray) -> bool:
         if keep_greater:
-            return bool(point[0] >= boundary - _GEOMETRY_EPSILON)
-        return bool(point[0] <= boundary + _GEOMETRY_EPSILON)
+            return bool(
+                point[vertex_axis] >= boundary - _GEOMETRY_EPSILON
+            )
+        return bool(point[vertex_axis] <= boundary + _GEOMETRY_EPSILON)
 
     output: list[np.ndarray] = []
     previous = polygon[-1]
@@ -465,12 +599,16 @@ def _clip_polygon_to_x_plane(
     for current in polygon:
         current_inside = inside(current)
         if current_inside != previous_inside:
-            delta = float(current[0] - previous[0])
+            delta = float(
+                current[vertex_axis] - previous[vertex_axis]
+            )
             if abs(delta) > _GEOMETRY_EPSILON:
-                interpolation = (boundary - float(previous[0])) / delta
+                interpolation = (
+                    boundary - float(previous[vertex_axis])
+                ) / delta
                 intersection = previous + interpolation * (current - previous)
                 intersection = np.asarray(intersection, dtype=np.float64)
-                intersection[0] = boundary
+                intersection[vertex_axis] = boundary
                 output.append(intersection)
         if current_inside:
             output.append(current)
@@ -520,14 +658,21 @@ def _unwrap_submissions(
     try:
         atlas.generate(chart_options, pack_options, False)
     except RuntimeError as error:
-        raise ValueError("The cornice UV charts could not be unwrapped.") from error
+        raise ValueError(
+            "The architectural-trim UV charts could not be unwrapped."
+        ) from error
     if int(atlas.atlas_count) != 1:
-        raise ValueError("The cornice UV charts require more than one texture atlas.")
+        raise ValueError(
+            "The architectural-trim UV charts require more than one texture "
+            "atlas."
+        )
 
     atlas_width = int(atlas.width)
     atlas_height = int(atlas.height)
     if atlas_width <= 0 or atlas_height <= 0:
-        raise ValueError("Xatlas returned invalid cornice UV dimensions.")
+        raise ValueError(
+            "Xatlas returned invalid architectural-trim UV dimensions."
+        )
     raw_outputs: list[_UvOutput] = []
     for submission in submissions:
         vertex_mapping, faces, uvs = atlas[submission.submission_index]
@@ -545,7 +690,9 @@ def _unwrap_submissions(
             or np.any(vertex_mapping >= len(submission.mesh.vertices))
             or not np.array_equal(vertex_mapping[faces], source_faces)
         ):
-            raise ValueError("Xatlas returned invalid cornice UV topology.")
+            raise ValueError(
+                "Xatlas returned invalid architectural-trim UV topology."
+            )
         raw_outputs.append(
             _UvOutput(
                 submission=submission,
@@ -572,7 +719,9 @@ def _xatlas_normalization(
     )
     largest_extent = float(np.max(maximum - minimum))
     if not math.isfinite(largest_extent) or largest_extent <= _GEOMETRY_EPSILON:
-        raise ValueError("The cornice UV source has no measurable extent.")
+        raise ValueError(
+            "The architectural-trim UV source has no measurable extent."
+        )
     return (minimum + maximum) * 0.5, 1.0 / largest_extent
 
 
@@ -665,7 +814,9 @@ def _estimate_xatlas_texel_density(
         default=0.0,
     )
     if not math.isfinite(world_extent) or world_extent <= _GEOMETRY_EPSILON:
-        raise ValueError("The cornice UV source has no measurable extent.")
+        raise ValueError(
+            "The architectural-trim UV source has no measurable extent."
+        )
     return float(resolution) / world_extent
 
 
@@ -697,7 +848,9 @@ def _flatten_triangle_isometrically(
         or not math.isfinite(doubled_area)
         or doubled_area <= np.finfo(np.float64).eps
     ):
-        raise ValueError("A cornice face has no measurable geometric area.")
+        raise ValueError(
+            "An architectural-trim face has no measurable geometric area."
+        )
     baseline_direction = baseline / baseline_length
     remaining_edge = points[remaining_index] - points[start_index]
     projected_x = float(np.dot(remaining_edge, baseline_direction))
@@ -708,7 +861,10 @@ def _flatten_triangle_isometrically(
     flattened -= np.min(flattened, axis=0)
     flattened *= float(texel_density)
     if not _triangle_has_measurable_2d_area(flattened):
-        raise ValueError("A cornice face could not be assigned measurable UVs.")
+        raise ValueError(
+            "An architectural-trim face could not be assigned measurable "
+            "UVs."
+        )
     return flattened
 
 
@@ -758,7 +914,9 @@ def _collect_oriented_charts(
                 np.any(extents <= extent_tolerance)
                 or not np.all(np.isfinite(extents))
             ):
-                raise ValueError("A cornice UV chart has no measurable area.")
+                raise ValueError(
+                    "An architectural-trim UV chart has no measurable area."
+                )
             if extents[1] > extents[0]:
                 points = np.column_stack((points[:, 1], extents[0] - points[:, 0]))
                 points -= np.min(points, axis=0)
@@ -774,7 +932,7 @@ def _collect_oriented_charts(
                 )
             )
     if not charts:
-        raise ValueError("Xatlas returned no cornice UV charts.")
+        raise ValueError("Xatlas returned no architectural-trim UV charts.")
     return tuple(charts)
 
 
@@ -824,7 +982,7 @@ def _pack_charts_into_horizontal_rows(
         texture_domain,
     )
     requested_gutter = min(
-        CORNICE_UV_GUTTER_PIXELS,
+        ARCHITECTURAL_TRIM_UV_GUTTER_PIXELS,
         max(1, texture_resolution // 32),
     )
     packed: tuple[float, tuple[_ChartPlacement, ...]] | None = None
@@ -838,7 +996,9 @@ def _pack_charts_into_horizontal_rows(
         if packed is not None:
             break
     if packed is None:
-        raise ValueError("The cornice UV charts could not fit into one texture.")
+        raise ValueError(
+            "The architectural-trim UV charts could not fit into one texture."
+        )
     scale, placements = packed
 
     final_uvs = [
@@ -853,24 +1013,21 @@ def _pack_charts_into_horizontal_rows(
         final_uvs[chart.output_index][chart.vertex_indices] = (
             packed_points / float(texture_resolution)
         )
+    is_left_half = (
+        texture_domain
+        == ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
+    )
+    maximum_u = 0.5 if is_left_half else 1.0
     for output_uvs in final_uvs:
-        maximum_u = (
-            0.5
-            if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
-            else 1.0
-        )
         if (
             not np.all(np.isfinite(output_uvs))
             or np.any(output_uvs < -_UV_EPSILON)
             or np.any(output_uvs[:, 0] > maximum_u + _UV_EPSILON)
             or np.any(output_uvs[:, 1] > 1.0 + _UV_EPSILON)
         ):
-            raise ValueError("The packed cornice UVs leave the texture atlas.")
-    maximum_u = (
-        0.5
-        if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
-        else 1.0
-    )
+            raise ValueError(
+                "The packed architectural-trim UVs leave the texture atlas."
+            )
     clipped_uvs = tuple(
         np.clip(uvs, (0.0, 0.0), (maximum_u, 1.0))
         for uvs in final_uvs
@@ -886,7 +1043,9 @@ def _pack_charts_into_horizontal_rows(
         or np.any(uvs < -_UV_EPSILON)
         for uvs in stabilized_uvs
     ):
-        raise ValueError("The stabilized cornice UVs leave the texture atlas.")
+        raise ValueError(
+            "The stabilized architectural-trim UVs leave the texture atlas."
+        )
     return stabilized_uvs
 
 
@@ -897,7 +1056,7 @@ def _texture_domain_pixel_size(
     """Return the physical pixel rectangle available to the UV packer."""
 
     width = float(texture_resolution)
-    if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF:
+    if texture_domain == ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF:
         width *= 0.5
     return width, float(texture_resolution)
 
@@ -947,7 +1106,10 @@ def _stabilize_uv_faces_for_float32(
                         if best_candidate is None or candidate[0] > best_candidate[0]:
                             best_candidate = candidate
             if best_candidate is None or best_candidate[0] <= 0.0:
-                raise ValueError("A cornice UV face cannot survive GLB precision.")
+                raise ValueError(
+                    "An architectural-trim UV face cannot survive GLB "
+                    "precision."
+                )
             _area, vertex_index, axis, candidate_value = best_candidate
             stabilized[vertex_index, axis] = candidate_value
         stabilized_outputs.append(np.asarray(stabilized, dtype=np.float64))
@@ -1096,7 +1258,9 @@ def _build_output_scene(
         occupied_names.add(node_name)
         scene.add_geometry(mesh, geom_name=node_name, node_name=node_name)
     if not scene.geometry:
-        raise ValueError("The cornice UV layout contains no output geometry.")
+        raise ValueError(
+            "The architectural-trim UV layout contains no output geometry."
+        )
     return scene
 
 
@@ -1115,16 +1279,18 @@ def _validate_uv_glb(
         rtol=0.0,
         atol=scale * 1e-6,
     ):
-        raise ValueError("The cornice UV layout changed the model bounds.")
+        raise ValueError(
+            "The architectural-trim UV layout changed the model bounds."
+        )
     for geometry in model.scene.geometry.values():
         if not isinstance(geometry, trimesh.Trimesh) or not len(geometry.faces):
             continue
         uvs = np.asarray(getattr(geometry.visual, "uv", None), dtype=np.float64)
-        maximum_u = (
-            0.5
-            if texture_domain == CORNICE_UV_TEXTURE_DOMAIN_LEFT_HALF
-            else 1.0
+        is_left_half = (
+            texture_domain
+            == ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
         )
+        maximum_u = 0.5 if is_left_half else 1.0
         if (
             uvs.shape != (len(geometry.vertices), 2)
             or not np.all(np.isfinite(uvs))
@@ -1132,4 +1298,6 @@ def _validate_uv_glb(
             or np.any(uvs[:, 0] > maximum_u + _UV_EPSILON)
             or np.any(uvs[:, 1] > 1.0 + _UV_EPSILON)
         ):
-            raise ValueError("The serialized cornice GLB contains invalid UVs.")
+            raise ValueError(
+                "The serialized architectural-trim GLB contains invalid UVs."
+            )
