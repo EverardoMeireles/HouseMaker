@@ -21,6 +21,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPolygonF,
+    QRegion,
     QShortcut,
 )
 from PySide6.QtWidgets import QWidget
@@ -155,6 +156,7 @@ CAMERA_INDICATOR_RADIUS_SCREEN = 7.0
 CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN = 34.0
 CAMERA_INDICATOR_ARROW_HEAD_LENGTH_SCREEN = 10.0
 CAMERA_INDICATOR_ARROW_HEAD_HALF_WIDTH_SCREEN = 6.0
+CAMERA_INDICATOR_UPDATE_MARGIN_SCREEN = 12.0
 DIRECTIONAL_LIGHT_MARKER_COLOR = QColor("#ffd54f")
 DIRECTIONAL_LIGHT_MARKER_OUTLINE_COLOR = QColor("#20242a")
 DIRECTIONAL_LIGHT_MARKER_SELECTED_COLOR = QColor("#ffffff")
@@ -1143,8 +1145,25 @@ class BlueprintCanvas(QWidget):
             raise TypeError("The Canvas camera indicator requires a CameraPose.")
         if pose == self._camera_indicator_pose:
             return
+        if (
+            pose is not None
+            and self._camera_indicator_pose is not None
+            and pose.x == self._camera_indicator_pose.x
+            and pose.y == self._camera_indicator_pose.y
+            and pose.yaw_degrees == self._camera_indicator_pose.yaw_degrees
+        ):
+            self._camera_indicator_pose = pose
+            return
+        previous_update_rect = self._get_camera_indicator_update_rect()
         self._camera_indicator_pose = pose
-        self.update()
+        current_update_rect = self._get_camera_indicator_update_rect()
+        update_region = QRegion()
+        if previous_update_rect is not None:
+            update_region += previous_update_rect
+        if current_update_rect is not None:
+            update_region += current_update_rect
+        if not update_region.isEmpty():
+            self.update(update_region)
 
     def get_camera_indicator_pose(self) -> CameraPose | None:
         """Return the world-space pose currently represented on the Canvas."""
@@ -3392,6 +3411,21 @@ class BlueprintCanvas(QWidget):
             return None
         direction *= CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN / direction_length
         return center, center + direction
+
+    def _get_camera_indicator_update_rect(self) -> QRect | None:
+        """Return the clipped widget region occupied by the camera indicator."""
+
+        geometry = self._get_camera_indicator_geometry()
+        if geometry is None:
+            return None
+        center, direction_tip = geometry
+        update_rect = QRectF(center, direction_tip).normalized().adjusted(
+            -CAMERA_INDICATOR_UPDATE_MARGIN_SCREEN,
+            -CAMERA_INDICATOR_UPDATE_MARGIN_SCREEN,
+            CAMERA_INDICATOR_UPDATE_MARGIN_SCREEN,
+            CAMERA_INDICATOR_UPDATE_MARGIN_SCREEN,
+        )
+        return update_rect.toAlignedRect().intersected(self.rect())
 
     # ### Directional-light painting and hit testing ###
     def _paint_directional_light_profiles(self, painter: QPainter) -> None:

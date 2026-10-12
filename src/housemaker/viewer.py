@@ -7,11 +7,11 @@ import math
 import threading
 import weakref
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from io import BytesIO
-from itertools import pairwise
+from itertools import groupby, pairwise
 
 import cv2
 import numpy as np
@@ -19,6 +19,7 @@ import pyqtgraph.opengl as gl
 import shapely
 import trimesh
 from OpenGL import GL
+from OpenGL.error import Error as OpenGLError
 from OpenGL.GL import shaders as opengl_shaders
 from PIL import Image, ImageDraw, ImageFont
 from pyqtgraph import Transform3D
@@ -766,6 +767,29 @@ class TextureMeshData:
 
 
 @dataclass(frozen=True)
+class _TextureDrawRange:
+    """One contiguous triangle range with cached local-space bounds."""
+
+    first_vertex: int
+    vertex_count: int
+    bounds_corners: np.ndarray = field(compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class _SurfaceTextureRenderPart:
+    """One semantic surface prepared for transient viewport batching."""
+
+    surface_id: str
+    source_ordinal: int
+    level_index: int | None
+    room_index: int | None
+    texture_data: TextureMeshData
+    double_sided: bool
+    progressive_bundle: TexturePreviewBundle | None = None
+    batch_eligible: bool = True
+
+
+@dataclass(frozen=True)
 class TexturePreviewBundle:
     """One aligned base-color and optional PBR texture update."""
 
@@ -1174,6 +1198,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self._update_navigation_tooltip()
+
+    def paintGL(self) -> None:  # type: ignore[override]
+        """Establish the renderer-owned depth baseline for every frame."""
+
+        GL.glDepthFunc(GL.GL_LESS)
+        super().paintGL()
 
     @property
     def is_rectangle_drawing_enabled(self) -> bool:
@@ -2526,6 +2556,7 @@ class TexturedMeshItem(GLGraphicsItem):
         translucent: bool = False,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
         point_light_world_position: Sequence[float] | None = None,
+        draw_ranges: Sequence[_TextureDrawRange] | None = None,
     ) -> None:
         super().__init__()
         self._vertices = np.ascontiguousarray(
@@ -2539,6 +2570,10 @@ class TexturedMeshItem(GLGraphicsItem):
         self._texture_coordinates = np.ascontiguousarray(
             texture_mesh_data.texture_coordinates,
             dtype=np.float32,
+        )
+        self._draw_ranges = _normalize_texture_draw_ranges(
+            self._vertices,
+            draw_ranges,
         )
         self._texture_rgba = np.ascontiguousarray(
             texture_mesh_data.texture_rgba,
@@ -3004,8 +3039,13 @@ class TexturedMeshItem(GLGraphicsItem):
             self._reset_gl_resource_handles()
 
     def paint(self) -> None:  # type: ignore[override]
+        visible_draw_ranges = self._get_visible_draw_ranges()
+        if not visible_draw_ranges:
+            return
         self.setupGLState()
-        culling_was_enabled = bool(GL.glIsEnabled(GL.GL_CULL_FACE))
+        # Every GL option configured by this item establishes culling as off.
+        # Restore that known baseline directly instead of synchronously reading
+        # the current driver state for every draw.
         if not self._double_sided:
             GL.glEnable(GL.GL_CULL_FACE)
             GL.glCullFace(GL.GL_BACK)
@@ -3013,7 +3053,7 @@ class TexturedMeshItem(GLGraphicsItem):
         if self._shader_program is None or self._texture_id is None:
             if self._transparency_mode == TEXTURE_ALPHA_MODE_TRANSLUCENT:
                 GL.glDepthMask(GL.GL_TRUE)
-            if not self._double_sided and not culling_was_enabled:
+            if not self._double_sided:
                 GL.glDisable(GL.GL_CULL_FACE)
             return
 
@@ -3259,7 +3299,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 GL.GL_TEXTURE_2D,
                 int(self._metallic_texture_id or 0),
             )
-            self._draw_bound_triangles()
+            self._draw_bound_triangles(visible_draw_ranges)
         finally:
             for location in enabled_locations:
                 GL.glDisableVertexAttribArray(location)
@@ -3275,7 +3315,7 @@ class TexturedMeshItem(GLGraphicsItem):
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glUseProgram(0)
-            if not self._double_sided and not culling_was_enabled:
+            if not self._double_sided:
                 GL.glDisable(GL.GL_CULL_FACE)
 
     def _get_point_light_position_in_view(self) -> tuple[float, float, float]:
@@ -3290,10 +3330,31 @@ class TexturedMeshItem(GLGraphicsItem):
         mapped = owning_view.viewMatrix().map(QVector3D(*position))
         return (float(mapped.x()), float(mapped.y()), float(mapped.z()))
 
-    def _draw_bound_triangles(self) -> None:
+    def _get_visible_draw_ranges(self) -> tuple[_TextureDrawRange, ...]:
+        """Return only ranges whose conservative bounds intersect the view."""
+
+        try:
+            projection_matrix = _get_view_projection_matrix(self.mvpMatrix())
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            return self._draw_ranges
+        return tuple(
+            draw_range
+            for draw_range in self._draw_ranges
+            if _bounds_intersect_clip_frustum(
+                draw_range.bounds_corners,
+                projection_matrix,
+            )
+        )
+
+    def _draw_bound_triangles(
+        self,
+        draw_ranges: Sequence[_TextureDrawRange] | None = None,
+    ) -> None:
         """Draw opaque and translucent texels with scoped depth-write state."""
 
         assert self._shader_program is not None
+        if draw_ranges is None:
+            draw_ranges = self._draw_ranges
         if self._transparency_mode == TEXTURE_ALPHA_MODE_MIXED:
             try:
                 GL.glDisable(GL.GL_BLEND)
@@ -3304,7 +3365,7 @@ class TexturedMeshItem(GLGraphicsItem):
                     1.0,
                     self._uniform_locations,
                 )
-                GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+                _draw_texture_ranges(draw_ranges)
 
                 GL.glEnable(GL.GL_BLEND)
                 GL.glBlendFuncSeparate(
@@ -3320,7 +3381,7 @@ class TexturedMeshItem(GLGraphicsItem):
                     2.0,
                     self._uniform_locations,
                 )
-                GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+                _draw_texture_ranges(draw_ranges)
             finally:
                 GL.glDepthMask(GL.GL_TRUE)
                 GL.glDisable(GL.GL_BLEND)
@@ -3335,11 +3396,11 @@ class TexturedMeshItem(GLGraphicsItem):
         if self._transparency_mode == TEXTURE_ALPHA_MODE_TRANSLUCENT:
             try:
                 GL.glDepthMask(GL.GL_FALSE)
-                GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+                _draw_texture_ranges(draw_ranges)
             finally:
                 GL.glDepthMask(GL.GL_TRUE)
             return
-        GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+        _draw_texture_ranges(draw_ranges)
 
     def _ensure_gl_resources(self) -> None:
         current_context = QOpenGLContext.currentContext()
@@ -3481,6 +3542,10 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._requested_visible = True
+        mesh_data = self.opts.get("meshdata")
+        vertices = () if mesh_data is None else mesh_data.vertexes()
+        self._bounds_corners = _build_axis_aligned_bounds_corners(vertices)
         edge_color = self.opts["edgeColor"]
         if hasattr(edge_color, "getRgbF"):
             edge_color = edge_color.getRgbF()
@@ -3497,6 +3562,36 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
                     "glCullFace": (GL.GL_BACK,),
                 }
             )
+        self._sync_traversal_visibility()
+
+    def setVisible(self, visible: bool) -> None:
+        """Retain caller visibility while skipping no-op draw traversal."""
+
+        self._requested_visible = bool(visible)
+        self._sync_traversal_visibility()
+
+    def set_draw_modes(self, *, draw_faces: bool, draw_edges: bool) -> None:
+        """Update face and edge modes and omit fully disabled items."""
+
+        self.opts["drawFaces"] = bool(draw_faces)
+        self.opts["drawEdges"] = bool(draw_edges)
+        self._sync_traversal_visibility()
+
+    def setMeshData(self, *args, **kwargs) -> None:
+        """Refresh conservative bounds whenever retained geometry changes."""
+
+        super().setMeshData(*args, **kwargs)
+        mesh_data = self.opts.get("meshdata")
+        vertices = () if mesh_data is None else mesh_data.vertexes()
+        self._bounds_corners = _build_axis_aligned_bounds_corners(vertices)
+
+    def _sync_traversal_visibility(self) -> None:
+        """Hide items which cannot contribute faces or edges to a frame."""
+
+        super().setVisible(
+            self._requested_visible
+            and bool(self.opts["drawFaces"] or self.opts["drawEdges"])
+        )
 
     def set_preview_opacity(
         self,
@@ -3528,6 +3623,15 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
             self.opts["drawEdges"] = draw_edges
 
     def paint(self) -> None:
+        try:
+            projection_matrix = _get_view_projection_matrix(self.mvpMatrix())
+            if not _bounds_intersect_clip_frustum(
+                self._bounds_corners,
+                projection_matrix,
+            ):
+                return
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            pass
         shader = self.shader()
         if shader.name == AMBIENT_LIT_SHADER_NAME:
             shader.setUniformData("u_opacity", [self._preview_opacity])
@@ -3535,36 +3639,21 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
             super().paint()
             return
 
-        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
-        GL.glDepthFunc(GL.GL_LEQUAL)
-        try:
-            super().paint()
-        finally:
-            GL.glDepthFunc(previous_depth_function)
+        _paint_with_coplanar_depth(super().paint)
 
 
 class _DepthTestedOverlayLineItem(gl.GLLinePlotItem):
     """Keep a coplanar guide visible without drawing it through solid meshes."""
 
     def paint(self) -> None:
-        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
-        GL.glDepthFunc(GL.GL_LEQUAL)
-        try:
-            super().paint()
-        finally:
-            GL.glDepthFunc(previous_depth_function)
+        _paint_with_coplanar_depth(super().paint)
 
 
 class _DepthTestedOverlayScatterItem(gl.GLScatterPlotItem):
     """Keep coplanar point markers visible while solid meshes still occlude them."""
 
     def paint(self) -> None:
-        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
-        GL.glDepthFunc(GL.GL_LEQUAL)
-        try:
-            super().paint()
-        finally:
-            GL.glDepthFunc(previous_depth_function)
+        _paint_with_coplanar_depth(super().paint)
 
 
 class _FaceOrientationOverlayMeshItem(gl.GLMeshItem):
@@ -3591,12 +3680,7 @@ class _FaceOrientationOverlayMeshItem(gl.GLMeshItem):
         )
 
     def paint(self) -> None:
-        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
-        GL.glDepthFunc(GL.GL_LEQUAL)
-        try:
-            super().paint()
-        finally:
-            GL.glDepthFunc(previous_depth_function)
+        _paint_with_coplanar_depth(super().paint)
 
 
 @dataclass
@@ -4336,7 +4420,10 @@ class GlbViewerWidget(QWidget):
         self.symmetric_preview_textured_mesh_item: TexturedMeshItem | None = None
         self.symmetric_preview_mesh_item: gl.GLMeshItem | None = None
         self.textured_surface_items: list[TexturedMeshItem] = []
-        self._textured_surface_item_ids: dict[TexturedMeshItem, str] = {}
+        self._textured_surface_item_ids: dict[
+            TexturedMeshItem,
+            str | frozenset[str],
+        ] = {}
         self.textured_wall_items: list[gl.GLImageItem] = []
         self.projection_camera_indicator_items: dict[
             str,
@@ -16517,6 +16604,22 @@ class GlbViewerWidget(QWidget):
         for object_id in token.placed_object_ids:
             self._progressive_object_texture_bundles[object_id] = bundle
 
+        partially_targeted_surface_items = tuple(
+            item
+            for item in self.textured_surface_items
+            if (
+                surface_ids := self._get_textured_surface_item_surface_ids(item)
+            )
+            and bool(surface_ids & token.surface_ids)
+            and not surface_ids.issubset(token.surface_ids)
+            and item._texture_bundle_signature != bundle.content_signature
+        )
+        if partially_targeted_surface_items:
+            # A shared draw item cannot receive pixels for only some of its
+            # semantic surfaces. Rebuild the transient batches after recording
+            # the override so differently textured members split naturally.
+            self._rebuild_textured_surface_items()
+
         candidates: list[TexturedMeshItem | None] = []
         if token.include_primary_model:
             candidates.extend((self.textured_mesh_item, *self.model_material_items))
@@ -16527,15 +16630,18 @@ class GlbViewerWidget(QWidget):
                     *self._embedded_symmetric_preview_groups,
                 )
             )
-        for item, surface_id in self._textured_surface_item_ids.items():
-            if surface_id in token.surface_ids:
+        for item in self.textured_surface_items:
+            if (
+                self._get_textured_surface_item_surface_ids(item)
+                & token.surface_ids
+            ):
                 candidates.append(item)
         for object_id in token.placed_object_ids:
             candidates.extend(
                 self._iter_placed_object_textured_mesh_items(object_id)
             )
 
-        changed_count = 0
+        changed_count = len(partially_targeted_surface_items)
         seen_item_ids: set[int] = set()
         for item in candidates:
             if (
@@ -16549,6 +16655,33 @@ class GlbViewerWidget(QWidget):
         if changed_count and hasattr(self, "view"):
             self.view.update()
         return changed_count
+
+    def _get_textured_surface_item_surface_ids(
+        self,
+        item: TexturedMeshItem,
+    ) -> frozenset[str]:
+        """Return every semantic surface represented by one retained item."""
+
+        raw_surface_ids = self._textured_surface_item_ids.get(item)
+        if isinstance(raw_surface_ids, str):
+            return frozenset((raw_surface_ids,))
+        if raw_surface_ids is None:
+            return frozenset()
+        return raw_surface_ids
+
+    def _rebuild_textured_surface_items(self) -> None:
+        """Repartition only surface batches after a targeted texture change."""
+
+        for item in self.textured_surface_items:
+            item.setVisible(False)
+            item.release_gl_resources()
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self.textured_surface_items = []
+        self._textured_surface_item_ids = {}
+        self._add_textured_surface_items()
+        self._apply_texture_color_balance_preview_to_items()
+        self._apply_render_display_options()
 
     def _invalidate_progressive_texture_updates(self) -> None:
         """Reject all results captured for an older model hierarchy."""
@@ -17299,10 +17432,28 @@ class GlbViewerWidget(QWidget):
                 self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
                 self.view.addItem(self.textured_mesh_item)
 
-            for material_mesh in material_preview_meshes:
+            material_texture_batches: dict[
+                tuple[object, ...],
+                list[TextureMeshData],
+            ] = {}
+            for material_index, material_mesh in enumerate(
+                material_preview_meshes
+            ):
                 material_texture_data = _build_texture_mesh_data(material_mesh)
                 if material_texture_data is None:
                     continue
+                material_texture_batches.setdefault(
+                    _build_texture_mesh_batch_key(
+                        material_texture_data,
+                        material_index,
+                    ),
+                    [],
+                ).append(material_texture_data)
+
+            for material_batch in material_texture_batches.values():
+                material_texture_data = _combine_texture_mesh_data(
+                    material_batch
+                )
                 material_item = TexturedMeshItem(
                     material_texture_data,
                     self._ambient_light_intensity,
@@ -17528,7 +17679,13 @@ class GlbViewerWidget(QWidget):
     def _add_textured_surface_items(self) -> None:
         if self.model is None:
             return
-        for textured_surface in self.model.preview_textured_surfaces:
+        batch_parts_by_key: dict[
+            tuple[object, ...],
+            list[_SurfaceTextureRenderPart],
+        ] = {}
+        for surface_ordinal, textured_surface in enumerate(
+            self.model.preview_textured_surfaces
+        ):
             stair_part = self._canvas_stair_part_targets.get(
                 textured_surface.surface_id
             )
@@ -17557,22 +17714,54 @@ class GlbViewerWidget(QWidget):
             texture_data = _build_texture_mesh_data(textured_surface.mesh)
             if texture_data is None:
                 continue
+            progressive_bundle = self._progressive_surface_texture_bundles.get(
+                textured_surface.surface_id
+            )
+            part = _SurfaceTextureRenderPart(
+                surface_id=textured_surface.surface_id,
+                source_ordinal=surface_ordinal,
+                level_index=textured_surface.level_index,
+                room_index=textured_surface.room_index,
+                texture_data=texture_data,
+                double_sided=textured_surface.double_sided,
+                progressive_bundle=progressive_bundle,
+                batch_eligible=bool(
+                    stair_part is None
+                    and not texture_data.is_prefab_glass
+                    and not texture_data.uses_texture_alpha
+                    and texture_data.alpha_mode == GLTF_ALPHA_MODE_OPAQUE
+                ),
+            )
+            batch_parts_by_key.setdefault(
+                _build_surface_texture_batch_key(part),
+                [],
+            ).append(part)
+
+        for batch_parts in batch_parts_by_key.values():
+            sorted_parts = sorted(
+                batch_parts,
+                key=_surface_texture_culling_sort_key,
+            )
+            texture_data, draw_ranges = _build_surface_texture_batch(
+                sorted_parts
+            )
+            representative = sorted_parts[0]
             texture_item = TexturedMeshItem(
                 texture_data,
                 self._ambient_light_intensity,
                 texture_repeat=True,
-                double_sided=textured_surface.double_sided,
+                double_sided=representative.double_sided,
                 pbr_maps_enabled=self._pbr_maps_enabled,
                 point_light_world_position=self._orbiting_point_light_position,
+                draw_ranges=draw_ranges,
             )
-            progressive_bundle = self._progressive_surface_texture_bundles.get(
-                textured_surface.surface_id
-            )
-            if progressive_bundle is not None:
-                texture_item.set_texture_bundle(progressive_bundle)
+            if representative.progressive_bundle is not None:
+                texture_item.set_texture_bundle(representative.progressive_bundle)
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)
-            self._textured_surface_item_ids[texture_item] = textured_surface.surface_id
+            self._textured_surface_item_ids[texture_item] = frozenset(
+                part.surface_id for part in sorted_parts
+            )
 
     # ### Placed-object rendering ###
     def _add_placed_object_items(self) -> None:
@@ -17589,17 +17778,10 @@ class GlbViewerWidget(QWidget):
             root_item = GLGraphicsItem()
             root_item.setTransform(_numpy_transform_to_qt(preview.placement_transform))
             self.view.addItem(root_item)
-            retained_parts = [
-                part
-                for mesh in preview.meshes
-                if (
-                    part := self._create_placed_object_mesh_render(
-                        mesh,
-                        root_item,
-                    )
-                )
-                is not None
-            ]
+            retained_parts = self._create_placed_object_mesh_renders(
+                preview.meshes,
+                root_item,
+            )
             mirrored_meshes = _build_local_symmetric_preview_meshes(preview)
             symmetric_groups = [
                 group
@@ -17661,23 +17843,86 @@ class GlbViewerWidget(QWidget):
         if has_symmetric_preview:
             self._start_symmetric_preview_animation()
 
-    def _create_placed_object_mesh_render(
+    def _create_placed_object_mesh_renders(
         self,
-        mesh,
+        meshes: Sequence[object],
+        root_item: GLGraphicsItem,
+    ) -> list[_PlacedObjectMeshRender]:
+        """Batch compatible local primitives below one editable object root."""
+
+        batches: dict[
+            tuple[object, ...],
+            list[tuple[object, TextureMeshData | None]],
+        ] = {}
+        for mesh_index, mesh in enumerate(meshes):
+            vertices = np.asarray(getattr(mesh, "vertices", ()), dtype=np.float32)
+            faces = np.asarray(getattr(mesh, "faces", ()), dtype=np.int32)
+            if (
+                vertices.ndim != 2
+                or vertices.shape[1:] != (3,)
+                or faces.ndim != 2
+                or faces.shape[1:] != (3,)
+                or not len(vertices)
+                or not len(faces)
+            ):
+                continue
+            texture_data = _build_texture_mesh_data(mesh)
+            batch_key = _build_texture_mesh_batch_key(
+                texture_data,
+                mesh_index,
+            )
+            batches.setdefault(batch_key, []).append((mesh, texture_data))
+
+        return [
+            render
+            for batch in batches.values()
+            if (
+                render := self._create_placed_object_mesh_batch_render(
+                    batch,
+                    root_item,
+                )
+            )
+            is not None
+        ]
+
+    def _create_placed_object_mesh_batch_render(
+        self,
+        batch: Sequence[tuple[object, TextureMeshData | None]],
         root_item: GLGraphicsItem,
     ) -> _PlacedObjectMeshRender | None:
-        vertices = np.asarray(mesh.vertices, dtype=np.float32)
-        faces = np.asarray(mesh.faces, dtype=np.int32)
-        if (
-            vertices.ndim != 2
-            or vertices.shape[1:] != (3,)
-            or faces.ndim != 2
-            or faces.shape[1:] != (3,)
-            or not len(vertices)
-            or not len(faces)
-        ):
+        """Create one retained draw pair for compatible local primitives."""
+
+        vertex_parts: list[np.ndarray] = []
+        face_parts: list[np.ndarray] = []
+        face_color_parts: list[np.ndarray] = []
+        texture_parts: list[TextureMeshData] = []
+        vertex_offset = 0
+        for mesh, texture_data in batch:
+            vertices = np.asarray(mesh.vertices, dtype=np.float32)
+            faces = np.asarray(mesh.faces, dtype=np.int32)
+            vertex_parts.append(vertices)
+            face_parts.append(faces + vertex_offset)
+            face_color_parts.append(
+                np.tile(FACE_COLOR, (faces.shape[0], 1))
+                if texture_data is not None
+                else _get_mesh_face_colors(mesh, faces)
+            )
+            if texture_data is not None:
+                texture_parts.append(texture_data)
+            vertex_offset += len(vertices)
+        if not vertex_parts:
             return None
-        texture_data = _build_texture_mesh_data(mesh)
+
+        vertices = np.ascontiguousarray(np.concatenate(vertex_parts, axis=0))
+        faces = np.ascontiguousarray(np.concatenate(face_parts, axis=0))
+        face_colors = np.ascontiguousarray(
+            np.concatenate(face_color_parts, axis=0)
+        )
+        texture_data = (
+            _combine_texture_mesh_data(texture_parts)
+            if len(texture_parts) == len(batch)
+            else None
+        )
         textured_item = None
         if texture_data is not None:
             textured_item = TexturedMeshItem(
@@ -17689,11 +17934,6 @@ class GlbViewerWidget(QWidget):
                 point_light_world_position=self._orbiting_point_light_position,
             )
             textured_item.setParentItem(root_item)
-        face_colors = (
-            np.tile(FACE_COLOR, (faces.shape[0], 1))
-            if texture_data is not None
-            else _get_mesh_face_colors(mesh, faces)
-        )
         mesh_item = _WireframeOverlayMeshItem(
             vertexes=vertices,
             faces=faces,
@@ -20047,17 +20287,21 @@ class GlbViewerWidget(QWidget):
             if group.textured_item is not None:
                 group.textured_item.setVisible(textures_visible)
         for textured_surface_item in self.textured_surface_items:
-            surface_id = self._textured_surface_item_ids.get(textured_surface_item)
-            stair_part = (
-                None
-                if surface_id is None
-                else self._canvas_stair_part_targets.get(surface_id)
+            stair_parts = tuple(
+                stair_part
+                for surface_id in self._get_textured_surface_item_surface_ids(
+                    textured_surface_item
+                )
+                if (
+                    stair_part := self._canvas_stair_part_targets.get(surface_id)
+                )
+                is not None
             )
             textured_surface_item.setVisible(
                 textures_visible
-                and (
-                    stair_part is None
-                    or not self._canvas_stair_part_is_preview_hidden(stair_part)
+                and all(
+                    not self._canvas_stair_part_is_preview_hidden(stair_part)
+                    for stair_part in stair_parts
                 )
             )
         for textured_wall_item in self.textured_wall_items:
@@ -20067,37 +20311,41 @@ class GlbViewerWidget(QWidget):
             for retained_part in placed_group.retained_parts:
                 if retained_part.textured_item is not None:
                     retained_part.textured_item.setVisible(textures_visible)
-                retained_part.mesh_item.opts["drawFaces"] = (
-                    not self._wireframe_only
-                    and (
-                        retained_part.textured_item is None
-                        or not self._textures_enabled
-                    )
+                retained_part.mesh_item.set_draw_modes(
+                    draw_faces=(
+                        not self._wireframe_only
+                        and (
+                            retained_part.textured_item is None
+                            or not self._textures_enabled
+                        )
+                    ),
+                    draw_edges=(
+                        self._wireframe_enabled or self._wireframe_only
+                    ),
                 )
-                retained_part.mesh_item.opts["drawEdges"] = (
-                    self._wireframe_enabled or self._wireframe_only
-                )
-                retained_part.mesh_item.update()
 
         if self.mesh_item is not None:
             has_textured_surface = self.textured_mesh_item is not None or bool(
                 self.model_material_items
             )
-            self.mesh_item.opts["drawFaces"] = not self._wireframe_only and (
-                not has_textured_surface or not self._textures_enabled
+            self.mesh_item.set_draw_modes(
+                draw_faces=(
+                    not self._wireframe_only
+                    and (not has_textured_surface or not self._textures_enabled)
+                ),
+                draw_edges=(self._wireframe_enabled or self._wireframe_only),
             )
-            self.mesh_item.opts["drawEdges"] = (
-                self._wireframe_enabled or self._wireframe_only
-            )
-            self.mesh_item.update()
         for group in symmetric_groups:
-            group.mesh_item.opts["drawFaces"] = not self._wireframe_only and (
-                group.textured_item is None or not self._textures_enabled
+            group.mesh_item.set_draw_modes(
+                draw_faces=(
+                    not self._wireframe_only
+                    and (
+                        group.textured_item is None
+                        or not self._textures_enabled
+                    )
+                ),
+                draw_edges=(self._wireframe_enabled or self._wireframe_only),
             )
-            group.mesh_item.opts["drawEdges"] = (
-                self._wireframe_enabled or self._wireframe_only
-            )
-            group.mesh_item.update()
 
         if hasattr(self, "view"):
             self.view.update()
@@ -21263,6 +21511,41 @@ def _get_view_projection_matrix(view_projection: object) -> np.ndarray:
     if matrix_data.shape != (16,):
         raise ValueError("Face selection requires a 4x4 view-projection matrix.")
     return matrix_data.reshape((4, 4), order="F")
+
+
+def _bounds_intersect_clip_frustum(
+    bounds_corners: np.ndarray,
+    projection_matrix: np.ndarray,
+) -> bool:
+    """Conservatively reject bounds wholly outside one homogeneous plane."""
+
+    normalized_bounds = np.asarray(bounds_corners, dtype=np.float32)
+    normalized_projection = np.asarray(projection_matrix, dtype=np.float32)
+    if (
+        normalized_bounds.shape != (8, 3)
+        or normalized_projection.shape != (4, 4)
+        or not np.all(np.isfinite(normalized_bounds))
+        or not np.all(np.isfinite(normalized_projection))
+    ):
+        return True
+    clip_corners = _transform_vertices_to_clip_space(
+        normalized_bounds,
+        normalized_projection,
+    )
+    if not np.all(np.isfinite(clip_corners)):
+        return True
+    plane_distances = clip_corners @ np.asarray(
+        SELECTION_HOMOGENEOUS_CLIP_PLANES,
+        dtype=np.float32,
+    ).T
+    return not bool(
+        np.any(
+            np.all(
+                plane_distances < -SELECTION_CLIP_PLANE_EPSILON,
+                axis=0,
+            )
+        )
+    )
 
 
 def _transform_vertices_to_clip_space(
@@ -25665,6 +25948,228 @@ _RESIZED_TEXTURE_RGBA_CACHE: weakref.WeakValueDictionary[
 ] = weakref.WeakValueDictionary()
 
 
+def _build_axis_aligned_bounds_corners(vertices: object) -> np.ndarray:
+    """Return eight finite AABB corners, or an empty conservative sentinel."""
+
+    normalized = np.asarray(vertices, dtype=np.float32)
+    if (
+        normalized.ndim != 2
+        or normalized.shape[1:] != (3,)
+        or not len(normalized)
+        or not np.all(np.isfinite(normalized))
+    ):
+        return np.empty((0, 3), dtype=np.float32)
+    minimum = np.min(normalized, axis=0)
+    maximum = np.max(normalized, axis=0)
+    return np.asarray(
+        tuple(
+            (x, y, z)
+            for x in (minimum[0], maximum[0])
+            for y in (minimum[1], maximum[1])
+            for z in (minimum[2], maximum[2])
+        ),
+        dtype=np.float32,
+    )
+
+
+def _normalize_texture_draw_ranges(
+    vertices: np.ndarray,
+    draw_ranges: Sequence[_TextureDrawRange] | None,
+) -> tuple[_TextureDrawRange, ...]:
+    """Validate retained triangle ranges and own their cached bounds."""
+
+    vertex_count = len(vertices)
+    if not vertex_count:
+        return ()
+    if draw_ranges is None:
+        return (
+            _TextureDrawRange(
+                first_vertex=0,
+                vertex_count=vertex_count,
+                bounds_corners=_build_axis_aligned_bounds_corners(vertices),
+            ),
+        )
+
+    normalized_ranges: list[_TextureDrawRange] = []
+    for draw_range in draw_ranges:
+        first_vertex = int(draw_range.first_vertex)
+        range_vertex_count = int(draw_range.vertex_count)
+        if (
+            first_vertex < 0
+            or range_vertex_count <= 0
+            or first_vertex % 3
+            or range_vertex_count % 3
+            or first_vertex + range_vertex_count > vertex_count
+        ):
+            raise ValueError("Texture draw ranges must contain complete triangles.")
+        bounds_corners = np.asarray(draw_range.bounds_corners, dtype=np.float32)
+        if bounds_corners.shape != (8, 3) or not np.all(
+            np.isfinite(bounds_corners)
+        ):
+            bounds_corners = _build_axis_aligned_bounds_corners(
+                vertices[first_vertex : first_vertex + range_vertex_count]
+            )
+        normalized_ranges.append(
+            _TextureDrawRange(
+                first_vertex=first_vertex,
+                vertex_count=range_vertex_count,
+                bounds_corners=np.ascontiguousarray(bounds_corners),
+            )
+        )
+    return tuple(normalized_ranges)
+
+
+def _build_surface_texture_batch_key(
+    part: _SurfaceTextureRenderPart,
+) -> tuple[object, ...]:
+    """Return an exact safe material key for one transient surface batch."""
+
+    if not part.batch_eligible:
+        return ("surface", part.source_ordinal)
+    texture_data = part.texture_data
+    texture_signature = (
+        part.progressive_bundle.content_signature
+        if part.progressive_bundle is not None
+        else _build_texture_bundle_content_signature(
+            texture_data.texture_rgba,
+            texture_data.normal_texture_rgba,
+            texture_data.roughness_texture_rgba,
+            texture_data.metallic_texture_rgba,
+        )
+    )
+    return (
+        "opaque-surface-batch",
+        part.level_index,
+        part.double_sided,
+        texture_data.double_sided,
+        texture_data.is_prefab_glass,
+        texture_data.uses_texture_alpha,
+        texture_data.alpha_mode,
+        texture_data.alpha_cutoff,
+        texture_data.base_color_alpha,
+        texture_signature,
+    )
+
+
+def _surface_texture_culling_sort_key(
+    part: _SurfaceTextureRenderPart,
+) -> tuple[bool, int, str]:
+    """Keep each room contiguous so its range can be culled independently."""
+
+    return (
+        part.room_index is None,
+        -1 if part.room_index is None else part.room_index,
+        part.surface_id,
+    )
+
+
+def _build_surface_texture_batch(
+    parts: Sequence[_SurfaceTextureRenderPart],
+) -> tuple[TextureMeshData, tuple[_TextureDrawRange, ...]]:
+    """Combine compatible surfaces and preserve room-level draw bounds."""
+
+    if not parts:
+        raise ValueError("Surface texture batches require at least one surface.")
+    texture_data = _combine_texture_mesh_data(
+        tuple(part.texture_data for part in parts)
+    )
+    draw_ranges: list[_TextureDrawRange] = []
+    first_vertex = 0
+    for _room_index, room_parts_iterator in groupby(
+        parts,
+        key=lambda part: part.room_index,
+    ):
+        room_parts = tuple(room_parts_iterator)
+        room_vertices = np.ascontiguousarray(
+            np.concatenate(
+                tuple(part.texture_data.vertices for part in room_parts),
+                axis=0,
+            ),
+            dtype=np.float32,
+        )
+        room_vertex_count = len(room_vertices)
+        draw_ranges.append(
+            _TextureDrawRange(
+                first_vertex=first_vertex,
+                vertex_count=room_vertex_count,
+                bounds_corners=_build_axis_aligned_bounds_corners(room_vertices),
+            )
+        )
+        first_vertex += room_vertex_count
+    return texture_data, tuple(draw_ranges)
+
+
+def _build_texture_mesh_batch_key(
+    texture_data: TextureMeshData | None,
+    mesh_index: int,
+) -> tuple[object, ...]:
+    """Group fallback or opaque primitives with compatible render state."""
+
+    if texture_data is None:
+        return ("untextured-mesh-batch",)
+    if (
+        texture_data.is_prefab_glass
+        or texture_data.uses_texture_alpha
+        or texture_data.alpha_mode != GLTF_ALPHA_MODE_OPAQUE
+    ):
+        return ("mesh-primitive", mesh_index)
+    return (
+        "opaque-texture-mesh-batch",
+        texture_data.double_sided,
+        texture_data.alpha_cutoff,
+        texture_data.base_color_alpha,
+        _build_texture_bundle_content_signature(
+            texture_data.texture_rgba,
+            texture_data.normal_texture_rgba,
+            texture_data.roughness_texture_rgba,
+            texture_data.metallic_texture_rgba,
+        ),
+    )
+
+
+def _combine_texture_mesh_data(
+    texture_meshes: Sequence[TextureMeshData],
+) -> TextureMeshData:
+    """Concatenate face-expanded geometry that shares one exact material."""
+
+    if not texture_meshes:
+        raise ValueError("Texture mesh batches require at least one mesh.")
+    representative = texture_meshes[0]
+    return TextureMeshData(
+        vertices=np.ascontiguousarray(
+            np.concatenate(
+                tuple(texture.vertices for texture in texture_meshes),
+                axis=0,
+            ),
+            dtype=np.float32,
+        ),
+        normals=np.ascontiguousarray(
+            np.concatenate(
+                tuple(texture.normals for texture in texture_meshes),
+                axis=0,
+            ),
+            dtype=np.float32,
+        ),
+        texture_coordinates=np.ascontiguousarray(
+            np.concatenate(
+                tuple(texture.texture_coordinates for texture in texture_meshes),
+                axis=0,
+            ),
+            dtype=np.float32,
+        ),
+        texture_rgba=representative.texture_rgba,
+        normal_texture_rgba=representative.normal_texture_rgba,
+        roughness_texture_rgba=representative.roughness_texture_rgba,
+        metallic_texture_rgba=representative.metallic_texture_rgba,
+        double_sided=representative.double_sided,
+        is_prefab_glass=representative.is_prefab_glass,
+        uses_texture_alpha=representative.uses_texture_alpha,
+        alpha_mode=representative.alpha_mode,
+        alpha_cutoff=representative.alpha_cutoff,
+        base_color_alpha=representative.base_color_alpha,
+    )
+
+
 def _mirror_preview_vertices(
     vertices: np.ndarray,
     orientation: str,
@@ -26654,6 +27159,79 @@ def _normalize_preview_opacity(opacity: float) -> float:
 
 
 # ### OpenGL helpers ###
+def _draw_texture_ranges(
+    draw_ranges: Sequence[_TextureDrawRange],
+) -> None:
+    """Submit one or many visible triangle ranges without material rebinding."""
+
+    if not draw_ranges:
+        return
+    submitted_ranges: list[tuple[int, int]] = []
+    for draw_range in draw_ranges:
+        first_vertex = int(draw_range.first_vertex)
+        vertex_count = int(draw_range.vertex_count)
+        if (
+            submitted_ranges
+            and submitted_ranges[-1][0] + submitted_ranges[-1][1]
+            == first_vertex
+        ):
+            previous_first, previous_count = submitted_ranges[-1]
+            submitted_ranges[-1] = (
+                previous_first,
+                previous_count + vertex_count,
+            )
+            continue
+        submitted_ranges.append((first_vertex, vertex_count))
+
+    if len(submitted_ranges) == 1:
+        first_vertex, vertex_count = submitted_ranges[0]
+        GL.glDrawArrays(
+            GL.GL_TRIANGLES,
+            first_vertex,
+            vertex_count,
+        )
+        return
+    first_vertices = np.asarray(
+        tuple(first_vertex for first_vertex, _count in submitted_ranges),
+        dtype=np.int32,
+    )
+    vertex_counts = np.asarray(
+        tuple(vertex_count for _first, vertex_count in submitted_ranges),
+        dtype=np.int32,
+    )
+    current_context = QOpenGLContext.currentContext()
+    use_multi_draw = current_context is None
+    if current_context is not None:
+        try:
+            use_multi_draw = not current_context.isOpenGLES()
+        except (AttributeError, RuntimeError):
+            use_multi_draw = False
+    multi_draw = getattr(GL, "glMultiDrawArrays", None)
+    if use_multi_draw and multi_draw is not None:
+        try:
+            multi_draw(
+                GL.GL_TRIANGLES,
+                first_vertices,
+                vertex_counts,
+                len(submitted_ranges),
+            )
+            return
+        except (OpenGLError, RuntimeError, TypeError):
+            pass
+    for first_vertex, vertex_count in submitted_ranges:
+        GL.glDrawArrays(GL.GL_TRIANGLES, first_vertex, vertex_count)
+
+
+def _paint_with_coplanar_depth(paint_callback: Callable[[], object]) -> None:
+    """Use the renderer-owned coplanar depth state without a driver readback."""
+
+    GL.glDepthFunc(GL.GL_LEQUAL)
+    try:
+        paint_callback()
+    finally:
+        GL.glDepthFunc(GL.GL_LESS)
+
+
 @dataclass
 class _SharedGlShaderProgramEntry:
     """One shader program retained by items in exactly one GL context."""

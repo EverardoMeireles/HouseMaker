@@ -59,9 +59,11 @@ from housemaker.viewer import (
     TexturePreviewBundle,
     _build_texture_mesh_data,
     _decode_texture_rgba,
+    _draw_texture_ranges,
     _limit_texture_preview_size,
     _project_vertices_to_view,
     _set_float_uniform,
+    _TextureDrawRange,
     build_initial_texture_proxy_bundle,
 )
 
@@ -1059,6 +1061,295 @@ class GlbViewerRenderingTests(unittest.TestCase):
             0,
         )
 
+    def test_compatible_textured_surfaces_share_one_retained_item(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.preview_base_mesh = model.mesh
+        first_mesh = model.mesh.copy()
+        second_mesh = model.mesh.copy()
+        second_mesh.apply_translation((2.0, 0.0, 0.0))
+        model.preview_textured_surfaces = [
+            PreviewTexturedSurface(
+                surface_id="floor-a",
+                surface_type="floor",
+                mesh=first_mesh,
+                level_index=0,
+                room_index=0,
+            ),
+            PreviewTexturedSurface(
+                surface_id="floor-b",
+                surface_type="floor",
+                mesh=second_mesh,
+                level_index=0,
+                room_index=0,
+            ),
+        ]
+        viewer = self._build_viewer()
+
+        viewer.set_model(model)
+
+        self.assertEqual(len(viewer.textured_surface_items), 1)
+        item = viewer.textured_surface_items[0]
+        self.assertEqual(
+            viewer._get_textured_surface_item_surface_ids(item),
+            frozenset(("floor-a", "floor-b")),
+        )
+        self.assertEqual(len(item._vertices), 6)
+        self.assertEqual(len(item._draw_ranges), 1)
+        self.assertEqual(item._draw_ranges[0].vertex_count, 6)
+
+    def test_ineligible_duplicate_surface_ids_remain_separate(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.preview_base_mesh = model.mesh
+        first_mesh = model.mesh.copy()
+        second_mesh = model.mesh.copy()
+        second_mesh.apply_translation((2.0, 0.0, 0.0))
+        for mesh in (first_mesh, second_mesh):
+            mesh.visual.material.alphaMode = "BLEND"
+        model.preview_textured_surfaces = [
+            PreviewTexturedSurface(
+                surface_id="two-sided-glass",
+                surface_type="wall",
+                mesh=first_mesh,
+                level_index=0,
+            ),
+            PreviewTexturedSurface(
+                surface_id="two-sided-glass",
+                surface_type="wall",
+                mesh=second_mesh,
+                level_index=0,
+            ),
+        ]
+        viewer = self._build_viewer()
+
+        viewer.set_model(model)
+
+        self.assertEqual(len(viewer.textured_surface_items), 2)
+
+    def test_surface_batch_culls_each_room_draw_range_independently(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.preview_base_mesh = model.mesh
+        visible_mesh = model.mesh.copy()
+        offscreen_mesh = model.mesh.copy()
+        offscreen_mesh.apply_translation((10.0, 0.0, 0.0))
+        model.preview_textured_surfaces = [
+            PreviewTexturedSurface(
+                surface_id="visible-room",
+                surface_type="floor",
+                mesh=visible_mesh,
+                level_index=0,
+                room_index=0,
+            ),
+            PreviewTexturedSurface(
+                surface_id="offscreen-room",
+                surface_type="floor",
+                mesh=offscreen_mesh,
+                level_index=0,
+                room_index=1,
+            ),
+        ]
+        viewer = self._build_viewer()
+        viewer.set_model(model)
+        self.assertEqual(len(viewer.textured_surface_items), 1)
+        item = viewer.textured_surface_items[0]
+        self.assertEqual(len(item._draw_ranges), 2)
+        identity_matrix = Mock()
+        identity_matrix.data.return_value = np.eye(4, dtype=np.float32).reshape(
+            -1,
+            order="F",
+        )
+
+        with patch.object(item, "mvpMatrix", return_value=identity_matrix):
+            visible_ranges = item._get_visible_draw_ranges()
+
+        self.assertEqual(len(visible_ranges), 1)
+        self.assertEqual(visible_ranges[0].first_vertex, 0)
+        self.assertEqual(visible_ranges[0].vertex_count, 3)
+        item._shader_program = 37
+        with (
+            patch("housemaker.viewer._set_float_uniform"),
+            patch.object(GL, "glDrawArrays") as draw_arrays,
+        ):
+            item._draw_bound_triangles(visible_ranges)
+        draw_arrays.assert_called_once_with(GL.GL_TRIANGLES, 0, 3)
+
+    def test_compatible_placed_primitives_share_one_retained_render(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.preview_base_mesh = model.mesh
+        first_mesh = model.mesh.copy()
+        second_mesh = model.mesh.copy()
+        second_mesh.apply_translation((2.0, 0.0, 0.0))
+        model.preview_placed_objects = [
+            PreviewPlacedObject(
+                object_id="batched-object",
+                meshes=(first_mesh, second_mesh),
+                placement_transform=np.eye(4, dtype=float),
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+            )
+        ]
+        viewer = self._build_viewer(window_editing_enabled=True)
+
+        viewer.set_model(model)
+
+        group = viewer._placed_object_render_groups["batched-object"]
+        self.assertEqual(len(group.retained_parts), 1)
+        retained_part = group.retained_parts[0]
+        self.assertIsNotNone(retained_part.textured_item)
+        assert retained_part.textured_item is not None
+        self.assertEqual(len(retained_part.textured_item._vertices), 6)
+        mesh_data = retained_part.mesh_item.opts["meshdata"]
+        self.assertEqual(mesh_data.vertexes().shape, (6, 3))
+        self.assertEqual(mesh_data.faces().shape, (2, 3))
+
+    def test_progressive_surface_update_splits_only_target_from_batch(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.preview_base_mesh = model.mesh
+        first_mesh = model.mesh.copy()
+        second_mesh = model.mesh.copy()
+        second_mesh.apply_translation((2.0, 0.0, 0.0))
+        model.preview_textured_surfaces = [
+            PreviewTexturedSurface(
+                surface_id="target-surface",
+                surface_type="floor",
+                mesh=first_mesh,
+                level_index=0,
+                room_index=0,
+            ),
+            PreviewTexturedSurface(
+                surface_id="untouched-surface",
+                surface_type="floor",
+                mesh=second_mesh,
+                level_index=0,
+                room_index=0,
+            ),
+        ]
+        viewer = self._build_viewer()
+        viewer.set_model(model)
+        self.assertEqual(len(viewer.textured_surface_items), 1)
+        original_item = viewer.textured_surface_items[0]
+        original_pixels = original_item._texture_rgba.copy()
+        no_op_token = viewer.begin_progressive_texture_update(
+            "no-op-surface-upgrade",
+            surface_ids=("target-surface",),
+        )
+
+        no_op_count = viewer.apply_progressive_texture_update(
+            no_op_token,
+            TexturePreviewBundle(base_color_rgba=original_pixels),
+        )
+
+        self.assertEqual(no_op_count, 0)
+        self.assertEqual(viewer.textured_surface_items, [original_item])
+        color_balance_settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(cyan_red=35)
+        )
+        viewer.set_texture_color_balance_preview(color_balance_settings)
+        replacement_pixels = np.full(
+            original_pixels.shape,
+            (15, 45, 215, 255),
+            dtype=np.uint8,
+        )
+        token = viewer.begin_progressive_texture_update(
+            "targeted-surface-upgrade",
+            surface_ids=("target-surface",),
+        )
+
+        changed_count = viewer.apply_progressive_texture_update(
+            token,
+            TexturePreviewBundle(base_color_rgba=replacement_pixels),
+        )
+
+        self.assertEqual(changed_count, 1)
+        self.assertEqual(len(viewer.textured_surface_items), 2)
+        items_by_surface_id = {
+            next(iter(viewer._get_textured_surface_item_surface_ids(item))): item
+            for item in viewer.textured_surface_items
+        }
+        self.assertEqual(
+            set(items_by_surface_id),
+            {"target-surface", "untouched-surface"},
+        )
+        np.testing.assert_array_equal(
+            items_by_surface_id["target-surface"]._texture_rgba,
+            replacement_pixels,
+        )
+        np.testing.assert_array_equal(
+            items_by_surface_id["untouched-surface"]._texture_rgba,
+            original_pixels,
+        )
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings == color_balance_settings
+                for item in viewer.textured_surface_items
+            )
+        )
+
+    def test_textured_paint_restores_known_cull_state_without_readback(
+        self,
+    ) -> None:
+        texture_data = _build_texture_mesh_data(
+            _build_generated_model(textured=True).mesh
+        )
+        assert texture_data is not None
+        item = TexturedMeshItem(texture_data, 1.0, double_sided=False)
+
+        with (
+            patch.object(
+                item,
+                "_get_visible_draw_ranges",
+                return_value=item._draw_ranges,
+            ),
+            patch.object(item, "setupGLState"),
+            patch.object(item, "_ensure_gl_resources"),
+            patch.object(GL, "glIsEnabled") as read_cull_state,
+            patch.object(GL, "glGetIntegerv") as read_integer_state,
+            patch.object(GL, "glEnable") as enable,
+            patch.object(GL, "glCullFace"),
+            patch.object(GL, "glDisable") as disable,
+        ):
+            item.paint()
+
+        read_cull_state.assert_not_called()
+        read_integer_state.assert_not_called()
+        enable.assert_called_once_with(GL.GL_CULL_FACE)
+        disable.assert_called_once_with(GL.GL_CULL_FACE)
+
+    def test_texture_draw_ranges_fall_back_on_opengl_es(self) -> None:
+        ranges = (
+            _TextureDrawRange(0, 3, np.zeros((8, 3), dtype=np.float32)),
+            _TextureDrawRange(6, 3, np.zeros((8, 3), dtype=np.float32)),
+        )
+        context = Mock()
+        context.isOpenGLES.return_value = True
+
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch.object(GL, "glMultiDrawArrays") as multi_draw,
+            patch.object(GL, "glDrawArrays") as draw_arrays,
+        ):
+            _draw_texture_ranges(ranges)
+
+        multi_draw.assert_not_called()
+        self.assertEqual(
+            draw_arrays.call_args_list,
+            [
+                call(GL.GL_TRIANGLES, 0, 3),
+                call(GL.GL_TRIANGLES, 6, 3),
+            ],
+        )
+
+    def test_viewport_establishes_depth_function_baseline_each_frame(self) -> None:
+        viewer = self._build_viewer()
+
+        with (
+            patch.object(GL, "glDepthFunc") as depth_function,
+            patch.object(gl.GLViewWidget, "paintGL") as base_paint,
+        ):
+            viewer.view.paintGL()
+
+        depth_function.assert_called_once_with(GL.GL_LESS)
+        base_paint.assert_called_once_with()
+
     def test_textured_item_releases_every_owned_gl_resource(self) -> None:
         model = _build_generated_model(textured=True)
         texture_data = _build_texture_mesh_data(model.mesh)
@@ -1659,6 +1950,28 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertTrue(viewer.get_wireframe_enabled())
         self.assertTrue(viewer.mesh_item.opts["drawEdges"])
 
+    def test_hidden_wireframe_is_skipped_by_view_traversal_until_needed(
+        self,
+    ) -> None:
+        viewer = self._build_viewer(wireframe_enabled=False)
+        viewer.set_model(_build_generated_model(textured=True))
+        assert viewer.mesh_item is not None
+
+        self.assertFalse(viewer.mesh_item.opts["drawFaces"])
+        self.assertFalse(viewer.mesh_item.opts["drawEdges"])
+        self.assertFalse(viewer.mesh_item.visible())
+
+        viewer.set_wireframe_enabled(True)
+
+        self.assertTrue(viewer.mesh_item.visible())
+        viewer.set_wireframe_enabled(False)
+        self.assertFalse(viewer.mesh_item.visible())
+
+        viewer.set_textures_enabled(False)
+
+        self.assertTrue(viewer.mesh_item.opts["drawFaces"])
+        self.assertTrue(viewer.mesh_item.visible())
+
     def test_reference_grid_stays_below_loaded_model_geometry(self) -> None:
         viewer = self._build_viewer(wireframe_enabled=False)
         model = _build_generated_model(textured=True)
@@ -1706,13 +2019,14 @@ class GlbViewerRenderingTests(unittest.TestCase):
                 GL,
                 "glGetIntegerv",
                 return_value=GL.GL_LESS,
-            ),
+            ) as read_depth_function,
             patch.object(GL, "glDepthFunc") as depth_function,
             patch.object(gl.GLMeshItem, "paint") as base_paint,
         ):
             viewer.mesh_item.paint()
 
         base_paint.assert_called_once_with()
+        read_depth_function.assert_not_called()
         gl_options = viewer.mesh_item._GLGraphicsItem__glOpts
         self.assertFalse(gl_options[GL.GL_CULL_FACE])
         self.assertEqual(

@@ -1,8 +1,8 @@
 # ### Environment setup ###
 from __future__ import annotations
 
-import os
 import math
+import os
 import unittest
 
 import numpy as np
@@ -27,25 +27,24 @@ from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
-from housemaker.surface_materials import (
-    ResolvedSurfaceMaterial,
-    build_world_planar_textured_mesh,
-)
 from housemaker.surface_geometry import (
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     FixedSurface,
 )
+from housemaker.surface_materials import (
+    ResolvedSurfaceMaterial,
+    build_world_planar_textured_mesh,
+)
 from housemaker.surface_texture_viewer import (
     SELECTED_SURFACE_EDGE_COLOR,
     SELECTED_SURFACE_OUTLINE_RADIUS_METERS,
-    SurfaceTextureViewer,
     RepeatingTexturedMeshItem,
+    SurfaceTextureViewer,
     _build_camera_ray,
     _build_surface_texture_mesh_data,
 )
 from housemaker.viewer import GlbViewerWidget
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -781,7 +780,12 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
         ]
         self.assertIsNotNone(surface_items.texture_item)
         self.assertEqual(len(surface_items.additional_texture_items), 1)
-        self.assertEqual(len(self.canvas_viewer.textured_surface_items), 2)
+        self.assertEqual(len(self.canvas_viewer.textured_surface_items), 1)
+        canvas_item = self.canvas_viewer.textured_surface_items[0]
+        self.assertEqual(
+            len(canvas_item._vertices),
+            len(first_preview.mesh.faces) * 3 * 2,
+        )
 
     def test_scene_base_remains_visible_when_a_surface_texture_is_applied(self) -> None:
         transparent_texture = self.texture_rgba.copy()

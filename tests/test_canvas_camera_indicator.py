@@ -5,13 +5,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QRegion
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -24,7 +25,6 @@ from housemaker.blueprint_canvas import (
 from housemaker.camera_models import CameraPose
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -133,6 +133,61 @@ class BlueprintCanvasCameraIndicatorTests(unittest.TestCase):
             rendered.pixel(round(center.x()), round(center.y()))
         )
         self.assertEqual(center_color.name(), CAMERA_INDICATOR_COLOR.name())
+
+    def test_pose_change_invalidates_only_old_and_new_indicator_bounds(
+        self,
+    ) -> None:
+        self.canvas.set_camera_indicator_pose(
+            CameraPose(x=0.0, y=0.0, yaw_degrees=0.0)
+        )
+        previous_rect = self.canvas._get_camera_indicator_update_rect()
+        assert previous_rect is not None
+
+        with patch.object(self.canvas, "update") as update:
+            self.canvas.set_camera_indicator_pose(
+                CameraPose(x=0.1, y=0.0, yaw_degrees=15.0)
+            )
+
+        current_rect = self.canvas._get_camera_indicator_update_rect()
+        assert current_rect is not None
+        expected_region = QRegion(previous_rect).united(QRegion(current_rect))
+        update.assert_called_once_with(expected_region)
+        self.assertNotEqual(expected_region.boundingRect(), self.canvas.rect())
+
+    def test_hiding_indicator_invalidates_its_previous_bounds(self) -> None:
+        self.canvas.set_camera_indicator_pose(CameraPose(yaw_degrees=45.0))
+        previous_rect = self.canvas._get_camera_indicator_update_rect()
+        assert previous_rect is not None
+
+        with patch.object(self.canvas, "update") as update:
+            self.canvas.set_camera_indicator_pose(None)
+
+        update.assert_called_once_with(QRegion(previous_rect))
+
+    def test_non_plan_pose_change_updates_state_without_repaint(self) -> None:
+        self.canvas.set_camera_indicator_pose(CameraPose(x=1.0, y=2.0))
+        pitch_only_pose = CameraPose(
+            x=1.0,
+            y=2.0,
+            z=1.7,
+            pitch_degrees=25.0,
+            roll_degrees=5.0,
+            fov_degrees=80.0,
+        )
+
+        with patch.object(self.canvas, "update") as update:
+            self.canvas.set_camera_indicator_pose(pitch_only_pose)
+
+        self.assertEqual(self.canvas.get_camera_indicator_pose(), pitch_only_pose)
+        update.assert_not_called()
+
+    def test_pose_change_without_visible_indicator_skips_repaint(self) -> None:
+        self.canvas.blueprint_image = None
+
+        with patch.object(self.canvas, "update") as update:
+            self.canvas.set_camera_indicator_pose(CameraPose(x=1.0))
+
+        update.assert_not_called()
 
 
 # ### Main-workspace integration tests ###
