@@ -133,7 +133,10 @@ class ResolvedSurfaceMaterial:
 
 # ### Public material helpers ###
 def resolve_surface_materials(
-    surface_materials: Mapping[str, SurfaceMaterialSource],
+    surface_materials: Mapping[
+        str,
+        SurfaceMaterialSource | ResolvedSurfaceMaterial,
+    ],
 ) -> dict[str, ResolvedSurfaceMaterial]:
     """Resolve a stable-surface material map without retaining open files."""
 
@@ -187,10 +190,12 @@ def build_assignment_surface_material_source_map(
 
 
 def resolve_surface_material(
-    source: SurfaceMaterialSource,
+    source: SurfaceMaterialSource | ResolvedSurfaceMaterial,
 ) -> ResolvedSurfaceMaterial:
     """Load one base PNG or aligned PBR family into owned RGBA arrays."""
 
+    if isinstance(source, ResolvedSurfaceMaterial):
+        return source
     if isinstance(source, SurfaceMaterialSourceSpec):
         resolved = resolve_surface_material(source.map_sources)
         return ResolvedSurfaceMaterial(
@@ -245,6 +250,51 @@ def resolve_surface_material(
             ),
         )
     return _resolve_surface_texture_source(source)
+
+
+def build_surface_material_preview_proxy(
+    map_rgba: Mapping[str, np.ndarray],
+    *,
+    tiling_mode: str | None = None,
+    tiling_seed: int = 0,
+    texture_repeat_size_m: float | None = None,
+) -> ResolvedSurfaceMaterial:
+    """Build one already-decoded material for a bounded scene preview.
+
+    Atlas source thumbnails reach this boundary as owned RGBA arrays.  Keeping
+    them decoded avoids opening the full-resolution PNG again while the first
+    interactive scene is assembled.
+    """
+
+    if not isinstance(map_rgba, Mapping):
+        raise TypeError("Surface preview maps must be provided as a mapping.")
+    unknown_map_types = {
+        str(map_type).strip().lower() for map_type in map_rgba
+    } - set(ATLAS_MAP_TYPES)
+    if unknown_map_types:
+        raise ValueError(
+            "Unknown surface preview maps: "
+            + ", ".join(sorted(unknown_map_types))
+        )
+    normalized_maps = {
+        str(map_type).strip().lower(): np.asarray(rgba, dtype=np.uint8)
+        for map_type, rgba in map_rgba.items()
+    }
+    base_rgba = normalized_maps.get(ATLAS_MAP_BASE_COLOR)
+    if base_rgba is None:
+        raise ValueError("A surface preview requires a base-color map.")
+    png_buffer = BytesIO()
+    Image.fromarray(base_rgba, mode="RGBA").save(png_buffer, format="PNG")
+    return ResolvedSurfaceMaterial(
+        png_bytes=png_buffer.getvalue(),
+        texture_rgba=base_rgba,
+        normal_texture_rgba=normalized_maps.get(PBR_MAP_NORMAL),
+        roughness_texture_rgba=normalized_maps.get(PBR_MAP_ROUGHNESS),
+        metallic_texture_rgba=normalized_maps.get(PBR_MAP_METALLIC),
+        tiling_mode=tiling_mode,
+        tiling_seed=tiling_seed,
+        texture_repeat_size_m=texture_repeat_size_m,
+    )
 
 
 def _resolve_surface_texture_source(

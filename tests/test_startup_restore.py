@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -199,6 +200,69 @@ class StartupRestorationTests(unittest.TestCase):
         self.assertEqual(
             self.store.get(LAST_PROJECT_PATH_SETTING_KEY),
             previous_path,
+        )
+
+    def test_deferred_restore_waits_until_after_window_construction(self) -> None:
+        project_path = Path(self._temporary_directory.name) / "deferred.json"
+        normalized_path = str(project_path.resolve())
+        self.store.set(LAST_PROJECT_PATH_SETTING_KEY, normalized_path)
+
+        with patch(
+            "housemaker.main.load_project",
+            return_value=_project_data(),
+        ) as load_project_mock:
+            window = self._track(
+                MainWindow(
+                    application_settings=self.store,
+                    restore_last_project_immediately=False,
+                )
+            )
+            window.schedule_last_project_restore()
+            load_project_mock.assert_not_called()
+            window._restore_last_project_after_show()
+
+        load_project_mock.assert_called_once_with(normalized_path)
+
+    def test_first_user_input_cancels_deferred_restore(self) -> None:
+        project_path = Path(self._temporary_directory.name) / "deferred.json"
+        normalized_path = str(project_path.resolve())
+        self.store.set(LAST_PROJECT_PATH_SETTING_KEY, normalized_path)
+
+        with patch("housemaker.main.load_project") as load_project_mock:
+            window = self._track(
+                MainWindow(
+                    application_settings=self.store,
+                    restore_last_project_immediately=False,
+                )
+            )
+            window.schedule_last_project_restore()
+            window.eventFilter(
+                window,
+                QEvent(QEvent.Type.MouseButtonPress),
+            )
+
+        self.assertFalse(window._startup_restore_timer.isActive())
+        load_project_mock.assert_not_called()
+
+    def test_transient_restore_failure_keeps_last_project_path(self) -> None:
+        workspace = self._track(
+            BlueprintWorkspace(application_settings=self.store)
+        )
+        project_path = Path(self._temporary_directory.name) / "busy.json"
+        normalized_path = str(project_path.resolve())
+        self.store.set(LAST_PROJECT_PATH_SETTING_KEY, normalized_path)
+
+        with patch.object(
+            workspace,
+            "_load_project_path",
+            side_effect=RuntimeError("Generation is still active."),
+        ):
+            restored = workspace.restore_last_project()
+
+        self.assertFalse(restored)
+        self.assertEqual(
+            self.store.get(LAST_PROJECT_PATH_SETTING_KEY),
+            normalized_path,
         )
 
 

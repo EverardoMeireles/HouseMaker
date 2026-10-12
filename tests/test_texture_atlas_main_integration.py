@@ -4153,7 +4153,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         item = self.workspace.texture_atlas_workspace.surface_list.item(0)
         self.assertIn("1 surface", item.text())
 
-    def test_project_load_materializes_persisted_wall_texture_placement(
+    def test_project_load_keeps_wall_atlas_lazy_until_materialized(
         self,
     ) -> None:
         levels = create_default_levels()
@@ -4185,6 +4185,15 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         self.workspace._apply_loaded_project(project)
 
+        loaded = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+            atlas.atlas_id
+        )
+        assert loaded is not None
+        self.assertIsNone(loaded.image_path)
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace.materialize_missing_atlases(),
+            1,
+        )
         loaded = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
             atlas.atlas_id
         )
@@ -4428,6 +4437,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 object_name="Cornice",
                 pipeline={
                     ARCHITECTURAL_TRIM_COMPONENT_PIPELINE_KEY: {
+                        "level_index": GROUND_LEVEL_INDEX,
+                        "trim_id": "cornice-transition",
                         "trim_kind": TRIM_KIND_CORNICE,
                     },
                     CORNICE_SEGMENTED_UV_PIPELINE_KEY: {

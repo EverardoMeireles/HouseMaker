@@ -16,7 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
-from PySide6.QtGui import QFocusEvent, QKeyEvent, QVector3D
+from PySide6.QtGui import QFocusEvent, QKeyEvent, QOpenGLContext, QVector3D
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 from trimesh.visual.material import MultiMaterial, PBRMaterial
@@ -48,17 +48,39 @@ from housemaker.texture_color_balance import (
 )
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.viewer import (
+    _SHARED_GL_TEXTURE_CACHE,
+    INITIAL_TEXTURE_PROXY_DIMENSION,
+    MAX_TEXTURE_PREVIEW_DIMENSION,
     NAVIGATION_MODE_FIRST_PERSON,
     NAVIGATION_MODE_ORBIT,
     GlbViewerWidget,
     SelectableGLViewWidget,
     TexturedMeshItem,
+    TexturePreviewBundle,
     _build_texture_mesh_data,
+    _decode_texture_rgba,
+    _limit_texture_preview_size,
     _project_vertices_to_view,
+    _set_float_uniform,
+    build_initial_texture_proxy_bundle,
 )
 
 
 # ### Test doubles ###
+class _FakeOpenGlContext:
+    """Weak-referenceable identity used to exercise context-local caches."""
+
+
+class _EqualFakeOpenGlContext:
+    """Distinct context identity that deliberately compares equal."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _EqualFakeOpenGlContext)
+
+    def __hash__(self) -> int:
+        return 1
+
+
 class FakeMouseMoveEvent:
     def __init__(
         self,
@@ -218,6 +240,94 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertFalse(viewer.get_textures_enabled())
         self.assertFalse(viewer.textured_mesh_item.visible())
         self.assertTrue(viewer.mesh_item.opts["drawFaces"])
+
+    def test_preview_textures_are_capped_without_mutating_source_pixels(self) -> None:
+        source = np.zeros((8, MAX_TEXTURE_PREVIEW_DIMENSION * 2, 4), dtype=np.uint8)
+
+        preview = _limit_texture_preview_size(source)
+
+        self.assertEqual(preview.shape[1], MAX_TEXTURE_PREVIEW_DIMENSION)
+        self.assertEqual(source.shape[1], MAX_TEXTURE_PREVIEW_DIMENSION * 2)
+
+    def test_initial_texture_proxy_keeps_every_map_aligned_at_256px(self) -> None:
+        base_color = np.full((512, 1024, 4), 40, dtype=np.uint8)
+        normal = np.full((512, 1024, 4), 128, dtype=np.uint8)
+
+        proxy = build_initial_texture_proxy_bundle(
+            base_color,
+            normal_rgba=normal,
+        )
+
+        self.assertEqual(
+            proxy.base_color_rgba.shape,
+            (INITIAL_TEXTURE_PROXY_DIMENSION // 2, INITIAL_TEXTURE_PROXY_DIMENSION, 4),
+        )
+        self.assertIsNotNone(proxy.normal_rgba)
+        assert proxy.normal_rgba is not None
+        self.assertEqual(proxy.normal_rgba.shape, proxy.base_color_rgba.shape)
+        self.assertIsNone(proxy.roughness_rgba)
+        self.assertFalse(proxy.base_color_rgba.flags.writeable)
+
+    def test_progressive_texture_bundle_requires_aligned_pbr_maps(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must match"):
+            TexturePreviewBundle(
+                base_color_rgba=np.zeros((4, 4, 4), dtype=np.uint8),
+                normal_rgba=np.zeros((2, 4, 4), dtype=np.uint8),
+            )
+
+    def test_identical_images_share_one_decoded_preview_array(self) -> None:
+        pixels = np.full((3, 4, 4), (20, 80, 140, 255), dtype=np.uint8)
+        first_source = Image.fromarray(pixels, mode="RGBA")
+        second_source = Image.fromarray(pixels.copy(), mode="RGBA")
+
+        first = _decode_texture_rgba(first_source)
+        second = _decode_texture_rgba(second_source)
+
+        self.assertIsNotNone(first)
+        self.assertIs(first, second)
+        second_source.putpixel((0, 0), (240, 10, 30, 255))
+        changed = _decode_texture_rgba(second_source)
+        self.assertIsNotNone(changed)
+        self.assertIsNot(changed, first)
+        assert changed is not None
+        self.assertEqual(tuple(changed[0, 0]), (240, 10, 30, 255))
+
+    def test_shader_uniform_locations_are_reused_by_one_render_item(self) -> None:
+        location_cache: dict[str, int] = {}
+        with (
+            patch.object(GL, "glGetUniformLocation", return_value=17) as lookup,
+            patch.object(GL, "glUniform1f") as upload,
+        ):
+            _set_float_uniform(31, "u_opacity", 0.25, location_cache)
+            _set_float_uniform(31, "u_opacity", 0.75, location_cache)
+
+        lookup.assert_called_once_with(31, "u_opacity")
+        self.assertEqual(upload.call_count, 2)
+
+    def test_desktop_animation_requires_an_active_application(self) -> None:
+        viewer = self._build_viewer()
+        with (
+            patch.object(viewer, "isVisible", return_value=True),
+            patch.object(QApplication, "platformName", return_value="windows"),
+            patch.object(
+                QApplication,
+                "applicationState",
+                return_value=Qt.ApplicationState.ApplicationInactive,
+            ),
+        ):
+            self.assertFalse(viewer._continuous_preview_animation_allowed())
+
+        with (
+            patch.object(viewer, "isVisible", return_value=True),
+            patch.object(QApplication, "platformName", return_value="offscreen"),
+            patch.object(
+                QApplication,
+                "applicationState",
+                return_value=Qt.ApplicationState.ApplicationInactive,
+            ),
+            patch.object(QApplication, "activeWindow", return_value=None),
+        ):
+            self.assertTrue(viewer._continuous_preview_animation_allowed())
 
     def test_texture_edit_mask_is_previewed_without_mutating_base_texture(
         self,
@@ -725,7 +835,14 @@ class GlbViewerRenderingTests(unittest.TestCase):
         _qt_application.processEvents()
         viewer._orbiting_point_light_timer.stop()
         position_before_tick = viewer.get_orbiting_point_light_position()
-        viewer._advance_orbiting_point_light()
+        with (
+            patch.object(TexturedMeshItem, "update") as item_update,
+            patch.object(viewer.view, "update") as view_update,
+        ):
+            viewer._advance_orbiting_point_light()
+
+        item_update.assert_not_called()
+        view_update.assert_called_once_with()
         position_after_tick = viewer.get_orbiting_point_light_position()
 
         self.assertIsNotNone(position_before_tick)
@@ -848,6 +965,100 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertIsNone(item._normal_texture_id)
         self.assertIsNone(item._roughness_texture_id)
 
+    def test_texture_bundle_swap_retains_geometry_and_shader_resources(self) -> None:
+        texture_data = _build_texture_mesh_data(
+            _build_generated_model(textured=True).mesh
+        )
+        assert texture_data is not None
+        item = TexturedMeshItem(
+            texture_data,
+            1.0,
+            pbr_maps_enabled=(PBR_MAP_NORMAL, PBR_MAP_ROUGHNESS),
+        )
+        context = _FakeOpenGlContext()
+        item._gl_context = context
+        item._resources_uploaded = True
+        item._position_buffer = 11
+        item._normal_buffer = 12
+        item._texture_coordinate_buffer = 13
+        item._tangent_buffer = 14
+        item._bitangent_buffer = 15
+        item._shader_program = 31
+        item._texture_id = 101
+        item._normal_texture_id = 102
+        item._roughness_texture_id = 103
+        replacement = TexturePreviewBundle(
+            base_color_rgba=np.full((4, 4, 4), (20, 40, 60, 255), dtype=np.uint8),
+            normal_rgba=np.full((4, 4, 4), (128, 128, 255, 255), dtype=np.uint8),
+            roughness_rgba=np.full((4, 4, 4), (180, 180, 180, 255), dtype=np.uint8),
+        )
+
+        self.assertTrue(item.set_texture_bundle(replacement))
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch.object(GL, "glDeleteTextures") as delete_textures,
+            patch.object(
+                item,
+                "_acquire_texture",
+                side_effect=(201, 202, 203),
+            ) as acquire_texture,
+        ):
+            item._ensure_gl_resources()
+
+        self.assertEqual(item._position_buffer, 11)
+        self.assertEqual(item._normal_buffer, 12)
+        self.assertEqual(item._texture_coordinate_buffer, 13)
+        self.assertEqual(item._shader_program, 31)
+        self.assertEqual(item._texture_id, 201)
+        self.assertEqual(item._normal_texture_id, 202)
+        self.assertEqual(item._roughness_texture_id, 203)
+        self.assertFalse(item._texture_bundle_dirty)
+        self.assertEqual(
+            tuple(delete_textures.call_args.args[1]),
+            (101, 102, 103),
+        )
+        self.assertEqual(
+            [call.args[0] for call in acquire_texture.call_args_list],
+            ["base_color", PBR_MAP_NORMAL, PBR_MAP_ROUGHNESS],
+        )
+
+    def test_progressive_texture_update_rejects_stale_worker_results(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model(textured=True))
+        assert viewer.textured_mesh_item is not None
+        original_mesh_item = viewer.mesh_item
+        original_vertices = viewer.textured_mesh_item._vertices
+        first = viewer.begin_progressive_texture_update(
+            "atlas:main",
+            include_primary_model=True,
+        )
+        latest = viewer.begin_progressive_texture_update(
+            "atlas:main",
+            include_primary_model=True,
+        )
+        bundle = TexturePreviewBundle(
+            base_color_rgba=np.full((8, 8, 4), (15, 25, 35, 255), dtype=np.uint8)
+        )
+
+        self.assertEqual(viewer.apply_progressive_texture_update(first, bundle), 0)
+        self.assertEqual(viewer.apply_progressive_texture_update(latest, bundle), 1)
+        self.assertIs(viewer.mesh_item, original_mesh_item)
+        self.assertIs(viewer.textured_mesh_item._vertices, original_vertices)
+        np.testing.assert_array_equal(
+            viewer.textured_mesh_item._texture_rgba,
+            bundle.base_color_rgba,
+        )
+
+        obsolete_scene = viewer.begin_progressive_texture_update(
+            "atlas:secondary",
+            include_primary_model=True,
+        )
+        viewer.set_model(_build_generated_model(textured=True), preserve_camera=True)
+        self.assertEqual(
+            viewer.apply_progressive_texture_update(obsolete_scene, bundle),
+            0,
+        )
+
     def test_textured_item_releases_every_owned_gl_resource(self) -> None:
         model = _build_generated_model(textured=True)
         texture_data = _build_texture_mesh_data(model.mesh)
@@ -888,6 +1099,330 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertFalse(item._has_gl_resource_handles())
         self.assertFalse(item._resources_uploaded)
 
+    def test_identical_items_share_context_shader_until_last_release(self) -> None:
+        texture_data = _build_texture_mesh_data(
+            _build_generated_model(textured=True).mesh
+        )
+        assert texture_data is not None
+        first = TexturedMeshItem(texture_data, 1.0)
+        faded = TexturedMeshItem(
+            texture_data,
+            1.0,
+            opacity=0.5,
+            texture_repeat=True,
+            pbr_maps_enabled=(PBR_MAP_NORMAL,),
+        )
+        context = _FakeOpenGlContext()
+
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch(
+                "housemaker.viewer.opengl_shaders.compileShader",
+                side_effect=(7, 8),
+            ) as compile_shader,
+            patch(
+                "housemaker.viewer.opengl_shaders.compileProgram",
+                return_value=31,
+            ) as compile_program,
+            patch("housemaker.viewer._upload_array_buffer", return_value=11),
+            patch("housemaker.viewer._upload_mask_texture", return_value=201),
+            patch("housemaker.viewer._upload_texture", return_value=101),
+            patch.object(_SHARED_GL_TEXTURE_CACHE, "acquire", return_value=None),
+        ):
+            first._ensure_gl_resources()
+            faded._ensure_gl_resources()
+
+        self.assertEqual(first._shader_program, 31)
+        self.assertEqual(faded._shader_program, 31)
+        self.assertEqual(compile_shader.call_count, 2)
+        compile_program.assert_called_once_with(7, 8)
+        self.assertIsNot(first._uniform_locations, faded._uniform_locations)
+        self.assertIsNot(first._attribute_locations, faded._attribute_locations)
+        first._uniform_locations["u_opacity"] = 17
+        first._attribute_locations["a_position"] = 4
+        self.assertNotIn("u_opacity", faded._uniform_locations)
+        self.assertNotIn("a_position", faded._attribute_locations)
+        self.assertFalse(first.get_pbr_maps_enabled()[PBR_MAP_NORMAL])
+        self.assertTrue(faded.get_pbr_maps_enabled()[PBR_MAP_NORMAL])
+
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch.object(GL, "glDeleteBuffers"),
+            patch.object(GL, "glDeleteTextures"),
+            patch.object(GL, "glDeleteProgram") as delete_program,
+        ):
+            first._release_gl_resources_in_current_context()
+            delete_program.assert_not_called()
+            faded._release_gl_resources_in_current_context()
+
+        delete_program.assert_called_once_with(31)
+
+    def test_shader_sharing_uses_exact_context_identity(self) -> None:
+        texture_data = _build_texture_mesh_data(
+            _build_generated_model(textured=True).mesh
+        )
+        assert texture_data is not None
+        first = TexturedMeshItem(texture_data, 1.0)
+        second = TexturedMeshItem(texture_data, 1.0)
+        first_context = _EqualFakeOpenGlContext()
+        second_context = _EqualFakeOpenGlContext()
+
+        with (
+            patch(
+                "housemaker.viewer.opengl_shaders.compileShader",
+                side_effect=(7, 8, 9, 10),
+            ) as compile_shader,
+            patch(
+                "housemaker.viewer.opengl_shaders.compileProgram",
+                side_effect=(31, 32),
+            ) as compile_program,
+            patch("housemaker.viewer._upload_array_buffer", return_value=11),
+            patch("housemaker.viewer._upload_mask_texture", return_value=201),
+            patch("housemaker.viewer._upload_texture", return_value=101),
+            patch.object(_SHARED_GL_TEXTURE_CACHE, "acquire", return_value=None),
+        ):
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=first_context,
+            ):
+                first._ensure_gl_resources()
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=second_context,
+            ):
+                second._ensure_gl_resources()
+
+        self.assertEqual(first._shader_program, 31)
+        self.assertEqual(second._shader_program, 32)
+        self.assertEqual(compile_shader.call_count, 4)
+        self.assertEqual(compile_program.call_count, 2)
+
+        with (
+            patch.object(GL, "glDeleteBuffers"),
+            patch.object(GL, "glDeleteTextures"),
+            patch.object(GL, "glDeleteProgram") as delete_program,
+        ):
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=first_context,
+            ):
+                first._release_gl_resources_in_current_context()
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=second_context,
+            ):
+                second._release_gl_resources_in_current_context()
+
+        self.assertEqual(
+            delete_program.call_args_list,
+            [call(31), call(32)],
+        )
+
+    def test_context_replacement_discards_old_shader_lease(self) -> None:
+        texture_data = _build_texture_mesh_data(
+            _build_generated_model(textured=True).mesh
+        )
+        assert texture_data is not None
+        item = TexturedMeshItem(texture_data, 1.0)
+        first_context = _FakeOpenGlContext()
+        replacement_context = _FakeOpenGlContext()
+
+        with (
+            patch(
+                "housemaker.viewer.opengl_shaders.compileShader",
+                side_effect=(7, 8, 9, 10),
+            ),
+            patch(
+                "housemaker.viewer.opengl_shaders.compileProgram",
+                side_effect=(31, 32),
+            ) as compile_program,
+            patch("housemaker.viewer._upload_array_buffer", return_value=11),
+            patch("housemaker.viewer._upload_mask_texture", return_value=201),
+            patch("housemaker.viewer._upload_texture", return_value=101),
+            patch.object(_SHARED_GL_TEXTURE_CACHE, "acquire", return_value=None),
+            patch.object(GL, "glDeleteProgram") as delete_program,
+        ):
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=first_context,
+            ):
+                item._ensure_gl_resources()
+            item._uniform_locations["u_opacity"] = 17
+            item._attribute_locations["a_position"] = 4
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=replacement_context,
+            ):
+                item._ensure_gl_resources()
+
+            self.assertEqual(item._shader_program, 32)
+            self.assertEqual(compile_program.call_count, 2)
+            self.assertEqual(item._uniform_locations, {})
+            self.assertEqual(item._attribute_locations, {})
+            delete_program.assert_not_called()
+
+            with (
+                patch.object(GL, "glDeleteBuffers"),
+                patch.object(GL, "glDeleteTextures"),
+                patch.object(
+                    QOpenGLContext,
+                    "currentContext",
+                    return_value=replacement_context,
+                ),
+            ):
+                item._release_gl_resources_in_current_context()
+
+        delete_program.assert_called_once_with(32)
+
+    def test_identical_items_share_context_texture_until_last_release(self) -> None:
+        model = _build_generated_model(textured=True)
+        mixed_pixels = np.full((2, 2, 4), (90, 120, 180, 255), dtype=np.uint8)
+        mixed_pixels[0, 0, 3] = 64
+        model.mesh.visual.material.baseColorTexture = Image.fromarray(
+            mixed_pixels,
+            mode="RGBA",
+        )
+        texture_data = _build_texture_mesh_data(model.mesh)
+        assert texture_data is not None
+        first = TexturedMeshItem(texture_data, 1.0)
+        faded = TexturedMeshItem(texture_data, 1.0, opacity=0.5)
+        context = _FakeOpenGlContext()
+
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch("housemaker.viewer.opengl_shaders.compileShader", return_value=7),
+            patch("housemaker.viewer.opengl_shaders.compileProgram", return_value=31),
+            patch("housemaker.viewer._upload_array_buffer", return_value=11),
+            patch(
+                "housemaker.viewer._upload_mask_texture",
+                side_effect=(201, 202),
+            ),
+            patch("housemaker.viewer._upload_texture", return_value=101) as upload,
+            patch("housemaker.viewer.hashlib.sha256") as hash_pixels,
+        ):
+            first._ensure_gl_resources()
+            faded._ensure_gl_resources()
+
+        self.assertEqual(first._texture_id, 101)
+        self.assertEqual(faded._texture_id, 101)
+        upload.assert_called_once()
+        hash_pixels.assert_not_called()
+        self.assertFalse(texture_data.uses_texture_alpha)
+        self.assertEqual(first._transparency_mode, "opaque")
+        self.assertEqual(faded._transparency_mode, "translucent")
+
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch.object(GL, "glDeleteBuffers"),
+            patch.object(GL, "glDeleteProgram"),
+            patch.object(GL, "glDeleteTextures") as delete_textures,
+        ):
+            first._release_gl_resources_in_current_context()
+            first_deleted = tuple(delete_textures.call_args.args[1])
+            faded._release_gl_resources_in_current_context()
+            second_deleted = tuple(delete_textures.call_args.args[1])
+
+        self.assertEqual(first_deleted, (201,))
+        self.assertEqual(second_deleted, (101, 202))
+
+    def test_pbr_toggle_acquires_existing_shared_map_independently(self) -> None:
+        model = _build_generated_model(textured=True)
+        normal_pixels = np.full(
+            (2, 2, 4),
+            (128, 150, 245, 255),
+            dtype=np.uint8,
+        )
+        model.mesh.visual.material.normalTexture = Image.fromarray(
+            normal_pixels,
+            mode="RGBA",
+        )
+        texture_data = _build_texture_mesh_data(model.mesh)
+        assert texture_data is not None
+        enabled = TexturedMeshItem(
+            texture_data,
+            1.0,
+            pbr_maps_enabled=(PBR_MAP_NORMAL,),
+        )
+        disabled = TexturedMeshItem(texture_data, 1.0)
+        context = _FakeOpenGlContext()
+
+        with (
+            patch.object(QOpenGLContext, "currentContext", return_value=context),
+            patch("housemaker.viewer.opengl_shaders.compileShader", return_value=7),
+            patch("housemaker.viewer.opengl_shaders.compileProgram", return_value=31),
+            patch("housemaker.viewer._upload_array_buffer", return_value=11),
+            patch("housemaker.viewer._upload_mask_texture", return_value=201),
+            patch(
+                "housemaker.viewer._upload_texture",
+                side_effect=(101, 102),
+            ) as upload,
+        ):
+            enabled._ensure_gl_resources()
+            disabled._ensure_gl_resources()
+            self.assertIsNone(disabled._normal_texture_id)
+            disabled.set_pbr_maps_enabled((PBR_MAP_NORMAL,))
+            disabled._ensure_gl_resources()
+
+        self.assertEqual(enabled._normal_texture_id, 102)
+        self.assertEqual(disabled._normal_texture_id, 102)
+        self.assertEqual(upload.call_count, 2)
+        self.assertTrue(enabled.get_pbr_maps_enabled()[PBR_MAP_NORMAL])
+        self.assertTrue(disabled.get_pbr_maps_enabled()[PBR_MAP_NORMAL])
+        enabled.set_pbr_maps_enabled(())
+        self.assertFalse(enabled.get_pbr_maps_enabled()[PBR_MAP_NORMAL])
+        self.assertTrue(disabled.get_pbr_maps_enabled()[PBR_MAP_NORMAL])
+        enabled._reset_gl_resource_handles()
+        disabled._reset_gl_resource_handles()
+
+    def test_texture_sharing_never_crosses_contexts_or_repeat_modes(self) -> None:
+        texture_data = _build_texture_mesh_data(
+            _build_generated_model(textured=True).mesh
+        )
+        assert texture_data is not None
+        first = TexturedMeshItem(texture_data, 1.0)
+        other_context = TexturedMeshItem(texture_data, 1.0)
+        repeating = TexturedMeshItem(texture_data, 1.0, texture_repeat=True)
+        first_context = _FakeOpenGlContext()
+        second_context = _FakeOpenGlContext()
+
+        with (
+            patch("housemaker.viewer.opengl_shaders.compileShader", return_value=7),
+            patch("housemaker.viewer.opengl_shaders.compileProgram", return_value=31),
+            patch("housemaker.viewer._upload_array_buffer", return_value=11),
+            patch("housemaker.viewer._upload_mask_texture", return_value=201),
+            patch(
+                "housemaker.viewer._upload_texture",
+                side_effect=(101, 102, 103),
+            ) as upload,
+        ):
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=first_context,
+            ):
+                first._ensure_gl_resources()
+                repeating._ensure_gl_resources()
+            with patch.object(
+                QOpenGLContext,
+                "currentContext",
+                return_value=second_context,
+            ):
+                other_context._ensure_gl_resources()
+
+        self.assertEqual(first._texture_id, 101)
+        self.assertEqual(repeating._texture_id, 102)
+        self.assertEqual(other_context._texture_id, 103)
+        self.assertEqual(upload.call_count, 3)
+        first._reset_gl_resource_handles()
+        repeating._reset_gl_resource_handles()
+        other_context._reset_gl_resource_handles()
+
     def test_model_rebuild_releases_textured_resources_before_clear(self) -> None:
         viewer = self._build_viewer()
         viewer.set_model(_build_generated_model(textured=True))
@@ -908,6 +1443,7 @@ class GlbViewerRenderingTests(unittest.TestCase):
             mixed_texture,
             mode="RGBA",
         )
+        model.mesh.visual.material.alphaMode = "BLEND"
         texture_data = _build_texture_mesh_data(model.mesh)
         assert texture_data is not None
         item = TexturedMeshItem(texture_data, 1.0)
@@ -946,6 +1482,102 @@ class GlbViewerRenderingTests(unittest.TestCase):
             disable.call_args_list,
             [call(GL.GL_BLEND), call(GL.GL_BLEND)],
         )
+
+    def test_transparent_atlas_padding_is_single_pass_for_opaque_material(
+        self,
+    ) -> None:
+        model = _build_generated_model(textured=True)
+        atlas_texture = np.full((2, 2, 4), 255, dtype=np.uint8)
+        atlas_texture[0, 0, 3] = 0
+        model.mesh.visual.material.baseColorTexture = Image.fromarray(
+            atlas_texture,
+            mode="RGBA",
+        )
+        model.mesh.visual.material.alphaMode = "OPAQUE"
+        texture_data = _build_texture_mesh_data(model.mesh)
+        assert texture_data is not None
+        item = TexturedMeshItem(texture_data, 1.0)
+        item._shader_program = 37
+
+        with (
+            patch("housemaker.viewer._set_float_uniform") as set_uniform,
+            patch.object(GL, "glDrawArrays") as draw_arrays,
+            patch.object(GL, "glDepthMask") as depth_mask,
+            patch.object(GL, "glEnable") as enable,
+        ):
+            item._draw_bound_triangles()
+
+        self.assertFalse(texture_data.uses_texture_alpha)
+        self.assertEqual(item._transparency_mode, "opaque")
+        draw_arrays.assert_called_once_with(
+            GL.GL_TRIANGLES,
+            0,
+            len(item._vertices),
+        )
+        self.assertEqual(set_uniform.call_args.args[2], 0.0)
+        depth_mask.assert_not_called()
+        enable.assert_not_called()
+
+    def test_blend_and_mask_materials_use_their_gltf_rendering_modes(self) -> None:
+        expected = {
+            "BLEND": ("mixed", 2),
+            "MASK": ("opaque", 1),
+        }
+        for alpha_mode, (transparency_mode, draw_count) in expected.items():
+            with self.subTest(alpha_mode=alpha_mode):
+                model = _build_generated_model(textured=True)
+                atlas_texture = np.full((2, 2, 4), 255, dtype=np.uint8)
+                atlas_texture[0, 0, 3] = 0
+                model.mesh.visual.material.baseColorTexture = Image.fromarray(
+                    atlas_texture,
+                    mode="RGBA",
+                )
+                model.mesh.visual.material.alphaMode = alpha_mode
+                texture_data = _build_texture_mesh_data(model.mesh)
+                assert texture_data is not None
+                item = TexturedMeshItem(texture_data, 1.0)
+                item._shader_program = 37
+
+                with (
+                    patch("housemaker.viewer._set_float_uniform"),
+                    patch.object(GL, "glDrawArrays") as draw_arrays,
+                    patch.object(GL, "glDepthMask"),
+                    patch.object(GL, "glBlendFuncSeparate"),
+                    patch.object(GL, "glEnable"),
+                    patch.object(GL, "glDisable"),
+                ):
+                    item._draw_bound_triangles()
+
+                self.assertTrue(texture_data.uses_texture_alpha)
+                self.assertEqual(item._transparency_mode, transparency_mode)
+                self.assertEqual(draw_arrays.call_count, draw_count)
+
+    def test_material_alpha_cutoff_and_factor_are_preserved(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.mesh.visual.material.alphaMode = "MASK"
+        model.mesh.visual.material.alphaCutoff = 0.73
+        model.mesh.visual.material.baseColorFactor = (1.0, 1.0, 1.0, 0.6)
+
+        texture_data = _build_texture_mesh_data(model.mesh)
+
+        assert texture_data is not None
+        self.assertEqual(texture_data.alpha_mode, "MASK")
+        self.assertAlmostEqual(texture_data.alpha_cutoff, 0.73)
+        self.assertAlmostEqual(texture_data.base_color_alpha, 0.6)
+        item = TexturedMeshItem(texture_data, 1.0)
+        self.assertEqual(item._transparency_mode, "opaque")
+
+    def test_blend_factor_alpha_uses_one_translucent_pass(self) -> None:
+        model = _build_generated_model(textured=True)
+        model.mesh.visual.material.alphaMode = "BLEND"
+        model.mesh.visual.material.baseColorFactor = (1.0, 1.0, 1.0, 0.5)
+
+        texture_data = _build_texture_mesh_data(model.mesh)
+
+        assert texture_data is not None
+        item = TexturedMeshItem(texture_data, 1.0)
+        self.assertEqual(item._transparency_mode, "translucent")
+        self.assertAlmostEqual(item._base_color_alpha, 0.5, places=2)
 
     def test_textured_wall_uses_translucent_gl_options_for_alpha_mask(
         self,

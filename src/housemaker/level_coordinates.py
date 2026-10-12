@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import math
+import threading
+import weakref
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.models import (
@@ -12,6 +15,35 @@ from housemaker.models import (
     DoorwayData,
     LevelData,
 )
+
+
+# ### Coordinate transform models ###
+@dataclass(frozen=True)
+class _LevelCoordinateTransform:
+    """One validated level transform shared by all point conversions."""
+
+    pivot_x: float
+    pivot_y: float
+    scale: float
+    offset_x: float
+    offset_y: float
+
+
+@dataclass(frozen=True)
+class _LevelCoordinateTransformCacheEntry:
+    """Identity-safe cached transform for one mutable level."""
+
+    level_reference: weakref.ReferenceType[LevelData]
+    dependency_key: tuple[object, ...]
+    transform: _LevelCoordinateTransform
+
+
+# ### Shared caches ###
+_LEVEL_COORDINATE_TRANSFORM_CACHE: dict[
+    int,
+    _LevelCoordinateTransformCacheEntry,
+] = {}
+_LEVEL_COORDINATE_TRANSFORM_CACHE_LOCK = threading.RLock()
 
 
 # ### Public coordinate helpers ###
@@ -173,21 +205,8 @@ def build_doorway_world_outline_positions(
 def get_level_world_pivot(level: LevelData) -> tuple[float, float]:
     """Return the unscaled world-space center of a level's vertex bounds."""
 
-    if not level.vertex_data.vertices:
-        return 0.0, 0.0
-
-    raw_points = [
-        _image_to_unscaled_world_xy(level, vertex.x, vertex.y)
-        for vertex in level.vertex_data.vertices
-    ]
-    minimum_x = min(point[0] for point in raw_points)
-    maximum_x = max(point[0] for point in raw_points)
-    minimum_y = min(point[1] for point in raw_points)
-    maximum_y = max(point[1] for point in raw_points)
-    return (
-        (minimum_x + maximum_x) / 2.0,
-        (minimum_y + maximum_y) / 2.0,
-    )
+    transform = _get_level_coordinate_transform(level)
+    return transform.pivot_x, transform.pivot_y
 
 
 def level_image_to_world_xy(
@@ -197,16 +216,15 @@ def level_image_to_world_xy(
 ) -> tuple[float, float]:
     """Transform blueprint-image pixels into the level's world XY coordinates."""
 
-    scale = _get_valid_level_scale(level)
+    transform = _get_level_coordinate_transform(level)
     raw_x, raw_y = _image_to_unscaled_world_xy(level, image_x, image_y)
-    pivot_x, pivot_y = get_level_world_pivot(level)
     return (
-        pivot_x
-        + (raw_x - pivot_x) * scale
-        + _get_valid_level_offset(level, "x"),
-        pivot_y
-        + (raw_y - pivot_y) * scale
-        + _get_valid_level_offset(level, "y"),
+        transform.pivot_x
+        + (raw_x - transform.pivot_x) * transform.scale
+        + transform.offset_x,
+        transform.pivot_y
+        + (raw_y - transform.pivot_y) * transform.scale
+        + transform.offset_y,
     )
 
 
@@ -217,24 +235,98 @@ def level_world_to_image_xy(
 ) -> tuple[float, float]:
     """Invert :func:`level_image_to_world_xy` for one world-space point."""
 
-    scale = _get_valid_level_scale(level)
-    pivot_x, pivot_y = get_level_world_pivot(level)
-    offset_x = _get_valid_level_offset(level, "x")
-    offset_y = _get_valid_level_offset(level, "y")
-    raw_x = pivot_x + (
+    transform = _get_level_coordinate_transform(level)
+    raw_x = transform.pivot_x + (
         float(world_x)
-        - offset_x
-        - pivot_x
-    ) / scale
-    raw_y = pivot_y + (
+        - transform.offset_x
+        - transform.pivot_x
+    ) / transform.scale
+    raw_y = transform.pivot_y + (
         float(world_y)
-        - offset_y
-        - pivot_y
-    ) / scale
+        - transform.offset_y
+        - transform.pivot_y
+    ) / transform.scale
     return _unscaled_world_to_image_xy(level, raw_x, raw_y)
 
 
 # ### Internal coordinate helpers ###
+def _get_level_coordinate_transform(level: LevelData) -> _LevelCoordinateTransform:
+    """Return one cached transform until its mutable dependencies change."""
+
+    scale = _get_valid_level_scale(level)
+    offset_x = _get_valid_level_offset(level, "x")
+    offset_y = _get_valid_level_offset(level, "y")
+    vertex_data = level.vertex_data
+    dependency_key = (
+        id(vertex_data),
+        vertex_data.revision,
+        id(vertex_data.vertices),
+        len(vertex_data.vertices),
+        level.image_size_pixels,
+        scale,
+        offset_x,
+        offset_y,
+    )
+    level_id = id(level)
+    with _LEVEL_COORDINATE_TRANSFORM_CACHE_LOCK:
+        cached = _LEVEL_COORDINATE_TRANSFORM_CACHE.get(level_id)
+        if (
+            cached is not None
+            and cached.level_reference() is level
+            and cached.dependency_key == dependency_key
+        ):
+            return cached.transform
+
+    pivot_x, pivot_y = _calculate_level_world_pivot(level)
+    transform = _LevelCoordinateTransform(
+        pivot_x=pivot_x,
+        pivot_y=pivot_y,
+        scale=scale,
+        offset_x=offset_x,
+        offset_y=offset_y,
+    )
+
+    def discard_level(
+        finalized_reference: weakref.ReferenceType[LevelData],
+    ) -> None:
+        with _LEVEL_COORDINATE_TRANSFORM_CACHE_LOCK:
+            current = _LEVEL_COORDINATE_TRANSFORM_CACHE.get(level_id)
+            if (
+                current is not None
+                and current.level_reference is finalized_reference
+            ):
+                _LEVEL_COORDINATE_TRANSFORM_CACHE.pop(level_id, None)
+
+    level_reference = weakref.ref(level, discard_level)
+    with _LEVEL_COORDINATE_TRANSFORM_CACHE_LOCK:
+        _LEVEL_COORDINATE_TRANSFORM_CACHE[level_id] = (
+            _LevelCoordinateTransformCacheEntry(
+                level_reference=level_reference,
+                dependency_key=dependency_key,
+                transform=transform,
+            )
+        )
+    return transform
+
+
+def _calculate_level_world_pivot(level: LevelData) -> tuple[float, float]:
+    """Calculate the unscaled pivot once for one topology revision."""
+
+    vertices = level.vertex_data.vertices
+    if not vertices:
+        return 0.0, 0.0
+    raw_points = tuple(
+        _image_to_unscaled_world_xy(level, vertex.x, vertex.y)
+        for vertex in vertices
+    )
+    raw_x = tuple(point[0] for point in raw_points)
+    raw_y = tuple(point[1] for point in raw_points)
+    return (
+        (min(raw_x) + max(raw_x)) / 2.0,
+        (min(raw_y) + max(raw_y)) / 2.0,
+    )
+
+
 def _get_level_story_span(level: LevelData) -> float:
     """Return one clear-height plus floor-thickness vertical span."""
 

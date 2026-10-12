@@ -695,10 +695,17 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             ]
         )
 
-        with patch.object(
-            self.workspace.generation,
-            "get_generated_object_model",
-            return_value=_generated_model((2.0, 1.0, 1.0)),
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_model",
+                return_value=_generated_model((2.0, 1.0, 1.0)),
+            ),
+            patch.object(
+                self.workspace,
+                "_sync_canvas_placed_object_profiles",
+                wraps=self.workspace._sync_canvas_placed_object_profiles,
+            ) as sync_profiles,
         ):
             self.workspace._apply_project_state(
                 [level],
@@ -706,6 +713,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
                 generation=generation,
             )
 
+        self.assertEqual(sync_profiles.call_count, 1)
         profiles = self.workspace.canvas.get_placed_object_profiles()
         self.assertEqual(tuple(profile.object_id for profile in profiles), ("chair",))
         self.assertEqual((profiles[0].anchor_x, profiles[0].anchor_y), (40.0, 50.0))
@@ -1208,8 +1216,8 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             ),
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=generation_data,
+                "get_generated_object_records",
+                return_value=tuple(generation_data.generated_objects),
             ),
             patch.object(
                 self.workspace.generation,
@@ -1382,8 +1390,8 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             ),
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=data,
+                "get_generated_object_records",
+                return_value=tuple(data.generated_objects),
             ),
             patch.object(
                 self.workspace.generation,

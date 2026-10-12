@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -57,6 +58,7 @@ from housemaker.texture_atlas_workspace import (
     ATLAS_MAP_TYPES,
     NEW_SOURCE_ATTENTION_COLOR,
     AtlasObjectTextureSource,
+    AtlasObjectTextureSourceLoadSpec,
     AtlasSurfaceTextureEntry,
     TextureAtlasWorkspace,
     _build_texture_source_mime_data,
@@ -67,6 +69,7 @@ from housemaker.texture_atlas_workspace import (
     choose_atlas_texture_resolution,
     get_atlas_wall_texture_assignment_id,
     load_atlas_object_texture_source,
+    load_atlas_object_texture_sources,
 )
 from housemaker.texture_color_balance import (
     TextureColorBalanceSettings,
@@ -761,6 +764,9 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_data(data)
         self.workspace.prepare_export_atlas(atlas.atlas_id)
         previous_size = self.workspace.selected_atlas_storage_size_bytes
+        Image.new("RGBA", (512, 512), (90, 30, 210, 255)).save(
+            source.physical_texture_path
+        )
 
         partial_size = 200_000
 
@@ -3421,6 +3427,121 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         for output_path, previous_payload in previous_payloads.items():
             with self.subTest(output_path=output_path.name):
                 self.assertEqual(output_path.read_bytes(), previous_payload)
+
+    def test_repeated_export_reuses_unchanged_materialized_maps(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Cached", 2048, atlas_id="atlas-cached")
+        source = _source("cached", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.workspace._materialize_atlas(selected_atlas)
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "write_texture_atlas_png",
+            wraps=texture_atlas_workspace_module.write_texture_atlas_png,
+        ) as writer:
+            first = self.workspace.prepare_export_atlas(atlas.atlas_id)
+            second = self.workspace.prepare_export_atlas(atlas.atlas_id)
+
+        writer.assert_not_called()
+        self.assertEqual(first.map_paths, second.map_paths)
+
+    def test_out_of_band_source_replacement_invalidates_materialization_cache(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Source revision", 2048, atlas_id="atlas-source")
+        source = _source(
+            "source-revision",
+            directory=self._temporary_directory.name,
+            color=(20, 40, 60, 255),
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.workspace._materialize_atlas(selected_atlas)
+        previous_stat = source.physical_texture_path.stat()
+        Image.new("RGBA", (512, 512), (210, 30, 80, 255)).save(
+            source.physical_texture_path
+        )
+        os.utime(
+            source.physical_texture_path,
+            ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns),
+        )
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "write_texture_atlas_png",
+            wraps=texture_atlas_workspace_module.write_texture_atlas_png,
+        ) as writer:
+            self.workspace.prepare_export_atlas(atlas.atlas_id)
+
+        self.assertEqual(writer.call_count, len(ATLAS_MAP_TYPES))
+        base_color_path = Path(
+            self._temporary_directory.name
+        ) / build_texture_atlas_map_image_relative_path(
+            atlas.atlas_id,
+            ATLAS_MAP_BASE_COLOR,
+        )
+        with Image.open(base_color_path) as output_image:
+            self.assertEqual(output_image.getpixel((10, 10)), (210, 30, 80, 255))
+
+    def test_out_of_band_output_replacement_invalidates_materialization_cache(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Output revision", 2048, atlas_id="atlas-output")
+        source = _source("output-revision", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.workspace._materialize_atlas(selected_atlas)
+        normal_path = Path(
+            self._temporary_directory.name
+        ) / build_texture_atlas_map_image_relative_path(
+            atlas.atlas_id,
+            ATLAS_MAP_NORMAL,
+        )
+        previous_stat = normal_path.stat()
+        Image.new("RGBA", (2048, 2048), (1, 2, 3, 255)).save(normal_path)
+        os.utime(
+            normal_path,
+            ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns),
+        )
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "write_texture_atlas_png",
+            wraps=texture_atlas_workspace_module.write_texture_atlas_png,
+        ) as writer:
+            self.workspace.prepare_export_atlas(atlas.atlas_id)
+
+        self.assertEqual(writer.call_count, len(ATLAS_MAP_TYPES))
+        with Image.open(normal_path) as output_image:
+            self.assertEqual(output_image.getpixel((10, 10)), (128, 128, 255, 255))
 
     def test_creates_named_atlas_with_selected_resolution(self) -> None:
         self.workspace.atlas_name_edit.setText("Furniture")
@@ -6691,6 +6812,415 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertLess(
             sum(source.preview_rgba.nbytes for source in sources),
             24 * 256 * 256 * 4,
+        )
+
+    def test_source_thumbnail_cache_reuses_unchanged_file_revision(self) -> None:
+        texture_path = (
+            Path(self._temporary_directory.name) / "cached-thumbnail.png"
+        )
+        Image.new("RGBA", (512, 512), (12, 34, 56, 255)).save(texture_path)
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+        self.addCleanup(
+            texture_atlas_workspace_module._clear_texture_thumbnail_cache
+        )
+        real_image_open = Image.open
+
+        with patch.object(
+            texture_atlas_workspace_module.Image,
+            "open",
+            wraps=real_image_open,
+        ) as image_open:
+            first = load_atlas_object_texture_source(
+                object_id="first",
+                object_name="First",
+                texture_path="textures/cached-thumbnail.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+            second = load_atlas_object_texture_source(
+                object_id="second",
+                object_name="Second",
+                texture_path="textures/cached-thumbnail.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+
+        self.assertEqual(image_open.call_count, 1)
+        np.testing.assert_array_equal(first.preview_rgba, second.preview_rgba)
+        self.assertFalse(first.preview_rgba.flags.writeable)
+        self.assertFalse(second.preview_rgba.flags.writeable)
+
+    def test_source_thumbnail_cache_invalidates_changed_file_revision(self) -> None:
+        texture_path = (
+            Path(self._temporary_directory.name) / "changed-thumbnail.png"
+        )
+        Image.new("RGBA", (512, 512), (10, 20, 30, 255)).save(texture_path)
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+        self.addCleanup(
+            texture_atlas_workspace_module._clear_texture_thumbnail_cache
+        )
+        real_image_open = Image.open
+
+        with patch.object(
+            texture_atlas_workspace_module.Image,
+            "open",
+            wraps=real_image_open,
+        ) as image_open:
+            before = load_atlas_object_texture_source(
+                object_id="before",
+                object_name="Before",
+                texture_path="textures/changed-thumbnail.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+            previous_stat = texture_path.stat()
+            Image.new("RGBA", (512, 512), (90, 80, 70, 255)).save(texture_path)
+            os.utime(
+                texture_path,
+                ns=(
+                    previous_stat.st_atime_ns,
+                    previous_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+            after = load_atlas_object_texture_source(
+                object_id="after",
+                object_name="After",
+                texture_path="textures/changed-thumbnail.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+
+        self.assertEqual(image_open.call_count, 2)
+        self.assertEqual(tuple(before.preview_rgba[0, 0]), (10, 20, 30, 255))
+        self.assertEqual(tuple(after.preview_rgba[0, 0]), (90, 80, 70, 255))
+
+    def test_source_thumbnail_cache_key_includes_decode_parameters(self) -> None:
+        texture_path = (
+            Path(self._temporary_directory.name) / "parameter-thumbnail.png"
+        )
+        Image.new("RGBA", (320, 160), (45, 67, 89, 255)).save(texture_path)
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+        self.addCleanup(
+            texture_atlas_workspace_module._clear_texture_thumbnail_cache
+        )
+        real_image_open = Image.open
+
+        with patch.object(
+            texture_atlas_workspace_module.Image,
+            "open",
+            wraps=real_image_open,
+        ) as image_open:
+            for object_id, resolution in (
+                ("small", 512),
+                ("large", 1024),
+                ("small-again", 512),
+            ):
+                load_atlas_object_texture_source(
+                    object_id=object_id,
+                    object_name=object_id,
+                    texture_path="textures/parameter-thumbnail.png",
+                    texture_resolution=resolution,
+                    physical_texture_path=texture_path,
+                    fit_to_square=True,
+                )
+
+        self.assertEqual(image_open.call_count, 2)
+
+    def test_source_thumbnail_cache_evicts_least_recently_used_entry(self) -> None:
+        texture_paths = []
+        for index in range(3):
+            texture_path = (
+                Path(self._temporary_directory.name) / f"eviction-{index}.png"
+            )
+            Image.new(
+                "RGBA",
+                (512, 512),
+                (index * 20, index * 30, index * 40, 255),
+            ).save(texture_path)
+            texture_paths.append(texture_path)
+        bounded_cache = texture_atlas_workspace_module._TextureThumbnailCache(
+            maximum_entries=2,
+            maximum_bytes=2 * 256 * 256 * 4,
+        )
+        disabled_disk_cache = Mock()
+        disabled_disk_cache.get.return_value = None
+        real_image_open = Image.open
+
+        with (
+            patch.object(
+                texture_atlas_workspace_module,
+                "_TEXTURE_THUMBNAIL_CACHE",
+                bounded_cache,
+            ),
+            patch.object(
+                texture_atlas_workspace_module,
+                "_TEXTURE_THUMBNAIL_DISK_CACHE",
+                disabled_disk_cache,
+            ),
+            patch.object(
+                texture_atlas_workspace_module.Image,
+                "open",
+                wraps=real_image_open,
+            ) as image_open,
+        ):
+            for index in (*range(3), 0):
+                load_atlas_object_texture_source(
+                    object_id=f"source-{index}",
+                    object_name=f"Source {index}",
+                    texture_path=f"textures/eviction-{index}.png",
+                    texture_resolution=512,
+                    physical_texture_path=texture_paths[index],
+                )
+
+        self.assertEqual(image_open.call_count, 4)
+        self.assertEqual(len(bounded_cache._entries), 2)
+
+    def test_source_thumbnail_disk_cache_survives_memory_cache_clear(self) -> None:
+        texture_path = (
+            Path(self._temporary_directory.name) / "persistent-thumbnail.png"
+        )
+        Image.new("RGBA", (512, 512), (23, 45, 67, 255)).save(texture_path)
+        disk_cache = texture_atlas_workspace_module._TextureThumbnailDiskCache(
+            cache_directory=(
+                Path(self._temporary_directory.name) / "persistent-cache"
+            ),
+            maximum_entries=8,
+            maximum_bytes=8 * 256 * 256 * 4,
+        )
+        real_decoder = (
+            texture_atlas_workspace_module._decode_texture_thumbnail_rgba
+        )
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+
+        with (
+            patch.object(
+                texture_atlas_workspace_module,
+                "_TEXTURE_THUMBNAIL_DISK_CACHE",
+                disk_cache,
+            ),
+            patch.object(
+                texture_atlas_workspace_module,
+                "_decode_texture_thumbnail_rgba",
+                wraps=real_decoder,
+            ) as decoder,
+        ):
+            first = load_atlas_object_texture_source(
+                object_id="first",
+                object_name="First",
+                texture_path="textures/persistent-thumbnail.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+            texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+            second = load_atlas_object_texture_source(
+                object_id="second",
+                object_name="Second",
+                texture_path="textures/persistent-thumbnail.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+
+        self.assertEqual(decoder.call_count, 1)
+        self.assertEqual(
+            len(tuple(disk_cache.cache_directory.glob("*/*.rgba.npy"))),
+            1,
+        )
+        np.testing.assert_array_equal(first.preview_rgba, second.preview_rgba)
+        self.assertFalse(second.preview_rgba.flags.writeable)
+
+    def test_source_thumbnail_disk_cache_recovers_from_corrupt_proxy(self) -> None:
+        texture_path = (
+            Path(self._temporary_directory.name) / "corrupt-proxy-source.png"
+        )
+        Image.new("RGBA", (512, 512), (78, 56, 34, 255)).save(texture_path)
+        disk_cache = texture_atlas_workspace_module._TextureThumbnailDiskCache(
+            cache_directory=(
+                Path(self._temporary_directory.name) / "corrupt-proxy-cache"
+            ),
+            maximum_entries=8,
+            maximum_bytes=8 * 256 * 256 * 4,
+        )
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "_TEXTURE_THUMBNAIL_DISK_CACHE",
+            disk_cache,
+        ):
+            load_atlas_object_texture_source(
+                object_id="before-corruption",
+                object_name="Before corruption",
+                texture_path="textures/corrupt-proxy-source.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+            cache_path = next(
+                disk_cache.cache_directory.glob("*/*.rgba.npy")
+            )
+            cache_path.write_bytes(b"not a numpy image")
+            texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+            recovered = load_atlas_object_texture_source(
+                object_id="after-corruption",
+                object_name="After corruption",
+                texture_path="textures/corrupt-proxy-source.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+
+        self.assertEqual(
+            tuple(recovered.preview_rgba[0, 0]),
+            (78, 56, 34, 255),
+        )
+        with cache_path.open("rb") as cache_file:
+            repaired = np.load(cache_file, allow_pickle=False)
+        self.assertEqual(tuple(repaired[0, 0]), (78, 56, 34, 255))
+
+    def test_source_thumbnail_disk_cache_failure_falls_back_to_source(self) -> None:
+        texture_path = (
+            Path(self._temporary_directory.name) / "fallback-source.png"
+        )
+        Image.new("RGBA", (512, 512), (91, 82, 73, 255)).save(texture_path)
+        unusable_cache_path = (
+            Path(self._temporary_directory.name) / "cache-is-a-file"
+        )
+        unusable_cache_path.write_text("not a directory", encoding="utf-8")
+        disk_cache = texture_atlas_workspace_module._TextureThumbnailDiskCache(
+            cache_directory=unusable_cache_path,
+            maximum_entries=8,
+            maximum_bytes=8 * 256 * 256 * 4,
+        )
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "_TEXTURE_THUMBNAIL_DISK_CACHE",
+            disk_cache,
+        ):
+            source = load_atlas_object_texture_source(
+                object_id="fallback",
+                object_name="Fallback",
+                texture_path="textures/fallback-source.png",
+                texture_resolution=512,
+                physical_texture_path=texture_path,
+            )
+
+        self.assertEqual(tuple(source.preview_rgba[0, 0]), (91, 82, 73, 255))
+
+    def test_source_thumbnail_disk_cache_enforces_entry_and_byte_caps(self) -> None:
+        disk_cache = texture_atlas_workspace_module._TextureThumbnailDiskCache(
+            cache_directory=(
+                Path(self._temporary_directory.name) / "bounded-disk-cache"
+            ),
+            maximum_entries=2,
+            maximum_bytes=600_000,
+        )
+        texture_paths = []
+        for index in range(3):
+            texture_path = (
+                Path(self._temporary_directory.name)
+                / f"bounded-source-{index}.png"
+            )
+            Image.new(
+                "RGBA",
+                (512, 512),
+                (index * 30, index * 40, index * 50, 255),
+            ).save(texture_path)
+            texture_paths.append(texture_path)
+        texture_atlas_workspace_module._clear_texture_thumbnail_cache()
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "_TEXTURE_THUMBNAIL_DISK_CACHE",
+            disk_cache,
+        ):
+            for index, texture_path in enumerate(texture_paths):
+                load_atlas_object_texture_source(
+                    object_id=f"bounded-{index}",
+                    object_name=f"Bounded {index}",
+                    texture_path=f"textures/bounded-source-{index}.png",
+                    texture_resolution=512,
+                    physical_texture_path=texture_path,
+                )
+
+        cache_paths = tuple(
+            disk_cache.cache_directory.glob("*/*.rgba.npy")
+        )
+        self.assertLessEqual(len(cache_paths), 2)
+        self.assertLessEqual(
+            sum(cache_path.stat().st_size for cache_path in cache_paths),
+            600_000,
+        )
+
+    def test_source_thumbnail_batch_preserves_order_and_isolates_failures(
+        self,
+    ) -> None:
+        texture_path = Path(self._temporary_directory.name) / "batch-valid.png"
+        missing_path = Path(self._temporary_directory.name) / "batch-missing.png"
+        Image.new("RGBA", (512, 512), (15, 25, 35, 255)).save(texture_path)
+        specs = tuple(
+            AtlasObjectTextureSourceLoadSpec(
+                object_id=object_id,
+                object_name=object_id.title(),
+                texture_path=f"textures/{object_id}.png",
+                texture_resolution=512,
+                physical_texture_path=physical_path,
+            )
+            for object_id, physical_path in (
+                ("first", texture_path),
+                ("missing", missing_path),
+                ("last", texture_path),
+            )
+        )
+
+        results = load_atlas_object_texture_sources(specs)
+
+        self.assertEqual(
+            tuple(result.spec.object_id for result in results),
+            ("first", "missing", "last"),
+        )
+        self.assertTrue(results[0].succeeded)
+        self.assertFalse(results[1].succeeded)
+        self.assertIsInstance(results[1].error, FileNotFoundError)
+        self.assertTrue(results[2].succeeded)
+
+    def test_source_thumbnail_batch_runs_independent_loads_concurrently(
+        self,
+    ) -> None:
+        sources = {
+            f"parallel-{index}": _source(
+                f"parallel-{index}",
+                directory=self._temporary_directory.name,
+            )
+            for index in range(4)
+        }
+        specs = tuple(
+            AtlasObjectTextureSourceLoadSpec(
+                object_id=object_id,
+                object_name=object_id.title(),
+                texture_path=source.texture_path,
+                texture_resolution=source.texture_resolution,
+                physical_texture_path=source.physical_texture_path,
+            )
+            for object_id, source in sources.items()
+        )
+        worker_barrier = threading.Barrier(4, timeout=2.0)
+
+        def synchronized_load(**load_values: object) -> AtlasObjectTextureSource:
+            worker_barrier.wait()
+            return sources[str(load_values["object_id"])]
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "load_atlas_object_texture_source",
+            side_effect=synchronized_load,
+        ) as source_loader:
+            results = load_atlas_object_texture_sources(specs)
+
+        self.assertEqual(source_loader.call_count, 4)
+        self.assertTrue(all(result.succeeded for result in results))
+        self.assertEqual(
+            tuple(result.source.object_id for result in results if result.source),
+            tuple(sources),
         )
 
     def test_symmetric_sources_pair_across_orientations_and_hit_each_half(

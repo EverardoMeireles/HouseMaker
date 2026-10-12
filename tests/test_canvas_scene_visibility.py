@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -529,6 +530,55 @@ class CanvasSceneVisibilityTests(unittest.TestCase):
             self.viewer.get_visible_canvas_level_indices(),
             (2, 1, 0),
         )
+
+    def test_unchanged_scene_levels_reuse_the_level_mesh_cache(self) -> None:
+        levels = ((1, "Upper"), (0, "Ground"))
+        object_levels = {"chair": 0}
+        self.viewer.set_canvas_scene_levels(
+            levels,
+            placed_object_levels=object_levels,
+        )
+
+        with patch.object(
+            self.viewer,
+            "_rebuild_canvas_scene_level_mesh_cache",
+            wraps=self.viewer._rebuild_canvas_scene_level_mesh_cache,
+        ) as rebuild_cache:
+            changed = self.viewer.set_canvas_scene_levels(
+                levels,
+                placed_object_levels=object_levels,
+            )
+
+        self.assertFalse(changed)
+        rebuild_cache.assert_not_called()
+
+    def test_object_level_change_does_not_rebuild_static_level_meshes(self) -> None:
+        levels = ((1, "Upper"), (0, "Ground"))
+        self.viewer.set_canvas_scene_levels(
+            levels,
+            placed_object_levels={"chair": 0},
+        )
+
+        with (
+            patch.object(
+                self.viewer,
+                "_rebuild_canvas_scene_level_mesh_cache",
+                wraps=self.viewer._rebuild_canvas_scene_level_mesh_cache,
+            ) as rebuild_cache,
+            patch.object(
+                self.viewer,
+                "_apply_canvas_scene_visibility_change",
+                wraps=self.viewer._apply_canvas_scene_visibility_change,
+            ) as apply_visibility,
+        ):
+            changed = self.viewer.set_canvas_scene_levels(
+                levels,
+                placed_object_levels={"chair": 1},
+            )
+
+        self.assertTrue(changed)
+        rebuild_cache.assert_not_called()
+        apply_visibility.assert_not_called()
 
     def test_level_list_filters_complete_generated_level_primitives(self) -> None:
         levels = (

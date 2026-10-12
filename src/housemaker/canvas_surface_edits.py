@@ -1688,6 +1688,7 @@ def _restore_level_mutation_snapshot(
     snapshot: _LevelMutationSnapshot,
 ) -> None:
     level.vertex_data.vertices = list(snapshot.vertices)
+    level.vertex_data.mark_changed()
     level.offset_x_meters = snapshot.offset_x_meters
     level.offset_y_meters = snapshot.offset_y_meters
     level.height_meters = snapshot.height_meters

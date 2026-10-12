@@ -900,6 +900,63 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             )
         )
 
+    def test_viewer_preview_reuses_precomputed_trim_placements(self) -> None:
+        trim_models = (object(),)
+        base_mesh = trimesh.creation.box()
+        base_model = GeneratedModel(
+            mesh=base_mesh,
+            scene=trimesh.Scene(base_mesh),
+            glb_bytes=b"",
+        )
+
+        with (
+            patch.object(
+                self.workspace,
+                "_build_active_architectural_trim_component_models",
+                return_value=(trim_models, ()),
+            ) as active_builder,
+            patch.object(
+                self.workspace,
+                "_build_placed_generated_models",
+                return_value=(),
+            ) as placed_builder,
+            patch(
+                "housemaker.main.convert_to_preview_model",
+                return_value=base_model,
+            ),
+        ):
+            preview = self.workspace._build_viewer_preview_model(None)
+
+        self.assertIs(preview, base_model)
+        active_builder.assert_called_once_with(
+            include_excluded_levels=True,
+            preview_only=True,
+        )
+        placed_builder.assert_called_once()
+        self.assertIs(
+            placed_builder.call_args.kwargs[
+                "precomputed_architectural_trim_models"
+            ],
+            trim_models,
+        )
+
+    def test_preview_placement_build_forwards_trim_preview_mode(self) -> None:
+        with patch.object(
+            self.workspace,
+            "_build_active_architectural_trim_component_models",
+            return_value=((), ()),
+        ) as active_builder:
+            placements = self.workspace._build_placed_generated_models(
+                include_excluded_levels=True,
+                preview_only=True,
+            )
+
+        self.assertEqual(placements, ())
+        active_builder.assert_called_once_with(
+            include_excluded_levels=True,
+            preview_only=True,
+        )
+
     def test_changed_authored_trim_dimensions_use_texture_transfer(self) -> None:
         trim_id = "8" * 32
         with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):

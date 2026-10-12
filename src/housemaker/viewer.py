@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import threading
 import weakref
@@ -169,10 +170,15 @@ ORBITING_POINT_LIGHT_MARKER_MINIMUM_RADIUS_METERS = 0.04
 ORBITING_POINT_LIGHT_MARKER_ROWS = 12
 ORBITING_POINT_LIGHT_MARKER_COLUMNS = 24
 ORBITING_POINT_LIGHT_MARKER_COLOR = (1.0, 1.0, 1.0, 1.0)
-MAX_TEXTURE_PREVIEW_DIMENSION = 4096
+AMBIENT_LIT_SHADER_NAME = "housemaker_ambient_lit"
+# Export assets retain their source resolution; only interactive GL previews
+# are capped so a base color plus PBR set cannot consume hundreds of MiB.
+MAX_TEXTURE_PREVIEW_DIMENSION = 2048
+INITIAL_TEXTURE_PROXY_DIMENSION = 256
 DEFAULT_TEXTURES_ENABLED = True
 DEFAULT_WIREFRAME_ENABLED = True
 DEFAULT_WIREFRAME_ONLY = False
+HEADLESS_QT_PLATFORM_NAMES = frozenset(("minimal", "offscreen"))
 DEFAULT_PBR_MAPS_ENABLED = {map_type: False for map_type in PBR_MAP_TYPES}
 NEUTRAL_NORMAL_TEXTURE_RGBA = (128, 128, 255, 255)
 NEUTRAL_ROUGHNESS_TEXTURE_RGBA = (255, 255, 255, 255)
@@ -180,6 +186,10 @@ NEUTRAL_METALLIC_TEXTURE_RGBA = (0, 0, 0, 255)
 TEXTURE_ALPHA_MODE_OPAQUE = "opaque"
 TEXTURE_ALPHA_MODE_MIXED = "mixed"
 TEXTURE_ALPHA_MODE_TRANSLUCENT = "translucent"
+GLTF_ALPHA_MODE_OPAQUE = "OPAQUE"
+GLTF_ALPHA_MODE_MASK = "MASK"
+GLTF_ALPHA_MODE_BLEND = "BLEND"
+DEFAULT_GLTF_ALPHA_CUTOFF = 0.5
 NAVIGATION_MODE_ORBIT = "orbit"
 NAVIGATION_MODE_FIRST_PERSON = "first_person"
 VIEWER_NAVIGATION_MODES = frozenset(
@@ -405,6 +415,7 @@ ARCHITECTURAL_TRIM_SNAP_DISTANCE_PIXELS = 18.0
 ARCHITECTURAL_TRIM_SNAP_MIN_DISTANCE_METERS = 0.025
 ARCHITECTURAL_TRIM_HOVER_ACTION_OFFSET_PIXELS = 14
 ARCHITECTURAL_TRIM_HOVER_ACTION_MARGIN_PIXELS = 8
+ARCHITECTURAL_TRIM_PASSIVE_HOVER_INTERVAL_MILLISECONDS = 33
 ARCHITECTURAL_TRIM_HOVER_KIND_ORDER = (
     TRIM_KIND_SKIRTING_BOARD,
     TRIM_KIND_EDGING_STRIP,
@@ -495,12 +506,16 @@ AMBIENT_LIT_FRAGMENT_SHADER = """
     precision mediump float;
     #endif
     uniform float u_ambient_light;
+    uniform float u_opacity;
     varying vec4 v_color;
     varying vec3 v_normal;
     void main() {
         float diffuse = max(dot(v_normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0);
         float illumination = min(1.0, u_ambient_light + diffuse * 0.65);
-        gl_FragColor = vec4(v_color.rgb * illumination, v_color.a);
+        gl_FragColor = vec4(
+            v_color.rgb * illumination,
+            v_color.a * u_opacity
+        );
     }
 """
 TEXTURED_AMBIENT_VERTEX_SHADER = """
@@ -540,6 +555,9 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     uniform float u_roughness_map_enabled;
     uniform float u_metallic_map_enabled;
     uniform float u_alpha_pass;
+    uniform float u_material_alpha_mode;
+    uniform float u_alpha_cutoff;
+    uniform float u_base_color_alpha;
     uniform float u_ambient_light;
     uniform float u_point_light_enabled;
     uniform vec3 u_point_light_position_view;
@@ -598,7 +616,16 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
 
     void main() {
         vec4 base_color = texture2D(u_texture, v_texcoord);
-        float output_alpha = base_color.a * u_opacity;
+        float material_alpha = 1.0;
+        if (u_material_alpha_mode > 1.5) {
+            material_alpha = base_color.a * u_base_color_alpha;
+        } else if (u_material_alpha_mode > 0.5) {
+            float mask_alpha = base_color.a * u_base_color_alpha;
+            if (mask_alpha < u_alpha_cutoff) {
+                discard;
+            }
+        }
+        float output_alpha = material_alpha * u_opacity;
         if (output_alpha <= 0.001) {
             discard;
         }
@@ -732,6 +759,72 @@ class TextureMeshData:
     metallic_texture_rgba: np.ndarray | None = None
     double_sided: bool = True
     is_prefab_glass: bool = False
+    uses_texture_alpha: bool = False
+    alpha_mode: str = GLTF_ALPHA_MODE_OPAQUE
+    alpha_cutoff: float = DEFAULT_GLTF_ALPHA_CUTOFF
+    base_color_alpha: float = 1.0
+
+
+@dataclass(frozen=True)
+class TexturePreviewBundle:
+    """One aligned base-color and optional PBR texture update."""
+
+    base_color_rgba: np.ndarray = field(compare=False)
+    normal_rgba: np.ndarray | None = field(default=None, compare=False)
+    roughness_rgba: np.ndarray | None = field(default=None, compare=False)
+    metallic_rgba: np.ndarray | None = field(default=None, compare=False)
+    content_signature: tuple[object, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        normalized_base_color = _normalize_texture_bundle_map(
+            self.base_color_rgba,
+            map_name="base color",
+        )
+        normalized_optional_maps: dict[str, np.ndarray | None] = {}
+        for field_name, map_name in (
+            ("normal_rgba", "normal"),
+            ("roughness_rgba", "roughness"),
+            ("metallic_rgba", "metallic"),
+        ):
+            raw_map = getattr(self, field_name)
+            if raw_map is None:
+                normalized_optional_maps[field_name] = None
+                continue
+            normalized_map = _normalize_texture_bundle_map(
+                raw_map,
+                map_name=map_name,
+            )
+            if normalized_map.shape[:2] != normalized_base_color.shape[:2]:
+                raise ValueError(
+                    "Progressive PBR maps must match the base-color dimensions."
+                )
+            normalized_optional_maps[field_name] = normalized_map
+
+        object.__setattr__(self, "base_color_rgba", normalized_base_color)
+        for field_name, normalized_map in normalized_optional_maps.items():
+            object.__setattr__(self, field_name, normalized_map)
+        object.__setattr__(
+            self,
+            "content_signature",
+            _build_texture_bundle_content_signature(
+                normalized_base_color,
+                normalized_optional_maps["normal_rgba"],
+                normalized_optional_maps["roughness_rgba"],
+                normalized_optional_maps["metallic_rgba"],
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ProgressiveTextureUpdateToken:
+    """One scene-bound request whose late result can be rejected safely."""
+
+    request_key: str
+    scene_revision: int
+    request_revision: int
+    surface_ids: frozenset[str] = frozenset()
+    placed_object_ids: frozenset[str] = frozenset()
+    include_primary_model: bool = False
 
 
 @dataclass(frozen=True)
@@ -2452,8 +2545,26 @@ class TexturedMeshItem(GLGraphicsItem):
             dtype=np.uint8,
         )
         self._is_prefab_glass = bool(texture_mesh_data.is_prefab_glass)
+        self._material_alpha_mode = _normalize_gltf_alpha_mode(
+            texture_mesh_data.alpha_mode
+        )
+        self._alpha_cutoff = _normalize_material_scalar_factor(
+            texture_mesh_data.alpha_cutoff,
+            default=DEFAULT_GLTF_ALPHA_CUTOFF,
+        )
+        self._base_color_alpha = _normalize_material_scalar_factor(
+            texture_mesh_data.base_color_alpha,
+            default=1.0,
+        )
+        texture_alpha = np.asarray(self._texture_rgba[:, :, 3], dtype=float) / 255.0
+        effective_alpha = texture_alpha * self._base_color_alpha
         self._contains_transparent_texels = bool(
-            np.any(self._texture_rgba[:, :, 3] < 255)
+            self._material_alpha_mode == GLTF_ALPHA_MODE_BLEND
+            and np.any(effective_alpha < 1.0 - 1e-6)
+        )
+        self._all_texels_are_translucent = bool(
+            self._material_alpha_mode == GLTF_ALPHA_MODE_BLEND
+            and np.all(effective_alpha < 1.0 - 1e-6)
         )
         self._translucent_requested = bool(translucent)
         self._opacity = _normalize_preview_opacity(opacity)
@@ -2478,6 +2589,24 @@ class TexturedMeshItem(GLGraphicsItem):
         self._metallic_texture_rgba = _normalize_optional_texture_rgba(
             texture_mesh_data.metallic_texture_rgba,
             NEUTRAL_METALLIC_TEXTURE_RGBA,
+        )
+        self._texture_bundle_signature = _build_texture_bundle_content_signature(
+            self._texture_rgba,
+            (
+                self._normal_texture_rgba
+                if self._normal_texture_available
+                else None
+            ),
+            (
+                self._roughness_texture_rgba
+                if self._roughness_texture_available
+                else None
+            ),
+            (
+                self._metallic_texture_rgba
+                if self._metallic_texture_available
+                else None
+            ),
         )
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
         self._point_light_world_position = _normalize_optional_world_position(
@@ -2506,14 +2635,24 @@ class TexturedMeshItem(GLGraphicsItem):
         self._roughness_texture_id: int | None = None
         self._metallic_texture_id: int | None = None
         self._shader_program: int | None = None
+        self._gl_context: object | None = None
+        self._shared_shader_program_lease: _SharedGlShaderProgramLease | None = None
+        self._shared_texture_leases: dict[str, _SharedGlTextureLease] = {}
+        self._attribute_locations: dict[str, int] = {}
+        self._uniform_locations: dict[str, int] = {}
         self._resources_uploaded = False
         self._edit_mask_dirty = False
+        self._texture_bundle_dirty = False
         self._sync_transparency_mode()
 
     def _sync_transparency_mode(self) -> None:
         """Choose opaque, mixed-alpha, or fully translucent rendering."""
 
-        if self._translucent_requested or self._opacity < 1.0:
+        if (
+            self._translucent_requested
+            or self._opacity < 1.0
+            or self._all_texels_are_translucent
+        ):
             self._transparency_mode = TEXTURE_ALPHA_MODE_TRANSLUCENT
             self.setGLOptions(
                 {
@@ -2558,7 +2697,12 @@ class TexturedMeshItem(GLGraphicsItem):
         self._ambient_light_intensity = _normalize_ambient_light_intensity(intensity)
         self.update()
 
-    def set_opacity(self, opacity: float) -> None:
+    def set_opacity(
+        self,
+        opacity: float,
+        *,
+        request_update: bool = True,
+    ) -> None:
         """Update a preview item's opacity without rebuilding its buffers."""
 
         normalized = _normalize_preview_opacity(opacity)
@@ -2566,7 +2710,8 @@ class TexturedMeshItem(GLGraphicsItem):
             return
         self._opacity = normalized
         self._sync_transparency_mode()
-        self.update()
+        if request_update:
+            self.update()
 
     def set_pbr_maps_enabled(
         self,
@@ -2590,6 +2735,8 @@ class TexturedMeshItem(GLGraphicsItem):
     def set_point_light_world_position(
         self,
         position: Sequence[float] | None,
+        *,
+        request_update: bool = True,
     ) -> None:
         """Set or clear the optional world-space preview point light."""
 
@@ -2597,7 +2744,8 @@ class TexturedMeshItem(GLGraphicsItem):
         if normalized == self._point_light_world_position:
             return
         self._point_light_world_position = normalized
-        self.update()
+        if request_update:
+            self.update()
 
     def get_point_light_world_position(self) -> tuple[float, float, float] | None:
         """Return the current optional point-light position."""
@@ -2617,6 +2765,53 @@ class TexturedMeshItem(GLGraphicsItem):
             return
         self._color_balance_preview_settings = normalized
         self.update()
+
+    def set_texture_bundle(self, bundle: TexturePreviewBundle) -> bool:
+        """Queue an atomic texture-only replacement without rebuilding geometry."""
+
+        if not isinstance(bundle, TexturePreviewBundle):
+            raise TypeError("Texture upgrades require a TexturePreviewBundle.")
+        if bundle.content_signature == self._texture_bundle_signature:
+            return False
+
+        self._texture_rgba = bundle.base_color_rgba
+        self._normal_texture_available = bundle.normal_rgba is not None
+        self._roughness_texture_available = bundle.roughness_rgba is not None
+        self._metallic_texture_available = bundle.metallic_rgba is not None
+        self._normal_texture_rgba = _normalize_optional_texture_rgba(
+            bundle.normal_rgba,
+            NEUTRAL_NORMAL_TEXTURE_RGBA,
+        )
+        self._roughness_texture_rgba = _normalize_optional_texture_rgba(
+            bundle.roughness_rgba,
+            NEUTRAL_ROUGHNESS_TEXTURE_RGBA,
+        )
+        self._metallic_texture_rgba = _normalize_optional_texture_rgba(
+            bundle.metallic_rgba,
+            NEUTRAL_METALLIC_TEXTURE_RGBA,
+        )
+        self._texture_bundle_signature = bundle.content_signature
+        self._refresh_texture_alpha_state()
+        if self._pbr_maps_enabled[PBR_MAP_NORMAL]:
+            self._ensure_tangent_frames()
+        self._texture_bundle_dirty = self._resources_uploaded
+        self.update()
+        return True
+
+    def _refresh_texture_alpha_state(self) -> None:
+        """Recompute draw-pass selection after replacing base-color pixels."""
+
+        texture_alpha = np.asarray(self._texture_rgba[:, :, 3], dtype=float) / 255.0
+        effective_alpha = texture_alpha * self._base_color_alpha
+        self._contains_transparent_texels = bool(
+            self._material_alpha_mode == GLTF_ALPHA_MODE_BLEND
+            and np.any(effective_alpha < 1.0 - 1e-6)
+        )
+        self._all_texels_are_translucent = bool(
+            self._material_alpha_mode == GLTF_ALPHA_MODE_BLEND
+            and np.all(effective_alpha < 1.0 - 1e-6)
+        )
+        self._sync_transparency_mode()
 
     def set_edit_mask(self, mask: np.ndarray | None) -> None:
         """Overlay the editable texels in orange without changing the model."""
@@ -2707,6 +2902,14 @@ class TexturedMeshItem(GLGraphicsItem):
     def _release_gl_resources_in_current_context(self) -> bool:
         """Delete every currently allocated GL name, then clear local handles."""
 
+        current_context = QOpenGLContext.currentContext()
+        if self._gl_context is not None and current_context is not self._gl_context:
+            # A GL name must never be deleted through an unrelated context. This
+            # path is expected only after Qt has discarded and replaced a view's
+            # context, so abandon the already-invalid names and their leases.
+            self._reset_gl_resource_handles()
+            return True
+
         buffer_ids = tuple(
             int(buffer_id)
             for buffer_id in (
@@ -2718,18 +2921,30 @@ class TexturedMeshItem(GLGraphicsItem):
             )
             if buffer_id is not None
         )
-        texture_ids = tuple(
-            int(texture_id)
-            for texture_id in (
-                self._texture_id,
-                self._edit_mask_texture_id,
-                self._normal_texture_id,
-                self._roughness_texture_id,
-                self._metallic_texture_id,
-            )
-            if texture_id is not None
-        )
+        texture_ids: list[int] = []
+        for texture_slot, texture_id in (
+            ("base_color", self._texture_id),
+            ("edit_mask", self._edit_mask_texture_id),
+            (PBR_MAP_NORMAL, self._normal_texture_id),
+            (PBR_MAP_ROUGHNESS, self._roughness_texture_id),
+            (PBR_MAP_METALLIC, self._metallic_texture_id),
+        ):
+            if texture_id is None:
+                continue
+            lease = self._shared_texture_leases.pop(texture_slot, None)
+            if lease is None:
+                texture_ids.append(int(texture_id))
+                continue
+            released_texture_id = _SHARED_GL_TEXTURE_CACHE.release(lease)
+            if released_texture_id is not None:
+                texture_ids.append(released_texture_id)
         shader_program = self._shader_program
+        shader_program_lease = self._shared_shader_program_lease
+        self._shared_shader_program_lease = None
+        if shader_program_lease is not None:
+            shader_program = _SHARED_GL_SHADER_PROGRAM_CACHE.release(
+                shader_program_lease
+            )
         released = True
         try:
             if buffer_ids:
@@ -2756,6 +2971,14 @@ class TexturedMeshItem(GLGraphicsItem):
         return released
 
     def _reset_gl_resource_handles(self) -> None:
+        if self._shared_shader_program_lease is not None:
+            _SHARED_GL_SHADER_PROGRAM_CACHE.discard(
+                self._shared_shader_program_lease
+            )
+            self._shared_shader_program_lease = None
+        for lease in self._shared_texture_leases.values():
+            _SHARED_GL_TEXTURE_CACHE.discard(lease)
+        self._shared_texture_leases.clear()
         self._position_buffer = None
         self._normal_buffer = None
         self._tangent_buffer = None
@@ -2767,8 +2990,12 @@ class TexturedMeshItem(GLGraphicsItem):
         self._roughness_texture_id = None
         self._metallic_texture_id = None
         self._shader_program = None
+        self._gl_context = None
+        self._attribute_locations.clear()
+        self._uniform_locations.clear()
         self._resources_uploaded = False
         self._edit_mask_dirty = False
+        self._texture_bundle_dirty = False
 
     def initializeGL(self) -> None:
         if self._has_gl_resource_handles():
@@ -2809,44 +3036,70 @@ class TexturedMeshItem(GLGraphicsItem):
             "u_mvp",
             model_view_projection,
             4,
+            self._uniform_locations,
         )
         _set_matrix_uniform(
             self._shader_program,
             "u_model_view",
             model_view,
             4,
+            self._uniform_locations,
         )
         _set_matrix_uniform(
             self._shader_program,
             "u_normal",
             normal_matrix,
             3,
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
             "u_ambient_light",
             self._ambient_light_intensity,
+            self._uniform_locations,
         )
         point_light_position_view = self._get_point_light_position_in_view()
         _set_float_uniform(
             self._shader_program,
             "u_point_light_enabled",
             float(self._point_light_world_position is not None),
+            self._uniform_locations,
         )
         _set_vector3_uniform(
             self._shader_program,
             "u_point_light_position_view",
             point_light_position_view,
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
             "u_opacity",
             self._opacity,
+            self._uniform_locations,
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_material_alpha_mode",
+            _gltf_alpha_mode_uniform(self._material_alpha_mode),
+            self._uniform_locations,
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_alpha_cutoff",
+            self._alpha_cutoff,
+            self._uniform_locations,
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_base_color_alpha",
+            self._base_color_alpha,
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
             "u_color_balance_enabled",
             float(not self._color_balance_preview_settings.is_neutral),
+            self._uniform_locations,
         )
         _set_vector3_uniform(
             self._shader_program,
@@ -2854,6 +3107,7 @@ class TexturedMeshItem(GLGraphicsItem):
             _color_balance_adjustment_uniform(
                 self._color_balance_preview_settings.shadows
             ),
+            self._uniform_locations,
         )
         _set_vector3_uniform(
             self._shader_program,
@@ -2861,6 +3115,7 @@ class TexturedMeshItem(GLGraphicsItem):
             _color_balance_adjustment_uniform(
                 self._color_balance_preview_settings.midtones
             ),
+            self._uniform_locations,
         )
         _set_vector3_uniform(
             self._shader_program,
@@ -2868,21 +3123,49 @@ class TexturedMeshItem(GLGraphicsItem):
             _color_balance_adjustment_uniform(
                 self._color_balance_preview_settings.highlights
             ),
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
             "u_color_balance_preserve_luminosity",
             float(self._color_balance_preview_settings.preserve_luminosity),
+            self._uniform_locations,
         )
-        _set_integer_uniform(self._shader_program, "u_texture", 0)
-        _set_integer_uniform(self._shader_program, "u_edit_mask", 1)
-        _set_integer_uniform(self._shader_program, "u_normal_texture", 2)
-        _set_integer_uniform(self._shader_program, "u_roughness_texture", 3)
-        _set_integer_uniform(self._shader_program, "u_metallic_texture", 4)
+        _set_integer_uniform(
+            self._shader_program,
+            "u_texture",
+            0,
+            self._uniform_locations,
+        )
+        _set_integer_uniform(
+            self._shader_program,
+            "u_edit_mask",
+            1,
+            self._uniform_locations,
+        )
+        _set_integer_uniform(
+            self._shader_program,
+            "u_normal_texture",
+            2,
+            self._uniform_locations,
+        )
+        _set_integer_uniform(
+            self._shader_program,
+            "u_roughness_texture",
+            3,
+            self._uniform_locations,
+        )
+        _set_integer_uniform(
+            self._shader_program,
+            "u_metallic_texture",
+            4,
+            self._uniform_locations,
+        )
         _set_float_uniform(
             self._shader_program,
             "u_edit_mask_enabled",
             float(self._edit_mask_enabled),
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
@@ -2891,6 +3174,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._pbr_maps_enabled[PBR_MAP_NORMAL]
                 and self._normal_texture_available
             ),
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
@@ -2899,6 +3183,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._pbr_maps_enabled[PBR_MAP_ROUGHNESS]
                 and self._roughness_texture_available
             ),
+            self._uniform_locations,
         )
         _set_float_uniform(
             self._shader_program,
@@ -2907,6 +3192,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._pbr_maps_enabled[PBR_MAP_METALLIC]
                 and self._metallic_texture_available
             ),
+            self._uniform_locations,
         )
 
         enabled_locations: list[int] = []
@@ -2917,6 +3203,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._position_buffer,
                 3,
                 enabled_locations,
+                self._attribute_locations,
             )
             _bind_float_attribute(
                 self._shader_program,
@@ -2924,6 +3211,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._normal_buffer,
                 3,
                 enabled_locations,
+                self._attribute_locations,
             )
             _bind_float_attribute(
                 self._shader_program,
@@ -2931,6 +3219,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._tangent_buffer,
                 3,
                 enabled_locations,
+                self._attribute_locations,
             )
             _bind_float_attribute(
                 self._shader_program,
@@ -2938,6 +3227,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._bitangent_buffer,
                 3,
                 enabled_locations,
+                self._attribute_locations,
             )
             _bind_float_attribute(
                 self._shader_program,
@@ -2945,6 +3235,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._texture_coordinate_buffer,
                 2,
                 enabled_locations,
+                self._attribute_locations,
             )
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
@@ -3007,7 +3298,12 @@ class TexturedMeshItem(GLGraphicsItem):
             try:
                 GL.glDisable(GL.GL_BLEND)
                 GL.glDepthMask(GL.GL_TRUE)
-                _set_float_uniform(self._shader_program, "u_alpha_pass", 1.0)
+                _set_float_uniform(
+                    self._shader_program,
+                    "u_alpha_pass",
+                    1.0,
+                    self._uniform_locations,
+                )
                 GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
 
                 GL.glEnable(GL.GL_BLEND)
@@ -3018,14 +3314,24 @@ class TexturedMeshItem(GLGraphicsItem):
                     GL.GL_ONE_MINUS_SRC_ALPHA,
                 )
                 GL.glDepthMask(GL.GL_FALSE)
-                _set_float_uniform(self._shader_program, "u_alpha_pass", 2.0)
+                _set_float_uniform(
+                    self._shader_program,
+                    "u_alpha_pass",
+                    2.0,
+                    self._uniform_locations,
+                )
                 GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
             finally:
                 GL.glDepthMask(GL.GL_TRUE)
                 GL.glDisable(GL.GL_BLEND)
             return
 
-        _set_float_uniform(self._shader_program, "u_alpha_pass", 0.0)
+        _set_float_uniform(
+            self._shader_program,
+            "u_alpha_pass",
+            0.0,
+            self._uniform_locations,
+        )
         if self._transparency_mode == TEXTURE_ALPHA_MODE_TRANSLUCENT:
             try:
                 GL.glDepthMask(GL.GL_FALSE)
@@ -3036,7 +3342,15 @@ class TexturedMeshItem(GLGraphicsItem):
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
 
     def _ensure_gl_resources(self) -> None:
+        current_context = QOpenGLContext.currentContext()
+        if self._resources_uploaded and current_context is not self._gl_context:
+            # Qt can replace a widget context after reparenting or surface loss.
+            # Old names are not valid in the replacement context and must not
+            # be rebound or deleted there.
+            self._reset_gl_resource_handles()
         if self._resources_uploaded:
+            if self._texture_bundle_dirty:
+                self._replace_uploaded_texture_bundle()
             self._ensure_enabled_pbr_gl_resources()
             if self._edit_mask_dirty and self._edit_mask_texture_id is not None:
                 _replace_uploaded_mask_texture(
@@ -3045,29 +3359,62 @@ class TexturedMeshItem(GLGraphicsItem):
                 )
                 self._edit_mask_dirty = False
             return
-        self._shader_program = opengl_shaders.compileProgram(
-            opengl_shaders.compileShader(
-                TEXTURED_AMBIENT_VERTEX_SHADER,
-                GL.GL_VERTEX_SHADER,
-            ),
-            opengl_shaders.compileShader(
-                TEXTURED_AMBIENT_FRAGMENT_SHADER,
-                GL.GL_FRAGMENT_SHADER,
-            ),
+        self._gl_context = current_context
+        shader_program_lease = _SHARED_GL_SHADER_PROGRAM_CACHE.acquire(
+            current_context
         )
+        if shader_program_lease is None:
+            self._shader_program = _compile_textured_mesh_shader_program()
+        else:
+            self._shared_shader_program_lease = shader_program_lease
+            self._shader_program = shader_program_lease.program_id
         self._position_buffer = _upload_array_buffer(self._vertices)
         self._normal_buffer = _upload_array_buffer(self._normals)
         self._texture_coordinate_buffer = _upload_array_buffer(
             self._texture_coordinates
         )
-        self._texture_id = _upload_texture(
+        self._texture_id = self._acquire_texture(
+            "base_color",
             self._texture_rgba,
-            repeat=self._texture_repeat,
         )
         self._edit_mask_texture_id = _upload_mask_texture(self._edit_mask)
         self._resources_uploaded = True
         self._ensure_enabled_pbr_gl_resources()
         self._edit_mask_dirty = False
+
+    def _replace_uploaded_texture_bundle(self) -> None:
+        """Swap every material map while retaining mesh and shader resources."""
+
+        texture_ids_to_delete: list[int] = []
+        for texture_slot, attribute_name in (
+            ("base_color", "_texture_id"),
+            (PBR_MAP_NORMAL, "_normal_texture_id"),
+            (PBR_MAP_ROUGHNESS, "_roughness_texture_id"),
+            (PBR_MAP_METALLIC, "_metallic_texture_id"),
+        ):
+            texture_id = getattr(self, attribute_name)
+            if texture_id is None:
+                continue
+            lease = self._shared_texture_leases.pop(texture_slot, None)
+            if lease is None:
+                texture_ids_to_delete.append(int(texture_id))
+            else:
+                released_texture_id = _SHARED_GL_TEXTURE_CACHE.release(lease)
+                if released_texture_id is not None:
+                    texture_ids_to_delete.append(released_texture_id)
+            setattr(self, attribute_name, None)
+        if texture_ids_to_delete:
+            GL.glDeleteTextures(
+                len(texture_ids_to_delete),
+                np.asarray(texture_ids_to_delete, dtype=np.uint32),
+            )
+
+        self._texture_id = self._acquire_texture(
+            "base_color",
+            self._texture_rgba,
+        )
+        self._ensure_enabled_pbr_gl_resources()
+        self._texture_bundle_dirty = False
 
     def _ensure_enabled_pbr_gl_resources(self) -> None:
         """Lazily upload optional maps while retaining instant later toggles."""
@@ -3079,28 +3426,49 @@ class TexturedMeshItem(GLGraphicsItem):
             if self._bitangent_buffer is None and self._bitangents is not None:
                 self._bitangent_buffer = _upload_array_buffer(self._bitangents)
             if self._normal_texture_id is None:
-                self._normal_texture_id = _upload_texture(
+                self._normal_texture_id = self._acquire_texture(
+                    PBR_MAP_NORMAL,
                     self._normal_texture_rgba,
-                    repeat=self._texture_repeat,
                 )
         if (
             self._pbr_maps_enabled[PBR_MAP_ROUGHNESS]
             and self._roughness_texture_available
             and self._roughness_texture_id is None
         ):
-            self._roughness_texture_id = _upload_texture(
+            self._roughness_texture_id = self._acquire_texture(
+                PBR_MAP_ROUGHNESS,
                 self._roughness_texture_rgba,
-                repeat=self._texture_repeat,
             )
         if (
             self._pbr_maps_enabled[PBR_MAP_METALLIC]
             and self._metallic_texture_available
             and self._metallic_texture_id is None
         ):
-            self._metallic_texture_id = _upload_texture(
+            self._metallic_texture_id = self._acquire_texture(
+                PBR_MAP_METALLIC,
                 self._metallic_texture_rgba,
+            )
+
+    def _acquire_texture(
+        self,
+        texture_slot: str,
+        texture_rgba: np.ndarray,
+    ) -> int:
+        """Acquire immutable pixels from the cache for the current GL context."""
+
+        context = QOpenGLContext.currentContext()
+        lease = _SHARED_GL_TEXTURE_CACHE.acquire(
+            context,
+            texture_rgba,
+            repeat=self._texture_repeat,
+        )
+        if lease is None:
+            return _upload_texture(
+                texture_rgba,
                 repeat=self._texture_repeat,
             )
+        self._shared_texture_leases[texture_slot] = lease
+        return lease.texture_id
 
 
 class _WireframeOverlayMeshItem(gl.GLMeshItem):
@@ -3113,6 +3481,11 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        edge_color = self.opts["edgeColor"]
+        if hasattr(edge_color, "getRgbF"):
+            edge_color = edge_color.getRgbF()
+        self._base_edge_color = tuple(float(value) for value in edge_color)
+        self._preview_opacity = 1.0
         if cull_back_faces:
             # GLMeshItem calls setupGLState inside paint(), so culling must be
             # part of its configured state rather than enabled beforehand.
@@ -3125,6 +3498,25 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
                 }
             )
 
+    def set_preview_opacity(
+        self,
+        opacity: float,
+        *,
+        request_update: bool = True,
+    ) -> None:
+        """Fade faces and edges without invalidating retained mesh buffers."""
+
+        normalized = _normalize_preview_opacity(opacity)
+        if normalized == self._preview_opacity:
+            return
+        self._preview_opacity = normalized
+        self.opts["edgeColor"] = (
+            *self._base_edge_color[:3],
+            self._base_edge_color[3] * normalized,
+        )
+        if request_update:
+            self.update()
+
     def parseMeshData(self):
         """Prepare edge buffers even when the first frame hides wireframe."""
 
@@ -3136,6 +3528,9 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
             self.opts["drawEdges"] = draw_edges
 
     def paint(self) -> None:
+        shader = self.shader()
+        if shader.name == AMBIENT_LIT_SHADER_NAME:
+            shader.setUniformData("u_opacity", [self._preview_opacity])
         if not self.opts["drawEdges"]:
             super().paint()
             return
@@ -3981,6 +4376,18 @@ class GlbViewerWidget(QWidget):
         self._orbiting_point_light_marker_item: gl.GLMeshItem | None = None
         self._orbiting_point_light_marker_radius: float | None = None
         self._texture_color_balance_preview_settings = TextureColorBalanceSettings()
+        self._progressive_texture_scene_revision = 0
+        self._progressive_texture_request_revision = 0
+        self._progressive_texture_requests: dict[str, int] = {}
+        self._progressive_primary_texture_bundle: TexturePreviewBundle | None = None
+        self._progressive_surface_texture_bundles: dict[
+            str,
+            TexturePreviewBundle,
+        ] = {}
+        self._progressive_object_texture_bundles: dict[
+            str,
+            TexturePreviewBundle,
+        ] = {}
         self._placed_object_color_balance_preview_object_id: str | None = None
         self._placed_object_color_balance_preview_settings = (
             TextureColorBalanceSettings()
@@ -4253,6 +4660,18 @@ class GlbViewerWidget(QWidget):
             str,
             _ArchitecturalTrimHoverCandidate,
         ] = {}
+        self._architectural_trim_passive_hover_position: QPointF | None = None
+        self._architectural_trim_passive_hover_timer = QTimer(self)
+        self._architectural_trim_passive_hover_timer.setSingleShot(True)
+        self._architectural_trim_passive_hover_timer.setTimerType(
+            Qt.TimerType.PreciseTimer
+        )
+        self._architectural_trim_passive_hover_timer.setInterval(
+            ARCHITECTURAL_TRIM_PASSIVE_HOVER_INTERVAL_MILLISECONDS
+        )
+        self._architectural_trim_passive_hover_timer.timeout.connect(
+            self._flush_architectural_trim_passive_hover
+        )
         self._architectural_trim_pointer_pressed = False
         self._architectural_trim_preview_items: list[gl.GLMeshItem] = []
         self._architectural_trim_edit_targets: dict[
@@ -4309,14 +4728,14 @@ class GlbViewerWidget(QWidget):
             SYMMETRIC_PREVIEW_UPDATE_INTERVAL_MILLISECONDS
         )
         self._symmetric_preview_timer.timeout.connect(
-            self._advance_symmetric_preview_fade
+            self._tick_symmetric_preview_animation
         )
         self._canvas_stair_preview_timer = QTimer(self)
         self._canvas_stair_preview_timer.setInterval(
             CANVAS_STAIR_PREVIEW_UPDATE_INTERVAL_MILLISECONDS
         )
         self._canvas_stair_preview_timer.timeout.connect(
-            self._advance_canvas_stair_preview_fade
+            self._tick_canvas_stair_preview_animation
         )
         self._orbiting_point_light_timer = QTimer(self)
         self._orbiting_point_light_timer.setTimerType(
@@ -4326,9 +4745,17 @@ class GlbViewerWidget(QWidget):
             ORBITING_POINT_LIGHT_UPDATE_INTERVAL_MILLISECONDS
         )
         self._orbiting_point_light_timer.timeout.connect(
-            self._advance_orbiting_point_light
+            self._tick_orbiting_point_light_animation
         )
         self._ambient_shader = _build_ambient_shader(self._ambient_light_intensity)
+        application = QApplication.instance()
+        if application is not None:
+            application.focusChanged.connect(
+                self._handle_application_focus_changed
+            )
+            application.applicationStateChanged.connect(
+                self._handle_application_state_changed
+            )
 
         self._build_ui()
         self._connect_tour_input()
@@ -5298,8 +5725,47 @@ class GlbViewerWidget(QWidget):
         widget.hide()
         self.architectural_trim_hover_action_widget = widget
 
-    def showEvent(self, event) -> None:  # type: ignore[override]
-        super().showEvent(event)
+    # ### Continuous preview animation lifecycle ###
+    def _continuous_preview_animation_allowed(self) -> bool:
+        """Return whether this viewer can currently present animation frames."""
+
+        if not self.isVisible():
+            return False
+        window = self.window()
+        if window.isMinimized():
+            return False
+        application = QApplication.instance()
+        if (
+            application is not None
+            and application.platformName().casefold()
+            not in HEADLESS_QT_PLATFORM_NAMES
+            and application.applicationState()
+            != Qt.ApplicationState.ApplicationActive
+        ):
+            return False
+        active_window = QApplication.activeWindow()
+        return active_window is None or active_window is window
+
+    @Slot(object, object)
+    def _handle_application_focus_changed(self, _old, _new) -> None:
+        """Pause background viewers and resume the newly active viewer."""
+
+        QTimer.singleShot(0, self._sync_continuous_preview_animation_timers)
+
+    @Slot(object)
+    def _handle_application_state_changed(self, _state) -> None:
+        """Synchronize animations after application activation changes."""
+
+        QTimer.singleShot(0, self._sync_continuous_preview_animation_timers)
+
+    def _sync_continuous_preview_animation_timers(self) -> None:
+        """Run continuous effects only while their viewer can display them."""
+
+        if not self._continuous_preview_animation_allowed():
+            self._symmetric_preview_timer.stop()
+            self._canvas_stair_preview_timer.stop()
+            self._orbiting_point_light_timer.stop()
+            return
         if (
             self._symmetric_preview_fade_enabled
             and self._get_fading_symmetric_preview_groups()
@@ -5308,6 +5774,34 @@ class GlbViewerWidget(QWidget):
         if self._canvas_stair_preview_groups:
             self._canvas_stair_preview_timer.start()
         self._sync_orbiting_point_light()
+
+    def _tick_symmetric_preview_animation(self) -> None:
+        """Advance symmetric fading only while its viewer is active."""
+
+        if not self._continuous_preview_animation_allowed():
+            self._symmetric_preview_timer.stop()
+            return
+        self._advance_symmetric_preview_fade()
+
+    def _tick_canvas_stair_preview_animation(self) -> None:
+        """Advance stair fading only while its viewer is active."""
+
+        if not self._continuous_preview_animation_allowed():
+            self._canvas_stair_preview_timer.stop()
+            return
+        self._advance_canvas_stair_preview_fade()
+
+    def _tick_orbiting_point_light_animation(self) -> None:
+        """Advance PBR lighting only while its viewer is active."""
+
+        if not self._continuous_preview_animation_allowed():
+            self._orbiting_point_light_timer.stop()
+            return
+        self._advance_orbiting_point_light()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._sync_continuous_preview_animation_timers()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._symmetric_preview_timer.stop()
@@ -5545,14 +6039,32 @@ class GlbViewerWidget(QWidget):
         object_levels_changed = (
             normalized_object_levels != self._placed_object_level_indices
         )
+        object_visibility_changed = any(
+            self._canvas_level_membership_is_visible(
+                self._placed_object_level_indices.get(object_id),
+                previous_level_indices,
+                self._visible_canvas_level_indices,
+            )
+            != self._canvas_level_membership_is_visible(
+                normalized_object_levels.get(object_id),
+                next_level_indices,
+                next_visible_indices,
+            )
+            for object_id in (
+                self._placed_object_level_indices.keys()
+                | normalized_object_levels.keys()
+            )
+        )
         self._canvas_scene_levels = next_levels
         self._canvas_scene_level_indices = frozenset(next_level_indices)
         self._visible_canvas_level_indices = next_visible_indices
         self._placed_object_level_indices = normalized_object_levels
-        self._rebuild_canvas_scene_level_mesh_cache()
-        self._sync_canvas_level_visibility_list()
-        if not visibility_filter_changed and not object_levels_changed:
-            return levels_changed or visibility_changed
+        if levels_changed:
+            self._rebuild_canvas_scene_level_mesh_cache()
+        if levels_changed or visibility_changed:
+            self._sync_canvas_level_visibility_list()
+        if not visibility_filter_changed and not object_visibility_changed:
+            return levels_changed or visibility_changed or object_levels_changed
         self._apply_canvas_scene_visibility_change()
         return True
 
@@ -5801,11 +6313,25 @@ class GlbViewerWidget(QWidget):
         )
 
     def _canvas_level_is_visible(self, level_index: int | None) -> bool:
-        if level_index is None or not self._canvas_scene_level_indices:
+        return self._canvas_level_membership_is_visible(
+            level_index,
+            self._canvas_scene_level_indices,
+            self._visible_canvas_level_indices,
+        )
+
+    @staticmethod
+    def _canvas_level_membership_is_visible(
+        level_index: int | None,
+        known_level_indices: set[int] | frozenset[int],
+        visible_level_indices: set[int] | frozenset[int],
+    ) -> bool:
+        """Evaluate one level assignment without mutating viewer state."""
+
+        if level_index is None or not known_level_indices:
             return True
         return bool(
-            level_index not in self._canvas_scene_level_indices
-            or level_index in self._visible_canvas_level_indices
+            level_index not in known_level_indices
+            or level_index in visible_level_indices
         )
 
     def _rebuild_canvas_scene_level_mesh_cache(self) -> None:
@@ -7678,7 +8204,7 @@ class GlbViewerWidget(QWidget):
                     or not np.all(np.isfinite(vertices))
                 ):
                     continue
-                item = gl.GLMeshItem(
+                item = _WireframeOverlayMeshItem(
                     vertexes=vertices,
                     faces=faces,
                     color=color,
@@ -8413,12 +8939,37 @@ class GlbViewerWidget(QWidget):
         )
         return changed
 
+    def _schedule_architectural_trim_passive_hover(
+        self,
+        position: QPointF,
+    ) -> bool:
+        """Retain the latest passive pointer and resolve it at a bounded rate."""
+
+        if not self._architectural_trim_passive_hover_is_available():
+            return self._clear_architectural_trim_passive_hover()
+        self._architectural_trim_passive_hover_position = QPointF(position)
+        if not self._architectural_trim_passive_hover_timer.isActive():
+            self._architectural_trim_passive_hover_timer.start()
+        return False
+
+    def _flush_architectural_trim_passive_hover(self) -> bool:
+        """Resolve the newest queued pointer once, including a burst's final move."""
+
+        self._architectural_trim_passive_hover_timer.stop()
+        position = self._architectural_trim_passive_hover_position
+        self._architectural_trim_passive_hover_position = None
+        if position is None:
+            return False
+        return self._update_architectural_trim_passive_hover(position)
+
     def _update_architectural_trim_passive_hover(
         self,
         position: QPointF,
     ) -> bool:
         """Expose applicable insertion actions before a persistent mode is armed."""
 
+        self._architectural_trim_passive_hover_timer.stop()
+        self._architectural_trim_passive_hover_position = None
         if not self._architectural_trim_passive_hover_is_available():
             return self._clear_architectural_trim_passive_hover()
         camera_ray = self.view.build_camera_ray(position)
@@ -8515,6 +9066,8 @@ class GlbViewerWidget(QWidget):
     def _clear_architectural_trim_passive_hover(self) -> bool:
         """Remove contextual insertion actions and their shared 3D preview."""
 
+        self._architectural_trim_passive_hover_timer.stop()
+        self._architectural_trim_passive_hover_position = None
         widget = self.architectural_trim_hover_action_widget
         had_state = bool(
             self._architectural_trim_passive_hover_candidates
@@ -12793,7 +13346,7 @@ class GlbViewerWidget(QWidget):
         if self.is_architectural_trim_placement_active:
             return self._update_architectural_trim_hover(position)
         if not self.is_surface_vertex_placement_active():
-            return self._update_architectural_trim_passive_hover(position)
+            return self._schedule_architectural_trim_passive_hover(position)
         self._clear_architectural_trim_passive_hover()
         preview, _is_occluded = self._resolve_surface_vertex_pointer_preview(position)
         if preview is None:
@@ -12810,6 +13363,8 @@ class GlbViewerWidget(QWidget):
     def _handle_surface_vertex_pointer_left(self) -> None:
         """Hide only the transient hover candidate outside the viewport."""
 
+        self._architectural_trim_passive_hover_timer.stop()
+        self._architectural_trim_passive_hover_position = None
         if self.is_directional_light_placement_active:
             if not self._directional_light_placement_pointer_pressed:
                 self._directional_light_placement_hover_position = None
@@ -13812,7 +14367,7 @@ class GlbViewerWidget(QWidget):
             )
         if self._canvas_stair_preview_groups:
             self._canvas_stair_preview_phase = math.pi / 2.0
-            if self.isVisible():
+            if self._continuous_preview_animation_allowed():
                 self._canvas_stair_preview_timer.start()
         self.view.update()
 
@@ -14406,6 +14961,7 @@ class GlbViewerWidget(QWidget):
         self.view.set_first_person_movement_mode(mode)
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
+        self._invalidate_progressive_texture_updates()
         retained_trim_placement_kind = (
             self._architectural_trim_placement_kind if preserve_camera else None
         )
@@ -14454,6 +15010,7 @@ class GlbViewerWidget(QWidget):
                 self.begin_architectural_trim_placement(retained_trim_placement_kind)
 
     def clear_model(self) -> None:
+        self._invalidate_progressive_texture_updates()
         self.view.cancel_transient_pointer_interactions()
         self.cancel_tour_point_placement(notify=False)
         self._cancel_canvas_rectangle_selection()
@@ -15337,6 +15894,15 @@ class GlbViewerWidget(QWidget):
             self._symmetric_preview_faces = group.faces
             self._symmetric_preview_face_colors = group.face_colors
             mirrored_vertices = group.vertices
+        if self._progressive_primary_texture_bundle is not None:
+            for preview_group in self._explicit_symmetric_preview_groups:
+                if (
+                    preview_group.textured_item is not None
+                    and not preview_group.textured_item._is_prefab_glass
+                ):
+                    preview_group.textured_item.set_texture_bundle(
+                        self._progressive_primary_texture_bundle
+                    )
         self._start_symmetric_preview_animation()
         self._apply_render_display_options()
         if not self._last_set_model_preserved_camera:
@@ -15459,6 +16025,15 @@ class GlbViewerWidget(QWidget):
                     live_source_id,
                     [],
                 ).append(binding)
+        if self._progressive_primary_texture_bundle is not None:
+            for preview_group in self._embedded_symmetric_preview_groups:
+                if (
+                    preview_group.textured_item is not None
+                    and not preview_group.textured_item._is_prefab_glass
+                ):
+                    preview_group.textured_item.set_texture_bundle(
+                        self._progressive_primary_texture_bundle
+                    )
         if self._embedded_symmetric_preview_groups:
             self._start_symmetric_preview_animation()
 
@@ -15543,18 +16118,17 @@ class GlbViewerWidget(QWidget):
             else _get_mesh_face_colors(retained_mesh, faces)
         )
         face_colors = np.ascontiguousarray(face_colors, dtype=float)
-        faded_colors = face_colors.copy()
-        faded_colors[:, 3] *= opacity
         mesh_item = _WireframeOverlayMeshItem(
             vertexes=mirrored_vertices,
             faces=mirrored_faces,
-            faceColors=faded_colors,
+            faceColors=face_colors,
             smooth=False,
             drawFaces=True,
             drawEdges=True,
-            edgeColor=(*EDGE_COLOR[:3], opacity),
+            edgeColor=EDGE_COLOR,
             shader=self._ambient_shader,
         )
+        mesh_item.set_preview_opacity(opacity, request_update=False)
         mesh_item.setGLOptions("translucent" if actually_fades else "opaque")
         self._attach_preview_item(mesh_item, parent_item)
         return _SymmetricPreviewRenderGroup(
@@ -15611,18 +16185,17 @@ class GlbViewerWidget(QWidget):
             else _get_mesh_face_colors(mirrored_mesh, faces)
         )
         face_colors = np.ascontiguousarray(face_colors, dtype=float)
-        faded_colors = face_colors.copy()
-        faded_colors[:, 3] *= opacity
         mesh_item = _WireframeOverlayMeshItem(
             vertexes=vertices,
             faces=faces,
-            faceColors=faded_colors,
+            faceColors=face_colors,
             smooth=False,
             drawFaces=True,
             drawEdges=True,
-            edgeColor=(*EDGE_COLOR[:3], opacity),
+            edgeColor=EDGE_COLOR,
             shader=self._ambient_shader,
         )
+        mesh_item.set_preview_opacity(opacity, request_update=False)
         mesh_item.setGLOptions("translucent" if actually_fades else "opaque")
         self._attach_preview_item(mesh_item, parent_item)
         return _SymmetricPreviewRenderGroup(
@@ -15651,7 +16224,7 @@ class GlbViewerWidget(QWidget):
         if not self._get_fading_symmetric_preview_groups():
             self._symmetric_preview_timer.stop()
             return
-        if self.isVisible():
+        if self._continuous_preview_animation_allowed():
             self._symmetric_preview_timer.start()
 
     def _get_symmetric_preview_groups(
@@ -15694,19 +16267,14 @@ class GlbViewerWidget(QWidget):
         )
         for group in groups:
             if group.textured_item is not None:
-                group.textured_item.set_opacity(opacity)
-            faded_colors = group.face_colors.copy()
-            faded_colors[:, 3] *= opacity
-            group.mesh_item.setMeshData(
-                vertexes=group.vertices,
-                faces=group.faces,
-                faceColors=faded_colors,
-            )
-            group.mesh_item.opts["edgeColor"] = (
-                *EDGE_COLOR[:3],
+                group.textured_item.set_opacity(
+                    opacity,
+                    request_update=False,
+                )
+            group.mesh_item.set_preview_opacity(
                 opacity,
+                request_update=False,
             )
-            group.mesh_item.update()
         self.view.update()
 
     def _frame_symmetric_preview(
@@ -15856,6 +16424,141 @@ class GlbViewerWidget(QWidget):
 
         return dict(self._pbr_maps_enabled)
 
+    # ### Progressive texture API ###
+    def begin_progressive_texture_update(
+        self,
+        request_key: str,
+        *,
+        surface_ids: Sequence[str] = (),
+        placed_object_ids: Sequence[str] = (),
+        include_primary_model: bool = False,
+    ) -> ProgressiveTextureUpdateToken:
+        """Reserve the latest background texture request for selected targets."""
+
+        normalized_key = str(request_key).strip()
+        if not normalized_key:
+            raise ValueError("Progressive texture requests require a key.")
+        normalized_surface_ids = frozenset(
+            surface_id
+            for raw_surface_id in surface_ids
+            if (surface_id := str(raw_surface_id).strip())
+        )
+        normalized_object_ids = frozenset(
+            object_id
+            for raw_object_id in placed_object_ids
+            if (object_id := str(raw_object_id).strip())
+        )
+        if (
+            not normalized_surface_ids
+            and not normalized_object_ids
+            and not include_primary_model
+        ):
+            raise ValueError(
+                "Progressive texture requests require at least one target."
+            )
+        if self.model is None:
+            raise RuntimeError("A model must be visible before upgrading textures.")
+
+        self._progressive_texture_request_revision += 1
+        request_revision = self._progressive_texture_request_revision
+        self._progressive_texture_requests[normalized_key] = request_revision
+        return ProgressiveTextureUpdateToken(
+            request_key=normalized_key,
+            scene_revision=self._progressive_texture_scene_revision,
+            request_revision=request_revision,
+            surface_ids=normalized_surface_ids,
+            placed_object_ids=normalized_object_ids,
+            include_primary_model=bool(include_primary_model),
+        )
+
+    def is_progressive_texture_update_current(
+        self,
+        token: ProgressiveTextureUpdateToken,
+    ) -> bool:
+        """Return whether one worker result still belongs to the visible scene."""
+
+        return bool(
+            isinstance(token, ProgressiveTextureUpdateToken)
+            and token.scene_revision == self._progressive_texture_scene_revision
+            and self._progressive_texture_requests.get(token.request_key)
+            == token.request_revision
+        )
+
+    def cancel_progressive_texture_update(self, request_key: str) -> bool:
+        """Invalidate one pending decode without disturbing any visible texture."""
+
+        normalized_key = str(request_key).strip()
+        if not normalized_key:
+            return False
+        return self._progressive_texture_requests.pop(normalized_key, None) is not None
+
+    def apply_progressive_texture_update(
+        self,
+        token: ProgressiveTextureUpdateToken,
+        bundle: TexturePreviewBundle,
+    ) -> int:
+        """Atomically queue a current bundle on matching retained draw items.
+
+        The method must be called on the viewer's Qt thread after background
+        decoding. It returns the number of retained items whose pixels changed;
+        stale tokens are ignored and return zero.
+        """
+
+        if not isinstance(bundle, TexturePreviewBundle):
+            raise TypeError("Texture upgrades require a TexturePreviewBundle.")
+        if not self.is_progressive_texture_update_current(token):
+            return 0
+        self._progressive_texture_requests.pop(token.request_key, None)
+
+        if token.include_primary_model:
+            self._progressive_primary_texture_bundle = bundle
+        for surface_id in token.surface_ids:
+            self._progressive_surface_texture_bundles[surface_id] = bundle
+        for object_id in token.placed_object_ids:
+            self._progressive_object_texture_bundles[object_id] = bundle
+
+        candidates: list[TexturedMeshItem | None] = []
+        if token.include_primary_model:
+            candidates.extend((self.textured_mesh_item, *self.model_material_items))
+            candidates.extend(
+                group.textured_item
+                for group in (
+                    *self._explicit_symmetric_preview_groups,
+                    *self._embedded_symmetric_preview_groups,
+                )
+            )
+        for item, surface_id in self._textured_surface_item_ids.items():
+            if surface_id in token.surface_ids:
+                candidates.append(item)
+        for object_id in token.placed_object_ids:
+            candidates.extend(
+                self._iter_placed_object_textured_mesh_items(object_id)
+            )
+
+        changed_count = 0
+        seen_item_ids: set[int] = set()
+        for item in candidates:
+            if (
+                item is None
+                or item._is_prefab_glass
+                or id(item) in seen_item_ids
+            ):
+                continue
+            seen_item_ids.add(id(item))
+            changed_count += int(item.set_texture_bundle(bundle))
+        if changed_count and hasattr(self, "view"):
+            self.view.update()
+        return changed_count
+
+    def _invalidate_progressive_texture_updates(self) -> None:
+        """Reject all results captured for an older model hierarchy."""
+
+        self._progressive_texture_scene_revision += 1
+        self._progressive_texture_requests.clear()
+        self._progressive_primary_texture_bundle = None
+        self._progressive_surface_texture_bundles.clear()
+        self._progressive_object_texture_bundles.clear()
+
     # ### PBR preview lighting API ###
     def is_orbiting_point_light_enabled(self) -> bool:
         """Return whether this viewer currently requests its PBR point light."""
@@ -15895,7 +16598,7 @@ class GlbViewerWidget(QWidget):
                 self._orbiting_point_light_position,
                 textured_items,
             )
-        if self.isVisible():
+        if self._continuous_preview_animation_allowed():
             self._orbiting_point_light_timer.start()
         else:
             self._orbiting_point_light_timer.stop()
@@ -15906,7 +16609,6 @@ class GlbViewerWidget(QWidget):
         if (
             not self._orbiting_point_light_enabled
             or self.model is None
-            or not self.isVisible()
         ):
             self._sync_orbiting_point_light()
             return
@@ -15987,9 +16689,14 @@ class GlbViewerWidget(QWidget):
             else tuple(textured_items)
         )
         for textured_item in targets:
-            textured_item.set_point_light_world_position(normalized)
-        self._move_orbiting_point_light_marker(normalized)
-        if hasattr(self, "view"):
+            textured_item.set_point_light_world_position(
+                normalized,
+                request_update=False,
+            )
+        marker_requested_update = self._move_orbiting_point_light_marker(
+            normalized
+        )
+        if hasattr(self, "view") and not marker_requested_update:
             self.view.update()
 
     def _ensure_orbiting_point_light_marker(self) -> None:
@@ -16043,15 +16750,17 @@ class GlbViewerWidget(QWidget):
     def _move_orbiting_point_light_marker(
         self,
         position: Sequence[float] | None,
-    ) -> None:
+    ) -> bool:
         """Move the retained marker without rebuilding its sphere geometry."""
 
         marker = self._orbiting_point_light_marker_item
         normalized = _normalize_optional_world_position(position)
         if marker is None or normalized is None:
-            return
-        marker.resetTransform()
-        marker.translate(*normalized)
+            return False
+        transform = Transform3D()
+        transform.translate(*normalized)
+        marker.setTransform(transform)
+        return True
 
     def _remove_orbiting_point_light_marker(self) -> None:
         """Remove the marker independently from the actual shader light."""
@@ -16580,6 +17289,13 @@ class GlbViewerWidget(QWidget):
                         self._orbiting_point_light_position
                     ),
                 )
+                if (
+                    self._progressive_primary_texture_bundle is not None
+                    and not self.textured_mesh_item._is_prefab_glass
+                ):
+                    self.textured_mesh_item.set_texture_bundle(
+                        self._progressive_primary_texture_bundle
+                    )
                 self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
                 self.view.addItem(self.textured_mesh_item)
 
@@ -16596,6 +17312,13 @@ class GlbViewerWidget(QWidget):
                         self._orbiting_point_light_position
                     ),
                 )
+                if (
+                    self._progressive_primary_texture_bundle is not None
+                    and not material_item._is_prefab_glass
+                ):
+                    material_item.set_texture_bundle(
+                        self._progressive_primary_texture_bundle
+                    )
                 if not material_texture_data.is_prefab_glass:
                     material_item.set_edit_mask(self._texture_edit_mask)
                 self.view.addItem(material_item)
@@ -16842,6 +17565,11 @@ class GlbViewerWidget(QWidget):
                 pbr_maps_enabled=self._pbr_maps_enabled,
                 point_light_world_position=self._orbiting_point_light_position,
             )
+            progressive_bundle = self._progressive_surface_texture_bundles.get(
+                textured_surface.surface_id
+            )
+            if progressive_bundle is not None:
+                texture_item.set_texture_bundle(progressive_bundle)
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)
             self._textured_surface_item_ids[texture_item] = textured_surface.surface_id
@@ -16884,6 +17612,22 @@ class GlbViewerWidget(QWidget):
                 )
                 is not None
             ]
+            progressive_bundle = self._progressive_object_texture_bundles.get(
+                preview.object_id
+            )
+            if progressive_bundle is not None:
+                for item in (
+                    *(
+                        part.textured_item
+                        for part in retained_parts
+                    ),
+                    *(
+                        group.textured_item
+                        for group in symmetric_groups
+                    ),
+                ):
+                    if item is not None and not item._is_prefab_glass:
+                        item.set_texture_bundle(progressive_bundle)
             pick_meshes = (*preview.meshes, *mirrored_meshes)
             bounds = _get_combined_mesh_bounds(pick_meshes)
             if not retained_parts or bounds is None:
@@ -24899,6 +25643,28 @@ def _get_mesh_face_colors(
 
 
 # ### Texture helpers ###
+_TEXTURE_CACHE_LOCK = threading.RLock()
+_DECODED_TEXTURE_RGBA_CACHE: weakref.WeakValueDictionary[
+    tuple[object, ...],
+    np.ndarray,
+] = weakref.WeakValueDictionary()
+_INTERNED_TEXTURE_RGBA_CACHE: weakref.WeakValueDictionary[
+    tuple[int, int, bytes],
+    np.ndarray,
+] = weakref.WeakValueDictionary()
+_TEXTURE_RGBA_CONTENT_KEYS_BY_ARRAY_ID: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[np.ndarray],
+        tuple[int, int, bytes],
+    ],
+] = {}
+_RESIZED_TEXTURE_RGBA_CACHE: weakref.WeakValueDictionary[
+    tuple[object, ...],
+    np.ndarray,
+] = weakref.WeakValueDictionary()
+
+
 def _mirror_preview_vertices(
     vertices: np.ndarray,
     orientation: str,
@@ -24948,6 +25714,10 @@ def _mirror_texture_mesh_data(
         metallic_texture_rgba=texture_mesh_data.metallic_texture_rgba,
         double_sided=texture_mesh_data.double_sided,
         is_prefab_glass=texture_mesh_data.is_prefab_glass,
+        uses_texture_alpha=texture_mesh_data.uses_texture_alpha,
+        alpha_mode=texture_mesh_data.alpha_mode,
+        alpha_cutoff=texture_mesh_data.alpha_cutoff,
+        base_color_alpha=texture_mesh_data.base_color_alpha,
     )
 
 
@@ -25033,13 +25803,17 @@ def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
         return None
 
     face_vertex_indices = faces.reshape(-1)
+    alpha_mode, alpha_cutoff, base_color_alpha = _resolve_material_alpha_settings(
+        material_leaves,
+        force_blend=prefab_glass_material is not None,
+    )
     return TextureMeshData(
         vertices=np.ascontiguousarray(vertices[face_vertex_indices]),
         normals=np.ascontiguousarray(np.repeat(face_normals, 3, axis=0)),
         texture_coordinates=np.ascontiguousarray(
             texture_coordinates[face_vertex_indices]
         ),
-        texture_rgba=_limit_texture_preview_size(texture_rgba),
+        texture_rgba=_prepare_texture_preview_rgba(texture_rgba),
         normal_texture_rgba=_limit_optional_texture_preview_size(normal_texture_rgba),
         roughness_texture_rgba=_limit_optional_texture_preview_size(
             roughness_texture_rgba
@@ -25053,7 +25827,86 @@ def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
             else True
         ),
         is_prefab_glass=prefab_glass_material is not None,
+        uses_texture_alpha=alpha_mode != GLTF_ALPHA_MODE_OPAQUE,
+        alpha_mode=alpha_mode,
+        alpha_cutoff=alpha_cutoff,
+        base_color_alpha=base_color_alpha,
     )
+
+
+def _resolve_material_alpha_settings(
+    materials: Sequence[object],
+    *,
+    force_blend: bool,
+) -> tuple[str, float, float]:
+    """Resolve one conservative glTF alpha policy for combined material leaves."""
+
+    modes = tuple(
+        _normalize_gltf_alpha_mode(getattr(material, "alphaMode", None))
+        for material in materials
+    )
+    if force_blend or GLTF_ALPHA_MODE_BLEND in modes:
+        alpha_mode = GLTF_ALPHA_MODE_BLEND
+    elif GLTF_ALPHA_MODE_MASK in modes:
+        alpha_mode = GLTF_ALPHA_MODE_MASK
+    else:
+        alpha_mode = GLTF_ALPHA_MODE_OPAQUE
+
+    mask_cutoffs = tuple(
+        _normalize_material_scalar_factor(
+            getattr(material, "alphaCutoff", None),
+            default=DEFAULT_GLTF_ALPHA_CUTOFF,
+        )
+        for material, mode in zip(materials, modes)
+        if mode == GLTF_ALPHA_MODE_MASK
+    )
+    alpha_cutoff = (
+        min(mask_cutoffs) if mask_cutoffs else DEFAULT_GLTF_ALPHA_CUTOFF
+    )
+    base_color_alphas = tuple(
+        _material_base_color_alpha(material) for material in materials
+    )
+    base_color_alpha = min(base_color_alphas) if base_color_alphas else 1.0
+    return alpha_mode, alpha_cutoff, base_color_alpha
+
+
+def _normalize_gltf_alpha_mode(raw_mode: object) -> str:
+    """Normalize trimesh/glTF alpha modes to the supported vocabulary."""
+
+    normalized = str(raw_mode or GLTF_ALPHA_MODE_OPAQUE).strip().upper()
+    if normalized in {
+        GLTF_ALPHA_MODE_BLEND,
+        GLTF_ALPHA_MODE_MASK,
+        GLTF_ALPHA_MODE_OPAQUE,
+    }:
+        return normalized
+    return GLTF_ALPHA_MODE_OPAQUE
+
+
+def _gltf_alpha_mode_uniform(alpha_mode: str) -> float:
+    """Encode one normalized material alpha mode for the preview shader."""
+
+    if alpha_mode == GLTF_ALPHA_MODE_MASK:
+        return 1.0
+    if alpha_mode == GLTF_ALPHA_MODE_BLEND:
+        return 2.0
+    return 0.0
+
+
+def _material_base_color_alpha(material: object) -> float:
+    """Read the base-color factor alpha independently from texture alpha."""
+
+    raw_factor = getattr(material, "baseColorFactor", None)
+    try:
+        factor = np.asarray(raw_factor, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return 1.0
+    if factor.shape != (4,) or not np.all(np.isfinite(factor)):
+        return 1.0
+    alpha = float(factor[3])
+    if float(np.max(np.abs(factor))) > 1.0:
+        alpha /= 255.0
+    return min(1.0, max(0.0, alpha))
 
 
 def _build_prefab_glass_preview_textures(
@@ -25213,6 +26066,13 @@ def _build_model_material_preview_meshes(
 def _decode_texture_rgba(texture: object) -> np.ndarray | None:
     """Decode PIL images, pixel arrays, and encoded byte arrays as RGBA."""
 
+    source_key = _decoded_texture_source_key(texture)
+    if source_key is not None:
+        with _TEXTURE_CACHE_LOCK:
+            cached = _DECODED_TEXTURE_RGBA_CACHE.get(source_key)
+        if cached is not None:
+            return cached
+
     try:
         if hasattr(texture, "convert"):
             rgba = np.asarray(texture.convert("RGBA"), dtype=np.uint8)
@@ -25235,7 +26095,261 @@ def _decode_texture_rgba(texture: object) -> np.ndarray | None:
         rgba = np.concatenate((rgba, alpha), axis=2)
     if rgba.shape[0] <= 0 or rgba.shape[1] <= 0:
         return None
-    return np.ascontiguousarray(rgba, dtype=np.uint8)
+    decoded = _intern_texture_rgba(
+        rgba,
+        content_key=_decoded_rgba_content_key_from_source_key(source_key),
+    )
+    if source_key is not None:
+        with _TEXTURE_CACHE_LOCK:
+            _DECODED_TEXTURE_RGBA_CACHE[source_key] = decoded
+    return decoded
+
+
+def _decoded_texture_source_key(texture: object) -> tuple[object, ...] | None:
+    """Fingerprint source pixels before conversion when that is unambiguous."""
+
+    try:
+        if isinstance(texture, Image.Image):
+            if texture.mode not in {"L", "LA", "RGB", "RGBA"}:
+                return None
+            raw_bytes = texture.tobytes()
+            transparency = texture.info.get("transparency")
+            return (
+                "pil",
+                texture.mode,
+                texture.size,
+                repr(transparency),
+                hashlib.sha256(raw_bytes).digest(),
+            )
+
+        raw_texture = np.asarray(texture)
+        if raw_texture.ndim < 1 or raw_texture.dtype.hasobject:
+            return None
+        contiguous = np.ascontiguousarray(raw_texture)
+        return (
+            "array",
+            contiguous.dtype.str,
+            contiguous.shape,
+            hashlib.sha256(memoryview(contiguous).cast("B")).digest(),
+        )
+    except (
+        AttributeError,
+        BufferError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _decoded_rgba_content_key_from_source_key(
+    source_key: tuple[object, ...] | None,
+) -> tuple[int, int, bytes] | None:
+    """Reuse a source digest when its bytes already are canonical RGBA."""
+
+    if source_key is None:
+        return None
+    if source_key[0] == "pil" and source_key[1] == "RGBA":
+        width, height = source_key[2]
+        return (int(height), int(width), source_key[4])
+    if (
+        source_key[0] == "array"
+        and source_key[1] == np.dtype(np.uint8).str
+        and len(source_key[2]) == 3
+        and source_key[2][2] == 4
+    ):
+        height, width, _channels = source_key[2]
+        return (int(height), int(width), source_key[3])
+    return None
+
+
+def _texture_rgba_content_key(
+    texture_rgba: np.ndarray,
+) -> tuple[int, int, bytes]:
+    """Build a collision-resistant key for immutable RGBA preview pixels."""
+
+    normalized = np.asarray(texture_rgba, dtype=np.uint8)
+    if (
+        normalized.ndim != 3
+        or normalized.shape[2] != 4
+        or normalized.shape[0] <= 0
+        or normalized.shape[1] <= 0
+    ):
+        raise ValueError("Texture previews must be non-empty RGBA images.")
+    contiguous = np.ascontiguousarray(normalized)
+    with _TEXTURE_CACHE_LOCK:
+        memoized = _TEXTURE_RGBA_CONTENT_KEYS_BY_ARRAY_ID.get(id(contiguous))
+        if memoized is not None and memoized[0]() is contiguous:
+            return memoized[1]
+    return (
+        int(contiguous.shape[0]),
+        int(contiguous.shape[1]),
+        hashlib.sha256(memoryview(contiguous).cast("B")).digest(),
+    )
+
+
+def _normalize_texture_bundle_map(
+    texture_rgba: np.ndarray,
+    *,
+    map_name: str,
+) -> np.ndarray:
+    """Own one immutable non-empty RGBA map used by background upgrades."""
+
+    normalized = np.asarray(texture_rgba, dtype=np.uint8)
+    if (
+        normalized.ndim != 3
+        or normalized.shape[2] != 4
+        or normalized.shape[0] <= 0
+        or normalized.shape[1] <= 0
+    ):
+        raise ValueError(
+            f"The progressive {map_name} texture must be a non-empty RGBA image."
+        )
+    return _intern_texture_rgba(normalized)
+
+
+def _build_texture_bundle_content_signature(
+    base_color_rgba: np.ndarray,
+    normal_rgba: np.ndarray | None,
+    roughness_rgba: np.ndarray | None,
+    metallic_rgba: np.ndarray | None,
+) -> tuple[object, ...]:
+    """Fingerprint an aligned texture family once for cheap retained updates."""
+
+    return tuple(
+        None if texture_rgba is None else _texture_rgba_content_key(texture_rgba)
+        for texture_rgba in (
+            base_color_rgba,
+            normal_rgba,
+            roughness_rgba,
+            metallic_rgba,
+        )
+    )
+
+
+def _intern_texture_rgba(
+    texture_rgba: np.ndarray,
+    *,
+    content_key: tuple[int, int, bytes] | None = None,
+) -> np.ndarray:
+    """Share one read-only decoded array while at least one preview retains it."""
+
+    normalized = np.ascontiguousarray(texture_rgba, dtype=np.uint8)
+    if (
+        content_key is None
+        or content_key[:2]
+        != (int(normalized.shape[0]), int(normalized.shape[1]))
+    ):
+        content_key = _texture_rgba_content_key(normalized)
+    with _TEXTURE_CACHE_LOCK:
+        cached = _INTERNED_TEXTURE_RGBA_CACHE.get(content_key)
+        if cached is not None:
+            return cached
+        owned = np.frombuffer(
+            normalized.tobytes(order="C"),
+            dtype=np.uint8,
+        ).reshape(normalized.shape)
+        _INTERNED_TEXTURE_RGBA_CACHE[content_key] = owned
+        _memoize_texture_rgba_content_key(owned, content_key)
+        return owned
+
+
+def _memoize_texture_rgba_content_key(
+    texture_rgba: np.ndarray,
+    content_key: tuple[int, int, bytes],
+) -> None:
+    """Memoize only arrays backed by immutable bytes, using identity safely."""
+
+    array_id = id(texture_rgba)
+
+    def remove(finalized_reference: weakref.ReferenceType[np.ndarray]) -> None:
+        with _TEXTURE_CACHE_LOCK:
+            current = _TEXTURE_RGBA_CONTENT_KEYS_BY_ARRAY_ID.get(array_id)
+            if current is not None and current[0] is finalized_reference:
+                _TEXTURE_RGBA_CONTENT_KEYS_BY_ARRAY_ID.pop(array_id, None)
+
+    reference = weakref.ref(texture_rgba, remove)
+    _TEXTURE_RGBA_CONTENT_KEYS_BY_ARRAY_ID[array_id] = (reference, content_key)
+
+
+def _prepare_texture_preview_rgba(texture_rgba: np.ndarray) -> np.ndarray:
+    """Resize and intern pixels used only by the interactive GL preview."""
+
+    return _intern_texture_rgba(_limit_texture_preview_size(texture_rgba))
+
+
+def build_texture_preview_bundle(
+    base_color_rgba: np.ndarray,
+    *,
+    normal_rgba: np.ndarray | None = None,
+    roughness_rgba: np.ndarray | None = None,
+    metallic_rgba: np.ndarray | None = None,
+    maximum_dimension: int | None = None,
+) -> TexturePreviewBundle:
+    """Build an aligned full-resolution bundle or a bounded proxy bundle."""
+
+    bundle = TexturePreviewBundle(
+        base_color_rgba=base_color_rgba,
+        normal_rgba=normal_rgba,
+        roughness_rgba=roughness_rgba,
+        metallic_rgba=metallic_rgba,
+    )
+    if maximum_dimension is None:
+        return bundle
+    if isinstance(maximum_dimension, bool) or not isinstance(
+        maximum_dimension,
+        (int, np.integer),
+    ):
+        raise TypeError("Texture preview dimensions must be positive integers.")
+    normalized_dimension = int(maximum_dimension)
+    if normalized_dimension <= 0:
+        raise ValueError("Texture preview dimensions must be positive integers.")
+    return TexturePreviewBundle(
+        base_color_rgba=_resize_texture_preview_map(
+            bundle.base_color_rgba,
+            normalized_dimension,
+        ),
+        normal_rgba=(
+            None
+            if bundle.normal_rgba is None
+            else _resize_texture_preview_map(bundle.normal_rgba, normalized_dimension)
+        ),
+        roughness_rgba=(
+            None
+            if bundle.roughness_rgba is None
+            else _resize_texture_preview_map(
+                bundle.roughness_rgba,
+                normalized_dimension,
+            )
+        ),
+        metallic_rgba=(
+            None
+            if bundle.metallic_rgba is None
+            else _resize_texture_preview_map(
+                bundle.metallic_rgba,
+                normalized_dimension,
+            )
+        ),
+    )
+
+
+def build_initial_texture_proxy_bundle(
+    base_color_rgba: np.ndarray,
+    *,
+    normal_rgba: np.ndarray | None = None,
+    roughness_rgba: np.ndarray | None = None,
+    metallic_rgba: np.ndarray | None = None,
+) -> TexturePreviewBundle:
+    """Build the standard 256px family displayed before full textures arrive."""
+
+    return build_texture_preview_bundle(
+        base_color_rgba,
+        normal_rgba=normal_rgba,
+        roughness_rgba=roughness_rgba,
+        metallic_rgba=metallic_rgba,
+        maximum_dimension=INITIAL_TEXTURE_PROXY_DIMENSION,
+    )
 
 
 def _extract_texture_channel_rgba(
@@ -25262,25 +26376,50 @@ def _limit_optional_texture_preview_size(
 ) -> np.ndarray | None:
     if texture_rgba is None:
         return None
-    return _limit_texture_preview_size(texture_rgba)
+    return _prepare_texture_preview_rgba(texture_rgba)
 
 
 def _limit_texture_preview_size(texture_rgba: np.ndarray) -> np.ndarray:
+    return _resize_texture_preview_map(
+        texture_rgba,
+        MAX_TEXTURE_PREVIEW_DIMENSION,
+    )
+
+
+def _resize_texture_preview_map(
+    texture_rgba: np.ndarray,
+    maximum_dimension: int,
+) -> np.ndarray:
+    """Resize one RGBA map to fit a square bound while preserving its ratio."""
+
     height, width = texture_rgba.shape[:2]
     largest_dimension = max(height, width)
-    if largest_dimension <= MAX_TEXTURE_PREVIEW_DIMENSION:
+    if largest_dimension <= maximum_dimension:
         return texture_rgba
 
-    scale = MAX_TEXTURE_PREVIEW_DIMENSION / float(largest_dimension)
+    scale = maximum_dimension / float(largest_dimension)
     resized_size = (
-        max(1, int(round(width * scale))),
-        max(1, int(round(height * scale))),
+        max(1, round(width * scale)),
+        max(1, round(height * scale)),
     )
+    resize_key = (
+        *_texture_rgba_content_key(texture_rgba),
+        resized_size,
+    )
+    with _TEXTURE_CACHE_LOCK:
+        cached = _RESIZED_TEXTURE_RGBA_CACHE.get(resize_key)
+    if cached is not None:
+        return cached
     resized = Image.fromarray(texture_rgba, mode="RGBA").resize(
         resized_size,
         Image.Resampling.LANCZOS,
     )
-    return np.ascontiguousarray(np.asarray(resized, dtype=np.uint8))
+    normalized = _intern_texture_rgba(
+        np.ascontiguousarray(np.asarray(resized, dtype=np.uint8))
+    )
+    with _TEXTURE_CACHE_LOCK:
+        _RESIZED_TEXTURE_RGBA_CACHE[resize_key] = normalized
+    return normalized
 
 
 def _normalize_optional_texture_rgba(
@@ -25466,7 +26605,7 @@ def _build_orthogonal_tangents(normals: np.ndarray) -> np.ndarray:
 def _build_ambient_shader(ambient_light_intensity: float):
     """Create an isolated shader so settings do not leak between viewers."""
 
-    shader_name = "housemaker_ambient_lit"
+    shader_name = AMBIENT_LIT_SHADER_NAME
     shader = gl_shaders.ShaderProgram(
         shader_name,
         [
@@ -25476,7 +26615,8 @@ def _build_ambient_shader(ambient_light_intensity: float):
         uniforms={
             "u_ambient_light": [
                 _normalize_ambient_light_intensity(ambient_light_intensity)
-            ]
+            ],
+            "u_opacity": [1.0],
         },
     )
     gl_shaders.ShaderProgram.names.pop(shader_name, None)
@@ -25514,6 +26654,228 @@ def _normalize_preview_opacity(opacity: float) -> float:
 
 
 # ### OpenGL helpers ###
+@dataclass
+class _SharedGlShaderProgramEntry:
+    """One shader program retained by items in exactly one GL context."""
+
+    context_reference: weakref.ReferenceType[object]
+    program_id: int
+    reference_count: int = 1
+
+
+@dataclass(frozen=True)
+class _SharedGlShaderProgramLease:
+    """One item's reference to a context-local shader program."""
+
+    context: object
+    program_id: int
+
+
+class _SharedGlShaderProgramCache:
+    """Reference-count the textured-mesh program by exact context identity."""
+
+    def __init__(self) -> None:
+        self._entries_by_context_id: dict[int, _SharedGlShaderProgramEntry] = {}
+        self._lock = threading.RLock()
+
+    def acquire(
+        self,
+        context: object | None,
+    ) -> _SharedGlShaderProgramLease | None:
+        """Return a shared program lease only for the exact current context."""
+
+        if context is None or QOpenGLContext.currentContext() is not context:
+            return None
+        context_id = id(context)
+        with self._lock:
+            entry = self._entries_by_context_id.get(context_id)
+            if entry is not None and entry.context_reference() is context:
+                entry.reference_count += 1
+                return _SharedGlShaderProgramLease(
+                    context=context,
+                    program_id=entry.program_id,
+                )
+            if entry is not None:
+                self._entries_by_context_id.pop(context_id, None)
+            try:
+                context_reference = weakref.ref(
+                    context,
+                    lambda reference: self._discard_dead_context(
+                        context_id,
+                        reference,
+                    ),
+                )
+            except TypeError:
+                # A non-weak-referenceable context cannot be retained safely;
+                # the caller falls back to an item-owned program.
+                return None
+            entry = _SharedGlShaderProgramEntry(
+                context_reference=context_reference,
+                program_id=_compile_textured_mesh_shader_program(),
+            )
+            self._entries_by_context_id[context_id] = entry
+            return _SharedGlShaderProgramLease(
+                context=context,
+                program_id=entry.program_id,
+            )
+
+    def release(self, lease: _SharedGlShaderProgramLease) -> int | None:
+        """Release a lease and return the program when its last owner leaves."""
+
+        if QOpenGLContext.currentContext() is not lease.context:
+            return None
+        return self._release_reference(lease)
+
+    def discard(self, lease: _SharedGlShaderProgramLease) -> None:
+        """Drop a lease after its context has already discarded GL objects."""
+
+        self._release_reference(lease)
+
+    def _release_reference(
+        self,
+        lease: _SharedGlShaderProgramLease,
+    ) -> int | None:
+        with self._lock:
+            context_id = id(lease.context)
+            entry = self._entries_by_context_id.get(context_id)
+            if (
+                entry is None
+                or entry.context_reference() is not lease.context
+                or entry.program_id != lease.program_id
+            ):
+                return None
+            entry.reference_count -= 1
+            if entry.reference_count > 0:
+                return None
+            self._entries_by_context_id.pop(context_id, None)
+            return entry.program_id
+
+    def _discard_dead_context(
+        self,
+        context_id: int,
+        context_reference: weakref.ReferenceType[object],
+    ) -> None:
+        with self._lock:
+            entry = self._entries_by_context_id.get(context_id)
+            if entry is not None and entry.context_reference is context_reference:
+                self._entries_by_context_id.pop(context_id, None)
+
+
+_SHARED_GL_SHADER_PROGRAM_CACHE = _SharedGlShaderProgramCache()
+
+
+@dataclass
+class _SharedGlTextureEntry:
+    """One texture name retained by items in exactly one GL context."""
+
+    texture_id: int
+    reference_count: int = 1
+
+
+@dataclass(frozen=True)
+class _SharedGlTextureLease:
+    """One item's reference to a context-local immutable texture."""
+
+    context: object
+    cache_key: tuple[object, ...]
+    texture_id: int
+
+
+class _SharedGlTextureCache:
+    """Reference-count immutable texture names without crossing GL contexts."""
+
+    def __init__(self) -> None:
+        self._entries_by_context: weakref.WeakKeyDictionary[
+            object,
+            dict[tuple[object, ...], _SharedGlTextureEntry],
+        ] = weakref.WeakKeyDictionary()
+        self._lock = threading.RLock()
+
+    def acquire(
+        self,
+        context: object | None,
+        texture_rgba: np.ndarray,
+        *,
+        repeat: bool,
+    ) -> _SharedGlTextureLease | None:
+        """Return a shared texture lease only for the exact current context."""
+
+        if context is None or QOpenGLContext.currentContext() is not context:
+            return None
+        cache_key = (*_texture_rgba_content_key(texture_rgba), bool(repeat))
+        with self._lock:
+            try:
+                context_entries = self._entries_by_context.setdefault(context, {})
+            except TypeError:
+                # A non-weak-referenceable context wrapper cannot be tracked
+                # safely, so the caller falls back to an item-owned texture.
+                return None
+            entry = context_entries.get(cache_key)
+            if entry is None:
+                entry = _SharedGlTextureEntry(
+                    texture_id=_upload_texture(texture_rgba, repeat=repeat)
+                )
+                context_entries[cache_key] = entry
+            else:
+                entry.reference_count += 1
+            return _SharedGlTextureLease(
+                context=context,
+                cache_key=cache_key,
+                texture_id=entry.texture_id,
+            )
+
+    def release(self, lease: _SharedGlTextureLease) -> int | None:
+        """Release a lease and return the GL name when its last owner leaves."""
+
+        if QOpenGLContext.currentContext() is not lease.context:
+            return None
+        return self._release_reference(lease)
+
+    def discard(self, lease: _SharedGlTextureLease) -> None:
+        """Drop a lease after its context has already discarded GL objects."""
+
+        self._release_reference(lease)
+
+    def _release_reference(self, lease: _SharedGlTextureLease) -> int | None:
+        with self._lock:
+            try:
+                context_entries = self._entries_by_context.get(lease.context)
+            except TypeError:
+                return None
+            if context_entries is None:
+                return None
+            entry = context_entries.get(lease.cache_key)
+            if entry is None or entry.texture_id != lease.texture_id:
+                return None
+            entry.reference_count -= 1
+            if entry.reference_count > 0:
+                return None
+            context_entries.pop(lease.cache_key, None)
+            if not context_entries:
+                self._entries_by_context.pop(lease.context, None)
+            return entry.texture_id
+
+
+_SHARED_GL_TEXTURE_CACHE = _SharedGlTextureCache()
+
+
+def _compile_textured_mesh_shader_program() -> int:
+    """Compile the shader program shared by textured meshes in one context."""
+
+    return int(
+        opengl_shaders.compileProgram(
+            opengl_shaders.compileShader(
+                TEXTURED_AMBIENT_VERTEX_SHADER,
+                GL.GL_VERTEX_SHADER,
+            ),
+            opengl_shaders.compileShader(
+                TEXTURED_AMBIENT_FRAGMENT_SHADER,
+                GL.GL_FRAGMENT_SHADER,
+            ),
+        )
+    )
+
+
 def _upload_array_buffer(values: np.ndarray) -> int:
     buffer_id = int(GL.glGenBuffers(1))
     GL.glBindBuffer(GL.GL_ARRAY_BUFFER, buffer_id)
@@ -25611,10 +26973,16 @@ def _bind_float_attribute(
     buffer_id: int | None,
     component_count: int,
     enabled_locations: list[int],
+    location_cache: dict[str, int] | None = None,
 ) -> None:
     if buffer_id is None:
         return
-    location = int(GL.glGetAttribLocation(shader_program, name))
+    location = _get_gl_location(
+        shader_program,
+        name,
+        location_cache,
+        GL.glGetAttribLocation,
+    )
     if location < 0:
         return
     GL.glBindBuffer(GL.GL_ARRAY_BUFFER, buffer_id)
@@ -25635,8 +27003,14 @@ def _set_matrix_uniform(
     name: str,
     values: np.ndarray,
     dimension: int,
+    location_cache: dict[str, int] | None = None,
 ) -> None:
-    location = int(GL.glGetUniformLocation(shader_program, name))
+    location = _get_gl_location(
+        shader_program,
+        name,
+        location_cache,
+        GL.glGetUniformLocation,
+    )
     if location < 0:
         return
     if dimension == 4:
@@ -25645,8 +27019,18 @@ def _set_matrix_uniform(
         GL.glUniformMatrix3fv(location, 1, False, values)
 
 
-def _set_float_uniform(shader_program: int, name: str, value: float) -> None:
-    location = int(GL.glGetUniformLocation(shader_program, name))
+def _set_float_uniform(
+    shader_program: int,
+    name: str,
+    value: float,
+    location_cache: dict[str, int] | None = None,
+) -> None:
+    location = _get_gl_location(
+        shader_program,
+        name,
+        location_cache,
+        GL.glGetUniformLocation,
+    )
     if location >= 0:
         GL.glUniform1f(location, float(value))
 
@@ -25655,18 +27039,50 @@ def _set_vector3_uniform(
     shader_program: int,
     name: str,
     values: tuple[float, float, float],
+    location_cache: dict[str, int] | None = None,
 ) -> None:
     """Set one RGB-style shader vector when the program exposes it."""
 
-    location = int(GL.glGetUniformLocation(shader_program, name))
+    location = _get_gl_location(
+        shader_program,
+        name,
+        location_cache,
+        GL.glGetUniformLocation,
+    )
     if location >= 0:
         GL.glUniform3f(location, *map(float, values))
 
 
-def _set_integer_uniform(shader_program: int, name: str, value: int) -> None:
-    location = int(GL.glGetUniformLocation(shader_program, name))
+def _set_integer_uniform(
+    shader_program: int,
+    name: str,
+    value: int,
+    location_cache: dict[str, int] | None = None,
+) -> None:
+    location = _get_gl_location(
+        shader_program,
+        name,
+        location_cache,
+        GL.glGetUniformLocation,
+    )
     if location >= 0:
         GL.glUniform1i(location, int(value))
+
+
+def _get_gl_location(
+    shader_program: int,
+    name: str,
+    location_cache: dict[str, int] | None,
+    lookup,
+) -> int:
+    """Return one cached shader location for a program owned by one item."""
+
+    if location_cache is not None and name in location_cache:
+        return location_cache[name]
+    location = int(lookup(shader_program, name))
+    if location_cache is not None:
+        location_cache[name] = location
+    return location
 
 
 def _color_balance_adjustment_uniform(

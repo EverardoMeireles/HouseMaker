@@ -1259,6 +1259,7 @@ class VertexData:
     vertices: list[Vertex] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
     _next_vertex_id: int = 1
+    _revision: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.normalize_next_vertex_id()
@@ -1267,6 +1268,7 @@ class VertexData:
         self.vertices.clear()
         self.edges.clear()
         self._next_vertex_id = 1
+        self._mark_changed()
 
     def clone(self) -> "VertexData":
         return copy.deepcopy(self)
@@ -1276,6 +1278,18 @@ class VertexData:
         self.vertices = snapshot.vertices
         self.edges = snapshot.edges
         self._next_vertex_id = snapshot._next_vertex_id
+        self._mark_changed()
+
+    @property
+    def revision(self) -> int:
+        """Return an in-memory topology revision for derived-data caches."""
+
+        return self._revision
+
+    def mark_changed(self) -> None:
+        """Invalidate derived geometry after an exceptional bulk mutation."""
+
+        self._mark_changed()
 
     def normalize_next_vertex_id(self) -> None:
         """Advance a stale allocator beyond every occupied vertex ID."""
@@ -1297,6 +1311,7 @@ class VertexData:
         vertex = Vertex(id=self._next_vertex_id, x=float(x), y=float(y))
         self.vertices.append(vertex)
         self._next_vertex_id += 1
+        self._mark_changed()
         return vertex
 
     def get_vertex(self, vertex_id: int) -> Vertex | None:
@@ -1312,6 +1327,7 @@ class VertexData:
 
             moved_vertex = Vertex(id=vertex.id, x=float(x), y=float(y))
             self.vertices[index] = moved_vertex
+            self._mark_changed()
             return moved_vertex
 
         return None
@@ -1338,6 +1354,7 @@ class VertexData:
             if edge.start_vertex_id not in deleted_ids
             and edge.end_vertex_id not in deleted_ids
         ]
+        self._mark_changed()
         return True
 
     def add_edge(self, start_vertex_id: int, end_vertex_id: int) -> Edge | None:
@@ -1348,6 +1365,7 @@ class VertexData:
 
         edge = Edge(start_vertex_id=start_vertex_id, end_vertex_id=end_vertex_id)
         self.edges.append(edge)
+        self._mark_changed()
         return edge
 
     def remove_edge(self, start_vertex_id: int, end_vertex_id: int) -> bool:
@@ -1358,7 +1376,10 @@ class VertexData:
             for edge in self.edges
             if self._edge_key(edge.start_vertex_id, edge.end_vertex_id) != expected_key
         ]
-        return len(self.edges) != original_edge_count
+        changed = len(self.edges) != original_edge_count
+        if changed:
+            self._mark_changed()
+        return changed
 
     def split_edge(
         self,
@@ -1439,6 +1460,11 @@ class VertexData:
     @staticmethod
     def _edge_key(start_vertex_id: int, end_vertex_id: int) -> tuple[int, int]:
         return tuple(sorted((start_vertex_id, end_vertex_id)))
+
+    def _mark_changed(self) -> None:
+        """Advance the process-local revision without affecting persistence."""
+
+        self._revision += 1
 
 
 # ### Open-space models ###

@@ -48,9 +48,12 @@ from shiboken6 import isValid as is_valid_qt_object
 from housemaker.architectural_trim_generation import (
     ArchitecturalTrimRepeatLayout,
     fit_architectural_trim_glb_to_dimensions,
+    fit_architectural_trim_preview_model_to_dimensions,
+    load_architectural_trim_preview_model,
     prepare_architectural_trim_repeat_module,
     repeat_architectural_trim_module_glb,
     retarget_architectural_trim_repeat_module_glb,
+    retarget_architectural_trim_repeat_module_preview_model,
 )
 from housemaker.architectural_trim_uv import (
     ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_X,
@@ -100,6 +103,12 @@ from housemaker.glb import (
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     GeneratedModel,
     import_generated_glb,
+    import_generated_glb_preview,
+)
+from housemaker.local_work_scheduler import (
+    MAX_CONCURRENT_LOCAL_STAGES,
+    LocalWorkCancelled,
+    run_bounded_local_work,
 )
 from housemaker.meshy_generation import (
     MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS,
@@ -229,6 +238,7 @@ VIEW_STRETCH = 1
 CONTROL_STRETCH = 0
 INTERRUPT_POLL_SECONDS = 0.01
 SHUTDOWN_WAIT_MILLISECONDS = 250
+MAX_CONCURRENT_LOCAL_GENERATION_STAGES = MAX_CONCURRENT_LOCAL_STAGES
 GENERATION_BACKEND_MESHY = "meshy"
 GENERATION_BACKEND_EXTERNAL_GLB = EXTERNAL_GLB_GENERATION_PROVIDER
 GENERATED_OBJECT_NAME_PREFIX = "object_"
@@ -3145,7 +3155,7 @@ class GenerationWorker(QObject):
                     "(84%)"
                 )
             )
-            generated_model = _run_interruptible_stage(
+            generated_model = _run_bounded_local_generation_stage(
                 lambda: _invoke_executor(self._executor, result),
                 self._cancel_event,
             )
@@ -3170,12 +3180,15 @@ class GenerationWorker(QObject):
                         else "Saving local object assets (94%)"
                     )
                 )
-                saved_output = _prepare_and_persist_object_generation(
-                    self._asset_directory,
-                    self._object_id,
-                    self._request,
-                    result,
-                    generated_model,
+                saved_output = _run_bounded_local_generation_stage(
+                    lambda: _prepare_and_persist_object_generation(
+                        self._asset_directory,
+                        self._object_id,
+                        self._request,
+                        result,
+                        generated_model,
+                        self._cancel_event,
+                    ),
                     self._cancel_event,
                 )
                 with self._output_lock:
@@ -3474,7 +3487,7 @@ class TextureRegenerationWorker(QObject):
             self.progress.emit(
                 "Preparing local 512, 1024 and 2048 texture variants (87%)"
             )
-            generated_model = _run_interruptible_stage(
+            generated_model = _run_bounded_local_generation_stage(
                 lambda: _invoke_executor(self._executor, result),
                 self._cancel_event,
             )
@@ -3538,17 +3551,20 @@ class TextureRegenerationWorker(QObject):
                         "Texture persistence requires an object snapshot."
                     )
                 self.progress.emit("Saving local texture assets (94%)")
-                saved_output = _prepare_and_persist_texture_regeneration(
-                    self._asset_directory,
-                    outcome,
-                    generated_model,
-                    self._symmetry,
-                    self._selected_resolution,
-                    self._record_snapshot,
-                    materialized.source_asset_path,
-                    materialized.source_asset_revision,
+                saved_output = _run_bounded_local_generation_stage(
+                    lambda: _prepare_and_persist_texture_regeneration(
+                        self._asset_directory,
+                        outcome,
+                        generated_model,
+                        self._symmetry,
+                        self._selected_resolution,
+                        self._record_snapshot,
+                        materialized.source_asset_path,
+                        materialized.source_asset_revision,
+                        self._cancel_event,
+                        door_side_duplication=self._door_side_duplication,
+                    ),
                     self._cancel_event,
-                    door_side_duplication=self._door_side_duplication,
                 )
                 with self._output_lock:
                     self._unclaimed_asset_paths = (
@@ -4181,9 +4197,26 @@ class GenerationWorkspace(QWidget):
             str,
             tuple[object, ...],
         ] = {}
+        self._generated_preview_model_cache: dict[str, GeneratedModel] = {}
+        self._generated_preview_model_cache_keys: dict[
+            str,
+            tuple[object, ...],
+        ] = {}
         self._architectural_trim_transfer_model_cache: dict[
             tuple[object, ...],
             GeneratedModel,
+        ] = {}
+        self._architectural_trim_preview_source_model_cache: dict[
+            tuple[object, ...],
+            GeneratedModel,
+        ] = {}
+        self._architectural_trim_preview_transfer_model_cache: dict[
+            tuple[object, ...],
+            GeneratedModel,
+        ] = {}
+        self._architectural_trim_transfer_source_validity_cache: dict[
+            tuple[object, ...],
+            bool,
         ] = {}
         self._object_face_geometry_cache: dict[
             tuple[object, ...],
@@ -4459,6 +4492,18 @@ class GenerationWorkspace(QWidget):
             if not is_door_component_record(record)
         )
 
+    def get_generated_object_records(self) -> tuple[GeneratedObjectRecord, ...]:
+        """Return the current records for internal read-only scene queries.
+
+        ``GeneratedObjectRecord`` values are frozen and the workspace replaces
+        records instead of mutating them.  Returning the tuple therefore avoids
+        cloning the complete Generation project state for every Atlas, Door,
+        and scene lookup.  Callers must treat the nested provenance mapping as
+        read-only; owned save and undo snapshots still use :meth:`get_data`.
+        """
+
+        return tuple(self._data.generated_objects)
+
     def register_door_component_model(
         self,
         *,
@@ -4573,6 +4618,7 @@ class GenerationWorkspace(QWidget):
         door_body_fit_dimensions: Sequence[float] | None = None,
         generation_ready: bool = True,
         announce_generation: bool | None = None,
+        defer_file_backed_preview: bool = False,
     ) -> bool:
         """Route Generation to one slot without owning its transform gizmo."""
 
@@ -4641,7 +4687,10 @@ class GenerationWorkspace(QWidget):
             self._clear_generated_object_display()
         else:
             self._selected_object_id = record.object_id
-            self._display_generated_object(record)
+            if defer_file_backed_preview:
+                self._clear_generated_object_display()
+            else:
+                self._display_generated_object(record)
         self._sync_face_selection_outputs()
         self._sync_controls()
         self.door_slot_editing_changed.emit(True)
@@ -4658,6 +4707,7 @@ class GenerationWorkspace(QWidget):
         fit_dimensions: Sequence[float],
         trim_kind: str | None = None,
         generation_ready: bool = True,
+        defer_file_backed_preview: bool = False,
     ) -> bool:
         """Route Generation actions to one persistent architectural trim."""
 
@@ -4695,7 +4745,10 @@ class GenerationWorkspace(QWidget):
         self.result_view.set_face_editing_enabled(False)
         self.result_view.set_selected_placed_object_ids(())
         self._selected_object_id = record.object_id
-        self._display_generated_object(record)
+        if defer_file_backed_preview:
+            self._clear_generated_object_display()
+        else:
+            self._display_generated_object(record)
         self._sync_face_selection_outputs()
         self._sync_controls()
         self.architectural_trim_editing_changed.emit(True)
@@ -5476,7 +5529,14 @@ class GenerationWorkspace(QWidget):
             None,
         )
 
-    def set_data(self, data: GenerationData | None) -> None:
+    def set_data(
+        self,
+        data: GenerationData | None,
+        *,
+        defer_file_backed_preview: bool = False,
+    ) -> None:
+        """Replace project data, optionally deferring the selected GLB decode."""
+
         if self.is_generating or self._external_glb_import_runtimes:
             raise RuntimeError("Cannot replace Generation data while generating.")
         self._finish_existing_object_placement_request()
@@ -5514,12 +5574,19 @@ class GenerationWorkspace(QWidget):
             self.show_frame(self._data.current_frame_index)
         self._generated_model_cache.clear()
         self._generated_model_cache_revisions.clear()
+        self._generated_preview_model_cache.clear()
+        self._generated_preview_model_cache_keys.clear()
         self._architectural_trim_transfer_model_cache.clear()
+        self._architectural_trim_preview_source_model_cache.clear()
+        self._architectural_trim_preview_transfer_model_cache.clear()
+        self._architectural_trim_transfer_source_validity_cache.clear()
         self._object_face_geometry_cache.clear()
         self._displayed_object_snapshot = None
         self._is_rebuilding_generation_data = True
         try:
-            self._rebuild_generated_objects()
+            self._rebuild_generated_objects(
+                defer_file_backed_preview=defer_file_backed_preview,
+            )
         finally:
             self._is_rebuilding_generation_data = False
         self._sync_controls()
@@ -5751,6 +5818,31 @@ class GenerationWorkspace(QWidget):
         except Exception:
             return None
 
+    def get_generated_object_preview_model(
+        self,
+        object_id: str,
+        texture_proxies: Mapping[str, np.ndarray] | None = None,
+    ) -> GeneratedModel | None:
+        """Load a scene-only model without decoding embedded full-size maps.
+
+        File-backed texture variants use externally cached source thumbnails.
+        Geometry-only and fresh in-memory models keep the authoritative loader
+        so their established preview behavior does not change.
+        """
+
+        if not texture_proxies or ATLAS_MAP_BASE_COLOR not in texture_proxies:
+            return self.get_generated_object_model(object_id)
+        record = self._find_generated_object_record(object_id)
+        if record is None:
+            return None
+        try:
+            return self._load_generated_object_preview_model(
+                record,
+                texture_proxies,
+            )
+        except Exception:
+            return None
+
     def build_architectural_trim_texture_transfer_model(
         self,
         object_id: str,
@@ -5838,6 +5930,163 @@ class GenerationWorkspace(QWidget):
             transferred_model
         )
         return transferred_model
+
+    def build_architectural_trim_texture_transfer_preview_model(
+        self,
+        object_id: str,
+        target_dimensions: Sequence[float],
+    ) -> GeneratedModel | None:
+        """Retarget one trim in memory without serializing preview-only GLBs."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None or not is_architectural_trim_component_record(record):
+            return None
+        target_extents = _normalize_architectural_trim_fit_dimensions(
+            target_dimensions
+        )
+        if target_extents is None:
+            return None
+        source_layout = _get_architectural_trim_repeat_layout(record)
+        raw_module_path = record.pipeline.get("postprocessed_asset_path")
+        try:
+            if source_layout is not None and isinstance(raw_module_path, str):
+                module_path = self._resolve_meshy_asset_path(raw_module_path)
+                module_revision = _build_generation_asset_revision(
+                    self._asset_directory,
+                    raw_module_path,
+                )
+                cache_key: tuple[object, ...] = (
+                    record.object_id,
+                    "preview-repeat-module",
+                    module_revision,
+                    source_layout.target_extents,
+                    source_layout.module_extents,
+                    source_layout.repeat_count,
+                    target_extents,
+                )
+                cached = self._architectural_trim_preview_transfer_model_cache.get(
+                    cache_key
+                )
+                if cached is not None:
+                    return cached
+                source_cache_key = (
+                    record.object_id,
+                    "preview-source-module",
+                    module_revision,
+                )
+                module_model = (
+                    self._architectural_trim_preview_source_model_cache.get(
+                        source_cache_key
+                    )
+                )
+                if module_model is None:
+                    module_model = load_architectural_trim_preview_model(
+                        module_path.read_bytes()
+                    )
+                    self._retain_architectural_trim_preview_model(
+                        self._architectural_trim_preview_source_model_cache,
+                        source_cache_key,
+                        module_model,
+                    )
+                transferred_model, _target_layout = (
+                    retarget_architectural_trim_repeat_module_preview_model(
+                        module_model,
+                        source_layout,
+                        target_extents,
+                    )
+                )
+            else:
+                source_model = self.get_generated_object_model(record.object_id)
+                if source_model is None:
+                    return None
+                source_revision = _build_generation_asset_revision(
+                    self._asset_directory,
+                    record.asset_path,
+                )
+                cache_key = (
+                    record.object_id,
+                    "preview-complete-model",
+                    source_revision,
+                    target_extents,
+                )
+                cached = self._architectural_trim_preview_transfer_model_cache.get(
+                    cache_key
+                )
+                if cached is not None:
+                    return cached
+                transferred_model = (
+                    fit_architectural_trim_preview_model_to_dimensions(
+                        source_model,
+                        target_extents,
+                    )
+                )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+
+        self._retain_architectural_trim_preview_model(
+            self._architectural_trim_preview_transfer_model_cache,
+            cache_key,
+            transferred_model,
+        )
+        return transferred_model
+
+    @staticmethod
+    def _retain_architectural_trim_preview_model(
+        cache: dict[tuple[object, ...], GeneratedModel],
+        cache_key: tuple[object, ...],
+        model: GeneratedModel,
+    ) -> None:
+        """Retain one exact preview result inside the existing hard bound."""
+
+        if len(cache) >= MAX_ARCHITECTURAL_TRIM_TRANSFER_CACHE_ENTRIES:
+            oldest_key = next(iter(cache))
+            cache.pop(oldest_key, None)
+        cache[cache_key] = model
+
+    def has_usable_architectural_trim_texture_transfer_source(
+        self,
+        object_id: str,
+        target_dimensions: Sequence[float],
+    ) -> bool:
+        """Validate a trim transfer source without serializing a fitted GLB."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None or not is_architectural_trim_component_record(record):
+            return False
+        if _normalize_architectural_trim_fit_dimensions(target_dimensions) is None:
+            return False
+
+        source_layout = _get_architectural_trim_repeat_layout(record)
+        raw_module_path = record.pipeline.get("postprocessed_asset_path")
+        source_path = (
+            raw_module_path
+            if source_layout is not None and isinstance(raw_module_path, str)
+            else record.asset_path
+        )
+        source_revision = _build_generation_asset_revision(
+            self._asset_directory,
+            source_path,
+        )
+        cache_key: tuple[object, ...] = (
+            record.object_id,
+            "trim-transfer-source",
+            source_revision,
+            source_layout,
+        )
+        cached = self._architectural_trim_transfer_source_validity_cache.get(
+            cache_key
+        )
+        if cached is not None:
+            return cached
+        try:
+            resolved_path = self._resolve_meshy_asset_path(source_path)
+            document = _parse_external_glb_document(resolved_path.read_bytes())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._architectural_trim_transfer_source_validity_cache[cache_key] = False
+            return False
+        is_valid = _glb_document_has_non_degenerate_position_bounds(document)
+        self._architectural_trim_transfer_source_validity_cache[cache_key] = is_valid
+        return is_valid
 
     def get_active_texture_variant(
         self,
@@ -10893,7 +11142,13 @@ class GenerationWorkspace(QWidget):
             return 0
         return min(max(int(frame_index), 0), metadata.frame_count - 1)
 
-    def _rebuild_generated_objects(self) -> None:
+    def _rebuild_generated_objects(
+        self,
+        *,
+        defer_file_backed_preview: bool = False,
+    ) -> None:
+        """Restore selection and optionally wait to decode its file-backed GLB."""
+
         trim_target = self._architectural_trim_editing_target
         preferred_id = (
             trim_target.object_id
@@ -10913,10 +11168,12 @@ class GenerationWorkspace(QWidget):
                 )
             )
             preferred_id = None if not visible_ids else visible_ids[-1]
-        self._select_generated_object(
-            preferred_id,
-            repair_missing_variant=True,
-        )
+        if defer_file_backed_preview and preferred_id is not None:
+            self._selected_object_id = preferred_id
+            self._clear_generated_object_display()
+            self._sync_controls()
+            return
+        self._select_generated_object(preferred_id, repair_missing_variant=True)
 
     def _select_generated_object(
         self,
@@ -11227,6 +11484,53 @@ class GenerationWorkspace(QWidget):
             return generated_model
         raise OSError("The generated GLB changed repeatedly while loading.")
 
+    def _load_generated_object_preview_model(
+        self,
+        record: GeneratedObjectRecord,
+        texture_proxies: Mapping[str, np.ndarray],
+    ) -> GeneratedModel:
+        """Cache one proxy-backed geometry scene independently from exports."""
+
+        proxy_signature = _build_generated_model_proxy_signature(texture_proxies)
+        for _attempt_index in range(2):
+            asset_revision_before = _build_generation_asset_revision(
+                self._asset_directory,
+                record.asset_path,
+            )
+            authoritative_model = self._generated_model_cache.get(record.object_id)
+            if (
+                authoritative_model is not None
+                and self._generated_model_cache_revisions.get(record.object_id)
+                == asset_revision_before
+            ):
+                return authoritative_model
+            cache_key = (asset_revision_before, proxy_signature)
+            cached_model = self._generated_preview_model_cache.get(record.object_id)
+            if (
+                cached_model is not None
+                and self._generated_preview_model_cache_keys.get(record.object_id)
+                == cache_key
+            ):
+                return cached_model
+            asset_path = self._resolve_meshy_asset_path(record.asset_path)
+            generated_model = import_generated_glb_preview(
+                asset_path.read_bytes(),
+                base_color_rgba=texture_proxies[ATLAS_MAP_BASE_COLOR],
+                normal_rgba=texture_proxies.get(PBR_MAP_NORMAL),
+                roughness_rgba=texture_proxies.get(PBR_MAP_ROUGHNESS),
+                metallic_rgba=texture_proxies.get(PBR_MAP_METALLIC),
+            )
+            asset_revision_after = _build_generation_asset_revision(
+                self._asset_directory,
+                record.asset_path,
+            )
+            if asset_revision_before != asset_revision_after:
+                continue
+            self._generated_preview_model_cache[record.object_id] = generated_model
+            self._generated_preview_model_cache_keys[record.object_id] = cache_key
+            return generated_model
+        raise OSError("The generated GLB changed repeatedly while loading.")
+
     def _load_object_face_geometry(
         self,
         record: GeneratedObjectRecord,
@@ -11234,6 +11538,11 @@ class GenerationWorkspace(QWidget):
     ) -> ObjectFaceGeometry:
         """Reuse immutable face/UV geometry for one exact asset revision."""
 
+        if model.preview_only:
+            raise ValueError(
+                "Preview-only generated models cannot provide editable face "
+                "geometry."
+            )
         asset_revision = _build_generation_asset_revision(
             self._asset_directory,
             record.asset_path,
@@ -11281,6 +11590,11 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Cache one model only for the exact active on-disk GLB revision."""
 
+        if model.preview_only:
+            raise ValueError(
+                "Preview-only generated models cannot enter the authoritative "
+                "model cache."
+            )
         if asset_revision is None:
             for _attempt_index in range(2):
                 revision_before = _build_generation_asset_revision(
@@ -13220,6 +13534,59 @@ def _parse_external_glb_document(payload: bytes) -> dict[str, object]:
     return document
 
 
+def _glb_document_has_non_degenerate_position_bounds(
+    document: Mapping[str, object],
+) -> bool:
+    """Check embedded position bounds without decoding the complete scene."""
+
+    raw_meshes = document.get("meshes")
+    raw_accessors = document.get("accessors")
+    if not isinstance(raw_meshes, list) or not isinstance(raw_accessors, list):
+        return False
+    minimum = np.full(3, np.inf, dtype=float)
+    maximum = np.full(3, -np.inf, dtype=float)
+    found_positions = False
+    for raw_mesh in raw_meshes:
+        if not isinstance(raw_mesh, Mapping):
+            continue
+        raw_primitives = raw_mesh.get("primitives")
+        if not isinstance(raw_primitives, list):
+            continue
+        for raw_primitive in raw_primitives:
+            if not isinstance(raw_primitive, Mapping):
+                continue
+            raw_attributes = raw_primitive.get("attributes")
+            if not isinstance(raw_attributes, Mapping):
+                continue
+            raw_accessor_index = raw_attributes.get("POSITION")
+            if not isinstance(raw_accessor_index, int) or isinstance(
+                raw_accessor_index,
+                bool,
+            ):
+                continue
+            if not 0 <= raw_accessor_index < len(raw_accessors):
+                continue
+            raw_accessor = raw_accessors[raw_accessor_index]
+            if not isinstance(raw_accessor, Mapping):
+                continue
+            try:
+                candidate_minimum = np.asarray(raw_accessor["min"], dtype=float)
+                candidate_maximum = np.asarray(raw_accessor["max"], dtype=float)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                candidate_minimum.shape != (3,)
+                or candidate_maximum.shape != (3,)
+                or not np.all(np.isfinite(candidate_minimum))
+                or not np.all(np.isfinite(candidate_maximum))
+            ):
+                continue
+            minimum = np.minimum(minimum, candidate_minimum)
+            maximum = np.maximum(maximum, candidate_maximum)
+            found_positions = True
+    return bool(found_positions and np.all((maximum - minimum) > 0.0))
+
+
 def _validate_external_glb_resource_uris(
     document: Mapping[str, object],
 ) -> None:
@@ -14272,6 +14639,38 @@ def _raise_if_generation_cancelled(
         raise _GenerationCancelled
 
 
+def _invoke_bounded_local_generation_stage(
+    operation: Callable[[], object],
+    cancel_event: threading.Event | None,
+) -> object:
+    """Run one memory-heavy local stage inside the shared CPU/RAM budget."""
+
+    try:
+        return run_bounded_local_work(
+            operation,
+            cancel_requested=(
+                None if cancel_event is None else cancel_event.is_set
+            ),
+        )
+    except LocalWorkCancelled as error:
+        raise _GenerationCancelled from error
+
+
+def _run_bounded_local_generation_stage(
+    operation: Callable[[], object],
+    cancel_event: threading.Event | None,
+) -> object:
+    """Keep network jobs concurrent while limiting expensive local processing."""
+
+    return _run_interruptible_stage(
+        lambda: _invoke_bounded_local_generation_stage(
+            operation,
+            cancel_event,
+        ),
+        cancel_event,
+    )
+
+
 def _run_interruptible_stage(
     operation: Callable[[], object],
     cancel_event: threading.Event | None = None,
@@ -14441,6 +14840,33 @@ def _build_generation_asset_revision(
         int(asset_stat.st_mtime_ns),
         int(asset_stat.st_ctime_ns),
     )
+
+
+def _build_generated_model_proxy_signature(
+    texture_proxies: Mapping[str, np.ndarray],
+) -> tuple[tuple[object, ...], ...]:
+    """Fingerprint the small external maps that define a preview scene."""
+
+    signature: list[tuple[object, ...]] = []
+    for map_type in (
+        ATLAS_MAP_BASE_COLOR,
+        PBR_MAP_NORMAL,
+        PBR_MAP_ROUGHNESS,
+        PBR_MAP_METALLIC,
+    ):
+        raw_proxy = texture_proxies.get(map_type)
+        if raw_proxy is None:
+            continue
+        proxy = np.ascontiguousarray(raw_proxy)
+        signature.append(
+            (
+                map_type,
+                proxy.dtype.str,
+                tuple(int(value) for value in proxy.shape),
+                hashlib.sha256(memoryview(proxy).cast("B")).digest(),
+            )
+        )
+    return tuple(signature)
 
 
 # ### Texture-variant helpers ###

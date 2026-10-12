@@ -40,6 +40,7 @@ WorldDirectionToImage = Callable[[Point2D], Point2D | None]
 WallSideCandidate = tuple[np.ndarray, Polygon]
 WallFrame = tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]
 ParallelWallSpan = tuple[float, Point2D, float, float]
+WallSegmentKey = tuple[float, float, float, float]
 
 
 # ### Orientation model ###
@@ -69,6 +70,16 @@ class WallOrientationResolver:
     )
     _point_to_world: LevelPointTransform = field(repr=False, compare=False)
     _world_direction_to_image: WorldDirectionToImage = field(
+        repr=False,
+        compare=False,
+    )
+    _facing_normal_cache: dict[WallSegmentKey, Point2D | None] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    _paired_facing_normal_cache: dict[WallSegmentKey, Point2D | None] = field(
+        default_factory=dict,
         repr=False,
         compare=False,
     )
@@ -138,6 +149,9 @@ class WallOrientationResolver:
         if wall_frame is None:
             return None
         start, end, wall_delta, wall_length, wall_normal = wall_frame
+        cache_key = _build_wall_segment_key(start, end)
+        if cache_key in self._facing_normal_cache:
+            return self._facing_normal_cache[cache_key]
         midpoint = (start + end) / 2.0
         candidates = self._build_side_candidates(
             midpoint,
@@ -177,8 +191,11 @@ class WallOrientationResolver:
             candidates,
             self.open_space_geometry,
         ):
-            return paired_wall_normal
-        return topology_normal
+            resolved_normal = paired_wall_normal
+        else:
+            resolved_normal = topology_normal
+        self._facing_normal_cache[cache_key] = resolved_normal
+        return resolved_normal
 
     def resolve_paired_wall_facing_normal(
         self,
@@ -191,6 +208,9 @@ class WallOrientationResolver:
         if wall_frame is None:
             return None
         start, end, wall_delta, wall_length, wall_normal = wall_frame
+        cache_key = _build_wall_segment_key(start, end)
+        if cache_key in self._paired_facing_normal_cache:
+            return self._paired_facing_normal_cache[cache_key]
         midpoint = (start + end) / 2.0
         candidates = self._build_side_candidates(
             midpoint,
@@ -201,13 +221,16 @@ class WallOrientationResolver:
             candidates,
             self.open_space_geometry,
         ):
+            self._paired_facing_normal_cache[cache_key] = None
             return None
-        return self._resolve_paired_wall_normal(
+        resolved_normal = self._resolve_paired_wall_normal(
             midpoint,
             wall_delta / wall_length,
             wall_normal,
             wall_length,
         )
+        self._paired_facing_normal_cache[cache_key] = resolved_normal
+        return resolved_normal
 
     def _build_side_candidates(
         self,
@@ -869,6 +892,20 @@ def _measure_normal_clearance(
 
 
 # ### Numeric helpers ###
+def _build_wall_segment_key(
+    start_point: Sequence[float],
+    end_point: Sequence[float],
+) -> WallSegmentKey:
+    """Return the exact directed segment key used within one resolver."""
+
+    return (
+        float(start_point[0]),
+        float(start_point[1]),
+        float(end_point[0]),
+        float(end_point[1]),
+    )
+
+
 def _build_wall_frame(
     start_point: Point2D,
     end_point: Point2D,

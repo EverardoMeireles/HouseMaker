@@ -22,6 +22,7 @@ from housemaker.camera_models import CameraPose
 from housemaker.generation_state import GeneratedObjectPlacement
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
+from housemaker.models import create_default_levels
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -421,6 +422,76 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
 
         build_preview.assert_called_once_with(None)
         set_canvas_model.assert_called_once()
+
+    def test_one_refresh_reuses_one_preview_level_snapshot(self) -> None:
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        _qt_application.processEvents()
+        self.workspace._mark_viewer_preview_dirty()
+
+        with patch.object(
+            self.workspace,
+            "_build_viewer_preview_levels",
+            wraps=self.workspace._build_viewer_preview_levels,
+        ) as build_levels:
+            self.workspace._refresh_viewer_preview(preserve_camera=True)
+
+        build_levels.assert_called_once_with()
+
+    def test_tab_dependency_fingerprint_is_reused_by_the_refresh(self) -> None:
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        _qt_application.processEvents()
+        self.assertEqual(
+            self.workspace._viewer_preview_dependency_signature_revision,
+            self.workspace._viewer_preview_revision,
+        )
+        changed_signature = (("external replacement",),)
+
+        with patch.object(
+            self.workspace,
+            "_build_viewer_preview_dependency_signature",
+            return_value=changed_signature,
+        ) as build_signature:
+            self.workspace._ensure_viewer_preview_current(preserve_camera=True)
+            self.workspace._run_scheduled_viewer_preview_refresh()
+
+        self.assertEqual(build_signature.call_count, 2)
+
+    def test_atlas_activation_skips_a_current_source_rescan(self) -> None:
+        self.workspace._sync_atlas_object_texture_sources()
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.settings_widget
+        )
+
+        with patch.object(
+            self.workspace,
+            "_sync_atlas_object_texture_sources",
+        ) as sync_sources:
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+
+        sync_sources.assert_not_called()
+
+    def test_project_apply_coalesces_atlas_sources_into_one_final_sync(
+        self,
+    ) -> None:
+        with patch.object(
+            self.workspace,
+            "_sync_atlas_object_texture_sources",
+            wraps=self.workspace._sync_atlas_object_texture_sources,
+        ) as sync_sources:
+            self.workspace._apply_project_state(
+                levels=create_default_levels(),
+                current_level_index=0,
+            )
+            _qt_application.processEvents()
+
+        sync_sources.assert_called_once_with()
+        self.assertFalse(self.workspace._is_applying_project_state)
 
     def test_reopening_every_workspace_skips_unchanged_heavy_work(self) -> None:
         expected_model = _preview_model("all-workspaces-current")
@@ -1100,8 +1171,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         with (
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=SimpleNamespace(generated_objects=[record]),
+                "get_generated_object_records",
+                return_value=(record,),
             ),
             patch.object(
                 self.workspace.generation,
@@ -1135,8 +1206,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         with (
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=SimpleNamespace(generated_objects=[record]),
+                "get_generated_object_records",
+                return_value=(record,),
             ),
             patch.object(
                 self.workspace.generation,

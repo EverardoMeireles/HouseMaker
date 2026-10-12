@@ -42,6 +42,10 @@ from housemaker.generation_shared_controls import GenerationSharedControls
 from housemaker.generation_state import MASK_MODE_ERASE, MASK_MODE_PAINT, MaskStroke
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
 from housemaker.glb import GeneratedModel
+from housemaker.local_work_scheduler import (
+    LocalWorkCancelled,
+    run_bounded_local_work,
+)
 from housemaker.models import LevelData
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
@@ -590,11 +594,12 @@ class SurfaceTextureWorker(QObject):
                     self._job_id,
                     "Preparing reference frames (5%)",
                 )
-                reference_pngs, frame_indices = (
-                    _build_reference_pngs_from_input(
+                reference_pngs, frame_indices = _run_bounded_surface_local_stage(
+                    lambda: _build_reference_pngs_from_input(
                         self._reference_input,
                         self._cancel_event,
-                    )
+                    ),
+                    self._cancel_event,
                 )
                 if not reference_pngs:
                     raise ValueError("The painted reference masks are empty.")
@@ -623,9 +628,12 @@ class SurfaceTextureWorker(QObject):
                 self._job_id,
                 "Preparing texture variants (90%)",
             )
-            prepared_outputs = _prepare_surface_texture_outputs(
-                request,
-                result,
+            prepared_outputs = _run_bounded_surface_local_stage(
+                lambda: _prepare_surface_texture_outputs(
+                    request,
+                    result,
+                    self._cancel_event,
+                ),
                 self._cancel_event,
             )
             _raise_surface_worker_cancelled(self._cancel_event)
@@ -633,9 +641,12 @@ class SurfaceTextureWorker(QObject):
                 self._job_id,
                 "Saving texture variants (95%)",
             )
-            saved_outputs = _persist_prepared_surface_texture_outputs(
-                self._asset_directory,
-                prepared_outputs,
+            saved_outputs = _run_bounded_surface_local_stage(
+                lambda: _persist_prepared_surface_texture_outputs(
+                    self._asset_directory,
+                    prepared_outputs,
+                    self._cancel_event,
+                ),
                 self._cancel_event,
             )
             with self._output_lock:
@@ -1186,9 +1197,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if len(surface_ids) != len(set(surface_ids)):
             raise ValueError("External semantic surface IDs must be unique.")
 
-        architectural_ids = set(
-            _build_all_existing_surfaces(self._levels)
-        )
+        architectural_ids: set[str] = set()
+        if normalized_surfaces:
+            # Reuse the revisioned architectural catalog populated by
+            # ``set_levels``.  Rebuilding all walls merely to validate a small
+            # procedural catalog dominated project restore time.
+            self._all_existing_surfaces_by_id()
+            architectural_ids = set(self._semantic_surfaces_by_id)
         conflicting_ids = architectural_ids.intersection(surface_ids)
         if conflicting_ids:
             raise ValueError(
@@ -2810,11 +2825,14 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def set_levels(
         self,
         levels: Sequence[LevelData],
+        *,
+        architectural_surfaces: Sequence[FixedSurface] | None = None,
     ) -> None:
         self._set_level_context(
             levels,
             preview_model=None,
             replace_preview_model=False,
+            architectural_surfaces=architectural_surfaces,
         )
 
     def set_preview_context(
@@ -2828,6 +2846,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             levels,
             preview_model=model,
             replace_preview_model=True,
+            architectural_surfaces=None,
         )
 
     def _set_level_context(
@@ -2836,9 +2855,31 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         *,
         preview_model: GeneratedModel | None,
         replace_preview_model: bool,
+        architectural_surfaces: Sequence[FixedSurface] | None,
     ) -> None:
         normalized_levels = list(levels)
         next_signature = _build_level_sync_signature(normalized_levels)
+        if architectural_surfaces is not None:
+            prepared_surfaces = tuple(architectural_surfaces)
+            if not all(
+                isinstance(surface, FixedSurface)
+                for surface in prepared_surfaces
+            ):
+                raise TypeError(
+                    "Prepared architectural surfaces must contain "
+                    "FixedSurface values."
+                )
+            prepared_ids = tuple(
+                surface.surface_id for surface in prepared_surfaces
+            )
+            if len(prepared_ids) != len(set(prepared_ids)):
+                raise ValueError(
+                    "Prepared architectural surface IDs must be unique."
+                )
+            self._semantic_surfaces_by_id = {
+                surface.surface_id: surface for surface in prepared_surfaces
+            }
+            self._semantic_surface_cache_signature = next_signature
         if next_signature == self._level_sync_signature:
             # Retain the latest model objects without rebuilding equivalent
             # semantic geometry, textures, atlas controls, or OpenGL items.
@@ -4437,6 +4478,21 @@ def _raise_surface_worker_cancelled(
 ) -> None:
     if cancel_event.is_set():
         raise _SurfaceTextureCancelled
+
+
+def _run_bounded_surface_local_stage(
+    operation: Callable[[], object],
+    cancel_event: threading.Event,
+) -> object:
+    """Share the process-wide CPU/RAM budget with object-generation jobs."""
+
+    try:
+        return run_bounded_local_work(
+            operation,
+            cancel_requested=cancel_event.is_set,
+        )
+    except LocalWorkCancelled as error:
+        raise _SurfaceTextureCancelled from error
 
 
 def _build_reference_pngs_from_input(

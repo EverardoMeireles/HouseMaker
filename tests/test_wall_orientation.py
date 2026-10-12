@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -70,6 +71,53 @@ def _build_room_owned_outer_wall_level() -> tuple[LevelData, str]:
 
 # ### Tests ###
 class WallOrientationResolverTests(unittest.TestCase):
+    def test_repeated_facing_normal_query_reuses_the_resolver_cache(self) -> None:
+        target = ((20.0, 20.0), (480.0, 20.0))
+        resolver = build_level_wall_orientation_resolver(
+            _build_level(
+                (
+                    target,
+                    ((0.0, 0.0), (500.0, 0.0)),
+                    ((0.0, 300.0), (500.0, 300.0)),
+                )
+            )
+        )
+
+        with patch.object(
+            type(resolver),
+            "_build_side_candidates",
+            side_effect=resolver._build_side_candidates,
+        ) as build_candidates:
+            first = resolver.resolve_image_wall_facing_normal(*target)
+            second = resolver.resolve_image_wall_facing_normal(*target)
+
+        np.testing.assert_allclose(first, second, atol=1e-9)
+        build_candidates.assert_called_once()
+
+    def test_repeated_missing_pair_query_reuses_the_resolver_cache(self) -> None:
+        target = ((0.0, 20.0), (500.0, 20.0))
+        resolver = build_level_wall_orientation_resolver(
+            _build_level(
+                (
+                    target,
+                    ((0.0, 0.0), (200.0, 0.0)),
+                    ((300.0, 0.0), (500.0, 0.0)),
+                )
+            )
+        )
+
+        with patch.object(
+            type(resolver),
+            "_build_side_candidates",
+            side_effect=resolver._build_side_candidates,
+        ) as build_candidates:
+            first = resolver.resolve_image_paired_wall_facing_normal(*target)
+            second = resolver.resolve_image_paired_wall_facing_normal(*target)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        build_candidates.assert_called_once()
+
     def test_parallel_wall_postprocess_faces_toward_the_farther_wall(self) -> None:
         target = ((20.0, 20.0), (480.0, 20.0))
         level = _build_level(

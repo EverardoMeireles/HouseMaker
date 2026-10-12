@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import os
 import tempfile
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
+from typing import BinaryIO
 
 import numpy as np
 from PIL import Image
@@ -144,6 +150,13 @@ ATLAS_PREVIEW_MAX_ZOOM = 16.0
 ATLAS_PREVIEW_BUTTON_ZOOM_FACTOR = 1.25
 ATLAS_PREVIEW_WHEEL_ZOOM_DIVISOR = 480.0
 MAX_SOURCE_THUMBNAIL_SIZE = 256
+MAX_SOURCE_THUMBNAIL_CACHE_ENTRIES = 256
+MAX_SOURCE_THUMBNAIL_CACHE_BYTES = 64 * 1024 * 1024
+SOURCE_THUMBNAIL_DISK_CACHE_VERSION = 1
+MAX_SOURCE_THUMBNAIL_DISK_CACHE_ENTRIES = 512
+MAX_SOURCE_THUMBNAIL_DISK_CACHE_BYTES = 128 * 1024 * 1024
+MAX_SOURCE_THUMBNAIL_DECODE_ATTEMPTS = 2
+MAX_CONCURRENT_SOURCE_THUMBNAIL_LOADS = 4
 MAX_VARIANT_SOURCE_CACHE_ENTRIES = 256
 TEXTURE_RESOLUTION_ORDER = (512, 1024, 2048)
 WALL_TEXTURE_SOURCE_ID_PREFIX = "surface-wall-texture:"
@@ -184,9 +197,340 @@ MAXIMUM_DISPLAYED_KILOBYTES = 999.0
 DEFAULT_SURFACE_TEXTURE_REPEAT_SIZE_M = 2.0
 MIN_SURFACE_TEXTURE_REPEAT_SIZE_M = 0.25
 MAX_SURFACE_TEXTURE_REPEAT_SIZE_M = 20.0
+PNG_FILE_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+# ### Texture thumbnail cache ###
+@dataclass(frozen=True)
+class _TextureFileStatRevision:
+    """Filesystem identity for one exact texture-file revision."""
+
+    resolved_path: str
+    size: int
+    modified_nanoseconds: int
+    changed_nanoseconds: int
+    device: int
+    file_id: int
+
+
+@dataclass(frozen=True)
+class _TextureThumbnailCacheKey:
+    """Every file and decode input which can affect a source thumbnail."""
+
+    file_revision: _TextureFileStatRevision
+    logical_texture_path: str
+    texture_resolution: int
+    packing_mode: str
+    fit_to_square: bool
+    maximum_size: int
+    resampling_filter: int
+
+
+class _TextureThumbnailCache:
+    """Thread-safe strong LRU bounded by both entries and pixel bytes."""
+
+    def __init__(self, *, maximum_entries: int, maximum_bytes: int) -> None:
+        self._maximum_entries = max(1, int(maximum_entries))
+        self._maximum_bytes = max(1, int(maximum_bytes))
+        self._entries: OrderedDict[
+            _TextureThumbnailCacheKey,
+            np.ndarray,
+        ] = OrderedDict()
+        self._retained_bytes = 0
+        self._lock = threading.RLock()
+
+    def get(self, key: _TextureThumbnailCacheKey) -> np.ndarray | None:
+        """Return and promote one immutable cached thumbnail."""
+
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is None:
+                return None
+            self._entries.move_to_end(key)
+            return cached
+
+    def put(self, key: _TextureThumbnailCacheKey, rgba: np.ndarray) -> None:
+        """Retain one immutable thumbnail and evict oldest entries as needed."""
+
+        if rgba.flags.writeable:
+            raise ValueError("Cached Atlas thumbnails must be immutable.")
+        retained_bytes = int(rgba.nbytes)
+        if retained_bytes > self._maximum_bytes:
+            return
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._retained_bytes -= int(previous.nbytes)
+            self._entries[key] = rgba
+            self._retained_bytes += retained_bytes
+            while (
+                len(self._entries) > self._maximum_entries
+                or self._retained_bytes > self._maximum_bytes
+            ):
+                _oldest_key, oldest = self._entries.popitem(last=False)
+                self._retained_bytes -= int(oldest.nbytes)
+
+    def clear(self) -> None:
+        """Release every retained thumbnail."""
+
+        with self._lock:
+            self._entries.clear()
+            self._retained_bytes = 0
+
+
+class _TextureThumbnailDiskCache:
+    """Persistent, failure-tolerant LRU for small source-image proxies."""
+
+    def __init__(
+        self,
+        *,
+        cache_directory: Path | None = None,
+        maximum_entries: int,
+        maximum_bytes: int,
+    ) -> None:
+        self._configured_cache_directory = cache_directory
+        self._maximum_entries = max(1, int(maximum_entries))
+        self._maximum_bytes = max(1, int(maximum_bytes))
+        self._entry_sizes: dict[Path, int] = {}
+        self._initialized = False
+        self._lock = threading.RLock()
+
+    @property
+    def cache_directory(self) -> Path:
+        """Return the user-cache location, never a project asset directory."""
+
+        if self._configured_cache_directory is not None:
+            return self._configured_cache_directory
+        root = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.CacheLocation
+        )
+        if not root:
+            root = tempfile.gettempdir()
+        return (
+            Path(root)
+            / "HouseMaker"
+            / f"atlas-thumbnails-v{SOURCE_THUMBNAIL_DISK_CACHE_VERSION}"
+        )
+
+    def get(self, key: _TextureThumbnailCacheKey) -> np.ndarray | None:
+        """Read one immutable proxy, treating every cache problem as a miss."""
+
+        try:
+            self._ensure_initialized()
+            cache_path = self._cache_path(key)
+            with cache_path.open("rb") as cache_file:
+                cached = np.load(cache_file, allow_pickle=False)
+            rgba = _normalize_persistent_thumbnail_rgba(cached)
+            try:
+                os.utime(cache_path, None)
+            except OSError:
+                pass
+            return rgba
+        except Exception:  # noqa: BLE001 - a cache miss must never block loading.
+            self._discard_corrupt_entry_locally(key)
+            return None
+
+    def put(self, key: _TextureThumbnailCacheKey, rgba: np.ndarray) -> None:
+        """Atomically retain one proxy and enforce the on-disk LRU bounds."""
+
+        try:
+            normalized = _normalize_persistent_thumbnail_rgba(rgba)
+            self._ensure_initialized()
+            cache_path = self._cache_path(key)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_cache_file_atomically(cache_path, normalized)
+            retained_bytes = int(cache_path.stat().st_size)
+            with self._lock:
+                self._entry_sizes[cache_path] = retained_bytes
+                self._enforce_bounds_locked()
+        except Exception:  # noqa: BLE001 - persistent caching is optional.
+            return
+
+    def clear(self) -> None:
+        """Remove persistent proxies without touching their source textures."""
+
+        try:
+            self._ensure_initialized()
+            with self._lock:
+                cache_paths = tuple(self._entry_sizes)
+                self._entry_sizes.clear()
+            for cache_path in cache_paths:
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except OSError:
+                    continue
+        except Exception:  # noqa: BLE001 - cache maintenance is best effort.
+            return
+
+    def _ensure_initialized(self) -> None:
+        """Index prior-process entries once and trim stale excess entries."""
+
+        with self._lock:
+            if self._initialized:
+                return
+            self._initialized = True
+            cache_directory = self.cache_directory
+            try:
+                cache_directory.mkdir(parents=True, exist_ok=True)
+                cache_paths = tuple(cache_directory.glob("*/*.rgba.npy"))
+            except OSError:
+                return
+            for cache_path in cache_paths:
+                try:
+                    self._entry_sizes[cache_path] = int(cache_path.stat().st_size)
+                except OSError:
+                    continue
+            self._enforce_bounds_locked()
+
+    def _cache_path(self, key: _TextureThumbnailCacheKey) -> Path:
+        """Map a complete decode key to an opaque versioned cache path."""
+
+        digest = _texture_thumbnail_disk_cache_digest(key)
+        return self.cache_directory / digest[:2] / f"{digest[2:]}.rgba.npy"
+
+    @staticmethod
+    def _write_cache_file_atomically(
+        cache_path: Path,
+        rgba: np.ndarray,
+    ) -> None:
+        """Publish a complete NumPy proxy with one same-volume replace."""
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{cache_path.stem}-",
+            suffix=".tmp",
+            dir=cache_path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as cache_file:
+                np.save(cache_file, rgba, allow_pickle=False)
+                cache_file.flush()
+            os.replace(temporary_path, cache_path)
+        finally:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _enforce_bounds_locked(self) -> None:
+        """Evict least-recently-read proxies until both hard caps hold."""
+
+        retained_bytes = sum(self._entry_sizes.values())
+        if (
+            len(self._entry_sizes) <= self._maximum_entries
+            and retained_bytes <= self._maximum_bytes
+        ):
+            return
+        entries_by_age: list[tuple[int, str, Path]] = []
+        for cache_path in tuple(self._entry_sizes):
+            try:
+                modified_nanoseconds = int(cache_path.stat().st_mtime_ns)
+            except OSError:
+                retained_bytes -= self._entry_sizes.pop(cache_path, 0)
+                continue
+            entries_by_age.append(
+                (modified_nanoseconds, str(cache_path), cache_path)
+            )
+        entries_by_age.sort()
+        for _modified_nanoseconds, _path_text, cache_path in entries_by_age:
+            if (
+                len(self._entry_sizes) <= self._maximum_entries
+                and retained_bytes <= self._maximum_bytes
+            ):
+                break
+            entry_bytes = self._entry_sizes.pop(cache_path, 0)
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError:
+                self._entry_sizes[cache_path] = entry_bytes
+                continue
+            retained_bytes -= entry_bytes
+
+    def _discard_corrupt_entry_locally(
+        self,
+        key: _TextureThumbnailCacheKey,
+    ) -> None:
+        """Forget one unreadable proxy while leaving all source files alone."""
+
+        try:
+            cache_path = self._cache_path(key)
+        except Exception:  # noqa: BLE001 - even path discovery may be unavailable.
+            return
+        with self._lock:
+            self._entry_sizes.pop(cache_path, None)
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_TEXTURE_THUMBNAIL_CACHE = _TextureThumbnailCache(
+    maximum_entries=MAX_SOURCE_THUMBNAIL_CACHE_ENTRIES,
+    maximum_bytes=MAX_SOURCE_THUMBNAIL_CACHE_BYTES,
+)
+_TEXTURE_THUMBNAIL_DISK_CACHE = _TextureThumbnailDiskCache(
+    maximum_entries=MAX_SOURCE_THUMBNAIL_DISK_CACHE_ENTRIES,
+    maximum_bytes=MAX_SOURCE_THUMBNAIL_DISK_CACHE_BYTES,
+)
+_SOURCE_THUMBNAIL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=MAX_CONCURRENT_SOURCE_THUMBNAIL_LOADS,
+    thread_name_prefix="atlas-thumbnail",
+)
 
 
 # ### Public texture-source model ###
+@dataclass(frozen=True)
+class AtlasObjectTextureSourceLoadSpec:
+    """Immutable inputs for one independently loadable Atlas source."""
+
+    object_id: str
+    object_name: str
+    texture_path: str
+    texture_resolution: int
+    physical_texture_path: str | Path
+    map_texture_paths: Mapping[str, str] | None = None
+    physical_map_texture_paths: Mapping[str, str | Path] | None = None
+    fallback_map_rgba: Mapping[str, tuple[int, int, int, int]] | None = None
+    fit_to_square: bool = False
+    supports_resolution_changes: bool = True
+    supports_3d_preview: bool = True
+    packing_mode: str = ATLAS_PACKING_MODE_FULL
+    symmetric_preview_orientation: str | None = None
+    symmetric_preview_plane_coordinate: float | None = None
+    surface_usage_count: int = 0
+
+    def __post_init__(self) -> None:
+        """Snapshot caller-owned mappings before worker threads consume them."""
+
+        for attribute_name in (
+            "map_texture_paths",
+            "physical_map_texture_paths",
+            "fallback_map_rgba",
+        ):
+            values = getattr(self, attribute_name)
+            if values is not None:
+                object.__setattr__(
+                    self,
+                    attribute_name,
+                    MappingProxyType(dict(values)),
+                )
+
+
+@dataclass(frozen=True)
+class AtlasObjectTextureSourceLoadResult:
+    """One ordered batch result containing either a source or its failure."""
+
+    spec: AtlasObjectTextureSourceLoadSpec
+    source: AtlasObjectTextureSource | None
+    error: Exception | None
+
+    @property
+    def succeeded(self) -> bool:
+        """Return whether this request produced a usable texture source."""
+
+        return self.source is not None and self.error is None
+
+
 @dataclass(frozen=True)
 class AtlasSurfaceTextureEntry:
     """Lightweight list metadata retained when texture pixels are unavailable."""
@@ -541,6 +885,70 @@ def load_atlas_object_texture_source(
     )
 
 
+def load_atlas_object_texture_sources(
+    specs: Sequence[AtlasObjectTextureSourceLoadSpec],
+) -> tuple[AtlasObjectTextureSourceLoadResult, ...]:
+    """Load independent source descriptors concurrently in request order."""
+
+    normalized_specs = tuple(specs)
+    if any(
+        not isinstance(spec, AtlasObjectTextureSourceLoadSpec)
+        for spec in normalized_specs
+    ):
+        raise TypeError(
+            "Atlas source batches must contain texture-source load specs."
+        )
+    if len(normalized_specs) <= 1:
+        return tuple(
+            _load_atlas_object_texture_source_result(spec)
+            for spec in normalized_specs
+        )
+    return tuple(
+        _SOURCE_THUMBNAIL_EXECUTOR.map(
+            _load_atlas_object_texture_source_result,
+            normalized_specs,
+        )
+    )
+
+
+def _load_atlas_object_texture_source_result(
+    spec: AtlasObjectTextureSourceLoadSpec,
+) -> AtlasObjectTextureSourceLoadResult:
+    """Resolve one batch item without allowing its failure to stop siblings."""
+
+    try:
+        source = load_atlas_object_texture_source(
+            object_id=spec.object_id,
+            object_name=spec.object_name,
+            texture_path=spec.texture_path,
+            texture_resolution=spec.texture_resolution,
+            physical_texture_path=spec.physical_texture_path,
+            map_texture_paths=spec.map_texture_paths,
+            physical_map_texture_paths=spec.physical_map_texture_paths,
+            fallback_map_rgba=spec.fallback_map_rgba,
+            fit_to_square=spec.fit_to_square,
+            supports_resolution_changes=spec.supports_resolution_changes,
+            supports_3d_preview=spec.supports_3d_preview,
+            packing_mode=spec.packing_mode,
+            symmetric_preview_orientation=spec.symmetric_preview_orientation,
+            symmetric_preview_plane_coordinate=(
+                spec.symmetric_preview_plane_coordinate
+            ),
+            surface_usage_count=spec.surface_usage_count,
+        )
+    except Exception as error:  # noqa: BLE001 - isolate each worker failure.
+        return AtlasObjectTextureSourceLoadResult(
+            spec=spec,
+            source=None,
+            error=error,
+        )
+    return AtlasObjectTextureSourceLoadResult(
+        spec=spec,
+        source=source,
+        error=None,
+    )
+
+
 # ### Texture-map helpers ###
 def _normalize_atlas_map_type(map_type: object) -> str:
     normalized_map_type = str(map_type).strip().lower()
@@ -701,7 +1109,153 @@ def _load_texture_thumbnail_rgba(
     packing_mode: str,
     fit_to_square: bool,
 ) -> np.ndarray:
-    """Load and validate one small map thumbnail without retaining its image."""
+    """Load one small map thumbnail, reusing an unchanged file revision."""
+
+    resolved_path = Path(physical_path).resolve()
+    for attempt in range(MAX_SOURCE_THUMBNAIL_DECODE_ATTEMPTS):
+        before_revision = _read_texture_file_stat_revision(resolved_path)
+        cache_key = _build_texture_thumbnail_cache_key(
+            before_revision,
+            logical_texture_path=logical_texture_path,
+            texture_resolution=texture_resolution,
+            packing_mode=packing_mode,
+            fit_to_square=fit_to_square,
+        )
+        cached = _TEXTURE_THUMBNAIL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        persistent = _TEXTURE_THUMBNAIL_DISK_CACHE.get(cache_key)
+        if persistent is not None:
+            after_revision = _read_texture_file_stat_revision(resolved_path)
+            if after_revision == before_revision:
+                _TEXTURE_THUMBNAIL_CACHE.put(cache_key, persistent)
+                return persistent
+            if attempt + 1 < MAX_SOURCE_THUMBNAIL_DECODE_ATTEMPTS:
+                continue
+            raise OSError(
+                "Texture changed while its cached Atlas thumbnail was read: "
+                f"{resolved_path}"
+            )
+
+        thumbnail_rgba = _decode_texture_thumbnail_rgba(
+            resolved_path,
+            logical_texture_path=logical_texture_path,
+            texture_resolution=texture_resolution,
+            packing_mode=packing_mode,
+            fit_to_square=fit_to_square,
+        )
+        after_revision = _read_texture_file_stat_revision(resolved_path)
+        if after_revision != before_revision:
+            if attempt + 1 < MAX_SOURCE_THUMBNAIL_DECODE_ATTEMPTS:
+                continue
+            raise OSError(
+                "Texture changed while its Atlas thumbnail was being decoded: "
+                f"{resolved_path}"
+            )
+        thumbnail_rgba.setflags(write=False)
+        _TEXTURE_THUMBNAIL_CACHE.put(cache_key, thumbnail_rgba)
+        _TEXTURE_THUMBNAIL_DISK_CACHE.put(cache_key, thumbnail_rgba)
+        return thumbnail_rgba
+    raise AssertionError("Atlas thumbnail decoding exhausted without a result.")
+
+
+def _read_texture_file_stat_revision(path: Path) -> _TextureFileStatRevision:
+    """Return the inexpensive revision fields used by thumbnail caching."""
+
+    stat = path.stat()
+    return _TextureFileStatRevision(
+        resolved_path=str(path),
+        size=int(stat.st_size),
+        modified_nanoseconds=int(stat.st_mtime_ns),
+        changed_nanoseconds=int(stat.st_ctime_ns),
+        device=int(stat.st_dev),
+        file_id=int(stat.st_ino),
+    )
+
+
+def _build_texture_thumbnail_cache_key(
+    file_revision: _TextureFileStatRevision,
+    *,
+    logical_texture_path: str,
+    texture_resolution: int,
+    packing_mode: str,
+    fit_to_square: bool,
+) -> _TextureThumbnailCacheKey:
+    """Build a complete key for one thumbnail decode operation."""
+
+    return _TextureThumbnailCacheKey(
+        file_revision=file_revision,
+        logical_texture_path=str(logical_texture_path),
+        texture_resolution=int(texture_resolution),
+        packing_mode=str(packing_mode),
+        fit_to_square=bool(fit_to_square),
+        maximum_size=MAX_SOURCE_THUMBNAIL_SIZE,
+        resampling_filter=int(Image.Resampling.LANCZOS),
+    )
+
+
+def _texture_thumbnail_disk_cache_digest(
+    key: _TextureThumbnailCacheKey,
+) -> str:
+    """Return a stable digest for one complete persistent-cache key."""
+
+    revision = key.file_revision
+    payload = {
+        "cache_version": SOURCE_THUMBNAIL_DISK_CACHE_VERSION,
+        "file_revision": {
+            "resolved_path": revision.resolved_path,
+            "size": revision.size,
+            "modified_nanoseconds": revision.modified_nanoseconds,
+            "changed_nanoseconds": revision.changed_nanoseconds,
+            "device": revision.device,
+            "file_id": revision.file_id,
+        },
+        "decode": {
+            "logical_texture_path": key.logical_texture_path,
+            "texture_resolution": key.texture_resolution,
+            "packing_mode": key.packing_mode,
+            "fit_to_square": key.fit_to_square,
+            "maximum_size": key.maximum_size,
+            "resampling_filter": key.resampling_filter,
+        },
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _normalize_persistent_thumbnail_rgba(rgba: object) -> np.ndarray:
+    """Validate cached bytes before allowing them into the in-memory LRU."""
+
+    candidate = np.asarray(rgba)
+    if (
+        candidate.dtype != np.uint8
+        or candidate.ndim != 3
+        or candidate.shape[2] != 4
+        or candidate.shape[0] <= 0
+        or candidate.shape[1] <= 0
+        or max(candidate.shape[:2]) > MAX_SOURCE_THUMBNAIL_SIZE
+    ):
+        raise ValueError("The persistent Atlas thumbnail is invalid.")
+    normalized = np.ascontiguousarray(candidate)
+    normalized.setflags(write=False)
+    return normalized
+
+
+def _decode_texture_thumbnail_rgba(
+    physical_path: Path,
+    *,
+    logical_texture_path: str,
+    texture_resolution: int,
+    packing_mode: str,
+    fit_to_square: bool,
+) -> np.ndarray:
+    """Decode and validate one owned thumbnail after a cache miss."""
 
     with Image.open(physical_path) as image:
         physical_resolution = _physical_texture_resolution(
@@ -726,7 +1280,17 @@ def _load_texture_thumbnail_rgba(
             (MAX_SOURCE_THUMBNAIL_SIZE, MAX_SOURCE_THUMBNAIL_SIZE),
             Image.Resampling.LANCZOS,
         )
-        return np.asarray(thumbnail, dtype=np.uint8)
+        return np.ascontiguousarray(
+            np.asarray(thumbnail, dtype=np.uint8),
+        ).copy()
+
+
+def _clear_texture_thumbnail_cache(*, include_disk: bool = False) -> None:
+    """Clear memory proxies and optionally the separate persistent cache."""
+
+    _TEXTURE_THUMBNAIL_CACHE.clear()
+    if include_disk:
+        _TEXTURE_THUMBNAIL_DISK_CACHE.clear()
 
 
 # ### Public source helpers ###
@@ -2058,6 +2622,28 @@ class _AtlasStorageSizeCacheEntry:
         return sum(size for _path, size in self.file_sizes)
 
 
+# ### Atlas materialization cache ###
+@dataclass(frozen=True)
+class _AtlasFileContentRevision:
+    """One stable PNG revision used at materialization boundaries."""
+
+    path: str
+    size: int
+    modified_nanoseconds: int
+    changed_nanoseconds: int
+    device: int
+    file_id: int
+    png_fingerprint: bytes
+
+
+@dataclass(frozen=True)
+class _AtlasMaterializationCacheEntry:
+    """Inputs and outputs from one complete successful Atlas build."""
+
+    input_signature: tuple[object, ...]
+    output_revisions: tuple[tuple[str, _AtlasFileContentRevision], ...]
+
+
 # ### Atlas workspace ###
 class TextureAtlasWorkspace(QWidget):
     """Create atlases and manage generated object and surface textures."""
@@ -2156,6 +2742,10 @@ class TextureAtlasWorkspace(QWidget):
         self._atlas_storage_size_cache: dict[
             str,
             _AtlasStorageSizeCacheEntry,
+        ] = {}
+        self._atlas_materialization_cache: dict[
+            str,
+            _AtlasMaterializationCacheEntry,
         ] = {}
         self._active_source_kind: str | None = None
         self._color_balance_editor_source_key: tuple[str, str] | None = None
@@ -2274,6 +2864,12 @@ class TextureAtlasWorkspace(QWidget):
             raise TypeError("Texture atlas data has an invalid type.")
         self._clear_new_source_attention()
         self._data = copy.deepcopy(data or TextureAtlasData())
+        retained_atlas_ids = {atlas.atlas_id for atlas in self._data.atlases}
+        self._atlas_materialization_cache = {
+            atlas_id: entry
+            for atlas_id, entry in self._atlas_materialization_cache.items()
+            if atlas_id in retained_atlas_ids
+        }
         self._invalidate_atlas_storage_size_cache()
         self.set_draw_call_estimate_unavailable()
         self._lazy_materialization_error = None
@@ -3077,8 +3673,8 @@ class TextureAtlasWorkspace(QWidget):
                 prepared.append(self._prepare_materialized_atlas(atlas))
             return tuple(prepared)
         finally:
-            # Export rebuilds are authoritative writes, including when a later
-            # Atlas fails after earlier files were already materialized.
+            # Export preparation may repair stale files before a later Atlas
+            # fails, so refresh sizes across both cache hits and rebuilds.
             self._refresh_atlas_storage_sizes()
 
     def prepare_surface_ao_atlas_context(
@@ -3166,9 +3762,9 @@ class TextureAtlasWorkspace(QWidget):
 
         active_map_types = self._active_export_map_types(atlas)
         output_paths = self._resolve_atlas_map_output_paths(atlas.atlas_id)
-        # Export and AO baking are authoritative boundaries: rebuild even an
-        # existing derived PNG so changed source pixels are never paired with
-        # stale material maps.
+        # Export and AO baking are authoritative boundaries. Materialization
+        # validates layout, source, and derived-output revisions before it
+        # reuses a complete map family, then rebuilds every map when stale.
         self._materialize_atlas(atlas)
         surface_ao_image_path = self._resolve_owned_atlas_path(
             atlas.surface_ao_image_path
@@ -5365,6 +5961,7 @@ class TextureAtlasWorkspace(QWidget):
         image_path = atlas.image_path
         if not self._data.remove_atlas(atlas_id):
             return
+        self._atlas_materialization_cache.pop(atlas_id, None)
         self._invalidate_atlas_storage_size_cache((atlas_id,))
         cleanup_errors: list[OSError] = []
         owned_image_paths = set(self._resolve_atlas_map_output_paths(atlas_id).values())
@@ -7071,8 +7668,6 @@ class TextureAtlasWorkspace(QWidget):
     ) -> None:
         """Atomically materialize base-color and PBR companion Atlas PNGs."""
 
-        self._invalidate_atlas_storage_size_cache((atlas.atlas_id,))
-        self._asset_directory.mkdir(parents=True, exist_ok=True)
         relative_paths = {
             map_type: build_texture_atlas_map_image_relative_path(
                 atlas.atlas_id,
@@ -7081,19 +7676,8 @@ class TextureAtlasWorkspace(QWidget):
             for map_type in ATLAS_MAP_TYPES
         }
         output_paths = self._resolve_atlas_map_output_paths(atlas.atlas_id)
-        snapshot_paths = set(output_paths.values())
-        previous_output_path = self._resolve_owned_atlas_path(atlas.image_path)
-        if previous_output_path is not None:
-            snapshot_paths.add(previous_output_path)
-        snapshots = {
-            path: path.read_bytes() if path.is_file() else None
-            for path in snapshot_paths
-        }
-        previous_image_path = atlas.image_path
-
-        def resolve_source(
-            placement: TextureAtlasPlacement,
-        ) -> AtlasObjectTextureSource:
+        resolved_sources: dict[str, AtlasObjectTextureSource] = {}
+        for placement in atlas.placements:
             source = (
                 None
                 if source_overrides is None
@@ -7117,7 +7701,38 @@ class TextureAtlasWorkspace(QWidget):
                 raise ValueError(
                     "The exact texture source does not match its Atlas placement."
                 )
-            return source
+            resolved_sources[placement.object_id] = source
+
+        input_signature = self._build_atlas_materialization_input_signature(
+            atlas,
+            resolved_sources,
+        )
+        cached = self._atlas_materialization_cache.get(atlas.atlas_id)
+        if cached is not None and cached.input_signature == input_signature:
+            try:
+                output_revisions = _build_atlas_output_content_revisions(output_paths)
+            except OSError:
+                output_revisions = None
+            if output_revisions == cached.output_revisions:
+                atlas.image_path = relative_paths[ATLAS_MAP_BASE_COLOR]
+                if (
+                    self._lazy_materialization_error is not None
+                    and self._lazy_materialization_error[0] == atlas.atlas_id
+                ):
+                    self._lazy_materialization_error = None
+                return
+
+        self._invalidate_atlas_storage_size_cache((atlas.atlas_id,))
+        self._asset_directory.mkdir(parents=True, exist_ok=True)
+        snapshot_paths = set(output_paths.values())
+        previous_output_path = self._resolve_owned_atlas_path(atlas.image_path)
+        if previous_output_path is not None:
+            snapshot_paths.add(previous_output_path)
+        snapshots = {
+            path: path.read_bytes() if path.is_file() else None
+            for path in snapshot_paths
+        }
+        previous_image_path = atlas.image_path
 
         try:
             for map_type in (*ATLAS_MAP_TYPES[1:], ATLAS_MAP_BASE_COLOR):
@@ -7129,7 +7744,7 @@ class TextureAtlasWorkspace(QWidget):
                     placement: TextureAtlasPlacement,
                     selected_map_type: str = map_type,
                 ) -> np.ndarray:
-                    source = resolve_source(placement)
+                    source = resolved_sources[placement.object_id]
                     rgba = source.load_texture_rgba(selected_map_type)
                     return np.ascontiguousarray(rgba[:, :, (2, 1, 0, 3)])
 
@@ -7157,15 +7772,81 @@ class TextureAtlasWorkspace(QWidget):
                         else None
                     ),
                 )
+            final_input_signature = self._build_atlas_materialization_input_signature(
+                atlas,
+                resolved_sources,
+            )
+            if final_input_signature != input_signature:
+                raise ValueError(
+                    "An Atlas source file changed while its PNG maps were "
+                    "being built. The previous Atlas files were restored."
+                )
+            output_revisions = _build_atlas_output_content_revisions(output_paths)
         except Exception:
             atlas.image_path = previous_image_path
             _restore_atlas_png_snapshots(snapshots)
             raise
+        self._atlas_materialization_cache[atlas.atlas_id] = (
+            _AtlasMaterializationCacheEntry(
+                input_signature=input_signature,
+                output_revisions=output_revisions,
+            )
+        )
         if (
             self._lazy_materialization_error is not None
             and self._lazy_materialization_error[0] == atlas.atlas_id
         ):
             self._lazy_materialization_error = None
+
+    def _build_atlas_materialization_input_signature(
+        self,
+        atlas: TextureAtlasRecord,
+        resolved_sources: Mapping[str, AtlasObjectTextureSource],
+    ) -> tuple[object, ...]:
+        """Describe every layout and source byte which affects Atlas output."""
+
+        source_signatures: list[tuple[object, ...]] = []
+        for placement in atlas.placements:
+            source = resolved_sources[placement.object_id]
+            assert source.map_texture_paths is not None
+            assert source.physical_map_texture_paths is not None
+            assert source.fallback_map_rgba is not None
+            map_signatures: list[tuple[object, ...]] = []
+            for map_type in ATLAS_MAP_TYPES:
+                physical_path = source.physical_map_texture_paths.get(map_type)
+                if physical_path is None:
+                    map_signatures.append(
+                        (
+                            map_type,
+                            "fallback",
+                            source.fallback_map_rgba[map_type],
+                        )
+                    )
+                    continue
+                map_signatures.append(
+                    (
+                        map_type,
+                        source.map_texture_paths[map_type],
+                        _build_atlas_file_content_revision(physical_path),
+                    )
+                )
+            source_signatures.append(
+                (
+                    placement.object_id,
+                    int(source.texture_resolution),
+                    source.texture_path,
+                    source.packing_mode,
+                    bool(source.fit_to_square),
+                    self._is_surface_texture_source_id(placement.object_id),
+                    tuple(map_signatures),
+                )
+            )
+        return (
+            atlas.atlas_id,
+            int(atlas.resolution),
+            tuple(atlas.placements),
+            tuple(source_signatures),
+        )
 
     def _rebuild_or_detach_atlas_image(
         self,
@@ -7189,6 +7870,7 @@ class TextureAtlasWorkspace(QWidget):
                 rebuilt = True
         if not rebuilt:
             atlas.image_path = None
+            self._atlas_materialization_cache.pop(atlas.atlas_id, None)
 
         cleanup_paths = set(
             self._resolve_atlas_map_output_paths(atlas.atlas_id).values()
@@ -7349,6 +8031,96 @@ class TextureAtlasWorkspace(QWidget):
         if candidate.suffix.lower() != ".png":
             return None
         return candidate
+
+
+# ### Atlas materialization cache helpers ###
+def _build_atlas_file_content_revision(
+    raw_path: str | Path,
+) -> _AtlasFileContentRevision:
+    """Read one stable PNG revision without scanning its compressed payload."""
+
+    path = Path(raw_path).resolve()
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        png_fingerprint = _build_png_chunk_fingerprint(handle, int(before.st_size))
+        after = os.fstat(handle.fileno())
+    before_revision = (
+        int(before.st_size),
+        int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+        int(before.st_dev),
+        int(before.st_ino),
+    )
+    after_revision = (
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+        int(after.st_dev),
+        int(after.st_ino),
+    )
+    if before_revision != after_revision:
+        raise OSError(f"File changed while its Atlas revision was read: {path}")
+    return _AtlasFileContentRevision(
+        path=str(path),
+        size=int(after.st_size),
+        modified_nanoseconds=int(after.st_mtime_ns),
+        changed_nanoseconds=int(after.st_ctime_ns),
+        device=int(after.st_dev),
+        file_id=int(after.st_ino),
+        png_fingerprint=png_fingerprint,
+    )
+
+
+def _build_png_chunk_fingerprint(handle: BinaryIO, file_size: int) -> bytes:
+    """Fingerprint valid PNG chunks while seeking over large pixel payloads."""
+
+    handle.seek(0)
+    if handle.read(len(PNG_FILE_SIGNATURE)) != PNG_FILE_SIGNATURE:
+        return _hash_complete_atlas_file(handle)
+    digest = hashlib.sha256(PNG_FILE_SIGNATURE)
+    while handle.tell() < file_size:
+        header = handle.read(8)
+        if len(header) != 8:
+            return _hash_complete_atlas_file(handle)
+        payload_size = int.from_bytes(header[:4], "big")
+        if payload_size > file_size - handle.tell() - 4:
+            return _hash_complete_atlas_file(handle)
+        handle.seek(payload_size, os.SEEK_CUR)
+        stored_crc = handle.read(4)
+        if len(stored_crc) != 4:
+            return _hash_complete_atlas_file(handle)
+        digest.update(header)
+        digest.update(stored_crc)
+        if header[4:] != b"IEND":
+            continue
+        if handle.tell() != file_size:
+            return _hash_complete_atlas_file(handle)
+        return b"png-chunks\0" + digest.digest()
+    return _hash_complete_atlas_file(handle)
+
+
+def _hash_complete_atlas_file(handle: BinaryIO) -> bytes:
+    """Hash malformed PNG bytes so corruption never receives a cache hit."""
+
+    handle.seek(0)
+    digest = hashlib.sha256()
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+    return b"raw-file\0" + digest.digest()
+
+
+def _build_atlas_output_content_revisions(
+    output_paths: Mapping[str, Path],
+) -> tuple[tuple[str, _AtlasFileContentRevision], ...]:
+    """Return deterministic revisions for a complete derived Atlas family."""
+
+    return tuple(
+        (
+            map_type,
+            _build_atlas_file_content_revision(output_paths[map_type]),
+        )
+        for map_type in ATLAS_MAP_TYPES
+    )
 
 
 # ### Atlas editing helpers ###

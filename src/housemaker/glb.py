@@ -149,6 +149,12 @@ GLB_VERSION = 2
 GLB_HEADER_BYTE_COUNT = 12
 GLB_CHUNK_HEADER_BYTE_COUNT = 8
 GLB_JSON_CHUNK_TYPE = b"JSON"
+GENERATED_MODEL_PREVIEW_PROXY_MAX_DIMENSION = 256
+GENERATED_MODEL_PREVIEW_NEUTRAL_IMAGE_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4////"
+    "fwAJ+wP99djxmgAAAABJRU5ErkJggg=="
+)
 GLTF_LINEAR_FILTER = 9729
 GLTF_LINEAR_MIPMAP_LINEAR_FILTER = 9987
 GLTF_CLAMP_TO_EDGE_WRAP = 33071
@@ -282,6 +288,14 @@ class _CachedStairRouteGeometry:
 
 @dataclass
 class GeneratedModel:
+    """Retained geometry, scene data, and the authoritative source payload.
+
+    ``preview_only`` marks scenes whose embedded images were deliberately
+    replaced with bounded display proxies. Their original ``glb_bytes`` stay
+    byte-for-byte intact, but the transient scene must never reach an export
+    or geometry-edit path.
+    """
+
     mesh: trimesh.Trimesh
     scene: trimesh.Scene
     glb_bytes: bytes
@@ -298,6 +312,7 @@ class GeneratedModel:
     preview_stair_parts: list[PreviewStairPart] = field(default_factory=list)
     preview_architectural_trim_parts: list[object] = field(default_factory=list)
     preview_base_mesh: trimesh.Trimesh | None = None
+    preview_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -1151,6 +1166,13 @@ def compose_generated_model_instance_sources(
         for placement in normalized_sources
     ):
         raise TypeError("Instance sources must contain placed generated models.")
+    if base_model.preview_only or any(
+        placement.model.preview_only for placement in normalized_sources
+    ):
+        raise ValueError(
+            "Preview-only generated models cannot be serialized as instance "
+            "sources."
+        )
     if not normalized_sources:
         return base_model
     if not isinstance(base_model.scene, trimesh.Scene):
@@ -1337,6 +1359,14 @@ def _compose_placed_generated_models(
         for placement in normalized_placements
     ):
         raise TypeError("Placed models must contain PlacedGeneratedModel values.")
+    if serialize_glb and (
+        base_model.preview_only
+        or any(placement.model.preview_only for placement in normalized_placements)
+    ):
+        raise ValueError(
+            "Preview-only generated models cannot be serialized; reload their "
+            "authoritative GLB scenes first."
+        )
     if not normalized_placements:
         return base_model
     if not isinstance(base_model.scene, trimesh.Scene):
@@ -1469,6 +1499,10 @@ def _compose_placed_generated_models(
         preview_stair_parts=list(base_model.preview_stair_parts),
         preview_architectural_trim_parts=list(
             base_model.preview_architectural_trim_parts
+        ),
+        preview_only=(
+            base_model.preview_only
+            or any(placement.model.preview_only for placement in normalized_placements)
         ),
     )
 
@@ -5585,6 +5619,11 @@ def _get_surface_object_name(surface_id: str) -> str:
 
 
 def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
+    if model.preview_only:
+        raise ValueError(
+            "Preview-only generated models cannot be exported; reload the "
+            "authoritative GLB scene first."
+        )
     export_path = Path(path)
     payload = _rewrite_serialized_glb_half_mesh_extras(
         model.glb_bytes,
@@ -5607,9 +5646,59 @@ def import_generated_glb(glb_bytes: bytes) -> GeneratedModel:
     payload = bytes(glb_bytes)
     if not payload:
         raise ValueError("The generated GLB is empty.")
+    return _import_generated_glb_payload(
+        payload,
+        authoritative_payload=payload,
+        preview_only=False,
+    )
+
+
+def import_generated_glb_preview(
+    glb_bytes: bytes,
+    *,
+    base_color_rgba: np.ndarray,
+    normal_rgba: np.ndarray | None = None,
+    roughness_rgba: np.ndarray | None = None,
+    metallic_rgba: np.ndarray | None = None,
+) -> GeneratedModel:
+    """Load geometry and UVs while bypassing every embedded full-size image.
+
+    The source payload is retained unchanged. Only a temporary in-memory GLB
+    document is redirected to a one-pixel image before trimesh parses its
+    materials; bounded external source maps are then installed on those
+    materials for the first viewer frame.
+    """
+
+    payload = bytes(glb_bytes)
+    if not payload:
+        raise ValueError("The generated GLB is empty.")
+    texture_proxies = _normalize_generated_model_preview_proxies(
+        base_color_rgba=base_color_rgba,
+        normal_rgba=normal_rgba,
+        roughness_rgba=roughness_rgba,
+        metallic_rgba=metallic_rgba,
+    )
+    preview_payload = _build_generated_model_preview_glb(payload)
+    model = _import_generated_glb_payload(
+        preview_payload,
+        authoritative_payload=payload,
+        preview_only=True,
+    )
+    _apply_generated_model_preview_proxies(model.scene, texture_proxies)
+    return model
+
+
+def _import_generated_glb_payload(
+    load_payload: bytes,
+    *,
+    authoritative_payload: bytes,
+    preview_only: bool,
+) -> GeneratedModel:
+    """Build one model from transient load bytes and retain authoritative bytes."""
+
     try:
         loaded = trimesh.load(
-            BytesIO(payload),
+            BytesIO(load_payload),
             file_type="glb",
             force="scene",
             process=False,
@@ -5641,8 +5730,236 @@ def import_generated_glb(glb_bytes: bytes) -> GeneratedModel:
     return GeneratedModel(
         mesh=preview_mesh,
         scene=scene,
-        glb_bytes=payload,
+        glb_bytes=authoritative_payload,
+        preview_only=preview_only,
     )
+
+
+def _build_generated_model_preview_glb(payload: bytes) -> bytes:
+    """Redirect all GLB images without reading any embedded image buffer view."""
+
+    try:
+        if (
+            len(payload) < GLB_HEADER_BYTE_COUNT + GLB_CHUNK_HEADER_BYTE_COUNT
+            or payload[:4] != GLB_MAGIC
+            or int.from_bytes(payload[4:8], "little") != GLB_VERSION
+            or int.from_bytes(payload[8:12], "little") != len(payload)
+        ):
+            raise ValueError("The GLB header is invalid.")
+        json_byte_count = int.from_bytes(payload[12:16], "little")
+        if payload[16:20] != GLB_JSON_CHUNK_TYPE:
+            raise ValueError("The first GLB chunk is not JSON.")
+        json_end = (
+            GLB_HEADER_BYTE_COUNT
+            + GLB_CHUNK_HEADER_BYTE_COUNT
+            + json_byte_count
+        )
+        if json_byte_count <= 0 or json_end > len(payload):
+            raise ValueError("The GLB JSON chunk is invalid.")
+        raw_document = payload[20:json_end].rstrip(b" \t\r\n\0")
+        document = json.loads(raw_document.decode("utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError("The GLB JSON root is invalid.")
+        raw_images = document.get("images", ())
+        if not isinstance(raw_images, list):
+            raise ValueError("The generated GLB image table is invalid.")
+        for raw_image in raw_images:
+            if not isinstance(raw_image, dict):
+                raise ValueError("The generated GLB contains an invalid image.")
+            retained_fields = {
+                key: copy.deepcopy(raw_image[key])
+                for key in ("name", "extras", "extensions")
+                if key in raw_image
+            }
+            raw_image.clear()
+            raw_image.update(retained_fields)
+            raw_image["uri"] = GENERATED_MODEL_PREVIEW_NEUTRAL_IMAGE_URI
+        encoded_document = json.dumps(
+            document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("The generated GLB could not be loaded.") from error
+
+    encoded_document += b" " * (-len(encoded_document) % 4)
+    trailing_chunks = payload[json_end:]
+    total_byte_count = (
+        GLB_HEADER_BYTE_COUNT
+        + GLB_CHUNK_HEADER_BYTE_COUNT
+        + len(encoded_document)
+        + len(trailing_chunks)
+    )
+    return b"".join(
+        (
+            GLB_MAGIC,
+            GLB_VERSION.to_bytes(4, "little"),
+            total_byte_count.to_bytes(4, "little"),
+            len(encoded_document).to_bytes(4, "little"),
+            GLB_JSON_CHUNK_TYPE,
+            encoded_document,
+            trailing_chunks,
+        )
+    )
+
+
+def _normalize_generated_model_preview_proxies(
+    *,
+    base_color_rgba: np.ndarray,
+    normal_rgba: np.ndarray | None,
+    roughness_rgba: np.ndarray | None,
+    metallic_rgba: np.ndarray | None,
+) -> dict[str, np.ndarray | None]:
+    """Validate bounded RGBA maps before any GLB parsing work begins."""
+
+    return {
+        "base_color": _normalize_generated_model_preview_proxy(
+            base_color_rgba,
+            map_name="base color",
+        ),
+        "normal": _normalize_generated_model_preview_proxy(
+            normal_rgba,
+            map_name="normal",
+            optional=True,
+        ),
+        "roughness": _normalize_generated_model_preview_proxy(
+            roughness_rgba,
+            map_name="roughness",
+            optional=True,
+        ),
+        "metallic": _normalize_generated_model_preview_proxy(
+            metallic_rgba,
+            map_name="metallic",
+            optional=True,
+        ),
+    }
+
+
+def _normalize_generated_model_preview_proxy(
+    raw_rgba: np.ndarray | None,
+    *,
+    map_name: str,
+    optional: bool = False,
+) -> np.ndarray | None:
+    """Return one immutable 256px-or-smaller RGBA source proxy."""
+
+    if raw_rgba is None:
+        if optional:
+            return None
+        raise ValueError("Generated-model previews require a base-color proxy.")
+    rgba = np.asarray(raw_rgba)
+    if (
+        rgba.dtype != np.uint8
+        or rgba.ndim != 3
+        or rgba.shape[2] != 4
+        or rgba.shape[0] <= 0
+        or rgba.shape[1] <= 0
+    ):
+        raise ValueError(
+            f"The generated-model {map_name} proxy must be a non-empty RGBA "
+            "uint8 image."
+        )
+    if max(rgba.shape[:2]) > GENERATED_MODEL_PREVIEW_PROXY_MAX_DIMENSION:
+        raise ValueError(
+            f"The generated-model {map_name} proxy cannot exceed "
+            f"{GENERATED_MODEL_PREVIEW_PROXY_MAX_DIMENSION} pixels per side."
+        )
+    normalized = np.ascontiguousarray(rgba)
+    normalized.setflags(write=False)
+    return normalized
+
+
+def _apply_generated_model_preview_proxies(
+    scene: trimesh.Scene,
+    proxies: Mapping[str, np.ndarray | None],
+) -> None:
+    """Replace transient scene images while retaining material semantics."""
+
+    base_color = proxies["base_color"]
+    assert isinstance(base_color, np.ndarray)
+    base_color_image = Image.fromarray(base_color, mode="RGBA")
+    normal = proxies["normal"]
+    normal_image = (
+        None if normal is None else Image.fromarray(normal, mode="RGBA")
+    )
+    roughness = proxies["roughness"]
+    metallic = proxies["metallic"]
+    roughness_image = (
+        None if roughness is None else Image.fromarray(roughness, mode="RGBA")
+    )
+    metallic_image = (
+        None if metallic is None else Image.fromarray(metallic, mode="RGBA")
+    )
+    packed_image = _build_metallic_roughness_preview_image(
+        roughness,
+        metallic,
+    )
+
+    visited_material_ids: set[int] = set()
+    for geometry in scene.geometry.values():
+        visual = getattr(geometry, "visual", None)
+        for material in _iter_generated_model_material_leaves(
+            getattr(visual, "material", None)
+        ):
+            material_id = id(material)
+            if material_id in visited_material_ids:
+                continue
+            visited_material_ids.add(material_id)
+            if getattr(material, "baseColorTexture", None) is not None:
+                material.baseColorTexture = base_color_image
+            elif getattr(material, "image", None) is not None:
+                material.image = base_color_image
+            if normal_image is not None:
+                material.normalTexture = normal_image
+            if roughness_image is not None:
+                material.roughnessTexture = roughness_image
+            if metallic_image is not None:
+                material.metallicTexture = metallic_image
+            if (
+                packed_image is not None
+                and getattr(material, "metallicRoughnessTexture", None) is not None
+            ):
+                material.metallicRoughnessTexture = packed_image
+
+
+def _iter_generated_model_material_leaves(material: object) -> tuple[object, ...]:
+    """Flatten trimesh multi-material containers without changing their order."""
+
+    if material is None:
+        return ()
+    nested = getattr(material, "materials", None)
+    if isinstance(nested, (list, tuple)):
+        return tuple(
+            leaf
+            for child in nested
+            for leaf in _iter_generated_model_material_leaves(child)
+        )
+    return (material,)
+
+
+def _build_metallic_roughness_preview_image(
+    roughness_rgba: np.ndarray | None,
+    metallic_rgba: np.ndarray | None,
+) -> Image.Image | None:
+    """Pack external grayscale proxies into glTF's green/blue channel layout."""
+
+    if roughness_rgba is None and metallic_rgba is None:
+        return None
+    reference = roughness_rgba if roughness_rgba is not None else metallic_rgba
+    assert reference is not None
+    height, width = reference.shape[:2]
+    if roughness_rgba is not None and roughness_rgba.shape[:2] != (height, width):
+        raise ValueError("Generated-model PBR proxies must have matching dimensions.")
+    if metallic_rgba is not None and metallic_rgba.shape[:2] != (height, width):
+        raise ValueError("Generated-model PBR proxies must have matching dimensions.")
+    packed = np.empty((height, width, 4), dtype=np.uint8)
+    packed[:, :, 0] = 255
+    packed[:, :, 1] = (
+        255 if roughness_rgba is None else roughness_rgba[:, :, 0]
+    )
+    packed[:, :, 2] = 0 if metallic_rgba is None else metallic_rgba[:, :, 0]
+    packed[:, :, 3] = 255
+    return Image.fromarray(packed, mode="RGBA")
 
 
 # ### Internal helpers ###

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import shapely
@@ -22,6 +23,7 @@ from housemaker.surface_geometry import (
     SURFACE_TYPE_WALL,
     FixedSurface,
     _build_horizontal_surface,
+    build_base_fixed_surfaces,
     build_fixed_surfaces,
     get_combined_surface_area,
 )
@@ -228,6 +230,41 @@ def _get_horizontal_surface_plan_geometry(surface: FixedSurface) -> BaseGeometry
 
 # ### Tests ###
 class FixedSurfaceGeometryTests(unittest.TestCase):
+    def test_fixed_surfaces_can_reuse_an_unclipped_base_snapshot(self) -> None:
+        level = _build_square_level(doorway=True)
+        expected = build_fixed_surfaces((level,))
+        base_surfaces = build_base_fixed_surfaces(
+            (level,),
+            clip_open_spaces=False,
+        )
+
+        with patch(
+            "housemaker.surface_geometry.build_base_fixed_surfaces",
+            side_effect=AssertionError("base geometry was rebuilt"),
+        ):
+            actual = build_fixed_surfaces(
+                (level,),
+                base_surfaces=base_surfaces,
+            )
+
+        self.assertEqual(
+            tuple(surface.surface_id for surface in actual),
+            tuple(surface.surface_id for surface in expected),
+        )
+        for actual_surface, expected_surface in zip(actual, expected):
+            self.assertTrue(
+                np.array_equal(
+                    actual_surface.mesh.vertices,
+                    expected_surface.mesh.vertices,
+                )
+            )
+            self.assertTrue(
+                np.array_equal(
+                    actual_surface.mesh.faces,
+                    expected_surface.mesh.faces,
+                )
+            )
+
     def test_horizontal_triangulation_discards_microscopic_slivers(self) -> None:
         polygon = Polygon(
             (

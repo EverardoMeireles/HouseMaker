@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -92,10 +93,17 @@ class SymmetricViewerPreviewTests(unittest.TestCase):
             faces_before[:, (0, 2, 1)],
         )
         ghost = self.viewer.symmetric_preview_textured_mesh_item
+        fallback = self.viewer.symmetric_preview_mesh_item
         assert ghost is not None
+        assert fallback is not None
         opacity_before = ghost._opacity
-        self.viewer._advance_symmetric_preview_fade()
+        fallback_opacity_before = fallback._preview_opacity
+        with patch.object(fallback, "setMeshData") as set_mesh_data:
+            self.viewer._advance_symmetric_preview_fade()
+
+        set_mesh_data.assert_not_called()
         self.assertNotEqual(ghost._opacity, opacity_before)
+        self.assertNotEqual(fallback._preview_opacity, fallback_opacity_before)
         np.testing.assert_array_equal(model.mesh.vertices, vertices_before)
         np.testing.assert_array_equal(model.mesh.faces, faces_before)
         np.testing.assert_array_equal(model.scene.bounds, scene_bounds_before)
@@ -343,6 +351,24 @@ class SymmetricViewerPreviewTests(unittest.TestCase):
         self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
         self.assertIsNone(self.viewer.symmetric_preview_textured_mesh_item)
         self.assertIsNone(self.viewer.symmetric_preview_mesh_item)
+
+    def test_inactive_viewer_stops_animation_before_advancing_it(self) -> None:
+        self.viewer.set_model(_textured_half_model())
+        self.viewer.set_symmetric_division_preview("vertical", 0.0)
+        self.assertTrue(self.viewer._symmetric_preview_timer.isActive())
+
+        with (
+            patch.object(
+                self.viewer,
+                "_continuous_preview_animation_allowed",
+                return_value=False,
+            ),
+            patch.object(self.viewer, "_advance_symmetric_preview_fade") as advance,
+        ):
+            self.viewer._tick_symmetric_preview_animation()
+
+        self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
+        advance.assert_not_called()
 
 
 # ### Test entry point ###

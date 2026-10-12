@@ -24,6 +24,7 @@ from PySide6.QtWidgets import QApplication
 from housemaker.architectural_trim_generation import (
     ArchitecturalTrimRepeatLayout,
     prepare_architectural_trim_repeat_module,
+    retarget_architectural_trim_repeat_module_preview_model,
 )
 from housemaker.architectural_trim_uv import (
     ARCHITECTURAL_TRIM_UV_LONGITUDINAL_AXIS_X,
@@ -1099,6 +1100,70 @@ class ArchitecturalTrimGenerationWorkspaceTests(unittest.TestCase):
         np.testing.assert_allclose(
             saved.preview_model.mesh.extents,
             self.fit_dimensions,
+        )
+
+    def test_trim_preview_transfer_reuses_in_memory_retarget(self) -> None:
+        module_glb, repeat_layout = prepare_architectural_trim_repeat_module(
+            _trim_component_model().glb_bytes,
+            self.fit_dimensions,
+        )
+        module_asset_path = self.workspace._persist_meshy_named_asset(
+            "preview-repeat-module.glb",
+            module_glb,
+        )
+        record_index = self.workspace._data.generated_objects.index(self.record)
+        self.workspace._data.generated_objects[record_index] = replace(
+            self.record,
+            pipeline={
+                **self.record.pipeline,
+                ARCHITECTURAL_TRIM_REPEAT_PIPELINE_KEY: (
+                    repeat_layout.to_pipeline_dict()
+                ),
+                "postprocessed_asset_path": module_asset_path,
+            },
+        )
+        target_extents = (4.5, 0.3, 0.6)
+
+        with (
+            patch(
+                "housemaker.generation_workspace."
+                "retarget_architectural_trim_repeat_module_preview_model",
+                wraps=retarget_architectural_trim_repeat_module_preview_model,
+            ) as preview_retarget,
+            patch(
+                "housemaker.generation_workspace."
+                "retarget_architectural_trim_repeat_module_glb",
+                side_effect=AssertionError("preview used authoritative GLB path"),
+            ),
+        ):
+            first_model = (
+                self.workspace
+                .build_architectural_trim_texture_transfer_preview_model(
+                    self.object_id,
+                    target_extents,
+                )
+            )
+            second_model = (
+                self.workspace
+                .build_architectural_trim_texture_transfer_preview_model(
+                    self.object_id,
+                    target_extents,
+                )
+            )
+
+        self.assertIsNotNone(first_model)
+        assert first_model is not None
+        self.assertIs(first_model, second_model)
+        self.assertEqual(first_model.glb_bytes, b"")
+        np.testing.assert_allclose(first_model.mesh.extents, target_extents)
+        preview_retarget.assert_called_once()
+        self.assertEqual(
+            len(self.workspace._architectural_trim_preview_source_model_cache),
+            1,
+        )
+        self.assertEqual(
+            len(self.workspace._architectural_trim_preview_transfer_model_cache),
+            1,
         )
 
     def test_cornice_half_texture_persistence_keeps_full_geometry(self) -> None:

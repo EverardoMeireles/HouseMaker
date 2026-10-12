@@ -122,17 +122,31 @@ class WallWindowPlacement:
 
 
 # ### Public surface builders ###
-def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
-    """Build walls, floors, and ceilings with stable semantic identities."""
+def build_fixed_surfaces(
+    levels: Sequence[LevelData],
+    *,
+    base_surfaces: Sequence[FixedSurface] | None = None,
+) -> list[FixedSurface]:
+    """Build semantic surfaces, optionally reusing one un-clipped base snapshot.
+
+    A supplied snapshot must have been produced for the same ``levels`` with
+    ``build_base_fixed_surfaces(..., clip_open_spaces=False)``.  This keeps a
+    project load from repeating the expensive wall and room reconstruction
+    when another consumer already owns that exact structural snapshot.
+    """
 
     from housemaker.architectural_surface_edits import apply_editable_surfaces
     from housemaker.architectural_trim import build_architectural_trim_geometry
 
-    base_surfaces = build_base_fixed_surfaces(
-        levels,
-        clip_open_spaces=False,
+    prepared_base_surfaces = (
+        build_base_fixed_surfaces(
+            levels,
+            clip_open_spaces=False,
+        )
+        if base_surfaces is None
+        else list(base_surfaces)
     )
-    edited_surfaces = apply_editable_surfaces(levels, base_surfaces)
+    edited_surfaces = apply_editable_surfaces(levels, prepared_base_surfaces)
     clipped_surfaces = _clip_horizontal_surfaces_for_open_spaces(
         levels,
         edited_surfaces,
@@ -142,7 +156,10 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
         clipped_surfaces,
         edited_surfaces_only=True,
     )
-    trim_geometry = build_architectural_trim_geometry(levels, base_surfaces)
+    trim_geometry = build_architectural_trim_geometry(
+        levels,
+        prepared_base_surfaces,
+    )
     trim_surfaces = tuple(
         FixedSurface(
             surface_id=part.semantic_id,

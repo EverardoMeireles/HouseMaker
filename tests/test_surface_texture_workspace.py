@@ -3838,6 +3838,41 @@ class SharedSceneSurfaceSelectionTests(unittest.TestCase):
             tuple(surface.surface_id for surface in selected_walls),
         )
 
+    def test_prepared_architectural_catalog_avoids_level_reconstruction(
+        self,
+    ) -> None:
+        level = _test_level()
+        prepared_surfaces = tuple(build_fixed_surfaces((level,)))
+        stair_mesh = trimesh.creation.box(extents=(1.0, 2.0, 0.1))
+        stair_surface = FixedSurface(
+            surface_id=f"stair:{'b' * 32}/part:treads:floor",
+            surface_type="floor",
+            level_index=level.index,
+            room_index=None,
+            mesh=stair_mesh,
+            area_square_meters=float(stair_mesh.area),
+        )
+
+        with patch(
+            "housemaker.surface_texture_workspace.build_fixed_surfaces",
+            side_effect=AssertionError("architectural geometry was rebuilt"),
+        ):
+            self.workspace.set_levels(
+                (level,),
+                architectural_surfaces=prepared_surfaces,
+            )
+            self.assertTrue(
+                self.workspace.set_external_semantic_surfaces((stair_surface,))
+            )
+
+        available_ids = set(self.workspace._all_existing_surfaces_by_id())
+        self.assertIn(stair_surface.surface_id, available_ids)
+        self.assertTrue(
+            {surface.surface_id for surface in prepared_surfaces}.issubset(
+                available_ids
+            )
+        )
+
     def test_mixed_scene_surface_types_cannot_start_one_texture_request(
         self,
     ) -> None:

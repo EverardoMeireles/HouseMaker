@@ -6,6 +6,7 @@ import math
 import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -15,6 +16,7 @@ import trimesh
 from PIL import Image
 from PySide6.QtCore import (
     QEvent,
+    QEventLoop,
     QObject,
     QPointF,
     QSignalBlocker,
@@ -70,9 +72,9 @@ from housemaker.architectural_trim import (
     TRIM_HANDLE_DEPTH,
     TRIM_HANDLE_HEIGHT,
     TRIM_HANDLE_WIDTH,
-    ArchitecturalTrimMiterDescriptor,
     ArchitecturalTrimEditTarget,
     ArchitecturalTrimEndpointMiter,
+    ArchitecturalTrimMiterDescriptor,
     ArchitecturalTrimPart,
     ArchitecturalTrimPlacementRequest,
     add_architectural_trim,
@@ -197,6 +199,7 @@ from housemaker.glb import (
     GeneratedModel,
     NoUsableBlueprintGeometryError,
     PlacedGeneratedModel,
+    PreviewPlacedObject,
     PreviewStairPart,
     build_canvas_stair_part_targets,
     build_gltf_mirror_plane_from_z_up_transform,
@@ -291,6 +294,8 @@ from housemaker.models import (
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
 from housemaker.plan_correction_models import (
@@ -332,6 +337,8 @@ from housemaker.surface_geometry import (
 from housemaker.surface_materials import (
     LEGACY_SURFACE_ROUGHNESS_FACTOR,
     SurfaceMaterialSourceSpec,
+    build_surface_material_preview_proxy,
+    resolve_surface_material,
 )
 from housemaker.surface_orientation_edits import (
     remap_flipped_surface_ids_with_lineage,
@@ -366,13 +373,14 @@ from housemaker.texture_atlas_state import (
 )
 from housemaker.texture_atlas_workspace import (
     AtlasObjectTextureSource,
+    AtlasObjectTextureSourceLoadSpec,
     AtlasSurfaceTextureEntry,
     TextureAtlasWorkspace,
     build_atlas_wall_texture_source_id,
     choose_atlas_texture_resolution,
     get_atlas_wall_texture_assignment_id,
     is_atlas_wall_texture_source_id,
-    load_atlas_object_texture_source,
+    load_atlas_object_texture_sources,
 )
 from housemaker.texture_color_balance import TextureColorBalanceSettings
 from housemaker.tour_state import (
@@ -400,8 +408,11 @@ from housemaker.viewer import (
     DoorPlacementPreviewPart,
     GlbViewerWidget,
     PlacedObjectInstanceRequest,
+    ProgressiveTextureUpdateToken,
     SceneObjectPlacementCandidate,
+    TexturePreviewBundle,
     build_scene_object_placement_group_candidate,
+    build_texture_preview_bundle,
 )
 from housemaker.wall_mirroring import (
     WallMirrorTopologyResult,
@@ -415,6 +426,17 @@ from housemaker.wall_mirroring import (
 
 # ### Constants ###
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
+STARTUP_PROJECT_RESTORE_DELAY_MILLISECONDS = 50
+STARTUP_PROJECT_RESTORE_CANCEL_EVENT_TYPES = frozenset(
+    (
+        QEvent.Type.KeyPress,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.ShortcutOverride,
+        QEvent.Type.TabletPress,
+        QEvent.Type.TouchBegin,
+        QEvent.Type.Wheel,
+    )
+)
 PROJECT_LOAD_FAILURES = (
     AttributeError,
     KeyError,
@@ -449,6 +471,9 @@ STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS = 35
 PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
 PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
 PLAN_WALL_PREVIEW_REFRESH_DELAY_MILLISECONDS = 75
+PROGRESSIVE_TEXTURE_LOAD_MAX_WORKERS = 4
+PROGRESSIVE_TEXTURE_SHUTDOWN_POLL_MILLISECONDS = 25
+ATLAS_SOURCE_LOAD_MAX_WORKERS = 4
 TOUR_CURVE_EYE_HEIGHT_METERS = 1.6
 TOUR_VIEWER_POINT_KIND_BY_ACTION = {
     TOUR_POINT_ACTION_TRIGGER: TOUR_POINT_KIND_TRIGGER,
@@ -579,6 +604,95 @@ class _PlanWallPreviewSession:
     baseline_vertex_data: VertexData
     existing_edge_keys: frozenset[tuple[int, int]]
     analysis: PlanWallAnalysis
+
+
+# ### Atlas texture-source jobs ###
+@dataclass(frozen=True)
+class _AtlasTextureSourceLoadRequest:
+    """One object or Surface source whose thumbnail maps can load independently."""
+
+    source_id: str
+    variant: object | None = None
+    symmetry: object | None = None
+    assignment: SurfaceTextureAssignment | None = None
+
+    def __post_init__(self) -> None:
+        has_variant = self.variant is not None
+        has_assignment = self.assignment is not None
+        if has_variant == has_assignment:
+            raise ValueError(
+                "An Atlas source request requires exactly one source kind."
+            )
+
+
+# ### Progressive scene-texture jobs ###
+@dataclass(frozen=True)
+class _ProgressiveTextureLoadRequest:
+    """One deduplicated material family and every visible scene target."""
+
+    request_key: str
+    map_paths: tuple[tuple[str, Path], ...]
+    source_revisions: tuple[tuple[object, ...], ...]
+    surface_ids: tuple[str, ...] = ()
+    object_ids: tuple[str, ...] = ()
+    priority: int = 1
+
+
+@dataclass(frozen=True)
+class _ProgressiveTextureLoadResult:
+    """One full-resolution bundle or its isolated decode failure."""
+
+    request: _ProgressiveTextureLoadRequest
+    bundle: TexturePreviewBundle | None = None
+    error_message: str | None = None
+
+
+@dataclass
+class _ProgressiveTextureGroup:
+    """Mutable request accumulator for one exact file-backed material."""
+
+    map_paths: tuple[tuple[str, Path], ...]
+    proxy_bundle: TexturePreviewBundle
+    priority: int
+    surface_ids: set[str]
+    object_ids: set[str]
+
+
+@dataclass
+class _ProgressiveTextureLoadRuntime:
+    """GUI-owned tokens and lifecycle for one scene-bound decode batch."""
+
+    request_id: int
+    futures_by_request_key: dict[str, Future[TexturePreviewBundle]]
+    tokens_by_request_key: dict[
+        str,
+        tuple[tuple[GlbViewerWidget, ProgressiveTextureUpdateToken], ...],
+    ]
+
+
+def _load_progressive_texture_request(
+    request: _ProgressiveTextureLoadRequest,
+) -> TexturePreviewBundle:
+    """Decode one aligned base/PBR family without touching Qt state."""
+
+    revisions_before = tuple(
+        _build_local_file_revision(path) for _map_type, path in request.map_paths
+    )
+    if revisions_before != request.source_revisions:
+        raise RuntimeError("A scene texture changed before it could be decoded.")
+    material = resolve_surface_material(dict(request.map_paths))
+    bundle = build_texture_preview_bundle(
+        material.texture_rgba,
+        normal_rgba=material.normal_texture_rgba,
+        roughness_rgba=material.roughness_texture_rgba,
+        metallic_rgba=material.metallic_texture_rgba,
+    )
+    revisions_after = tuple(
+        _build_local_file_revision(path) for _map_type, path in request.map_paths
+    )
+    if revisions_after != request.source_revisions:
+        raise RuntimeError("A scene texture changed while it was being decoded.")
+    return bundle
 
 
 # ### Atlas ambient-occlusion jobs ###
@@ -1348,6 +1462,8 @@ class StairEditorHeightFilter(QObject):
 
 
 class BlueprintWorkspace(QWidget):
+    _progressive_texture_result_ready = Signal(int, object)
+
     def __init__(
         self,
         parent: QWidget | None = None,
@@ -1427,6 +1543,13 @@ class BlueprintWorkspace(QWidget):
         self._viewer_preview_model: GeneratedModel | None = None
         self._viewer_preview_dependency_signature: tuple[object, ...] | None = None
         self._viewer_preview_dependency_signature_revision = -1
+        self._is_applying_project_state = False
+        self._project_apply_base_surfaces: tuple[FixedSurface, ...] | None = None
+        self._project_apply_base_surfaces_by_id: dict[str, FixedSurface] | None = None
+        self._project_apply_fixed_surfaces: tuple[FixedSurface, ...] | None = None
+        self._base_fixed_surfaces_cache_revision = -1
+        self._base_fixed_surfaces_cache: tuple[FixedSurface, ...] = ()
+        self._base_fixed_surfaces_cache_by_id: dict[str, FixedSurface] = {}
         # Structural edits remain live in project data while these separate
         # snapshots control which edits have reached the expensive 3D mesh.
         self._viewer_doorways_by_level_index: dict[
@@ -1549,6 +1672,7 @@ class BlueprintWorkspace(QWidget):
         self._atlas_source_content_revisions: (
             dict[str, tuple[tuple[object, ...], ...]] | None
         ) = None
+        self._atlas_source_file_revisions: tuple[tuple[object, ...], ...] = ()
         self._atlas_pending_source_content_refresh_ids: set[str] = set()
         self._atlas_wall_texture_source_ids: set[str] = set()
         self._atlas_surface_assignment_id_by_source_id: dict[str, str] = {}
@@ -1583,6 +1707,11 @@ class BlueprintWorkspace(QWidget):
         )
         self._is_syncing_door_selection = False
         self._tour_viewer_preview_revision = -1
+        self._pending_viewer_preview_dependency_signature: (
+            tuple[object, ...] | None
+        ) = None
+        self._pending_viewer_preview_dependency_signature_revision = -1
+        self._viewer_preview_levels_for_model_build: list[LevelData] | None = None
         self._tour_point_request_revision = 0
         self._tour_draft_overlay: dict[str, object] | None = None
         self._suppress_tour_preview_camera_updates = False
@@ -1597,6 +1726,23 @@ class BlueprintWorkspace(QWidget):
             int,
             _PlanWallDetectionRuntime,
         ] = {}
+        self._progressive_texture_load_runtimes: dict[
+            int,
+            _ProgressiveTextureLoadRuntime,
+        ] = {}
+        self._progressive_texture_load_futures: set[
+            Future[TexturePreviewBundle]
+        ] = set()
+        self._progressive_texture_load_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(
+                max_workers=PROGRESSIVE_TEXTURE_LOAD_MAX_WORKERS,
+                thread_name_prefix="scene-texture",
+            )
+        )
+        self._progressive_texture_result_ready.connect(
+            self._handle_progressive_texture_loaded
+        )
+        self._progressive_texture_load_request_id = 0
         self._plan_wall_preview_session: _PlanWallPreviewSession | None = None
         self._plan_wall_preview_is_valid = False
         self._is_syncing_plan_wall_controls = False
@@ -1690,6 +1836,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_plan_wall_detections()
+        self._shutdown_progressive_texture_loads()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
@@ -4623,9 +4770,16 @@ class BlueprintWorkspace(QWidget):
     def _set_canvas_viewer_targets(
         self,
         surfaces: Sequence[FixedSurface],
+        *,
+        preview_levels: Sequence[LevelData] | None = None,
     ) -> None:
         """Install semantic surfaces and their selectable opening overlays."""
 
+        semantic_levels = (
+            preview_levels
+            if preview_levels is not None
+            else self._build_viewer_preview_levels()
+        )
         surface_targets = tuple(
             surface
             for surface in surfaces
@@ -4656,7 +4810,7 @@ class BlueprintWorkspace(QWidget):
                 for target in edit_targets
             }
             self.viewer.set_canvas_surface_edit_targets(edit_targets)
-            self._sync_canvas_surface_drawing_overlay()
+            self._sync_canvas_surface_drawing_overlay(semantic_levels)
             if self._desired_canvas_surface_ids:
                 self.viewer.set_selected_canvas_surface_ids(
                     self._desired_canvas_surface_ids
@@ -4692,10 +4846,10 @@ class BlueprintWorkspace(QWidget):
         }
         self.viewer.set_canvas_opening_targets(opening_targets)
         stair_part_targets = self._sync_canvas_stair_semantic_targets(
-            self._build_viewer_preview_levels()
+            semantic_levels
         )
         trim_part_targets = self._sync_canvas_architectural_trim_semantic_targets(
-            self._build_viewer_preview_levels()
+            semantic_levels
         )
         assignable_surface_ids = (
             installed_surface_ids
@@ -4795,6 +4949,64 @@ class BlueprintWorkspace(QWidget):
         )
         return stair_part_targets
 
+    def _get_base_fixed_surface_snapshot(
+        self,
+        levels: Sequence[LevelData],
+    ) -> tuple[FixedSurface, ...]:
+        """Reuse structural surfaces for one exact scene revision."""
+
+        if levels is not self.levels:
+            return tuple(build_base_fixed_surfaces(levels))
+        if self._is_applying_project_state:
+            if self._project_apply_base_surfaces is None:
+                all_included_levels = tuple(
+                    replace(level, include_in_export=True)
+                    for level in self.levels
+                )
+                surfaces = tuple(
+                    build_base_fixed_surfaces(
+                        all_included_levels,
+                        clip_open_spaces=False,
+                    )
+                )
+                self._project_apply_base_surfaces = surfaces
+                self._project_apply_base_surfaces_by_id = {
+                    surface.surface_id: surface for surface in surfaces
+                }
+            return self._project_apply_base_surfaces
+        if self._base_fixed_surfaces_cache_revision != self._viewer_preview_revision:
+            surfaces = tuple(build_base_fixed_surfaces(self.levels))
+            self._base_fixed_surfaces_cache = surfaces
+            self._base_fixed_surfaces_cache_by_id = {
+                surface.surface_id: surface for surface in surfaces
+            }
+            self._base_fixed_surfaces_cache_revision = self._viewer_preview_revision
+        return self._base_fixed_surfaces_cache
+
+    def _get_project_apply_fixed_surface_snapshot(
+        self,
+    ) -> tuple[FixedSurface, ...]:
+        """Build edited project surfaces once from the shared base snapshot."""
+
+        if not self._is_applying_project_state:
+            raise RuntimeError(
+                "Prepared project surfaces are available only while loading."
+            )
+        if self._project_apply_fixed_surfaces is None:
+            all_included_levels = tuple(
+                replace(level, include_in_export=True)
+                for level in self.levels
+            )
+            self._project_apply_fixed_surfaces = tuple(
+                build_fixed_surfaces(
+                    all_included_levels,
+                    base_surfaces=self._get_base_fixed_surface_snapshot(
+                        self.levels
+                    ),
+                )
+            )
+        return self._project_apply_fixed_surfaces
+
     def _sync_canvas_architectural_trim_semantic_targets(
         self,
         levels: Sequence[LevelData],
@@ -4802,7 +5014,7 @@ class BlueprintWorkspace(QWidget):
         """Publish trim parts, independent texture targets, and edit handles."""
 
         try:
-            structural_surfaces = build_base_fixed_surfaces(levels)
+            structural_surfaces = self._get_base_fixed_surface_snapshot(levels)
             geometry = build_architectural_trim_geometry(
                 levels,
                 structural_surfaces,
@@ -4846,17 +5058,19 @@ class BlueprintWorkspace(QWidget):
         self,
         *,
         emit_signals: bool = True,
+        refresh_semantic_targets: bool = True,
     ) -> bool:
         """Rebuild procedural targets before reconciling shared assignments."""
 
-        if hasattr(self, "stairs"):
+        if refresh_semantic_targets and hasattr(self, "stairs"):
             BlueprintWorkspace._sync_canvas_stair_semantic_targets(
                 self,
                 self.levels,
             )
-        if hasattr(self, "_canvas_architectural_trim_parts_by_id") and hasattr(
-            self,
-            "viewer",
+        if (
+            refresh_semantic_targets
+            and hasattr(self, "_canvas_architectural_trim_parts_by_id")
+            and hasattr(self, "viewer")
         ):
             BlueprintWorkspace._sync_canvas_architectural_trim_semantic_targets(
                 self,
@@ -5109,7 +5323,7 @@ class BlueprintWorkspace(QWidget):
         record = next(
             (
                 candidate
-                for candidate in self.generation.get_data().generated_objects
+                for candidate in self.generation.get_generated_object_records()
                 if get_architectural_trim_component_identity(candidate)
                 == (level.index, trim.trim_id)
             ),
@@ -5156,6 +5370,7 @@ class BlueprintWorkspace(QWidget):
             fit_dimensions=frame.target_extents,
             trim_kind=trim.kind,
             generation_ready=True,
+            defer_file_backed_preview=self._is_applying_project_state,
         )
         if not accepted:
             self.generation.clear_architectural_trim_editing_target()
@@ -5194,10 +5409,16 @@ class BlueprintWorkspace(QWidget):
             for surface_id in wall_surface_ids
         }
         if any(surface is None for surface in surfaces_by_id.values()):
-            fallback = {
-                surface.surface_id: surface
-                for surface in build_base_fixed_surfaces(self.levels)
-            }
+            fallback = self._project_apply_base_surfaces_by_id
+            if fallback is None:
+                self._get_base_fixed_surface_snapshot(self.levels)
+                fallback = (
+                    self._project_apply_base_surfaces_by_id
+                    if self._is_applying_project_state
+                    else self._base_fixed_surfaces_cache_by_id
+                )
+            if fallback is None:
+                fallback = {}
             for surface_id in wall_surface_ids:
                 if surfaces_by_id.get(surface_id) is None:
                     surfaces_by_id[surface_id] = fallback.get(surface_id)
@@ -7342,10 +7563,18 @@ class BlueprintWorkspace(QWidget):
             self.texture_atlas_workspace.set_data(atlas_data)
         return skipped
 
-    def _sync_canvas_surface_drawing_overlay(self) -> None:
+    def _sync_canvas_surface_drawing_overlay(
+        self,
+        preview_levels: Sequence[LevelData] | None = None,
+    ) -> None:
         """Keep persistent drawn vertices and edges aligned with preview levels."""
 
-        overlay = build_surface_drawing_overlay(self._build_viewer_preview_levels())
+        effective_levels = (
+            preview_levels
+            if preview_levels is not None
+            else self._build_viewer_preview_levels()
+        )
+        overlay = build_surface_drawing_overlay(effective_levels)
         known_vertex_ids = {vertex.vertex_id for vertex in overlay.vertices}
         if self._active_canvas_surface_drawing_vertex_id not in known_vertex_ids:
             self._active_canvas_surface_drawing_vertex_id = None
@@ -8262,7 +8491,7 @@ class BlueprintWorkspace(QWidget):
         record = next(
             (
                 candidate
-                for candidate in self.generation.get_data().generated_objects
+                for candidate in self.generation.get_generated_object_records()
                 if candidate.object_id == object_id
             ),
             None,
@@ -8410,7 +8639,7 @@ class BlueprintWorkspace(QWidget):
             else next(
                 (
                     record
-                    for record in self.generation.get_data().generated_objects
+                    for record in self.generation.get_generated_object_records()
                     if get_architectural_trim_component_identity(record)
                     == (active_trim_part.level_index, active_trim_part.trim_id)
                     and self._is_active_architectural_trim_component_record(record)
@@ -10912,7 +11141,8 @@ class BlueprintWorkspace(QWidget):
         elif selected_widget is self.scene_3d_workspace:
             self.viewer.focus_navigation()
         elif is_atlas_workspace:
-            self._sync_atlas_object_texture_sources()
+            if self._atlas_sources_need_tab_sync():
+                self._sync_atlas_object_texture_sources()
             self._schedule_atlas_draw_call_estimate()
         elif is_doors_workspace:
             self._sync_selected_door_slot_preview()
@@ -10942,7 +11172,10 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Refresh Atlas object choices after generation, deletion, or selection."""
 
-        if self._is_automatically_assigning_atlas_textures:
+        if (
+            self._is_applying_project_state
+            or self._is_automatically_assigning_atlas_textures
+        ):
             self._atlas_generation_signature = None
             return
         self._sync_atlas_object_texture_sources()
@@ -10983,7 +11216,7 @@ class BlueprintWorkspace(QWidget):
         record = next(
             (
                 candidate
-                for candidate in self.generation.get_data().generated_objects
+                for candidate in self.generation.get_generated_object_records()
                 if candidate.object_id == object_id
             ),
             None,
@@ -11041,6 +11274,10 @@ class BlueprintWorkspace(QWidget):
         _placeable_objects: object,
     ) -> None:
         """Refresh active placement choices and clear vanished selections."""
+
+        if self._is_applying_project_state:
+            self._atlas_generation_signature = None
+            return
 
         selected_source_id = self.texture_atlas_workspace.selected_object_id
         self._handle_generation_data_changed_for_atlases(_placeable_objects)
@@ -12299,7 +12536,7 @@ class BlueprintWorkspace(QWidget):
             return
         if any(
             record.object_id == normalized_object_id and record.placement is not None
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
         ):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -12327,7 +12564,7 @@ class BlueprintWorkspace(QWidget):
         source_record = next(
             (
                 record
-                for record in self.generation.get_data().generated_objects
+                for record in self.generation.get_generated_object_records()
                 if record.object_id == source_object_id
             ),
             None,
@@ -12379,7 +12616,8 @@ class BlueprintWorkspace(QWidget):
         """Refresh Atlas surface choices without reloading unchanged thumbnails."""
 
         if (
-            self._is_automatically_assigning_atlas_textures
+            self._is_applying_project_state
+            or self._is_automatically_assigning_atlas_textures
             or self._is_assigning_surface_texture_from_atlas
         ):
             self._atlas_generation_signature = None
@@ -12391,6 +12629,10 @@ class BlueprintWorkspace(QWidget):
         _selected_atlas: object,
     ) -> None:
         """Retry pending textures and refresh an active AO-only preview."""
+
+        if self._is_applying_project_state:
+            self._atlas_generation_signature = None
+            return
 
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_surface_ambient_occlusion_preview_refresh()
@@ -12955,7 +13197,7 @@ class BlueprintWorkspace(QWidget):
         )
         records_by_id = {
             record.object_id: record
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
         }
         records = tuple(
             records_by_id[object_id]
@@ -13777,7 +14019,7 @@ class BlueprintWorkspace(QWidget):
         record_lookup = (
             {
                 record.object_id: record
-                for record in self.generation.get_data().generated_objects
+                for record in self.generation.get_generated_object_records()
             }
             if records_by_id is None
             else records_by_id
@@ -14488,17 +14730,11 @@ class BlueprintWorkspace(QWidget):
         included_level_indices = {
             level.index for level in self.levels if level.include_in_export
         }
-        trim_models, generated_trim_keys = (
-            self._build_active_architectural_trim_component_models()
-        )
-        active_trim_source_ids = {
-            str(
-                model.atlas_source_object_id
-                or model.source_object_id
-                or model.object_id
+        active_trim_source_ids, generated_trim_keys = (
+            self._build_active_architectural_trim_source_requirements(
+                included_level_indices
             )
-            for model in trim_models
-        }
+        )
         required_ids: list[str] = []
         for object_id in self.generation.get_generated_object_ids():
             placement = self.generation.get_generated_object_placement(object_id)
@@ -14777,7 +15013,7 @@ class BlueprintWorkspace(QWidget):
     def _atlas_texture_source_display_name(self, source_id: str) -> str:
         """Resolve a human-readable name for one export-blocking source."""
 
-        for record in self.generation.get_data().generated_objects:
+        for record in self.generation.get_generated_object_records():
             if record.object_id == source_id:
                 return record.object_name
         assignment_id = (
@@ -14792,6 +15028,20 @@ class BlueprintWorkspace(QWidget):
                     f"{assignment.surface_type.title()} texture"
                 )
         return source_id
+
+    def _atlas_sources_need_tab_sync(self) -> bool:
+        """Check cheap revision evidence before rebuilding every Atlas source."""
+
+        if (
+            self._atlas_generation_signature is None
+            or self._atlas_pending_source_content_refresh_ids
+        ):
+            return True
+        return any(
+            _build_local_file_revision(revision[0]) != revision
+            for revision in self._atlas_source_file_revisions
+            if revision
+        )
 
     def _sync_atlas_object_texture_sources(
         self,
@@ -14810,6 +15060,7 @@ class BlueprintWorkspace(QWidget):
             str,
             tuple[tuple[object, ...], ...],
         ] = {}
+        source_file_revisions: list[tuple[object, ...]] = []
         placeable_object_names_by_id = (
             self.generation.get_placeable_object_names_by_id()
         )
@@ -14817,7 +15068,7 @@ class BlueprintWorkspace(QWidget):
         generated_object_id_lookup = set(generated_object_ids)
         architectural_trim_object_ids = {
             record.object_id
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
             if is_architectural_trim_component_record(record)
         }
         surface_assignments = list(self.surface_texture_generation.get_assignments())
@@ -14846,7 +15097,7 @@ class BlueprintWorkspace(QWidget):
         )
         scene_bound_source_ids.extend(
             record.object_id
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
             if self._is_active_architectural_trim_component_record(record)
             and record.object_id in scene_bound_object_backed_surface_source_ids
             and self.generation.get_active_texture_variant(record.object_id)
@@ -14865,6 +15116,17 @@ class BlueprintWorkspace(QWidget):
             texture_variant_signature = (
                 self.generation.get_texture_variant_dependency_signature(object_id)
             )
+            for variant_item in texture_variant_signature:
+                for revision_index in (2, 4):
+                    revision = variant_item[revision_index]
+                    if isinstance(revision, tuple):
+                        source_file_revisions.append(revision)
+                if len(variant_item) > 5:
+                    source_file_revisions.extend(
+                        map_item[2]
+                        for map_item in variant_item[5]
+                        if len(map_item) > 2 and isinstance(map_item[2], tuple)
+                    )
             texture_source_signature = tuple(
                 (
                     item[0],
@@ -14996,6 +15258,8 @@ class BlueprintWorkspace(QWidget):
                     )
                 )
                 physical_path = physical_map_paths.get(ATLAS_MAP_BASE_COLOR)
+                physical_revision = _build_local_file_revision(physical_path)
+                source_file_revisions.append(physical_revision)
                 logical_map_paths = (
                     {ATLAS_MAP_BASE_COLOR: logical_path}
                     if texture_variant is None
@@ -15009,11 +15273,16 @@ class BlueprintWorkspace(QWidget):
                     )
                     for map_type, map_asset_path in (logical_map_paths.items())
                 )
+                source_file_revisions.extend(
+                    map_item[2]
+                    for map_item in map_signature
+                    if isinstance(map_item[2], tuple)
+                )
                 variant_signature.append(
                     (
                         resolution,
                         str(logical_path),
-                        _build_local_file_revision(physical_path),
+                        physical_revision,
                         map_signature,
                     )
                 )
@@ -15085,7 +15354,9 @@ class BlueprintWorkspace(QWidget):
             ("scene_bound_sources", normalized_scene_bound_source_ids)
         )
         signature = tuple(signature_items)
+        current_source_file_revisions = tuple(dict.fromkeys(source_file_revisions))
         if signature == self._atlas_generation_signature:
+            self._atlas_source_file_revisions = current_source_file_revisions
             self.texture_atlas_workspace.set_scene_bound_source_ids(
                 normalized_scene_bound_source_ids
             )
@@ -15119,6 +15390,7 @@ class BlueprintWorkspace(QWidget):
         available_source_ids: set[str] = set()
         failed_source_ids: set[str] = set()
         source_build_failed = False
+        source_load_requests: list[_AtlasTextureSourceLoadRequest] = []
         for variant, symmetry in active_variants:
             variant_object_id = str(getattr(variant, "object_id"))
             if (
@@ -15126,16 +15398,13 @@ class BlueprintWorkspace(QWidget):
                 or variant_object_id in architectural_trim_object_ids
             ):
                 continue
-            source = self._build_atlas_object_texture_source(
-                variant,
-                symmetry,
+            source_load_requests.append(
+                _AtlasTextureSourceLoadRequest(
+                    source_id=variant_object_id,
+                    variant=variant,
+                    symmetry=symmetry,
+                )
             )
-            if source is None:
-                source_build_failed = True
-                failed_source_ids.add(variant_object_id)
-                continue
-            active_sources.append(source)
-            available_source_ids.add(variant_object_id)
         surface_sources: dict[str, AtlasObjectTextureSource] = {}
         surface_assignments_by_source_id: dict[
             str,
@@ -15168,15 +15437,48 @@ class BlueprintWorkspace(QWidget):
                 is None
             ):
                 continue
-            source = self._build_atlas_wall_texture_source(assignment)
+            source_load_requests.append(
+                _AtlasTextureSourceLoadRequest(
+                    source_id=surface_source_id,
+                    assignment=assignment,
+                )
+            )
+
+        if len(source_load_requests) <= 1:
+            loaded_sources = tuple(
+                self._load_atlas_texture_source_request(request)
+                for request in source_load_requests
+            )
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    ATLAS_SOURCE_LOAD_MAX_WORKERS,
+                    len(source_load_requests),
+                ),
+                thread_name_prefix="atlas-source",
+            ) as executor:
+                loaded_sources = tuple(
+                    executor.map(
+                        self._load_atlas_texture_source_request,
+                        source_load_requests,
+                    )
+                )
+        for request, source in zip(
+            source_load_requests,
+            loaded_sources,
+            strict=True,
+        ):
             if source is None:
                 source_build_failed = True
-                failed_source_ids.add(surface_source_id)
+                failed_source_ids.add(request.source_id)
                 continue
             active_sources.append(source)
-            available_source_ids.add(surface_source_id)
-            surface_sources[source.object_id] = source
-            surface_assignments_by_source_id[source.object_id] = assignment
+            available_source_ids.add(request.source_id)
+            if request.assignment is not None:
+                surface_sources[source.object_id] = source
+                surface_assignments_by_source_id[source.object_id] = (
+                    request.assignment
+                )
 
         placement_refresh_source_ids: list[str] = []
         resolved_surface_sources: dict[
@@ -15343,6 +15645,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._atlas_source_content_paths = source_content_paths
         self._atlas_source_content_revisions = source_content_revisions
+        self._atlas_source_file_revisions = current_source_file_revisions
         self._refresh_scene_atlas_texture_requirements(
             automatically_assign=automatically_assign_scene_textures
         )
@@ -15366,88 +15669,117 @@ class BlueprintWorkspace(QWidget):
         if variant is None:
             return None
         try:
-            packing_mode = ATLAS_PACKING_MODE_FULL
-            if texture_only_packing_mode is not None:
-                if texture_only_packing_mode not in (
-                    ATLAS_PACKING_MODE_FULL,
-                    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
-                ):
-                    raise ValueError("Unknown texture-only packing mode.")
-                packing_mode = texture_only_packing_mode
-            elif symmetry is not None:
-                symmetry_version = getattr(symmetry, "version", None)
-                is_legacy_pair = (
-                    isinstance(symmetry_version, int)
-                    and not isinstance(symmetry_version, bool)
-                    and symmetry_version == 3
-                    and getattr(symmetry, "packing_mode", None)
-                    == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
-                    and getattr(symmetry, "texture_content_half", None)
-                    == ATLAS_SLOT_HALF_LEFT
-                )
-                is_square_pair = (
-                    isinstance(symmetry_version, int)
-                    and not isinstance(symmetry_version, bool)
-                    and symmetry_version == 4
-                    and getattr(symmetry, "packing_mode", None)
-                    == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
-                    and getattr(symmetry, "texture_content_half", None)
-                    == ATLAS_SLOT_HALF_LEFT
-                )
-                is_quarter = (
-                    symmetry_version == 2
-                    and getattr(symmetry, "packing_mode", None)
-                    == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
-                    and getattr(
-                        symmetry,
-                        "texture_content_quadrant",
-                        None,
-                    )
-                    == "top_left"
-                )
-                if is_square_pair:
-                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
-                elif is_legacy_pair:
-                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_PAIR
-                elif is_quarter:
-                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
-                elif symmetry_version == 1:
-                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_HALF
-                else:
-                    raise ValueError("Unknown symmetric texture packing metadata.")
-            return load_atlas_object_texture_source(
-                object_id=str(getattr(variant, "object_id")),
-                object_name=str(getattr(variant, "object_name")),
-                texture_path=str(getattr(variant, "texture_asset_relative_path")),
-                texture_resolution=int(getattr(variant, "resolution")),
-                physical_texture_path=getattr(
-                    variant,
-                    "texture_asset_path",
-                ),
-                map_texture_paths=getattr(
-                    variant,
-                    "map_texture_asset_relative_paths",
-                    {},
-                ),
-                physical_map_texture_paths=getattr(
-                    variant,
-                    "map_texture_asset_paths",
-                    {},
-                ),
-                packing_mode=packing_mode,
-                symmetric_preview_orientation=(
-                    None
-                    if symmetry is None or texture_only_packing_mode is not None
-                    else str(getattr(symmetry, "orientation"))
-                ),
-                symmetric_preview_plane_coordinate=(
-                    None
-                    if symmetry is None or texture_only_packing_mode is not None
-                    else float(getattr(symmetry, "plane_coordinate"))
-                ),
+            spec = BlueprintWorkspace._build_atlas_object_texture_source_load_spec(
+                variant,
+                symmetry,
+                texture_only_packing_mode=texture_only_packing_mode,
             )
+            if spec is None:
+                return None
+            result = load_atlas_object_texture_sources((spec,))[0]
+            if result.error is not None:
+                raise result.error
+            return result.source
         except (AttributeError, OSError, TypeError, ValueError):
             return None
+
+    def _load_atlas_texture_source_request(
+        self,
+        request: _AtlasTextureSourceLoadRequest,
+    ) -> AtlasObjectTextureSource | None:
+        """Load one independent Atlas source for an ordered worker batch."""
+
+        if request.assignment is not None:
+            return self._build_atlas_wall_texture_source(request.assignment)
+        return self._build_atlas_object_texture_source(
+            request.variant,
+            request.symmetry,
+        )
+
+    @staticmethod
+    def _build_atlas_object_texture_source_load_spec(
+        variant: object,
+        symmetry: object | None = None,
+        *,
+        texture_only_packing_mode: str | None = None,
+    ) -> AtlasObjectTextureSourceLoadSpec | None:
+        """Prepare immutable worker inputs without decoding texture pixels."""
+
+        if variant is None:
+            return None
+        packing_mode = ATLAS_PACKING_MODE_FULL
+        if texture_only_packing_mode is not None:
+            if texture_only_packing_mode not in (
+                ATLAS_PACKING_MODE_FULL,
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            ):
+                raise ValueError("Unknown texture-only packing mode.")
+            packing_mode = texture_only_packing_mode
+        elif symmetry is not None:
+            symmetry_version = getattr(symmetry, "version", None)
+            is_legacy_pair = (
+                isinstance(symmetry_version, int)
+                and not isinstance(symmetry_version, bool)
+                and symmetry_version == 3
+                and getattr(symmetry, "packing_mode", None)
+                == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+                and getattr(symmetry, "texture_content_half", None)
+                == ATLAS_SLOT_HALF_LEFT
+            )
+            is_square_pair = (
+                isinstance(symmetry_version, int)
+                and not isinstance(symmetry_version, bool)
+                and symmetry_version == 4
+                and getattr(symmetry, "packing_mode", None)
+                == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+                and getattr(symmetry, "texture_content_half", None)
+                == ATLAS_SLOT_HALF_LEFT
+            )
+            is_quarter = (
+                symmetry_version == 2
+                and getattr(symmetry, "packing_mode", None)
+                == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                and getattr(symmetry, "texture_content_quadrant", None)
+                == "top_left"
+            )
+            if is_square_pair:
+                packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
+            elif is_legacy_pair:
+                packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+            elif is_quarter:
+                packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+            elif symmetry_version == 1:
+                packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_HALF
+            else:
+                raise ValueError("Unknown symmetric texture packing metadata.")
+        return AtlasObjectTextureSourceLoadSpec(
+            object_id=str(getattr(variant, "object_id")),
+            object_name=str(getattr(variant, "object_name")),
+            texture_path=str(getattr(variant, "texture_asset_relative_path")),
+            texture_resolution=int(getattr(variant, "resolution")),
+            physical_texture_path=getattr(variant, "texture_asset_path"),
+            map_texture_paths=getattr(
+                variant,
+                "map_texture_asset_relative_paths",
+                {},
+            ),
+            physical_map_texture_paths=getattr(
+                variant,
+                "map_texture_asset_paths",
+                {},
+            ),
+            packing_mode=packing_mode,
+            symmetric_preview_orientation=(
+                None
+                if symmetry is None or texture_only_packing_mode is not None
+                else str(getattr(symmetry, "orientation"))
+            ),
+            symmetric_preview_plane_coordinate=(
+                None
+                if symmetry is None or texture_only_packing_mode is not None
+                else float(getattr(symmetry, "plane_coordinate"))
+            ),
+        )
 
     def _build_atlas_wall_texture_source(
         self,
@@ -15467,6 +15799,24 @@ class BlueprintWorkspace(QWidget):
         resolution: int | None = None,
     ) -> AtlasObjectTextureSource:
         """Load one exact Surface source or expose its validation failure."""
+
+        spec = self._build_atlas_wall_texture_source_load_spec(
+            assignment,
+            resolution,
+        )
+        result = load_atlas_object_texture_sources((spec,))[0]
+        if result.error is not None:
+            raise result.error
+        if result.source is None:
+            raise ValueError("The Surface texture could not be loaded.")
+        return result.source
+
+    def _build_atlas_wall_texture_source_load_spec(
+        self,
+        assignment: SurfaceTextureAssignment,
+        resolution: int | None = None,
+    ) -> AtlasObjectTextureSourceLoadSpec:
+        """Prepare one Surface source without decoding its texture pixels."""
 
         supports_resolution_changes = bool(assignment.texture_variants)
         requested_resolution = resolution
@@ -15498,7 +15848,9 @@ class BlueprintWorkspace(QWidget):
                 int(requested_resolution)
             )
             if selected_variant is None:
-                return None
+                raise ValueError(
+                    "The Surface texture family is missing its requested variant."
+                )
             logical_map_paths = selected_variant.map_asset_paths
         live_map_types = tuple(
             map_type
@@ -15533,7 +15885,7 @@ class BlueprintWorkspace(QWidget):
             fit_to_square = True
             asset_path = assignment.asset_path
         surface_count = len(assignment.surface_ids)
-        return load_atlas_object_texture_source(
+        return AtlasObjectTextureSourceLoadSpec(
             object_id=self._atlas_source_id_for_surface_assignment(assignment),
             object_name=(
                 assignment.display_name
@@ -16023,18 +16375,19 @@ class BlueprintWorkspace(QWidget):
     def _invalidate_viewer_preview_for_dependency_changes(
         self,
         preserve_camera: bool,
-    ) -> None:
+    ) -> tuple[object, ...] | None:
         """Advance the preview revision after an out-of-band asset change."""
 
         if (
             self._viewer_preview_dependency_signature_revision
             != self._viewer_preview_revision
         ):
-            return
+            return None
         dependency_signature = self._build_viewer_preview_dependency_signature()
         if dependency_signature == self._viewer_preview_dependency_signature:
-            return
+            return dependency_signature
         self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
+        return dependency_signature
 
     # ### Debounced Canvas mesh previews ###
     @staticmethod
@@ -16162,7 +16515,7 @@ class BlueprintWorkspace(QWidget):
         )
         placed_object_levels = {
             record.object_id: record.placement.level_index
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
             if record.placement is not None
         }
         placed_object_levels.update(
@@ -16180,7 +16533,7 @@ class BlueprintWorkspace(QWidget):
         placed_object_levels.update(
             {
                 record.object_id: identity[0]
-                for record in self.generation.get_data().generated_objects
+                for record in self.generation.get_generated_object_records()
                 if self._is_active_architectural_trim_component_record(record)
                 and (
                     identity := get_architectural_trim_component_identity(record)
@@ -16459,7 +16812,7 @@ class BlueprintWorkspace(QWidget):
         }
         records_by_id = {
             record.object_id: record
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
         }
         reconstructions: list[DoorBodyReconstruction] = []
         library = self.doors_workspace.data()
@@ -16539,12 +16892,16 @@ class BlueprintWorkspace(QWidget):
     ) -> GeneratedModel | None:
         """Build render data without paying the GLB serialization cost."""
 
+        trim_models: tuple[PlacedGeneratedModel, ...] = ()
         try:
             try:
-                preview_levels = self._build_viewer_preview_levels()
-                _trim_models, generated_trim_keys = (
+                preview_levels = self._viewer_preview_levels_for_model_build
+                if preview_levels is None:
+                    preview_levels = self._build_viewer_preview_levels()
+                trim_models, generated_trim_keys = (
                     self._build_active_architectural_trim_component_models(
                         include_excluded_levels=True,
+                        preview_only=True,
                     )
                 )
                 preview_levels = remove_generated_architectural_trims_from_levels(
@@ -16554,9 +16911,7 @@ class BlueprintWorkspace(QWidget):
                 base_model = convert_to_preview_model(
                     preview_levels,
                     stairs=self.stairs,
-                    surface_materials=(
-                        self.surface_texture_generation.get_surface_material_sources()
-                    ),
+                    surface_materials=self._build_surface_preview_material_sources(),
                 )
             except NoUsableBlueprintGeometryError:
                 base_model = GeneratedModel(
@@ -16567,6 +16922,8 @@ class BlueprintWorkspace(QWidget):
             placed_models = self._build_placed_generated_models(
                 include_excluded_levels=True,
                 include_instances=True,
+                preview_only=True,
+                precomputed_architectural_trim_models=trim_models,
             )
             if not placed_models:
                 return base_model
@@ -16578,6 +16935,423 @@ class BlueprintWorkspace(QWidget):
             if failure_title is not None:
                 QMessageBox.warning(self, failure_title, str(error))
             return None
+
+    def _build_surface_preview_material_sources(self) -> dict[str, object]:
+        """Use cached 256px Atlas thumbnails for the first scene model."""
+
+        full_sources = (
+            self.surface_texture_generation.get_surface_material_sources()
+        )
+        preview_sources: dict[str, object] = dict(full_sources)
+        for assignment in self.surface_texture_generation.get_assignments():
+            if assignment.source_object_id is not None:
+                continue
+            source = self._build_atlas_wall_texture_source(assignment)
+            if source is None:
+                continue
+            try:
+                preview_maps = self._atlas_source_preview_maps(source)
+                material = build_surface_material_preview_proxy(
+                    preview_maps,
+                    tiling_mode=assignment.tiling_mode,
+                    tiling_seed=assignment.tiling_seed,
+                    texture_repeat_size_m=assignment.texture_repeat_size_m,
+                )
+            except (OSError, TypeError, ValueError):
+                continue
+            for surface_id in assignment.surface_ids:
+                if surface_id in full_sources:
+                    preview_sources[surface_id] = material
+        return preview_sources
+
+    @staticmethod
+    def _atlas_source_preview_maps(
+        source: AtlasObjectTextureSource,
+    ) -> dict[str, np.ndarray]:
+        """Return only maps genuinely owned by one 256px Atlas source."""
+
+        preview_maps = source.preview_rgba_by_map or {}
+        return {
+            map_type: preview_maps[map_type]
+            for map_type in (
+                ATLAS_MAP_BASE_COLOR,
+                PBR_MAP_NORMAL,
+                PBR_MAP_ROUGHNESS,
+                PBR_MAP_METALLIC,
+            )
+            if map_type in preview_maps and source.has_texture_map(map_type)
+        }
+
+    def _collect_progressive_scene_texture_requests(
+        self,
+        model: GeneratedModel,
+    ) -> tuple[
+        tuple[_ProgressiveTextureLoadRequest, TexturePreviewBundle],
+        ...,
+    ]:
+        """Deduplicate visible scene textures and prioritize the current level."""
+
+        if not isinstance(model, GeneratedModel):
+            return ()
+        current_level_index = self.current_level.index
+        visible_surface_ids = {
+            surface.surface_id for surface in model.preview_textured_surfaces
+        }
+        current_level_surface_ids = {
+            surface.surface_id
+            for surface in model.preview_textured_surfaces
+            if surface.level_index == current_level_index
+        }
+        grouped: dict[tuple[tuple[str, str], ...], _ProgressiveTextureGroup] = {}
+
+        def add_source(
+            source: AtlasObjectTextureSource,
+            *,
+            surface_ids: Sequence[str] = (),
+            object_ids: Sequence[str] = (),
+            priority: int,
+        ) -> None:
+            physical_paths = source.physical_map_texture_paths or {}
+            path_items = tuple(
+                (map_type, Path(physical_paths[map_type]).resolve())
+                for map_type in (
+                    ATLAS_MAP_BASE_COLOR,
+                    PBR_MAP_NORMAL,
+                    PBR_MAP_ROUGHNESS,
+                    PBR_MAP_METALLIC,
+                )
+                if map_type in physical_paths and source.has_texture_map(map_type)
+            )
+            if not path_items or path_items[0][0] != ATLAS_MAP_BASE_COLOR:
+                return
+            group_key = tuple(
+                (map_type, str(path)) for map_type, path in path_items
+            )
+            group = grouped.get(group_key)
+            if group is None:
+                try:
+                    preview_maps = self._atlas_source_preview_maps(source)
+                    proxy_bundle = build_texture_preview_bundle(
+                        preview_maps[ATLAS_MAP_BASE_COLOR],
+                        normal_rgba=preview_maps.get(PBR_MAP_NORMAL),
+                        roughness_rgba=preview_maps.get(PBR_MAP_ROUGHNESS),
+                        metallic_rgba=preview_maps.get(PBR_MAP_METALLIC),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return
+                group = _ProgressiveTextureGroup(
+                    map_paths=path_items,
+                    proxy_bundle=proxy_bundle,
+                    priority=int(priority),
+                    surface_ids=set(),
+                    object_ids=set(),
+                )
+                grouped[group_key] = group
+            else:
+                group.priority = min(group.priority, int(priority))
+            group.surface_ids.update(surface_ids)
+            group.object_ids.update(object_ids)
+
+        for assignment in self.surface_texture_generation.get_assignments():
+            if assignment.source_object_id is not None:
+                continue
+            surface_ids = tuple(
+                surface_id
+                for surface_id in assignment.surface_ids
+                if surface_id in visible_surface_ids
+            )
+            if not surface_ids:
+                continue
+            source = self._build_atlas_wall_texture_source(assignment)
+            if source is None:
+                continue
+            add_source(
+                source,
+                surface_ids=surface_ids,
+                priority=(
+                    0
+                    if current_level_surface_ids.intersection(surface_ids)
+                    else 1
+                ),
+            )
+
+        previews_by_source_id: dict[str, list[PreviewPlacedObject]] = {}
+        for preview in model.preview_placed_objects:
+            source_object_id = str(preview.source_object_id or preview.object_id)
+            previews_by_source_id.setdefault(source_object_id, []).append(preview)
+        for source_object_id, previews in previews_by_source_id.items():
+            variant = self.generation.get_active_texture_variant(source_object_id)
+            if variant is None:
+                continue
+            source = self._build_atlas_object_texture_source(
+                variant,
+                self.generation.get_object_symmetric_division(source_object_id),
+            )
+            if source is None:
+                continue
+            object_ids = tuple(str(preview.object_id) for preview in previews)
+            is_current_level = any(
+                placement is not None
+                and placement.level_index == current_level_index
+                for object_id in object_ids
+                for placement in (
+                    self.generation.get_scene_object_placement(object_id),
+                )
+            )
+            add_source(
+                source,
+                object_ids=object_ids,
+                priority=0 if is_current_level else 1,
+            )
+
+        prepared: list[
+            tuple[_ProgressiveTextureLoadRequest, TexturePreviewBundle]
+        ] = []
+        ordered_groups = sorted(
+            grouped.values(),
+            key=lambda group: (
+                group.priority,
+                str(group.map_paths),
+            ),
+        )
+        for index, group in enumerate(ordered_groups, start=1):
+            paths = group.map_paths
+            surface_ids = tuple(sorted(group.surface_ids))
+            object_ids = tuple(sorted(group.object_ids))
+            prepared.append(
+                (
+                    _ProgressiveTextureLoadRequest(
+                        request_key=f"scene-texture-{index}",
+                        map_paths=paths,
+                        source_revisions=tuple(
+                            _build_local_file_revision(path)
+                            for _map_type, path in paths
+                        ),
+                        surface_ids=surface_ids,
+                        object_ids=object_ids,
+                        priority=group.priority,
+                    ),
+                    group.proxy_bundle,
+                )
+            )
+        return tuple(prepared)
+
+    def _start_progressive_scene_texture_load(
+        self,
+        model: GeneratedModel,
+        viewers: Sequence[GlbViewerWidget],
+    ) -> None:
+        """Install proxies now, then stream exact pixels into retained meshes."""
+
+        executor = self._progressive_texture_load_executor
+        if self._is_shutdown or executor is None:
+            return
+        target_viewers = tuple(dict.fromkeys(viewers))
+        if not target_viewers:
+            return
+        self._retire_progressive_texture_viewers(target_viewers)
+        prepared_requests = self._collect_progressive_scene_texture_requests(model)
+        if not prepared_requests:
+            return
+        self._progressive_texture_load_futures = {
+            future
+            for future in self._progressive_texture_load_futures
+            if not future.done()
+        }
+
+        tokens_by_request_key: dict[
+            str,
+            tuple[tuple[GlbViewerWidget, ProgressiveTextureUpdateToken], ...],
+        ] = {}
+        full_requests: list[_ProgressiveTextureLoadRequest] = []
+        for request, proxy_bundle in prepared_requests:
+            viewer_tokens: list[
+                tuple[GlbViewerWidget, ProgressiveTextureUpdateToken]
+            ] = []
+            for viewer in target_viewers:
+                try:
+                    proxy_token = viewer.begin_progressive_texture_update(
+                        f"{request.request_key}:proxy",
+                        surface_ids=request.surface_ids,
+                        placed_object_ids=request.object_ids,
+                    )
+                    viewer.apply_progressive_texture_update(
+                        proxy_token,
+                        proxy_bundle,
+                    )
+                    full_token = viewer.begin_progressive_texture_update(
+                        f"{request.request_key}:full",
+                        surface_ids=request.surface_ids,
+                        placed_object_ids=request.object_ids,
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    continue
+                viewer_tokens.append((viewer, full_token))
+            if viewer_tokens:
+                tokens_by_request_key[request.request_key] = tuple(viewer_tokens)
+                full_requests.append(request)
+        if not full_requests:
+            return
+
+        self._progressive_texture_load_request_id += 1
+        request_id = self._progressive_texture_load_request_id
+        futures_by_request_key: dict[str, Future[TexturePreviewBundle]] = {}
+        try:
+            for request in full_requests:
+                futures_by_request_key[request.request_key] = executor.submit(
+                    _load_progressive_texture_request,
+                    request,
+                )
+        except RuntimeError:
+            for future in futures_by_request_key.values():
+                future.cancel()
+            return
+        runtime = _ProgressiveTextureLoadRuntime(
+            request_id=request_id,
+            futures_by_request_key=futures_by_request_key,
+            tokens_by_request_key=tokens_by_request_key,
+        )
+        self._progressive_texture_load_runtimes[request_id] = runtime
+        self._progressive_texture_load_futures.update(
+            futures_by_request_key.values()
+        )
+        requests_by_key = {
+            request.request_key: request for request in full_requests
+        }
+        for request_key, future in futures_by_request_key.items():
+            request = requests_by_key[request_key]
+            future.add_done_callback(
+                lambda completed_future,
+                active_request_id=request_id,
+                active_request=request: self._emit_progressive_texture_result(
+                    active_request_id,
+                    active_request,
+                    completed_future,
+                )
+            )
+
+    def _retire_progressive_texture_viewers(
+        self,
+        viewers: Sequence[GlbViewerWidget],
+    ) -> None:
+        """Detach refreshed viewers without disturbing other active viewers."""
+
+        target_viewer_ids = {id(viewer) for viewer in viewers}
+        for request_id, runtime in tuple(
+            self._progressive_texture_load_runtimes.items()
+        ):
+            for request_key, viewer_tokens in tuple(
+                runtime.tokens_by_request_key.items()
+            ):
+                retained_tokens = tuple(
+                    (viewer, token)
+                    for viewer, token in viewer_tokens
+                    if id(viewer) not in target_viewer_ids
+                )
+                if retained_tokens:
+                    runtime.tokens_by_request_key[request_key] = retained_tokens
+                    continue
+                runtime.tokens_by_request_key.pop(request_key, None)
+                future = runtime.futures_by_request_key.pop(request_key, None)
+                if future is not None and future.cancel():
+                    self._progressive_texture_load_futures.discard(future)
+            if not runtime.futures_by_request_key:
+                self._progressive_texture_load_runtimes.pop(request_id, None)
+
+    def _emit_progressive_texture_result(
+        self,
+        request_id: int,
+        request: _ProgressiveTextureLoadRequest,
+        future: Future[TexturePreviewBundle],
+    ) -> None:
+        """Forward one executor result safely onto the GUI thread."""
+
+        try:
+            bundle = future.result()
+        except CancelledError:
+            return
+        except Exception as error:  # noqa: BLE001 - isolated worker result.
+            result = _ProgressiveTextureLoadResult(
+                request=request,
+                error_message=str(error) or type(error).__name__,
+            )
+        else:
+            result = _ProgressiveTextureLoadResult(
+                request=request,
+                bundle=bundle,
+            )
+        try:
+            self._progressive_texture_result_ready.emit(request_id, result)
+        except RuntimeError:
+            # Final shutdown joins the executor before QObject destruction, but
+            # tolerate Qt teardown ordering during interpreter shutdown.
+            pass
+
+    def _handle_progressive_texture_loaded(
+        self,
+        request_id: int,
+        raw_result: object,
+    ) -> None:
+        """Apply one current worker result atomically on the Qt thread."""
+
+        self._progressive_texture_load_futures = {
+            future
+            for future in self._progressive_texture_load_futures
+            if not future.done()
+        }
+        runtime = self._progressive_texture_load_runtimes.get(request_id)
+        if runtime is None or not isinstance(raw_result, _ProgressiveTextureLoadResult):
+            return
+        request_key = raw_result.request.request_key
+        runtime.futures_by_request_key.pop(request_key, None)
+        viewer_tokens = runtime.tokens_by_request_key.pop(request_key, ())
+        if not runtime.futures_by_request_key:
+            self._progressive_texture_load_runtimes.pop(request_id, None)
+        if raw_result.bundle is None:
+            return
+        for viewer, token in viewer_tokens:
+            try:
+                viewer.apply_progressive_texture_update(token, raw_result.bundle)
+            except (RuntimeError, TypeError, ValueError):
+                continue
+
+    def _cancel_progressive_texture_loads(
+        self,
+    ) -> tuple[Future[TexturePreviewBundle], ...]:
+        """Cancel queued loads and make every in-flight result stale."""
+
+        self._progressive_texture_load_runtimes.clear()
+        active_futures: list[Future[TexturePreviewBundle]] = []
+        for future in tuple(self._progressive_texture_load_futures):
+            future.cancel()
+            if not future.done():
+                active_futures.append(future)
+        self._progressive_texture_load_futures = set(active_futures)
+        return tuple(active_futures)
+
+    def _shutdown_progressive_texture_loads(self) -> None:
+        """Drain the workspace-owned pool before the workspace is destroyed."""
+
+        executor = self._progressive_texture_load_executor
+        if executor is None:
+            return
+        active_futures = self._cancel_progressive_texture_loads()
+        executor.shutdown(wait=False, cancel_futures=True)
+        pending_futures = set(active_futures)
+        while pending_futures:
+            _completed, pending_futures = wait(
+                pending_futures,
+                timeout=(
+                    PROGRESSIVE_TEXTURE_SHUTDOWN_POLL_MILLISECONDS / 1_000.0
+                ),
+            )
+            QApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents,
+                PROGRESSIVE_TEXTURE_SHUTDOWN_POLL_MILLISECONDS,
+            )
+        executor.shutdown(wait=True, cancel_futures=True)
+        self._progressive_texture_load_futures.clear()
+        self._progressive_texture_load_executor = None
 
     def _sync_viewer_architectural_trim_placed_object_bindings(
         self,
@@ -16594,7 +17368,7 @@ class BlueprintWorkspace(QWidget):
 
         records_by_id = {
             record.object_id: record
-            for record in self.generation.get_data().generated_objects
+            for record in self.generation.get_generated_object_records()
         }
         fallback_identity_by_object_id: dict[str, tuple[int, str] | None] = {}
         for identity in parts_by_identity:
@@ -16624,6 +17398,11 @@ class BlueprintWorkspace(QWidget):
         *,
         include_excluded_levels: bool = False,
         include_instances: bool = False,
+        include_door_placements: bool = True,
+        preview_only: bool = False,
+        precomputed_architectural_trim_models: (
+            Sequence[PlacedGeneratedModel] | None
+        ) = None,
     ) -> tuple[PlacedGeneratedModel, ...]:
         """Resolve authored placements and optional linked preview instances."""
 
@@ -16635,12 +17414,10 @@ class BlueprintWorkspace(QWidget):
         if not visible_level_by_index:
             return ()
         base_z_by_level_index = build_level_base_z_lookup(self.levels)
-        generation_data = self.generation.get_data()
-        records_by_id = {
-            record.object_id: record for record in generation_data.generated_objects
-        }
+        generated_records = self.generation.get_generated_object_records()
+        records_by_id = {record.object_id: record for record in generated_records}
         placed_models: list[PlacedGeneratedModel] = []
-        for record in generation_data.generated_objects:
+        for record in generated_records:
             if is_architectural_trim_component_record(record):
                 continue
             placement = record.placement
@@ -16653,11 +17430,12 @@ class BlueprintWorkspace(QWidget):
                 placement=placement,
                 visible_level_by_index=visible_level_by_index,
                 base_z_by_level_index=base_z_by_level_index,
+                preview_only=preview_only,
             )
             if placed_model is not None:
                 placed_models.append(placed_model)
         if include_instances:
-            for instance in generation_data.object_instances:
+            for instance in self.generation.get_generated_object_instances():
                 source_record = records_by_id.get(instance.source_object_id)
                 if source_record is None:
                     continue
@@ -16668,27 +17446,177 @@ class BlueprintWorkspace(QWidget):
                     placement=instance.placement,
                     visible_level_by_index=visible_level_by_index,
                     base_z_by_level_index=base_z_by_level_index,
+                    preview_only=preview_only,
                 )
                 if placed_model is not None:
                     placed_models.append(placed_model)
-        placed_models.extend(
-            self._build_placed_door_models(
-                visible_level_by_index=visible_level_by_index,
-                base_z_by_level_index=base_z_by_level_index,
+        if include_door_placements:
+            placed_models.extend(
+                self._build_placed_door_models(
+                    visible_level_by_index=visible_level_by_index,
+                    base_z_by_level_index=base_z_by_level_index,
+                    preview_only=preview_only,
+                )
             )
-        )
-        trim_models, _generated_trim_keys = (
-            self._build_active_architectural_trim_component_models(
-                include_excluded_levels=include_excluded_levels,
+        trim_models = precomputed_architectural_trim_models
+        if trim_models is None:
+            trim_models, _generated_trim_keys = (
+                self._build_active_architectural_trim_component_models(
+                    include_excluded_levels=include_excluded_levels,
+                    preview_only=preview_only,
+                )
             )
-        )
         placed_models.extend(trim_models)
         return tuple(placed_models)
+
+    def _build_active_architectural_trim_source_requirements(
+        self,
+        included_level_indices: set[int],
+    ) -> tuple[frozenset[str], tuple[tuple[int, str], ...]]:
+        """Resolve valid Atlas trim ownership without serializing fitted GLBs."""
+
+        generated_records = self.generation.get_generated_object_records()
+        records_by_id = {record.object_id: record for record in generated_records}
+        records_by_trim_key = {
+            identity: record
+            for record in generated_records
+            if (identity := get_architectural_trim_component_identity(record))
+            is not None
+        }
+        linked_bindings = (
+            self._collect_linked_architectural_trim_component_bindings(
+                included_level_indices,
+                records_by_id=records_by_id,
+            )
+        )
+        linked_source_object_ids = {
+            source_record.object_id
+            for source_record, _level, _trim in linked_bindings.values()
+        }
+        active_record_trim_keys = {
+            identity
+            for record in generated_records
+            if (identity := get_architectural_trim_component_identity(record))
+            is not None
+            and identity[0] in included_level_indices
+            and self._is_active_architectural_trim_component_record(record)
+            and (
+                not self.generation.has_generated_object_texture_variants(
+                    record.object_id
+                )
+                or record.object_id in linked_source_object_ids
+            )
+        }
+        trim_miters_by_trim_key = {
+            (descriptor.level_index, descriptor.trim_id): descriptor
+            for descriptor in build_architectural_trim_miter_descriptors(
+                self.levels,
+                self._get_base_fixed_surface_snapshot(self.levels),
+            )
+        }
+        replacement_trim_keys = self._expand_connected_linear_trim_replacement_keys(
+            active_record_trim_keys | set(linked_bindings),
+            included_level_indices=included_level_indices,
+            trim_miters_by_trim_key=trim_miters_by_trim_key,
+        )
+        source_id_by_trim_key: dict[tuple[int, str], str] = {}
+
+        for trim_key in sorted(linked_bindings):
+            source_record, target_level, target_trim = linked_bindings[trim_key]
+            if not self._architectural_trim_source_requirement_is_valid(
+                source_record,
+                target_level,
+                target_trim,
+            ):
+                continue
+            source_id_by_trim_key[trim_key] = source_record.object_id
+
+        for trim_key in sorted(active_record_trim_keys):
+            if trim_key in source_id_by_trim_key:
+                continue
+            record = records_by_trim_key.get(trim_key)
+            owner = self._get_architectural_trim_owner(*trim_key)
+            if record is None or owner is None:
+                continue
+            level, trim = owner
+            if not self._architectural_trim_source_requirement_is_valid(
+                record,
+                level,
+                trim,
+            ):
+                continue
+            source_id_by_trim_key[trim_key] = record.object_id
+
+        companion_trim_keys = replacement_trim_keys.difference(
+            active_record_trim_keys,
+            linked_bindings,
+        )
+        for trim_key in sorted(companion_trim_keys):
+            owner = self._get_architectural_trim_owner(*trim_key)
+            if owner is None or owner[1].kind not in {
+                TRIM_KIND_CORNICE,
+                TRIM_KIND_SKIRTING_BOARD,
+            }:
+                continue
+            level, trim = owner
+            record = records_by_trim_key.get(trim_key)
+            object_id = (
+                f"architectural-trim-{trim.trim_id}"
+                if record is None
+                else record.object_id
+            )
+            if not self._architectural_trim_frame_is_valid(level, trim):
+                continue
+            source_id_by_trim_key[trim_key] = object_id
+
+        return (
+            frozenset(source_id_by_trim_key.values()),
+            tuple(sorted(source_id_by_trim_key)),
+        )
+
+    def _architectural_trim_source_requirement_is_valid(
+        self,
+        record: GeneratedObjectRecord,
+        level: LevelData,
+        trim: ArchitecturalTrimData,
+    ) -> bool:
+        """Validate one authored trim source without building its fitted GLB."""
+
+        try:
+            frame = build_architectural_trim_component_frame(
+                level,
+                trim,
+                self._get_architectural_trim_wall_surfaces(trim),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return self.generation.has_usable_architectural_trim_texture_transfer_source(
+            record.object_id,
+            frame.target_extents,
+        )
+
+    def _architectural_trim_frame_is_valid(
+        self,
+        level: LevelData,
+        trim: ArchitecturalTrimData,
+    ) -> bool:
+        """Validate one procedural trim companion without serializing it."""
+
+        try:
+            build_architectural_trim_component_frame(
+                level,
+                trim,
+                self._get_architectural_trim_wall_surfaces(trim),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return True
 
     def _build_active_architectural_trim_component_models(
         self,
         *,
         include_excluded_levels: bool = False,
+        preview_only: bool = False,
     ) -> tuple[
         tuple[PlacedGeneratedModel, ...],
         tuple[tuple[int, str], ...],
@@ -16700,20 +17628,19 @@ class BlueprintWorkspace(QWidget):
             for level in self.levels
             if include_excluded_levels or level.include_in_export
         }
-        generation_data = self.generation.get_data()
-        records_by_id = {
-            record.object_id: record for record in generation_data.generated_objects
-        }
+        generated_records = self.generation.get_generated_object_records()
+        records_by_id = {record.object_id: record for record in generated_records}
         records_by_trim_key = {
             identity: record
-            for record in generation_data.generated_objects
+            for record in generated_records
             if (identity := get_architectural_trim_component_identity(record))
             is not None
         }
         trim_miters_by_trim_key = {
             (descriptor.level_index, descriptor.trim_id): descriptor
             for descriptor in build_architectural_trim_miter_descriptors(
-                self.levels
+                self.levels,
+                self._get_base_fixed_surface_snapshot(self.levels),
             )
         }
         linked_bindings = (
@@ -16728,7 +17655,7 @@ class BlueprintWorkspace(QWidget):
         }
         active_record_trim_keys = {
             identity
-            for record in generation_data.generated_objects
+            for record in generated_records
             if (identity := get_architectural_trim_component_identity(record))
             is not None
             and identity[0] in included_level_indices
@@ -16750,9 +17677,10 @@ class BlueprintWorkspace(QWidget):
             records_by_trim_key=records_by_trim_key,
             trim_miters_by_trim_key=trim_miters_by_trim_key,
             replacement_trim_keys=replacement_trim_keys,
+            preview_only=preview_only,
         )
         placements_by_trim_key = dict(linked_models)
-        for record in generation_data.generated_objects:
+        for record in generated_records:
             identity = get_architectural_trim_component_identity(record)
             if (
                 identity is None
@@ -16789,6 +17717,7 @@ class BlueprintWorkspace(QWidget):
                         trim_miters_by_trim_key.get(identity),
                         replacement_trim_keys,
                     ),
+                    serialize_glb=not preview_only,
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
@@ -16813,6 +17742,7 @@ class BlueprintWorkspace(QWidget):
                     level,
                     trim,
                     self._get_architectural_trim_wall_surfaces(trim),
+                    serialize_glb=not preview_only,
                 )
                 record = records_by_trim_key.get(identity)
                 object_id = (
@@ -16835,6 +17765,7 @@ class BlueprintWorkspace(QWidget):
                             trim_miters_by_trim_key.get(identity),
                             replacement_trim_keys,
                         ),
+                        serialize_glb=not preview_only,
                     )
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
@@ -16961,6 +17892,7 @@ class BlueprintWorkspace(QWidget):
             ArchitecturalTrimMiterDescriptor,
         ],
         replacement_trim_keys: set[tuple[int, str]],
+        preview_only: bool,
     ) -> dict[tuple[int, str], PlacedGeneratedModel]:
         """Reuse one authored trim UV model on every compatible component."""
 
@@ -16973,11 +17905,15 @@ class BlueprintWorkspace(QWidget):
                     target_trim,
                     self._get_architectural_trim_wall_surfaces(target_trim),
                 )
-                model = (
-                    self.generation.build_architectural_trim_texture_transfer_model(
-                        source_record.object_id,
-                        frame.target_extents,
-                    )
+                transfer_model = (
+                    self.generation
+                    .build_architectural_trim_texture_transfer_preview_model
+                    if preview_only
+                    else self.generation.build_architectural_trim_texture_transfer_model
+                )
+                model = transfer_model(
+                    source_record.object_id,
+                    frame.target_extents,
                 )
                 if model is None:
                     continue
@@ -17004,6 +17940,7 @@ class BlueprintWorkspace(QWidget):
                             trim_miters_by_trim_key.get(target_key),
                             replacement_trim_keys,
                         ),
+                        serialize_glb=not preview_only,
                     )
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
@@ -17065,6 +18002,7 @@ class BlueprintWorkspace(QWidget):
         *,
         visible_level_by_index: Mapping[int, LevelData],
         base_z_by_level_index: Mapping[int, float],
+        preview_only: bool = False,
     ) -> tuple[PlacedGeneratedModel, ...]:
         """Resolve doorway-bound doors into ordinary authored scene meshes."""
 
@@ -17091,6 +18029,7 @@ class BlueprintWorkspace(QWidget):
                     door,
                     doorway,
                     include_unjoined=False,
+                    preview_only=preview_only,
                 )
                 if placement.mirrored_horizontally:
                     model = mirror_door_model_horizontally(model)
@@ -17330,6 +18269,7 @@ class BlueprintWorkspace(QWidget):
         placement: GeneratedObjectPlacement,
         visible_level_by_index: Mapping[int, LevelData],
         base_z_by_level_index: Mapping[int, float],
+        preview_only: bool = False,
     ) -> PlacedGeneratedModel | None:
         """Resolve one source-backed scene object without duplicating its asset."""
 
@@ -17337,14 +18277,18 @@ class BlueprintWorkspace(QWidget):
         base_z = base_z_by_level_index.get(placement.level_index)
         if level is None or base_z is None:
             return None
-        generated_model = self.generation.get_generated_object_model(record.object_id)
+        symmetry = self.generation.resolve_symmetric_division_for_record(record)
+        generated_model = self._get_scene_generated_object_model(
+            record.object_id,
+            symmetry=symmetry,
+            preview_only=preview_only,
+        )
         if generated_model is None:
             if not self.generation.is_generated_object_asset_available(record.object_id):
                 return None
             raise ValueError(
                 f"Placed object '{record.object_name}' is temporarily unavailable."
             )
-        symmetry = self.generation.resolve_symmetric_division_for_record(record)
         world_x, world_y = level_image_to_world_xy(
             level,
             placement.image_x,
@@ -17371,6 +18315,28 @@ class BlueprintWorkspace(QWidget):
             axis_scales=placement.axis_scales,
         )
 
+    def _get_scene_generated_object_model(
+        self,
+        object_id: str,
+        *,
+        symmetry: object | None,
+        preview_only: bool,
+    ) -> GeneratedModel | None:
+        """Choose proxy-backed parsing only for file-backed scene previews."""
+
+        if not preview_only:
+            return self.generation.get_generated_object_model(object_id)
+        variant = self.generation.get_active_texture_variant(object_id)
+        if variant is None:
+            return self.generation.get_generated_object_model(object_id)
+        source = self._build_atlas_object_texture_source(variant, symmetry)
+        if source is None:
+            return None
+        return self.generation.get_generated_object_preview_model(
+            object_id,
+            self._atlas_source_preview_maps(source),
+        )
+
     def _sync_canvas_placed_object_profiles(self) -> None:
         """Publish current-level object footprints without loading in paint code."""
 
@@ -17392,6 +18358,9 @@ class BlueprintWorkspace(QWidget):
             placed_models = self._build_placed_generated_models(
                 include_excluded_levels=True,
                 include_instances=True,
+                include_door_placements=False,
+                preview_only=True,
+                precomputed_architectural_trim_models=(),
             )
         except (TypeError, ValueError, OverflowError):
             placed_models = ()
@@ -17448,6 +18417,8 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_surface_texture_content_changed(self) -> None:
+        if self._is_applying_project_state:
+            return
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_generation_scene_pbr_maps_changed(self, _checked: bool) -> None:
@@ -17512,10 +18483,25 @@ class BlueprintWorkspace(QWidget):
         preview_levels = self._build_viewer_preview_levels()
         self._sync_viewer_scene_levels()
         if self._viewer_preview_model_revision != revision:
-            dependency_signature_before = (
-                self._build_viewer_preview_dependency_signature()
-            )
-            next_model = self._build_viewer_preview_model(None)
+            if (
+                self._pending_viewer_preview_dependency_signature_revision
+                == revision
+                and self._pending_viewer_preview_dependency_signature is not None
+            ):
+                dependency_signature_before = (
+                    self._pending_viewer_preview_dependency_signature
+                )
+            else:
+                dependency_signature_before = (
+                    self._build_viewer_preview_dependency_signature()
+                )
+            self._pending_viewer_preview_dependency_signature = None
+            self._pending_viewer_preview_dependency_signature_revision = -1
+            self._viewer_preview_levels_for_model_build = preview_levels
+            try:
+                next_model = self._build_viewer_preview_model(None)
+            finally:
+                self._viewer_preview_levels_for_model_build = None
             if next_model is None:
                 return
             dependency_signature_after = (
@@ -17528,10 +18514,14 @@ class BlueprintWorkspace(QWidget):
             self._viewer_preview_dependency_signature = dependency_signature_after
             self._viewer_preview_dependency_signature_revision = revision
         generated_model = self._viewer_preview_model
+        progressive_viewers: list[GlbViewerWidget] = []
 
         if canvas_is_stale:
             if generated_model is None or not len(generated_model.mesh.faces):
-                self._set_canvas_viewer_targets(())
+                self._set_canvas_viewer_targets(
+                    (),
+                    preview_levels=preview_levels,
+                )
                 self._sync_viewer_architectural_trim_placed_object_bindings(None)
                 self._is_syncing_canvas_scene_selection = True
                 try:
@@ -17540,7 +18530,8 @@ class BlueprintWorkspace(QWidget):
                     self._is_syncing_canvas_scene_selection = False
             else:
                 self._set_canvas_viewer_targets(
-                    tuple(build_fixed_surfaces(preview_levels))
+                    tuple(build_fixed_surfaces(preview_levels)),
+                    preview_levels=preview_levels,
                 )
                 self._sync_viewer_architectural_trim_placed_object_bindings(
                     generated_model
@@ -17551,6 +18542,7 @@ class BlueprintWorkspace(QWidget):
                         generated_model,
                         preserve_camera=preserve_camera,
                     )
+                    progressive_viewers.append(self.viewer)
                     self._restore_desired_canvas_scene_selection()
                 finally:
                     self._is_syncing_canvas_scene_selection = False
@@ -17573,8 +18565,15 @@ class BlueprintWorkspace(QWidget):
                     generated_model,
                     preserve_camera=preserve_camera,
                 )
+                progressive_viewers.append(tour_preview_viewer)
             self._tour_viewer_preview_revision = revision
             self._sync_tour_overlays()
+
+        if generated_model is not None and progressive_viewers:
+            self._start_progressive_scene_texture_load(
+                generated_model,
+                progressive_viewers,
+            )
 
     def _mark_viewer_preview_dirty(
         self,
@@ -17584,6 +18583,8 @@ class BlueprintWorkspace(QWidget):
     ) -> int:
         """Invalidate shared preview data and retain future camera intent."""
 
+        self._pending_viewer_preview_dependency_signature = None
+        self._pending_viewer_preview_dependency_signature_revision = -1
         self._viewer_preview_revision += 1
         self._scheduled_viewer_refresh_preserve_camera = bool(
             self._scheduled_viewer_refresh_preserve_camera and preserve_camera
@@ -17630,9 +18631,16 @@ class BlueprintWorkspace(QWidget):
         if not self._viewer_preview_is_active():
             return
         self._refresh_blueprint_file_dependencies(include_exported_levels=True)
-        self._invalidate_viewer_preview_for_dependency_changes(
-            preserve_camera=preserve_camera
+        dependency_signature = (
+            self._invalidate_viewer_preview_for_dependency_changes(
+                preserve_camera=preserve_camera
+            )
         )
+        if dependency_signature is not None:
+            self._pending_viewer_preview_dependency_signature = dependency_signature
+            self._pending_viewer_preview_dependency_signature_revision = (
+                self._viewer_preview_revision
+            )
         if (
             self._canvas_viewer_preview_is_active()
             and self._canvas_viewer_preview_revision != self._viewer_preview_revision
@@ -17745,7 +18753,7 @@ class BlueprintWorkspace(QWidget):
             QMessageBox.critical(self, "Project load failed", str(error))
 
     def restore_last_project(self) -> bool:
-        """Load the most recently opened or saved project without blocking startup."""
+        """Load the most recently opened or saved project."""
 
         if self._application_settings is None:
             return False
@@ -17760,6 +18768,8 @@ class BlueprintWorkspace(QWidget):
 
         try:
             self._load_project_path(stored_path)
+        except RuntimeError:
+            return False
         except PROJECT_LOAD_FAILURES:
             self.current_project_path = None
             self._application_settings.remove(LAST_PROJECT_PATH_SETTING_KEY)
@@ -20082,13 +21092,20 @@ class BlueprintWorkspace(QWidget):
     def _get_door_slot_models(
         self,
         door: DoorDefinition,
+        *,
+        preview_only: bool = False,
     ) -> dict[str, GeneratedModel]:
         """Load real slot assets, with procedural fallbacks for every body."""
 
         models: dict[str, GeneratedModel] = {}
         for slot in door.slots:
-            model = self.generation.get_generated_object_model(
+            symmetry = self.generation.get_object_symmetric_division(
                 slot.source_object_id
+            )
+            model = self._get_scene_generated_object_model(
+                slot.source_object_id,
+                symmetry=symmetry,
+                preview_only=preview_only,
             )
             if model is None:
                 continue
@@ -20108,12 +21125,17 @@ class BlueprintWorkspace(QWidget):
     def _build_door_assembly_preview(
         self,
         door: DoorDefinition,
+        *,
+        preview_only: bool = False,
     ) -> GeneratedModel:
         """Build a complete editor preview, including unconfirmed parts."""
 
         return assemble_door_model(
             door,
-            self._get_door_slot_models(door),
+            self._get_door_slot_models(
+                door,
+                preview_only=preview_only,
+            ),
             include_unjoined=True,
             body_mirrors=self._resolve_door_body_mirror_configurations(door),
         )
@@ -20169,6 +21191,7 @@ class BlueprintWorkspace(QWidget):
         doorway: DoorwayData,
         *,
         include_unjoined: bool,
+        preview_only: bool = False,
     ) -> tuple[DoorDefinition, GeneratedModel]:
         """Build one destination-fitted door with its reconstruction data."""
 
@@ -20177,7 +21200,10 @@ class BlueprintWorkspace(QWidget):
             fitted_door,
             assemble_door_model(
                 fitted_door,
-                self._get_door_slot_models(door),
+                self._get_door_slot_models(
+                    door,
+                    preview_only=preview_only,
+                ),
                 include_unjoined=include_unjoined,
                 body_mirrors=(
                     self._resolve_door_body_mirror_configurations(door)
@@ -20256,7 +21282,7 @@ class BlueprintWorkspace(QWidget):
         return next(
             (
                 record
-                for record in self.generation.get_data().generated_objects
+                for record in self.generation.get_generated_object_records()
                 if record.object_id == body_slot.source_object_id
             ),
             None,
@@ -20304,7 +21330,7 @@ class BlueprintWorkspace(QWidget):
             if enabled:
                 known_object_ids = {
                     record.object_id
-                    for record in self.generation.get_data().generated_objects
+                    for record in self.generation.get_generated_object_records()
                 }
                 procedural_models = build_default_door_slot_models(updated)
                 for slot in updated.slots:
@@ -20487,7 +21513,10 @@ class BlueprintWorkspace(QWidget):
             else bool(generation_ready)
         )
         try:
-            preview_model = self._build_door_assembly_preview(door)
+            preview_model = self._build_door_assembly_preview(
+                door,
+                preview_only=self._is_applying_project_state,
+            )
         except (OSError, RuntimeError, TypeError, ValueError):
             self.doors_workspace.set_preview_model(None)
             self.generation.clear_door_slot_editing_target()
@@ -20532,6 +21561,7 @@ class BlueprintWorkspace(QWidget):
                 ),
                 generation_ready=resolved_generation_ready,
                 announce_generation=announce_generation,
+                defer_file_backed_preview=self._is_applying_project_state,
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             accepted = False
@@ -22360,6 +23390,88 @@ class BlueprintWorkspace(QWidget):
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
     ) -> None:
+        """Install one project while coalescing expensive dependent refreshes."""
+
+        if self._is_applying_project_state:
+            raise RuntimeError("A project is already being applied.")
+        self._is_applying_project_state = True
+        self._project_apply_base_surfaces = None
+        self._project_apply_base_surfaces_by_id = None
+        self._project_apply_fixed_surfaces = None
+        apply_completed = False
+        try:
+            self._apply_project_state_contents(
+                levels=levels,
+                current_level_index=current_level_index,
+                image_library_paths=image_library_paths,
+                doorway_presets=doorway_presets,
+                generation=generation,
+                surface_texture_generation=surface_texture_generation,
+                texture_atlases=texture_atlases,
+                stairs=stairs,
+                wall_mirror_links=wall_mirror_links,
+                tours=tours,
+                doors=doors,
+                directional_lights=directional_lights,
+            )
+            apply_completed = True
+        finally:
+            self._project_apply_base_surfaces = None
+            self._project_apply_base_surfaces_by_id = None
+            self._project_apply_fixed_surfaces = None
+            self._is_applying_project_state = False
+            self._invalidate_project_apply_dependents()
+            if apply_completed:
+                self._finalize_project_state_apply()
+            else:
+                QTimer.singleShot(0, self._refresh_after_failed_project_apply)
+
+    def _invalidate_project_apply_dependents(self) -> None:
+        """Make every coalesced consumer observe the installed project state."""
+
+        self._atlas_generation_signature = None
+        self._atlas_source_content_paths = None
+        self._atlas_source_content_revisions = None
+        self._atlas_pending_source_content_refresh_ids.clear()
+        self._atlas_wall_texture_source_ids.clear()
+        self._atlas_surface_assignment_id_by_source_id.clear()
+        self._architectural_trim_texture_targets_by_operation_id.clear()
+        self._atlas_available_source_ids.clear()
+        self._last_automatic_atlas_assignment_key = None
+
+    def _finalize_project_state_apply(self) -> None:
+        """Replay expensive project consumers once after signal coalescing."""
+
+        self._schedule_viewer_preview_refresh()
+        self._sync_atlas_object_texture_sources()
+        # Atlas thumbnails are sufficient for the first interactive frame.
+        # Exact full-size map families remain lazy until export, AO baking, or
+        # an explicit Atlas edit reaches an authoritative materialization edge.
+        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            self._refresh_surface_ambient_occlusion_preview()
+
+    def _refresh_after_failed_project_apply(self) -> None:
+        """Refresh a partially installed project without masking its error."""
+
+        if self._is_shutdown:
+            return
+        self._schedule_viewer_preview_refresh(preserve_camera=False)
+
+    def _apply_project_state_contents(
+        self,
+        levels: list[LevelData],
+        current_level_index: int,
+        image_library_paths: list[str] | None = None,
+        doorway_presets: list[DoorwayPreset] | None = None,
+        generation: GenerationData | None = None,
+        surface_texture_generation: SurfaceTextureData | None = None,
+        texture_atlases: TextureAtlasData | None = None,
+        stairs: list[StairData] | None = None,
+        wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
+        tours: Sequence[TourData] | None = None,
+        doors: DoorLibraryData | None = None,
+        directional_lights: Sequence[DirectionalLightData] | None = None,
+    ) -> None:
         if (
             self.generation.is_generating
             or self.surface_texture_generation.is_generating
@@ -22370,11 +23482,12 @@ class BlueprintWorkspace(QWidget):
             )
 
         # Manual loading and startup restoration both reach this shared state
-        # boundary. Finish retiring workers while the old scene and Atlas data
-        # are still intact, so a queued completion cannot commit into the
+        # boundary. Retire result bindings and queued work before replacing the
+        # old scene, so any active decode can finish without committing into the
         # incoming project.
         self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_plan_wall_detections()
+        self._cancel_progressive_texture_loads()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
@@ -22493,7 +23606,10 @@ class BlueprintWorkspace(QWidget):
                 surface_texture_generation,
             )
         )
-        self.generation.set_data(generation)
+        self.generation.set_data(
+            generation,
+            defer_file_backed_preview=True,
+        )
         self.doors_workspace.set_data(
             DoorLibraryData() if doors is None else doors
         )
@@ -22506,7 +23622,12 @@ class BlueprintWorkspace(QWidget):
         self._sync_canvas_placed_object_profiles()
         self._sync_viewer_scene_levels(reset_visibility=True)
         self.texture_atlas_workspace.set_data(texture_atlases)
-        self.surface_texture_generation.set_levels(self.levels)
+        self.surface_texture_generation.set_levels(
+            self.levels,
+            architectural_surfaces=(
+                self._get_project_apply_fixed_surface_snapshot()
+            ),
+        )
         self._sync_canvas_stair_semantic_targets(self.levels)
         self._sync_canvas_architectural_trim_semantic_targets(self.levels)
         self.surface_texture_generation.set_data(surface_texture_generation)
@@ -22548,22 +23669,8 @@ class BlueprintWorkspace(QWidget):
         self.merged_generation_workspace.sync_shared_controls()
         self._reconcile_surface_assignments_with_scene(
             emit_signals=False,
+            refresh_semantic_targets=False,
         )
-        self._atlas_generation_signature = None
-        self._atlas_source_content_paths = None
-        self._atlas_source_content_revisions = None
-        self._atlas_pending_source_content_refresh_ids.clear()
-        self._atlas_wall_texture_source_ids.clear()
-        self._atlas_surface_assignment_id_by_source_id.clear()
-        self._architectural_trim_texture_targets_by_operation_id.clear()
-        self._atlas_available_source_ids.clear()
-        self._last_automatic_atlas_assignment_key = None
-        self._sync_atlas_object_texture_sources()
-        self.texture_atlas_workspace.materialize_missing_atlases()
-        self._schedule_viewer_preview_refresh()
-        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
-            self._refresh_surface_ambient_occlusion_preview()
-
     def _set_current_level_image(
         self,
         file_path: str,
@@ -22646,7 +23753,11 @@ class BlueprintWorkspace(QWidget):
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
-        self._sync_canvas_placed_object_profiles()
+        # Project restore has not installed the incoming Generation data yet.
+        # Publishing footprints here would rebuild the outgoing objects, only
+        # to repeat the same work after ``generation.set_data`` below.
+        if not self._is_applying_project_state:
+            self._sync_canvas_placed_object_profiles()
         self._sync_canvas_directional_light_profiles()
         self._sync_canvas_wall_mirror_state()
         self._update_wall_mirror_button_state()
@@ -22677,6 +23788,8 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         application_settings: ApplicationSettingsStore | None = None,
+        *,
+        restore_last_project_immediately: bool = True,
     ) -> None:
         super().__init__()
         self.application_settings = (
@@ -22684,9 +23797,18 @@ class MainWindow(QMainWindow):
             if application_settings is not None
             else ApplicationSettingsStore()
         )
-        self._build_ui()
+        self._startup_restore_scheduled = False
+        self._startup_restore_pending = False
+        self._startup_restore_timer = QTimer(self)
+        self._startup_restore_timer.setSingleShot(True)
+        self._startup_restore_timer.timeout.connect(
+            self._restore_last_project_after_show
+        )
+        self._build_ui(
+            restore_last_project_immediately=restore_last_project_immediately
+        )
 
-    def _build_ui(self) -> None:
+    def _build_ui(self, *, restore_last_project_immediately: bool) -> None:
         self.setWindowTitle("HouseMaker")
         self.resize(1600, 900)
 
@@ -22694,9 +23816,69 @@ class MainWindow(QMainWindow):
             application_settings=self.application_settings
         )
         self.setCentralWidget(self.blueprint_workspace)
-        self.blueprint_workspace.restore_last_project()
+        if restore_last_project_immediately:
+            self.blueprint_workspace.restore_last_project()
+
+    def schedule_last_project_restore(self) -> None:
+        """Let the application shell paint before restoring the saved scene."""
+
+        if self._startup_restore_scheduled:
+            return
+        self._startup_restore_scheduled = True
+        self._startup_restore_pending = True
+        application = QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
+        self.statusBar().showMessage("Loading the last project…")
+        self._startup_restore_timer.start(
+            STARTUP_PROJECT_RESTORE_DELAY_MILLISECONDS
+        )
+
+    def _restore_last_project_after_show(self) -> None:
+        """Restore one queued project after startup has reached the event loop."""
+
+        self._finish_scheduled_last_project_restore()
+        if self.blueprint_workspace._is_shutdown:
+            return
+        if (
+            self.blueprint_workspace.current_project_path is not None
+            or self.blueprint_workspace.generation.is_generating
+            or self.blueprint_workspace.surface_texture_generation.is_generating
+        ):
+            self.statusBar().showMessage("Ready.", 3000)
+            return
+        restored = self.blueprint_workspace.restore_last_project()
+        self.statusBar().showMessage(
+            "Last project loaded." if restored else "Ready.",
+            3000,
+        )
+
+    def _finish_scheduled_last_project_restore(self) -> None:
+        """Disarm deferred restoration and stop observing startup input."""
+
+        self._startup_restore_pending = False
+        self._startup_restore_timer.stop()
+        application = QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
+
+    def eventFilter(
+        self,
+        watched: QObject,
+        event: QEvent,
+    ) -> bool:  # type: ignore[override]
+        """Keep first user input from being overwritten by deferred restore."""
+
+        if (
+            self._startup_restore_pending
+            and event.type() in STARTUP_PROJECT_RESTORE_CANCEL_EVENT_TYPES
+        ):
+            self._finish_scheduled_last_project_restore()
+            self.statusBar().showMessage("Ready.", 3000)
+        return super().eventFilter(watched, event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._finish_scheduled_last_project_restore()
         self.blueprint_workspace.shutdown()
         super().closeEvent(event)
 
@@ -23012,8 +24194,9 @@ def main() -> int:
     app.setApplicationName("HouseMaker")
     app.setStyle("Fusion")
 
-    window = MainWindow()
+    window = MainWindow(restore_last_project_immediately=False)
     _show_window_on_primary_screen(window)
+    window.schedule_last_project_restore()
     return app.exec()
 
 

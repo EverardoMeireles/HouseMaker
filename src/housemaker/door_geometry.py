@@ -32,6 +32,7 @@ from housemaker.glb import (
     PlacedGeneratedModel,
     PreviewSymmetricObject,
     compose_placed_generated_models,
+    compose_placed_generated_models_preview,
 )
 
 # ### Constants ###
@@ -258,7 +259,12 @@ def assemble_door_model(
         scene=trimesh.Scene(),
         glb_bytes=b"",
     )
-    assembled = compose_placed_generated_models(empty_base, placements)
+    compose_models = (
+        compose_placed_generated_models_preview
+        if any(placement.model.preview_only for placement in placements)
+        else compose_placed_generated_models
+    )
+    assembled = compose_models(empty_base, placements)
     assembled.preview_symmetric_objects = [
         replace(preview, fade_enabled=False)
         for preview in assembled.preview_symmetric_objects

@@ -336,10 +336,86 @@ class ArchitecturalTrimViewerTests(unittest.TestCase):
         self.assertTrue(
             all(
                 button.isHidden()
-                for button in self.viewer.architectural_trim_hover_action_buttons.values()
+                for button in (
+                    self.viewer.architectural_trim_hover_action_buttons.values()
+                )
             )
         )
         self.assertFalse(self.viewer._architectural_trim_preview_items)
+
+    def test_passive_hover_coalesces_pointer_burst_to_latest_position(self) -> None:
+        timer = self.viewer._architectural_trim_passive_hover_timer
+        timer.setInterval(1)
+        positions = (
+            QPointF(12.0, 18.0),
+            QPointF(44.0, 52.0),
+            QPointF(73.0, 81.0),
+        )
+
+        with patch.object(
+            self.viewer,
+            "_update_architectural_trim_passive_hover",
+            return_value=True,
+        ) as update_hover:
+            timeout = QSignalSpy(timer.timeout)
+            for position in positions:
+                self.assertFalse(
+                    self.viewer._handle_surface_vertex_pointer_hovered(position)
+                )
+
+            update_hover.assert_not_called()
+            self.assertTrue(timer.isActive())
+            self.assertTrue(timeout.wait(500))
+
+        update_hover.assert_called_once()
+        resolved_position = update_hover.call_args.args[0]
+        self.assertEqual(resolved_position, positions[-1])
+        self.assertIsNone(self.viewer._architectural_trim_passive_hover_position)
+        self.assertFalse(timer.isActive())
+
+    def test_clearing_passive_hover_discards_queued_pointer(self) -> None:
+        position = QPointF(24.0, 36.0)
+        with patch.object(
+            self.viewer,
+            "_update_architectural_trim_passive_hover",
+            return_value=True,
+        ) as update_hover:
+            self.viewer._handle_surface_vertex_pointer_hovered(position)
+            self.assertTrue(
+                self.viewer._architectural_trim_passive_hover_timer.isActive()
+            )
+
+            self.viewer._handle_surface_vertex_pointer_left()
+
+            self.assertFalse(
+                self.viewer._architectural_trim_passive_hover_timer.isActive()
+            )
+            self.assertIsNone(
+                self.viewer._architectural_trim_passive_hover_position
+            )
+            self.assertFalse(
+                self.viewer._flush_architectural_trim_passive_hover()
+            )
+
+        update_hover.assert_not_called()
+
+    def test_active_trim_hover_bypasses_passive_coalescing(self) -> None:
+        self.viewer.begin_architectural_trim_placement(TRIM_KIND_SKIRTING_BOARD)
+        position = QPointF(31.0, 47.0)
+
+        with patch.object(
+            self.viewer,
+            "_update_architectural_trim_hover",
+            return_value=True,
+        ) as update_hover:
+            self.assertTrue(
+                self.viewer._handle_surface_vertex_pointer_hovered(position)
+            )
+
+        update_hover.assert_called_once_with(position)
+        self.assertFalse(
+            self.viewer._architectural_trim_passive_hover_timer.isActive()
+        )
 
     def test_derived_editable_wall_faces_are_not_trim_hosts(self) -> None:
         source_wall = self.walls[0]

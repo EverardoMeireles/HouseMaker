@@ -85,6 +85,28 @@ class LevelCoordinateTests(unittest.TestCase):
         self.assertAlmostEqual(image_point[0], 25.0)
         self.assertAlmostEqual(image_point[1], -10.0)
 
+    def test_coordinate_cache_invalidates_after_vertex_move(self) -> None:
+        level = LevelData(index=2, name="Ground")
+        first = level.vertex_data.add_vertex(0.0, 0.0)
+        level.vertex_data.add_vertex(100.0, 100.0)
+        self.assertEqual(get_level_world_pivot(level), (1.0, -1.0))
+
+        level.vertex_data.move_vertex(first.id, 100.0, 100.0)
+
+        self.assertEqual(get_level_world_pivot(level), (2.0, -2.0))
+
+    def test_coordinate_cache_invalidates_after_transform_change(self) -> None:
+        level = LevelData(index=2, name="Ground")
+        level.vertex_data.add_vertex(0.0, 0.0)
+        level.vertex_data.add_vertex(100.0, 100.0)
+        self.assertEqual(level_image_to_world_xy(level, 25.0, 25.0), (0.5, -0.5))
+
+        level.scale = 2.0
+        level.offset_x_meters = 3.0
+        level.offset_y_meters = -4.0
+
+        self.assertEqual(level_image_to_world_xy(level, 25.0, 25.0), (3.0, -4.0))
+
     def test_level_base_z_lookup_accumulates_above_and_below_ground(self) -> None:
         levels = create_default_levels()
         levels[0].height_meters = 2.0

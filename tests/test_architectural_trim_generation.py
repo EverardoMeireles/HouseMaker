@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from collections import Counter
 from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 import trimesh
@@ -22,9 +23,11 @@ from housemaker.architectural_trim_generation import (
     build_architectural_trim_component_placement,
     build_architectural_trim_component_seed_model,
     fit_architectural_trim_glb_to_dimensions,
+    load_architectural_trim_preview_model,
     prepare_architectural_trim_repeat_module,
     repeat_architectural_trim_module_glb,
     retarget_architectural_trim_repeat_module_glb,
+    retarget_architectural_trim_repeat_module_preview_model,
 )
 from housemaker.architectural_trim_uv import build_cornice_segmented_uv_glb
 from housemaker.glb import (
@@ -143,6 +146,52 @@ def _textured_box_glb(
     return exported
 
 
+def _ornamented_textured_glb() -> bytes:
+    """Build one textured module with genuine intermediate-X relief."""
+
+    base_mesh = trimesh.creation.box(extents=(2.0, 0.5, 1.0))
+    ornament_mesh = trimesh.creation.icosphere(subdivisions=1, radius=0.2)
+    ornament_mesh.apply_translation((0.0, 0.35, 0.0))
+    z_up_mesh = trimesh.util.concatenate((base_mesh, ornament_mesh))
+    z_up_mesh.apply_translation((0.0, 0.0, 0.5))
+    z_up_mesh.visual = TextureVisuals(
+        uv=np.zeros((len(z_up_mesh.vertices), 2), dtype=float),
+        material=PBRMaterial(
+            name="ornamented_trim_material",
+            baseColorTexture=Image.new("RGBA", (2, 2), (120, 80, 40, 255)),
+        ),
+    )
+    gltf_mesh = z_up_mesh.copy()
+    gltf_mesh.apply_transform(Z_UP_TO_GLTF_Y_UP_TRANSFORM)
+    exported = trimesh.Scene(gltf_mesh).export(file_type="glb")
+    if not isinstance(exported, bytes):
+        raise TypeError("The ornamented-trim fixture could not be serialized.")
+    return exported
+
+
+def _tapered_textured_glb() -> bytes:
+    """Build a two-plane module whose end profiles do not meet when repeated."""
+
+    z_up_mesh = trimesh.creation.box(extents=(2.0, 0.5, 1.0))
+    maximum_x = float(np.max(z_up_mesh.vertices[:, 0]))
+    maximum_profile = np.isclose(z_up_mesh.vertices[:, 0], maximum_x)
+    z_up_mesh.vertices[maximum_profile, 1:] *= 0.5
+    z_up_mesh.apply_translation((0.0, 0.0, 0.5))
+    z_up_mesh.visual = TextureVisuals(
+        uv=np.zeros((len(z_up_mesh.vertices), 2), dtype=float),
+        material=PBRMaterial(
+            name="tapered_trim_material",
+            baseColorTexture=Image.new("RGBA", (2, 2), (70, 110, 150, 255)),
+        ),
+    )
+    gltf_mesh = z_up_mesh.copy()
+    gltf_mesh.apply_transform(Z_UP_TO_GLTF_Y_UP_TRANSFORM)
+    exported = trimesh.Scene(gltf_mesh).export(file_type="glb")
+    if not isinstance(exported, bytes):
+        raise TypeError("The tapered-trim fixture could not be serialized.")
+    return exported
+
+
 def _corner_wall_surface(
     surface_id: str,
     start: tuple[float, float, float],
@@ -234,6 +283,26 @@ def _uv_counts(mesh: trimesh.Trimesh) -> Counter[tuple[float, float]]:
         tuple(float(value) for value in row)
         for row in np.round(uv_coordinates, decimals=7)
     )
+
+
+def _expected_extruded_repeat_face_count(
+    mesh: trimesh.Trimesh,
+    repeat_count: int,
+) -> int:
+    """Count repeated strip faces with only the two exterior caps retained."""
+
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    minimum_x = float(np.min(vertices[:, 0]))
+    maximum_x = float(np.max(vertices[:, 0]))
+    face_x = vertices[faces, 0]
+    cap_count = int(
+        np.count_nonzero(
+            np.all(np.isclose(face_x, minimum_x), axis=1)
+            | np.all(np.isclose(face_x, maximum_x), axis=1)
+        )
+    )
+    return (len(faces) - cap_count) * repeat_count + cap_count
 
 
 # ### GLB fitting tests ###
@@ -368,7 +437,7 @@ class ArchitecturalTrimRepeatModuleTests(unittest.TestCase):
             atol=1e-7,
         )
 
-    def test_repeat_merges_each_primitive_and_reuses_uvs_and_materials(
+    def test_repeat_builds_cap_free_strips_and_reuses_uvs_and_materials(
         self,
     ) -> None:
         module_glb, layout = prepare_architectural_trim_repeat_module(
@@ -403,6 +472,13 @@ class ArchitecturalTrimRepeatModuleTests(unittest.TestCase):
                 repeated_geometry = repeated_by_material[material_name]
                 self.assertEqual(
                     len(repeated_geometry.faces),
+                    _expected_extruded_repeat_face_count(
+                        module_geometry,
+                        layout.repeat_count,
+                    ),
+                )
+                self.assertLess(
+                    len(repeated_geometry.faces),
                     len(module_geometry.faces) * layout.repeat_count,
                 )
                 np.testing.assert_array_equal(
@@ -414,15 +490,8 @@ class ArchitecturalTrimRepeatModuleTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(
-                    _uv_counts(repeated_geometry),
-                    Counter(
-                        {
-                            coordinate: count * layout.repeat_count
-                            for coordinate, count in _uv_counts(
-                                module_geometry
-                            ).items()
-                        }
-                    ),
+                    set(_uv_counts(repeated_geometry)),
+                    set(_uv_counts(module_geometry)),
                 )
 
     def test_repeat_refits_provider_geometry_before_expanding_span(self) -> None:
@@ -468,16 +537,57 @@ class ArchitecturalTrimRepeatModuleTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(
-                    _uv_counts(repeated_geometry),
-                    Counter(
-                        {
-                            coordinate: count * layout.repeat_count
-                            for coordinate, count in _uv_counts(
-                                provider_geometry
-                            ).items()
-                        }
+                    len(repeated_geometry.faces),
+                    _expected_extruded_repeat_face_count(
+                        provider_geometry,
+                        layout.repeat_count,
                     ),
                 )
+                self.assertEqual(
+                    set(_uv_counts(repeated_geometry)),
+                    set(_uv_counts(provider_geometry)),
+                )
+
+    def test_repeat_preserves_non_extruded_ornament_geometry(self) -> None:
+        module_glb, layout = prepare_architectural_trim_repeat_module(
+            _ornamented_textured_glb(),
+            (6.0, 0.5, 1.0),
+        )
+        module_model = import_generated_glb(module_glb)
+
+        repeated_model = import_generated_glb(
+            repeat_architectural_trim_module_glb(module_glb, layout)
+        )
+
+        self.assertEqual(
+            len(repeated_model.mesh.faces),
+            len(module_model.mesh.faces) * layout.repeat_count,
+        )
+        np.testing.assert_allclose(
+            repeated_model.mesh.extents,
+            layout.target_extents,
+        )
+
+    def test_repeat_preserves_caps_for_mismatched_end_profiles(self) -> None:
+        module_glb, layout = prepare_architectural_trim_repeat_module(
+            _tapered_textured_glb(),
+            (6.0, 0.5, 1.0),
+        )
+        module_model = import_generated_glb(module_glb)
+
+        repeated_model = import_generated_glb(
+            repeat_architectural_trim_module_glb(module_glb, layout)
+        )
+
+        self.assertEqual(layout.repeat_count, 3)
+        self.assertEqual(
+            len(repeated_model.mesh.faces),
+            len(module_model.mesh.faces) * layout.repeat_count,
+        )
+        np.testing.assert_allclose(
+            repeated_model.mesh.extents,
+            layout.target_extents,
+        )
 
     def test_repeated_model_placement_uses_identity_axis_scale(self) -> None:
         target_extents = (6.0, 0.5, 1.0)
@@ -536,40 +646,23 @@ class ArchitecturalTrimRepeatModuleTests(unittest.TestCase):
         for material_name, source_geometry in source_by_material.items():
             with self.subTest(material_name=material_name):
                 target_geometry = target_by_material[material_name]
-                source_faces = np.asarray(source_geometry.faces, dtype=np.int64)
                 target_faces = np.asarray(target_geometry.faces, dtype=np.int64)
-                source_uvs = np.asarray(source_geometry.visual.uv, dtype=float)
-                target_uvs = np.asarray(target_geometry.visual.uv, dtype=float)
                 self.assertEqual(
                     len(target_faces),
-                    len(source_faces) * target_layout.repeat_count,
-                )
-                self.assertEqual(
-                    _uv_counts(target_geometry),
-                    Counter(
-                        {
-                            coordinate: count * target_layout.repeat_count
-                            for coordinate, count in _uv_counts(
-                                source_geometry
-                            ).items()
-                        }
+                    _expected_extruded_repeat_face_count(
+                        source_geometry,
+                        target_layout.repeat_count,
                     ),
                 )
-                for repeat_index in range(target_layout.repeat_count):
-                    face_start = repeat_index * len(source_faces)
-                    face_end = face_start + len(source_faces)
-                    vertex_start = repeat_index * len(source_geometry.vertices)
-                    vertex_end = vertex_start + len(source_geometry.vertices)
-                    np.testing.assert_array_equal(
-                        target_faces[face_start:face_end] - vertex_start,
-                        source_faces,
-                    )
-                    np.testing.assert_allclose(
-                        target_uvs[vertex_start:vertex_end],
-                        source_uvs,
-                        rtol=0.0,
-                        atol=0.0,
-                    )
+                self.assertEqual(
+                    set(_uv_counts(target_geometry)),
+                    set(_uv_counts(source_geometry)),
+                )
+                self.assertTrue(np.all(target_faces >= 0))
+                self.assertLess(
+                    int(np.max(target_faces)),
+                    len(target_geometry.vertices),
+                )
 
     def test_retarget_clamps_repeat_count_and_rejects_invalid_dimensions(
         self,
@@ -598,6 +691,63 @@ class ArchitecturalTrimRepeatModuleTests(unittest.TestCase):
                 source_layout,
                 (6.0, float("nan"), 1.0),
             )
+
+    def test_preview_retarget_keeps_materials_without_glb_round_trip(self) -> None:
+        source_module_glb, source_layout = prepare_architectural_trim_repeat_module(
+            _textured_two_primitive_glb(),
+            (6.0, 0.5, 1.0),
+        )
+        source_model = load_architectural_trim_preview_model(source_module_glb)
+        source_by_material = _geometry_by_material_name(source_model.scene)
+        target_extents = (4.6, 0.75, 1.5)
+
+        with (
+            patch.object(
+                trimesh.Scene,
+                "export",
+                side_effect=AssertionError("preview retarget serialized a GLB"),
+            ),
+            patch(
+                "housemaker.architectural_trim_generation.import_generated_glb",
+                side_effect=AssertionError("preview retarget imported a GLB"),
+            ),
+        ):
+            target_model, target_layout = (
+                retarget_architectural_trim_repeat_module_preview_model(
+                    source_model,
+                    source_layout,
+                    target_extents,
+                )
+            )
+
+        self.assertEqual(target_model.glb_bytes, b"")
+        self.assertEqual(target_layout.repeat_count, 5)
+        np.testing.assert_allclose(target_model.mesh.extents, target_extents)
+        target_by_material = _geometry_by_material_name(target_model.scene)
+        self.assertEqual(set(target_by_material), set(source_by_material))
+        for material_name, source_geometry in source_by_material.items():
+            with self.subTest(material_name=material_name):
+                target_geometry = target_by_material[material_name]
+                self.assertIs(
+                    target_geometry.visual.material,
+                    source_geometry.visual.material,
+                )
+                self.assertEqual(
+                    target_geometry.visual.material.name,
+                    source_geometry.visual.material.name,
+                )
+                self.assertIs(
+                    target_geometry.visual.material.baseColorTexture,
+                    source_geometry.visual.material.baseColorTexture,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(target_geometry.visual.material.baseColorTexture),
+                    np.asarray(source_geometry.visual.material.baseColorTexture),
+                )
+                self.assertEqual(
+                    set(_uv_counts(target_geometry)),
+                    set(_uv_counts(source_geometry)),
+                )
 
 
 # ### Generated corner-miter tests ###
