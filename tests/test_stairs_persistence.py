@@ -150,6 +150,11 @@ class StairDataTests(unittest.TestCase):
             starting_step_edge_radius_meters=0.18,
             starting_step_edge_points=4,
             stringer_placement=STAIR_STRINGER_LEFT,
+            removed_face_indices=(("treads", 7), ("risers", 2)),
+            removed_face_topology_fingerprints=(
+                ("treads", "a" * 64),
+                ("risers", "b" * 64),
+            ),
         )
 
         restored = StairData.from_dict(stair.to_dict())
@@ -164,12 +169,34 @@ class StairDataTests(unittest.TestCase):
         self.assertEqual(stair.starting_step_edge_radius_meters, 0.18)
         self.assertEqual(stair.starting_step_edge_points, 4)
         self.assertEqual(
+            restored.removed_face_indices,
+            (("risers", 2), ("treads", 7)),
+        )
+        self.assertEqual(
+            restored.removed_face_topology_fingerprints,
+            (("risers", "b" * 64), ("treads", "a" * 64)),
+        )
+        self.assertEqual(
             stair.to_dict()["starting_step"],
             STAIR_STARTING_STEP_CURTAIL,
         )
         self.assertEqual(
             stair.to_dict()["nosing_placements"],
             [STAIR_NOSING_LEFT, STAIR_NOSING_RIGHT, STAIR_NOSING_FRONT],
+        )
+        self.assertEqual(
+            stair.to_dict()["removed_face_indices"],
+            [
+                {"part_kind": "risers", "face_index": 2},
+                {"part_kind": "treads", "face_index": 7},
+            ],
+        )
+        self.assertEqual(
+            stair.to_dict()["removed_face_topology_fingerprints"],
+            [
+                {"part_kind": "risers", "fingerprint": "b" * 64},
+                {"part_kind": "treads", "fingerprint": "a" * 64},
+            ],
         )
 
     def test_nosing_placements_accept_empty_and_canonicalize_iterables(self) -> None:

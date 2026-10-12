@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,8 @@ from PySide6.QtGui import (
     QPen,
 )
 from shapely import Polygon
+from shapely.affinity import affine_transform
+from shapely.geometry.base import BaseGeometry
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
@@ -172,6 +175,10 @@ STAIR_PART_SURFACE_TYPE = {
     STAIR_PART_RISERS: "wall",
     STAIR_PART_STRINGERS: "wall",
 }
+STAIR_SOURCE_FACE_INDICES_METADATA_KEY = "_housemaker_stair_source_face_indices"
+STAIR_SOURCE_TOPOLOGY_METADATA_KEY = (
+    "_housemaker_stair_source_topology_fingerprint"
+)
 
 # ### Module state ###
 _fallback_qt_application: QGuiApplication | None = None
@@ -227,6 +234,8 @@ class PreviewStairPart:
     surface_type: str
     mesh: trimesh.Trimesh
     level_indices: tuple[int, ...]
+    source_face_indices: tuple[int, ...] = ()
+    source_topology_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.stair_id, str) or not self.stair_id.strip():
@@ -257,8 +266,41 @@ class PreviewStairPart:
         normalized_levels = tuple(sorted(set(self.level_indices)))
         if not normalized_levels:
             raise ValueError("Preview stair parts require owning levels.")
+        source_face_indices = self.source_face_indices
+        if not source_face_indices:
+            source_face_indices = tuple(range(len(self.mesh.faces)))
+        if (
+            len(source_face_indices) != len(self.mesh.faces)
+            or any(
+                isinstance(face_index, bool)
+                or not isinstance(face_index, int)
+                or face_index < 0
+                for face_index in source_face_indices
+            )
+            or len(set(source_face_indices)) != len(source_face_indices)
+        ):
+            raise ValueError(
+                "Preview stair source face indices must uniquely match its faces."
+            )
         object.__setattr__(self, "stair_id", self.stair_id.strip())
         object.__setattr__(self, "level_indices", normalized_levels)
+        object.__setattr__(self, "source_face_indices", tuple(source_face_indices))
+        normalized_fingerprint = self.source_topology_fingerprint.strip().lower()
+        if normalized_fingerprint and (
+            len(normalized_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in normalized_fingerprint
+            )
+        ):
+            raise ValueError(
+                "Preview stair source topology fingerprints must be SHA-256 hex."
+            )
+        object.__setattr__(
+            self,
+            "source_topology_fingerprint",
+            normalized_fingerprint,
+        )
 
     @property
     def key(self) -> str:
@@ -866,7 +908,10 @@ def _build_blueprint_model(
             level_source,
             exportable_stairs,
         )
-        base_fixed_surfaces = build_base_fixed_surfaces(level_source)
+        base_fixed_surfaces = build_base_fixed_surfaces(
+            level_source,
+            stairs=exportable_stairs,
+        )
         trim_geometry = build_architectural_trim_geometry(
             level_source,
             base_fixed_surfaces,
@@ -880,7 +925,10 @@ def _build_blueprint_model(
             )
             for run in trim_geometry.runs
         )
-        fixed_surfaces = build_fixed_surfaces(level_source)
+        fixed_surfaces = build_fixed_surfaces(
+            level_source,
+            stairs=exportable_stairs,
+        )
         structural_fixed_surfaces = tuple(
             surface
             for surface in fixed_surfaces
@@ -2417,6 +2465,146 @@ def _slugify_scene_name(raw_name: object) -> str:
     return _slugify_name(str(raw_name))
 
 
+# ### Stair slab opening helpers ###
+def build_stair_slab_openings_by_level(
+    levels: Sequence[LevelData],
+    stairs: Sequence[StairData],
+) -> dict[int, BaseGeometry]:
+    """Return world-space stair corridors owned by every crossed upper slab.
+
+    The same ordered and smoothed route used to build the stair meshes drives
+    these openings.  For an ordinary adjacent-level stair, its complete route
+    cuts the upper floor and the ceiling immediately below it.  A stair which
+    spans several levels contributes only the corresponding route interval to
+    each crossed slab instead of cutting its full footprint repeatedly.
+    """
+
+    if not stairs:
+        return {}
+
+    level_lookup = {level.index: level for level in levels}
+    base_z_by_level_index = build_level_base_z_lookup(levels)
+    included_levels = tuple(
+        level
+        for level in sorted(levels, key=lambda item: item.index)
+        if level.include_in_export
+    )
+    openings_by_level: dict[int, list[Polygon]] = {}
+    for stair in stairs:
+        route_levels = tuple(
+            level_lookup.get(section.level_index) for section in stair.sections
+        )
+        if any(level is None for level in route_levels):
+            continue
+        if any(not level.include_in_export for level in route_levels if level is not None):
+            continue
+
+        route_sections = _resolve_stair_route_sections(stair, level_lookup)
+        start_z = _get_stair_endpoint_base_z(
+            base_z_by_level_index,
+            stair.start_level_index,
+            "start",
+        )
+        end_z = _get_stair_endpoint_base_z(
+            base_z_by_level_index,
+            stair.end_level_index,
+            "end",
+        )
+        lower_z, upper_z = sorted((start_z, end_z))
+        if start_z > end_z:
+            route_sections.reverse()
+            route_sections = _normalize_stair_rail_correspondence(route_sections)
+        sampled_sections, cumulative_distances = (
+            _get_smoothed_stair_route_geometry(route_sections)
+        )
+        total_run = cumulative_distances[-1]
+        total_rise = upper_z - lower_z
+        if (
+            total_run <= STAIR_GEOMETRY_EPSILON
+            or total_rise <= STAIR_GEOMETRY_EPSILON
+        ):
+            continue
+
+        previous_z = lower_z
+        for owner_level in included_levels:
+            owner_z = base_z_by_level_index[owner_level.index]
+            if (
+                owner_z <= lower_z + STAIR_GEOMETRY_EPSILON
+                or owner_z > upper_z + STAIR_GEOMETRY_EPSILON
+            ):
+                continue
+            interval_start = total_run * (previous_z - lower_z) / total_rise
+            interval_end = total_run * (owner_z - lower_z) / total_rise
+            interval_end = min(total_run, interval_end)
+            opening_parts = _build_stair_route_opening_parts(
+                sampled_sections,
+                cumulative_distances,
+                interval_start,
+                interval_end,
+            )
+            openings_by_level.setdefault(owner_level.index, []).extend(
+                opening_parts
+            )
+            previous_z = owner_z
+
+    return {
+        level_index: geometry
+        for level_index, polygons in openings_by_level.items()
+        if (
+            (geometry := shapely.union_all(polygons)) is not None
+            and not geometry.is_empty
+            and float(geometry.area) > STAIR_GEOMETRY_EPSILON
+        )
+    }
+
+
+def _build_stair_route_opening_parts(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    interval_start: float,
+    interval_end: float,
+) -> list[Polygon]:
+    """Build valid strip polygons for one elevation interval of a route."""
+
+    if interval_end - interval_start <= STAIR_GEOMETRY_EPSILON:
+        return []
+    sample_distances = [interval_start]
+    sample_distances.extend(
+        distance
+        for distance in cumulative_distances[1:-1]
+        if (
+            distance > interval_start + STAIR_GEOMETRY_EPSILON
+            and distance < interval_end - STAIR_GEOMETRY_EPSILON
+        )
+    )
+    sample_distances.append(interval_end)
+    sections = tuple(
+        _sample_stair_route(
+            route_sections,
+            cumulative_distances,
+            distance,
+        )
+        for distance in sample_distances
+    )
+
+    polygons: list[Polygon] = []
+    for (start_a, start_b), (end_a, end_b) in zip(
+        sections,
+        sections[1:],
+    ):
+        candidate = shapely.make_valid(
+            Polygon((start_a, start_b, end_b, end_a))
+        )
+        polygons.extend(
+            part
+            for part in shapely.get_parts(candidate)
+            if isinstance(part, Polygon)
+            and not part.is_empty
+            and float(part.area) > STAIR_GEOMETRY_EPSILON
+        )
+    return polygons
+
+
 # ### Stair geometry helpers ###
 def clear_stair_route_geometry_cache() -> None:
     """Discard retained stair-route topology and sampling calculations."""
@@ -2538,6 +2726,19 @@ def build_canvas_stair_part_targets(
                     surface_type=surface_type,
                     mesh=part_mesh,
                     level_indices=level_indices,
+                    source_face_indices=tuple(
+                        int(face_index)
+                        for face_index in part_mesh.metadata.get(
+                            STAIR_SOURCE_FACE_INDICES_METADATA_KEY,
+                            range(len(part_mesh.faces)),
+                        )
+                    ),
+                    source_topology_fingerprint=str(
+                        part_mesh.metadata.get(
+                            STAIR_SOURCE_TOPOLOGY_METADATA_KEY,
+                            "",
+                        )
+                    ),
                 )
             )
     return targets
@@ -2882,11 +3083,72 @@ def _build_stair_part_meshes(
             tread_thickness_meters,
         )
 
-    return {
-        part_kind: _combine_mesh_geometry(meshes)
-        for part_kind, meshes in part_meshes.items()
-        if meshes
-    }
+    removed_faces_by_part: dict[str, set[int]] = {}
+    for part_kind, face_index in stair.removed_face_indices:
+        removed_faces_by_part.setdefault(part_kind, set()).add(face_index)
+    expected_fingerprints = dict(stair.removed_face_topology_fingerprints)
+
+    combined_parts: dict[str, trimesh.Trimesh] = {}
+    for part_kind, meshes in part_meshes.items():
+        if not meshes:
+            continue
+        part_mesh = _combine_mesh_geometry(meshes)
+        source_topology_fingerprint = _build_stair_part_topology_fingerprint(
+            part_mesh
+        )
+        source_face_indices = np.arange(len(part_mesh.faces), dtype=np.int64)
+        removed_indices = (
+            removed_faces_by_part.get(part_kind, set())
+            if expected_fingerprints.get(part_kind)
+            == source_topology_fingerprint
+            else set()
+        )
+        if removed_indices:
+            keep_faces = np.asarray(
+                [
+                    face_index not in removed_indices
+                    for face_index in source_face_indices
+                ],
+                dtype=bool,
+            )
+            source_face_indices = source_face_indices[keep_faces]
+            part_mesh.update_faces(keep_faces)
+            part_mesh.remove_unreferenced_vertices()
+        if not len(part_mesh.faces):
+            continue
+        part_mesh.metadata[STAIR_SOURCE_FACE_INDICES_METADATA_KEY] = tuple(
+            int(face_index) for face_index in source_face_indices
+        )
+        part_mesh.metadata[STAIR_SOURCE_TOPOLOGY_METADATA_KEY] = (
+            source_topology_fingerprint
+        )
+        combined_parts[part_kind] = part_mesh
+    return combined_parts
+
+
+def _build_stair_part_topology_fingerprint(mesh: trimesh.Trimesh) -> str:
+    """Fingerprint ordered source geometry independent of level transforms."""
+
+    source_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    minimum = np.min(source_vertices, axis=0)
+    extents = np.ptp(source_vertices, axis=0)
+    normalized_vertices = source_vertices - minimum
+    scalable_axes = extents > STAIR_GEOMETRY_EPSILON
+    normalized_vertices[:, scalable_axes] /= extents[scalable_axes]
+    vertices = np.ascontiguousarray(
+        np.round(normalized_vertices, decimals=9),
+        dtype="<f8",
+    )
+    faces = np.ascontiguousarray(
+        np.asarray(mesh.faces, dtype=np.int64),
+        dtype="<i8",
+    )
+    digest = hashlib.sha256()
+    digest.update(np.asarray(vertices.shape, dtype="<i8").tobytes())
+    digest.update(vertices.tobytes())
+    digest.update(np.asarray(faces.shape, dtype="<i8").tobytes())
+    digest.update(faces.tobytes())
+    return digest.hexdigest()
 
 
 def _resolve_stair_route_sections(
@@ -6791,6 +7053,10 @@ def _build_multi_level_meshes(
     level_lookup = {level.index: level for level in sorted_levels}
     floor_base_z_by_level_index = build_level_floor_base_z_lookup(sorted_levels)
     base_z_by_level_index = build_level_base_z_lookup(sorted_levels)
+    stair_openings_by_level = build_stair_slab_openings_by_level(
+        sorted_levels,
+        stairs,
+    )
     named_meshes: list[NamedMesh] = []
 
     for level in sorted_levels:
@@ -6805,6 +7071,7 @@ def _build_multi_level_meshes(
             floor_base_z_meters=floor_base_z_by_level_index[level.index],
             base_z_meters=base_z_by_level_index[level.index],
             blueprint_size_pixels=blueprint_size_pixels,
+            stair_opening_geometry=stair_openings_by_level.get(level.index),
         )
         if not level_named_meshes:
             continue
@@ -6848,20 +7115,29 @@ def _build_named_meshes_for_level(
     floor_base_z_meters: float,
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
+    stair_opening_geometry: BaseGeometry | None = None,
 ) -> list[NamedMesh]:
     level_blueprint_size = level.image_size_pixels or blueprint_size_pixels
     level_source_transform = _build_level_source_transform(
         level,
         level_blueprint_size,
     )
+    local_stair_opening_geometry = _transform_world_plan_geometry_to_source(
+        stair_opening_geometry,
+        level_source_transform,
+    )
     room_vertex_sets = _get_room_vertex_sets(level.rooms)
-    wall_orientation = build_level_wall_orientation_resolver(level)
+    wall_orientation = build_level_wall_orientation_resolver(
+        level,
+        additional_floor_coherency_geometry=stair_opening_geometry,
+    )
     named_meshes: list[NamedMesh] = []
     floor_mesh = build_level_floor_mesh(
         level=level,
         floor_base_z_meters=floor_base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
         point_to_world_xy=_point_to_world_xy,
+        additional_opening_geometry=local_stair_opening_geometry,
     )
     if floor_mesh is not None:
         named_meshes.append(
@@ -9622,6 +9898,31 @@ def _build_level_source_transform(
     transform[0, 3] += offset_x_meters
     transform[1, 3] += offset_y_meters
     return transform
+
+
+def _transform_world_plan_geometry_to_source(
+    geometry: BaseGeometry | None,
+    source_transform: np.ndarray,
+) -> BaseGeometry | None:
+    """Map world XY opening geometry into one level mesh's local XY space."""
+
+    if geometry is None or geometry.is_empty:
+        return None
+    inverse = np.linalg.inv(_get_valid_source_transform(source_transform))
+    transformed = affine_transform(
+        geometry,
+        (
+            float(inverse[0, 0]),
+            float(inverse[0, 1]),
+            float(inverse[1, 0]),
+            float(inverse[1, 1]),
+            float(inverse[0, 3]),
+            float(inverse[1, 3]),
+        ),
+    )
+    if transformed.is_empty:
+        return None
+    return transformed
 
 
 def _transform_source_point(

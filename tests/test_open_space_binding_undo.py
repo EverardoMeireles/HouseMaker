@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import LevelData, VertexData
+from housemaker.models import LevelData, OpenSpaceData, VertexData
 from housemaker.surface_texture_state import (
     SURFACE_TYPE_FLOOR,
     SurfaceTextureAssignment,
@@ -105,6 +105,26 @@ def _atlas_placement(
     if atlas is None:
         return None
     return atlas.placement_for_object(source_id)
+
+
+def _resize_selected_open_space_corner(
+    workspace: BlueprintWorkspace,
+    source_point: tuple[float, float],
+    target_point: tuple[float, float],
+) -> None:
+    """Commit one corner move without coupling the test to pointer timing."""
+
+    canvas = workspace.canvas
+    source_widget = canvas._image_to_widget(*source_point)
+    hit = canvas._find_selected_open_space_corner_at(source_widget)
+    if hit is None:
+        raise AssertionError("The selected open-space corner was not found.")
+    canvas._begin_open_space_corner_drag(hit, source_widget)
+    canvas._open_space_corner_drag_active = True
+    canvas._open_space_corner_drag_preview_point = target_point
+    if not canvas._finish_open_space_corner_drag():
+        raise AssertionError("The open-space corner edit did not commit.")
+    _qt_application.processEvents()
 
 
 # ### Open-space binding undo integration tests ###
@@ -300,6 +320,69 @@ class OpenSpaceBindingUndoTests(unittest.TestCase):
         self.assertIn(
             "newer texture bindings were kept",
             self.workspace.viewer.surface_tools_status_label.text(),
+        )
+
+    def test_two_delayed_corner_releases_remain_separate_undo_steps(self) -> None:
+        assignment, source_id, atlas_id, original_placement = (
+            self._seed_floor_texture()
+        )
+        opening = OpenSpaceData(
+            "resized-opening",
+            20.0,
+            20.0,
+            80.0,
+            80.0,
+        )
+        self.ground.open_spaces.append(opening)
+        self.workspace.canvas.selected_open_space_id = opening.open_space_id
+        self.workspace._handle_canvas_surface_geometry_changed()
+        assignments_before = (
+            self.workspace.surface_texture_generation.snapshot_assignments()
+        )
+
+        _resize_selected_open_space_corner(
+            self.workspace,
+            (20.0, 20.0),
+            (15.0, 15.0),
+        )
+        _resize_selected_open_space_corner(
+            self.workspace,
+            (15.0, 15.0),
+            (10.0, 10.0),
+        )
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+        self.workspace._commit_pending_wall_vertex_update()
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(
+            self.ground.open_spaces,
+            [OpenSpaceData("resized-opening", 15.0, 15.0, 80.0, 80.0)],
+        )
+        self.assertEqual(
+            self.workspace.surface_texture_generation.snapshot_assignments(),
+            assignments_before,
+        )
+        assert self.workspace.viewer.surface_tools_status_label is not None
+        self.assertEqual(
+            self.workspace.viewer.surface_tools_status_label.text(),
+            "Canvas action undone.",
+        )
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(self.ground.open_spaces, [opening])
+        self.assertEqual(
+            self.workspace.surface_texture_generation.snapshot_assignments(),
+            assignments_before,
+        )
+        self.assertEqual(
+            _atlas_placement(self.workspace, atlas_id, source_id),
+            original_placement,
+        )
+        self.assertEqual(
+            self.workspace.viewer.surface_tools_status_label.text(),
+            "Canvas action undone.",
         )
 
 

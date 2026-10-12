@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1149,6 +1150,124 @@ class StairMainIntegrationTests(unittest.TestCase):
         self.assertEqual(self.workspace.stairs, [])
         self.assertEqual(self.workspace.viewer.get_selected_canvas_stair_part_ids(), ())
         self.assertEqual(self.workspace.stair_status_label.text(), "Stair deleted.")
+
+    def test_delete_box_selected_stair_faces_is_persistent_and_undoable(
+        self,
+    ) -> None:
+        stair = _make_editable_stair()
+        self.workspace.stairs = [stair]
+        self.workspace.canvas.set_stair_context(
+            self.workspace.stairs,
+            self.workspace.current_level,
+        )
+        self.workspace._set_canvas_viewer_targets(())
+        target = next(
+            target
+            for target in self.workspace._canvas_stair_part_targets_by_id.values()
+            if target.part_kind == STAIR_PART_TREADS
+        )
+        removed_source_index = target.source_face_indices[0]
+        original_face_count = len(target.mesh.faces)
+        self.workspace.viewer.set_selected_canvas_stair_face_refs(
+            ((target.semantic_id, removed_source_index),)
+        )
+
+        self.workspace.viewer._handle_view_delete_requested()
+
+        self.assertEqual(len(self.workspace.stairs), 1)
+        self.assertEqual(
+            self.workspace.stairs[0].removed_face_indices,
+            ((STAIR_PART_TREADS, removed_source_index),),
+        )
+        self.assertEqual(
+            self.workspace.stairs[0].removed_face_topology_fingerprints,
+            (
+                (
+                    STAIR_PART_TREADS,
+                    target.source_topology_fingerprint,
+                ),
+            ),
+        )
+        revised_target = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                self.workspace.levels,
+                self.workspace.stairs,
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        self.assertEqual(len(revised_target.mesh.faces), original_face_count - 1)
+        self.assertNotIn(removed_source_index, revised_target.source_face_indices)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(self.workspace.stairs[0].removed_face_indices, ())
+        self.assertEqual(
+            self.workspace.stairs[0].removed_face_topology_fingerprints,
+            (),
+        )
+        restored_target = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                self.workspace.levels,
+                self.workspace.stairs,
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        self.assertEqual(len(restored_target.mesh.faces), original_face_count)
+        self.assertIn(removed_source_index, restored_target.source_face_indices)
+
+    def test_new_face_deletion_replaces_stale_part_face_indices(self) -> None:
+        stair = _make_editable_stair()
+        baseline_target = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                self.workspace.levels,
+                (stair,),
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        stale_source_index = baseline_target.source_face_indices[0]
+        selected_source_index = baseline_target.source_face_indices[1]
+        self.workspace.stairs = [
+            replace(
+                stair,
+                removed_face_indices=(
+                    (STAIR_PART_TREADS, stale_source_index),
+                ),
+                removed_face_topology_fingerprints=(
+                    (STAIR_PART_TREADS, "a" * 64),
+                ),
+            )
+        ]
+        self.workspace.canvas.set_stair_context(
+            self.workspace.stairs,
+            self.workspace.current_level,
+        )
+        self.workspace._set_canvas_viewer_targets(())
+        current_target = next(
+            target
+            for target in self.workspace._canvas_stair_part_targets_by_id.values()
+            if target.part_kind == STAIR_PART_TREADS
+        )
+
+        self.workspace._handle_canvas_stair_face_deletion_requested(
+            ((current_target.semantic_id, selected_source_index),)
+        )
+
+        self.assertEqual(
+            self.workspace.stairs[0].removed_face_indices,
+            ((STAIR_PART_TREADS, selected_source_index),),
+        )
+        self.assertEqual(
+            self.workspace.stairs[0].removed_face_topology_fingerprints,
+            (
+                (
+                    STAIR_PART_TREADS,
+                    current_target.source_topology_fingerprint,
+                ),
+            ),
+        )
 
     def test_dragged_canvas_stair_point_waits_for_mesh_edit_delay(self) -> None:
         stair = _make_editable_stair()

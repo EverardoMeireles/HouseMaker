@@ -708,36 +708,61 @@ def _remove_wall_mirror_link_closure(
     }
     changed_levels: set[int] = set()
     try:
-        for link in sorted(
-            removed_links,
-            key=_wall_mirror_link_sort_key,
-            reverse=True,
-        ):
+        deleted_target_ids_by_level: dict[int, set[int]] = {}
+        for link in removed_links:
+            changed_levels.add(link.source_level_index)
             target_level = level_lookup.get(link.target_level_index)
             if target_level is None:
-                changed_levels.add(link.source_level_index)
                 continue
+            deleted_target_ids_by_level.setdefault(
+                target_level.index,
+                set(),
+            ).add(link.target_vertex_id)
+
+        for target_level_index in sorted(deleted_target_ids_by_level):
+            target_level = level_lookup[target_level_index]
+            deleted_target_ids = deleted_target_ids_by_level[
+                target_level_index
+            ]
+            removed_edges = tuple(
+                edge
+                for edge in target_level.vertex_data.edges
+                if edge.start_vertex_id in deleted_target_ids
+                or edge.end_vertex_id in deleted_target_ids
+            )
+            replacement_edges = (
+                target_level.vertex_data.build_collinear_deletion_bridges(
+                    deleted_target_ids
+                )
+            )
             removed_doorway_indices = doorway_indices_on_removed_wall_edges(
                 target_level.vertex_data,
                 target_level.doorways,
-                (
-                    edge
-                    for edge in target_level.vertex_data.edges
-                    if link.target_vertex_id in (
-                        edge.start_vertex_id,
-                        edge.end_vertex_id,
-                    )
-                ),
+                removed_edges,
             )
-            if target_level.vertex_data.delete_vertex(link.target_vertex_id):
-                changed_levels.add(link.target_level_index)
+            if target_level.vertex_data.delete_vertices(deleted_target_ids):
+                for replacement_edge in replacement_edges:
+                    target_level.vertex_data.add_edge(
+                        replacement_edge.start_vertex_id,
+                        replacement_edge.end_vertex_id,
+                    )
+                retained_doorway_indices = (
+                    doorway_indices_on_removed_wall_edges(
+                        target_level.vertex_data,
+                        target_level.doorways,
+                        replacement_edges,
+                    )
+                )
+                removed_doorway_indices.difference_update(
+                    retained_doorway_indices
+                )
+                changed_levels.add(target_level_index)
                 if removed_doorway_indices:
                     target_level.doorways[:] = [
                         doorway
                         for index, doorway in enumerate(target_level.doorways)
                         if index not in removed_doorway_indices
                     ]
-            changed_levels.add(link.source_level_index)
     except Exception:
         for level in levels:
             level.vertex_data.copy_from(level_snapshots[level.index])

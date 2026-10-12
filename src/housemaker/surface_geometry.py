@@ -24,12 +24,13 @@ from housemaker.glb import (
     _build_visible_wall_pieces,
     _build_wall_opening_reveal_quads,
     _interpolate_2d_point,
+    build_stair_slab_openings_by_level,
 )
 from housemaker.level_coordinates import (
     build_level_base_z_lookup,
     level_image_to_world_xy,
 )
-from housemaker.models import Edge, LevelData, RoomData, WindowData
+from housemaker.models import Edge, LevelData, RoomData, StairData, WindowData
 from housemaker.uv_layout import build_room_walls
 from housemaker.wall_orientation import (
     WallOrientationResolver,
@@ -125,6 +126,7 @@ class WallWindowPlacement:
 def build_fixed_surfaces(
     levels: Sequence[LevelData],
     *,
+    stairs: Sequence[StairData] = (),
     base_surfaces: Sequence[FixedSurface] | None = None,
 ) -> list[FixedSurface]:
     """Build semantic surfaces, optionally reusing one un-clipped base snapshot.
@@ -141,15 +143,17 @@ def build_fixed_surfaces(
     prepared_base_surfaces = (
         build_base_fixed_surfaces(
             levels,
+            stairs=stairs,
             clip_open_spaces=False,
         )
         if base_surfaces is None
         else list(base_surfaces)
     )
     edited_surfaces = apply_editable_surfaces(levels, prepared_base_surfaces)
-    clipped_surfaces = _clip_horizontal_surfaces_for_open_spaces(
+    clipped_surfaces = _clip_horizontal_surfaces_for_slab_openings(
         levels,
         edited_surfaces,
+        stairs,
     )
     resolved_surfaces = _apply_manual_surface_orientation_overrides(
         levels,
@@ -264,24 +268,16 @@ def _get_manual_orientation_flip_face_mask(
     return coplanar_faces
 
 
-# ### Open-space clipping ###
-def _clip_horizontal_surfaces_for_open_spaces(
+# ### Slab opening clipping ###
+def _clip_horizontal_surfaces_for_slab_openings(
     levels: Sequence[LevelData],
     surfaces: Sequence[FixedSurface],
+    stairs: Sequence[StairData] = (),
 ) -> list[FixedSurface]:
-    """Cut holes through floor and ceiling faces after authored edits apply."""
+    """Cut explicit and stair openings after authored topology edits apply."""
 
-    included_levels = {
-        level.index: level
-        for level in levels
-        if level.include_in_export
-    }
-    open_spaces_by_level_index: dict[int, BaseGeometry] = {}
-    for level in included_levels.values():
-        geometry = _build_level_world_open_space_geometry(level)
-        if geometry is not None:
-            open_spaces_by_level_index[level.index] = geometry
-    if not open_spaces_by_level_index:
+    openings_by_level_index = _build_slab_openings_by_level(levels, stairs)
+    if not openings_by_level_index:
         return list(surfaces)
 
     clipped_surfaces: list[FixedSurface] = []
@@ -293,19 +289,51 @@ def _clip_horizontal_surfaces_for_open_spaces(
         else:
             clipped_surfaces.append(surface)
             continue
-        open_space_geometry = open_spaces_by_level_index.get(
+        opening_geometry = openings_by_level_index.get(
             open_space_level_index
         )
-        if open_space_geometry is None:
+        if opening_geometry is None:
             clipped_surfaces.append(surface)
             continue
         clipped_surface = _clip_horizontal_surface(
             surface,
-            open_space_geometry,
+            opening_geometry,
         )
         if clipped_surface is not None:
             clipped_surfaces.append(clipped_surface)
     return clipped_surfaces
+
+
+def _build_slab_openings_by_level(
+    levels: Sequence[LevelData],
+    stairs: Sequence[StairData],
+) -> dict[int, BaseGeometry]:
+    """Combine explicit rectangles and stair corridors by owning floor."""
+
+    included_levels = {
+        level.index: level
+        for level in levels
+        if level.include_in_export
+    }
+    geometries_by_level: dict[int, list[BaseGeometry]] = {}
+    for level in included_levels.values():
+        geometry = _build_level_world_open_space_geometry(level)
+        if geometry is not None:
+            geometries_by_level.setdefault(level.index, []).append(geometry)
+    for level_index, geometry in build_stair_slab_openings_by_level(
+        levels,
+        stairs,
+    ).items():
+        if level_index in included_levels:
+            geometries_by_level.setdefault(level_index, []).append(geometry)
+
+    openings_by_level: dict[int, BaseGeometry] = {}
+    for level_index, geometries in geometries_by_level.items():
+        union = shapely.union_all(geometries)
+        if union.is_empty or float(union.area) <= SURFACE_GEOMETRY_EPSILON:
+            continue
+        openings_by_level[level_index] = union
+    return openings_by_level
 
 
 def _clip_horizontal_surface(
@@ -358,18 +386,24 @@ def _clip_horizontal_surface(
 def build_base_fixed_surfaces(
     levels: Sequence[LevelData],
     *,
+    stairs: Sequence[StairData] = (),
     clip_open_spaces: bool = True,
 ) -> list[FixedSurface]:
     """Build generated semantic surfaces before authored topology edits."""
 
     level_base_z = build_level_base_z_lookup(levels)
     level_by_index = {level.index: level for level in levels}
+    slab_openings_by_level = _build_slab_openings_by_level(levels, stairs)
     surfaces: list[FixedSurface] = []
     for level in sorted(levels, key=lambda item: item.index):
         if not level.include_in_export:
             continue
         base_z_meters = level_base_z.get(level.index, 0.0)
-        wall_orientation = build_level_wall_orientation_resolver(level)
+        floor_coherency_geometry = slab_openings_by_level.get(level.index)
+        wall_orientation = build_level_wall_orientation_resolver(
+            level,
+            additional_floor_coherency_geometry=floor_coherency_geometry,
+        )
         doorway_reveals_by_surface_id = _group_doorway_reveals_by_surface_id(
             _build_level_doorway_reveals(
                 level,
@@ -380,9 +414,7 @@ def build_base_fixed_surfaces(
             _build_level_window_reveals(level, wall_orientation)
         )
         floor_open_spaces = (
-            _build_level_world_open_space_geometry(level)
-            if clip_open_spaces
-            else None
+            floor_coherency_geometry if clip_open_spaces else None
         )
         upper_level = level_by_index.get(level.index + 1)
         ceiling_open_spaces = (
@@ -392,7 +424,7 @@ def build_base_fixed_surfaces(
                 or upper_level is None
                 or not upper_level.include_in_export
             )
-            else _build_level_world_open_space_geometry(upper_level)
+            else slab_openings_by_level.get(upper_level.index)
         )
         level_floor_footprint = wall_orientation.floor_footprint
         surfaces.extend(

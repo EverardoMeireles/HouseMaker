@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import LevelData, VertexData
+from housemaker.models import DoorwayData, LevelData, OpenSpaceData, VertexData
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -124,10 +124,10 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
         self.assertFalse(self.workspace._wall_vertex_update_timer.isActive())
 
-    def test_new_vertex_defers_mesh_work_for_fifteen_seconds(self) -> None:
+    def test_new_vertex_uses_the_shared_mesh_edit_delay(self) -> None:
         timer = self.workspace._wall_vertex_update_timer
         self.assertTrue(timer.isSingleShot())
-        self.assertEqual(timer.interval(), 15_000)
+        self.assertEqual(timer.interval(), 1_000)
 
         with (
             patch.object(
@@ -147,10 +147,12 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
                 1,
             )
             self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
-            self.assertTrue(timer.isActive())
+            self.assertFalse(timer.isActive())
             reconcile_assignments.assert_not_called()
             schedule_refresh.assert_not_called()
 
+            self.workspace.canvas._apply_active_chain()
+            self.assertTrue(timer.isActive())
             self.workspace._commit_pending_wall_vertex_update()
 
         reconcile_assignments.assert_called_once_with(self.workspace.levels)
@@ -158,7 +160,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
         self.assertFalse(timer.isActive())
 
-    def test_blank_addition_starts_timer_only_on_left_release(self) -> None:
+    def test_blank_addition_keeps_timer_frozen_after_left_release(self) -> None:
         canvas = self.workspace.canvas
         position = self._image_position(20.0, 30.0)
 
@@ -195,11 +197,105 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
 
         self.assertEqual(len(canvas.vertex_data.vertices), 1)
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
-        self.assertTrue(self.workspace._wall_vertex_update_timer.isActive())
+        self.assertFalse(self.workspace._wall_vertex_update_timer.isActive())
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
 
-    def test_edge_addition_starts_timer_only_on_left_release(self) -> None:
+    def test_active_vertex_chain_keeps_mesh_delay_frozen_between_points(
+        self,
+    ) -> None:
+        canvas = self.workspace.canvas
+        timer = self.workspace._wall_vertex_update_timer
+        timer.setInterval(20)
+        first_position = self._image_position(20.0, 30.0)
+        second_position = self._image_position(80.0, 30.0)
+
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            QTest.mouseClick(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=first_position,
+            )
+
+            self.assertIsNotNone(canvas.active_vertex_id)
+            self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+            self.assertFalse(timer.isActive())
+            QTest.qWait(50)
+            reconcile_assignments.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            QTest.mouseClick(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=second_position,
+            )
+
+            self.assertIsNotNone(canvas.active_vertex_id)
+            self.assertEqual(len(canvas.vertex_data.vertices), 2)
+            self.assertEqual(len(canvas.vertex_data.edges), 1)
+            self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+            self.assertFalse(timer.isActive())
+            QTest.qWait(50)
+
+        reconcile_assignments.assert_not_called()
+        schedule_refresh.assert_not_called()
+
+    def test_finishing_vertex_chain_starts_delay_and_rebuilds_once(self) -> None:
+        canvas = self.workspace.canvas
+        timer = self.workspace._wall_vertex_update_timer
+        timer.setInterval(20)
+        position = self._image_position(20.0, 30.0)
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=position,
+        )
+        self.assertIsNotNone(canvas.active_vertex_id)
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+
+        # Keep this assertion focused on the completion transition: ending a
+        # pending chain must arm the shared delay even when it is disarmed.
+        timer.stop()
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            QTest.mouseClick(
+                canvas,
+                Qt.MouseButton.RightButton,
+                pos=position,
+            )
+
+            self.assertIsNone(canvas.active_vertex_id)
+            self.assertTrue(timer.isActive())
+            reconcile_assignments.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            QTest.qWait(80)
+
+        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertFalse(timer.isActive())
+        reconcile_assignments.assert_called_once_with(self.workspace.levels)
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+    def test_edge_addition_keeps_timer_frozen_after_left_release(self) -> None:
         level = _build_level_with_wall()
         self._install_levels([level])
         canvas = self.workspace.canvas
@@ -222,15 +318,15 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         )
 
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
-        self.assertTrue(self.workspace._wall_vertex_update_timer.isActive())
+        self.assertFalse(self.workspace._wall_vertex_update_timer.isActive())
 
-    def test_dragging_new_vertex_pauses_timer_until_left_release(
+    def test_dragging_chain_vertex_keeps_timer_frozen_after_left_release(
         self,
     ) -> None:
         canvas = self.workspace.canvas
         canvas._handle_new_vertex_click((20.0, 20.0))
         timer = self.workspace._wall_vertex_update_timer
-        self.assertTrue(timer.isActive())
+        self.assertFalse(timer.isActive())
         start = self._image_position(20.0, 20.0)
         target = self._image_position(70.0, 60.0)
 
@@ -255,7 +351,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         )
 
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
-        self.assertTrue(timer.isActive())
+        self.assertFalse(timer.isActive())
 
     def test_moving_existing_vertex_waits_until_release_and_then_debounces(
         self,
@@ -356,7 +452,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
             level.vertex_data.has_edge(first_vertex.id, second_vertex.id)
         )
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
-        self.assertTrue(timer.isActive())
+        self.assertFalse(timer.isActive())
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
 
@@ -391,13 +487,13 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
 
-    def test_new_vertex_press_without_movement_pauses_until_release(
+    def test_new_vertex_press_without_movement_keeps_chain_frozen(
         self,
     ) -> None:
         canvas = self.workspace.canvas
         canvas._handle_new_vertex_click((20.0, 20.0))
         timer = self.workspace._wall_vertex_update_timer
-        self.assertTrue(timer.isActive())
+        self.assertFalse(timer.isActive())
         position = self._image_position(20.0, 20.0)
 
         QTest.mousePress(
@@ -415,9 +511,9 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         )
 
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
-        self.assertTrue(timer.isActive())
+        self.assertFalse(timer.isActive())
 
-    def test_repeated_additions_restart_and_coalesce_one_update(self) -> None:
+    def test_repeated_additions_stay_frozen_and_coalesce_one_update(self) -> None:
         timer = self.workspace._wall_vertex_update_timer
         with (
             patch.object(
@@ -432,14 +528,11 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         ):
             self.workspace.canvas._handle_new_vertex_click((10.0, 10.0))
             QTest.qWait(30)
-            remaining_before_second_addition = timer.remainingTime()
+            self.assertFalse(timer.isActive())
 
             self.workspace.canvas._handle_new_vertex_click((90.0, 10.0))
 
-            self.assertGreater(
-                timer.remainingTime(),
-                remaining_before_second_addition,
-            )
+            self.assertFalse(timer.isActive())
             self.assertEqual(
                 len(self.workspace.current_level.vertex_data.vertices),
                 2,
@@ -451,6 +544,8 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
             reconcile_assignments.assert_not_called()
             schedule_refresh.assert_not_called()
 
+            self.workspace.canvas._apply_active_chain()
+            self.assertTrue(timer.isActive())
             self.workspace._commit_pending_wall_vertex_update()
             self.workspace._commit_pending_wall_vertex_update()
 
@@ -462,6 +557,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
     ) -> None:
         timer = self.workspace._wall_vertex_update_timer
         self.workspace.canvas._handle_new_vertex_click((20.0, 20.0))
+        self.workspace.canvas._apply_active_chain()
         QTest.qWait(30)
         remaining_before_general_change = timer.remainingTime()
 
@@ -536,6 +632,129 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         assert refreshed_model is not None
         self.assertLess(len(refreshed_model.mesh.faces), installed_face_count)
 
+    def test_vertex_delete_defers_dependent_doorway_and_surface_work(self) -> None:
+        level = _build_level_with_wall()
+        level.doorways.append(
+            DoorwayData(
+                center_x=50.0,
+                center_y=50.0,
+                width_meters=0.9,
+                height_meters=2.1,
+                rotation_degrees=90.0,
+            )
+        )
+        self._install_levels([level])
+        original_revision = self.workspace._viewer_preview_revision
+        committed_doorways = self.workspace._viewer_doorways_by_level_index[
+            level.index
+        ]
+        self.assertEqual(len(committed_doorways), 1)
+        deleted_vertex_id = level.vertex_data.vertices[0].id
+        self.workspace.canvas.set_selected_vertex_ids((deleted_vertex_id,))
+
+        with (
+            patch.object(
+                self.workspace,
+                "_reconcile_door_placements",
+                return_value=False,
+            ) as reconcile_doors,
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            self.workspace.canvas._delete_selected_vertices()
+
+            self.assertEqual(level.doorways, [])
+            self.assertEqual(
+                self.workspace._viewer_doorways_by_level_index[level.index],
+                committed_doorways,
+            )
+            self.assertEqual(
+                self.workspace._viewer_preview_revision,
+                original_revision,
+            )
+            self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+            self.assertTrue(self.workspace._wall_vertex_update_timer.isActive())
+            reconcile_doors.assert_not_called()
+            reconcile_assignments.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            self.workspace._commit_pending_wall_vertex_update()
+
+        self.assertEqual(
+            self.workspace._viewer_doorways_by_level_index[level.index],
+            (),
+        )
+        reconcile_doors.assert_called_once_with()
+        reconcile_assignments.assert_called_once_with(self.workspace.levels)
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+    def test_open_space_corner_release_waits_for_mesh_edit_delay(self) -> None:
+        level = self.workspace.current_level
+        opening = OpenSpaceData("opening-a", 20.0, 20.0, 80.0, 80.0)
+        level.open_spaces.append(opening)
+        self.workspace.canvas.selected_open_space_id = opening.open_space_id
+        self.workspace._set_mesh_edit_update_delay_seconds(2.4)
+        original_revision = self.workspace._viewer_preview_revision
+        start = self._image_position(20.0, 20.0)
+        target = self._image_position(10.0, 12.0)
+
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            QTest.mousePress(
+                self.workspace.canvas,
+                Qt.MouseButton.LeftButton,
+                pos=start,
+            )
+            _send_drag_move(self.workspace.canvas, target)
+            QTest.mouseRelease(
+                self.workspace.canvas,
+                Qt.MouseButton.LeftButton,
+                pos=target,
+            )
+
+            self.assertEqual(len(level.open_spaces), 1)
+            resized_opening = level.open_spaces[0]
+            self.assertEqual(resized_opening.open_space_id, "opening-a")
+            self.assertAlmostEqual(resized_opening.minimum_x, 10.0, places=1)
+            self.assertAlmostEqual(resized_opening.minimum_y, 12.0, places=1)
+            self.assertEqual(
+                (resized_opening.maximum_x, resized_opening.maximum_y),
+                (80.0, 80.0),
+            )
+            self.assertEqual(
+                self.workspace._viewer_preview_revision,
+                original_revision,
+            )
+            self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+            self.assertTrue(self.workspace._wall_vertex_update_timer.isActive())
+            self.assertEqual(
+                self.workspace._wall_vertex_update_timer.interval(),
+                2_400,
+            )
+            reconcile_assignments.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            self.workspace._commit_pending_wall_vertex_update()
+
+        reconcile_assignments.assert_called_once_with(self.workspace.levels)
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+
     def test_deleting_the_last_wall_clears_the_live_3d_geometry_after_delay(
         self,
     ) -> None:
@@ -608,22 +827,20 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
         self.assertFalse(timer.isActive())
 
-    def test_wall_and_mesh_edit_delay_timers_are_independent(self) -> None:
+    def test_mesh_edit_delay_updates_every_mesh_edit_timer(self) -> None:
         wall_timer = self.workspace._wall_vertex_update_timer
         doorway_timer = self.workspace._doorway_mesh_update_timer
         surface_timer = self.workspace._canvas_surface_mesh_update_timer
+
+        self.workspace._handle_canvas_wall_vertex_added()
+        self.assertTrue(wall_timer.isActive())
 
         self.workspace._set_mesh_edit_update_delay_seconds(2.4)
 
         self.assertEqual(doorway_timer.interval(), 2_400)
         self.assertEqual(surface_timer.interval(), 2_400)
-        self.assertEqual(wall_timer.interval(), 15_000)
-
-        self.workspace._set_wall_vertex_update_delay_seconds(18.5)
-
-        self.assertEqual(wall_timer.interval(), 18_500)
-        self.assertEqual(doorway_timer.interval(), 2_400)
-        self.assertEqual(surface_timer.interval(), 2_400)
+        self.assertEqual(wall_timer.interval(), 2_400)
+        self.assertTrue(wall_timer.isActive())
 
     def test_surface_selection_commits_pending_vertex_update(self) -> None:
         self.workspace.canvas._handle_new_vertex_click((30.0, 40.0))

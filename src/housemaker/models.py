@@ -149,6 +149,14 @@ STAIR_STRINGER_PLACEMENTS = frozenset(
     }
 )
 DEFAULT_STAIR_STRINGER_PLACEMENT = STAIR_STRINGER_BOTH
+STAIR_REMOVABLE_PART_KINDS = frozenset(
+    {
+        "treads",
+        "support",
+        "risers",
+        "stringers",
+    }
+)
 _INFER_STAIR_LEGACY_PART_LAYOUT = object()
 LEGACY_STAIR_WIDTH_PIXELS = 50.0
 PIXEL_TO_METER = 0.02
@@ -157,6 +165,7 @@ MIN_LEVEL_INDEX = 0
 MAX_LEVEL_INDEX = 7
 SNAP_ANGLE_DEGREES = 10.0
 VERTEX_HIT_RADIUS_SCREEN = 12.0
+STRAIGHT_VERTEX_DELETION_TOLERANCE = 1e-5
 _WINDOW_WALL_SURFACE_ID_PATTERN = re.compile(
     r"^level:(?:0|[1-9]\d*)/"
     r"(?:room:(?:0|[1-9]\d*)/)?"
@@ -774,6 +783,8 @@ class StairData:
     end_a_vertex_id: int | None = None
     end_b_vertex_id: int | None = None
     intermediate_sections: tuple[StairSectionData, ...] = ()
+    removed_face_indices: tuple[tuple[str, int], ...] = ()
+    removed_face_topology_fingerprints: tuple[tuple[str, str], ...] = ()
 
     def __init__(
         self,
@@ -798,6 +809,8 @@ class StairData:
         end_a_vertex_id: object = None,
         end_b_vertex_id: object = None,
         intermediate_sections: object = (),
+        removed_face_indices: object = (),
+        removed_face_topology_fingerprints: object = (),
         stair_id: object = None,
         stair_type: object = None,
         target_rise_meters: object = DEFAULT_STAIR_TARGET_RISE_METERS,
@@ -1023,6 +1036,18 @@ class StairData:
             "intermediate_sections",
             _normalize_stair_intermediate_sections(intermediate_sections),
         )
+        object.__setattr__(
+            self,
+            "removed_face_indices",
+            _normalize_stair_removed_face_indices(removed_face_indices),
+        )
+        object.__setattr__(
+            self,
+            "removed_face_topology_fingerprints",
+            _normalize_stair_removed_face_topology_fingerprints(
+                removed_face_topology_fingerprints
+            ),
+        )
 
     @property
     def start_points(self) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -1160,6 +1185,22 @@ class StairData:
             "intermediate_sections": [
                 section.to_dict() for section in self.intermediate_sections
             ],
+            "removed_face_indices": [
+                {
+                    "part_kind": part_kind,
+                    "face_index": int(face_index),
+                }
+                for part_kind, face_index in self.removed_face_indices
+            ],
+            "removed_face_topology_fingerprints": [
+                {
+                    "part_kind": part_kind,
+                    "fingerprint": fingerprint,
+                }
+                for part_kind, fingerprint in (
+                    self.removed_face_topology_fingerprints
+                )
+            ],
         }
 
     @classmethod
@@ -1223,6 +1264,11 @@ class StairData:
             "end_a_vertex_id": payload.get("end_a_vertex_id"),
             "end_b_vertex_id": payload.get("end_b_vertex_id"),
             "intermediate_sections": payload.get("intermediate_sections", ()),
+            "removed_face_indices": payload.get("removed_face_indices", ()),
+            "removed_face_topology_fingerprints": payload.get(
+                "removed_face_topology_fingerprints",
+                (),
+            ),
         }
         canonical_names = (
             "start_a_x",
@@ -1356,6 +1402,69 @@ class VertexData:
         ]
         self._mark_changed()
         return True
+
+    def build_collinear_deletion_bridges(
+        self,
+        vertex_ids: Iterable[int],
+    ) -> tuple[Edge, ...]:
+        """Plan replacement edges for deleted straight-through vertices.
+
+        A replacement is safe only when the deleted vertex has exactly two
+        distinct neighbors, both neighbors survive this deletion, and the
+        incident segments continue straight through the deleted point.
+        """
+
+        requested_ids = set(vertex_ids)
+        deleted_ids = {
+            vertex.id
+            for vertex in self.vertices
+            if vertex.id in requested_ids
+        }
+        if not deleted_ids:
+            return ()
+
+        vertices_by_id = {vertex.id: vertex for vertex in self.vertices}
+        neighbors_by_deleted_id: dict[int, list[int]] = {
+            vertex_id: [] for vertex_id in deleted_ids
+        }
+        for edge in self.edges:
+            if edge.start_vertex_id in deleted_ids:
+                neighbors_by_deleted_id[edge.start_vertex_id].append(
+                    edge.end_vertex_id
+                )
+            if edge.end_vertex_id in deleted_ids:
+                neighbors_by_deleted_id[edge.end_vertex_id].append(
+                    edge.start_vertex_id
+                )
+
+        bridges: list[Edge] = []
+        bridge_keys: set[tuple[int, int]] = set()
+        for deleted_vertex_id in sorted(deleted_ids):
+            neighbor_ids = neighbors_by_deleted_id[deleted_vertex_id]
+            if len(neighbor_ids) != 2 or len(set(neighbor_ids)) != 2:
+                continue
+            if any(neighbor_id in deleted_ids for neighbor_id in neighbor_ids):
+                continue
+
+            deleted_vertex = vertices_by_id[deleted_vertex_id]
+            first_neighbor = vertices_by_id.get(neighbor_ids[0])
+            second_neighbor = vertices_by_id.get(neighbor_ids[1])
+            if first_neighbor is None or second_neighbor is None:
+                continue
+            if not _vertices_continue_straight_through(
+                first_neighbor,
+                deleted_vertex,
+                second_neighbor,
+            ):
+                continue
+
+            bridge_key = self._edge_key(first_neighbor.id, second_neighbor.id)
+            if bridge_key in bridge_keys:
+                continue
+            bridge_keys.add(bridge_key)
+            bridges.append(Edge(*bridge_key))
+
+        return tuple(bridges)
 
     def add_edge(self, start_vertex_id: int, end_vertex_id: int) -> Edge | None:
         if start_vertex_id == end_vertex_id:
@@ -1735,6 +1844,38 @@ def _normalize_open_space_coordinate(value: object, field_name: str) -> float:
 
 
 # ### Geometry helpers ###
+def _vertices_continue_straight_through(
+    first: Vertex,
+    middle: Vertex,
+    second: Vertex,
+) -> bool:
+    """Return whether ``middle`` lies between two collinear neighbors."""
+
+    first_vector = (first.x - middle.x, first.y - middle.y)
+    second_vector = (second.x - middle.x, second.y - middle.y)
+    first_length = math.hypot(*first_vector)
+    second_length = math.hypot(*second_vector)
+    if (
+        first_length <= STRAIGHT_VERTEX_DELETION_TOLERANCE
+        or second_length <= STRAIGHT_VERTEX_DELETION_TOLERANCE
+    ):
+        return False
+
+    cross_product = (
+        first_vector[0] * second_vector[1]
+        - first_vector[1] * second_vector[0]
+    )
+    dot_product = (
+        first_vector[0] * second_vector[0]
+        + first_vector[1] * second_vector[1]
+    )
+    normalized_cross = abs(cross_product) / (first_length * second_length)
+    return (
+        normalized_cross <= STRAIGHT_VERTEX_DELETION_TOLERANCE
+        and dot_product < 0.0
+    )
+
+
 def snap_point(
     base_vertex: Vertex,
     x: float,
@@ -2035,6 +2176,91 @@ def _normalize_stair_intermediate_sections(
             continue
         normalized_sections.append(StairSectionData.from_dict(section))
     return tuple(normalized_sections)
+
+
+def _normalize_stair_removed_face_indices(
+    value: object,
+) -> tuple[tuple[str, int], ...]:
+    """Return unique canonical face exclusions for one procedural stair."""
+
+    if not isinstance(value, list | tuple):
+        raise ValueError("Stair removed face indices must contain a list.")
+
+    normalized: list[tuple[str, int]] = []
+    for entry in value:
+        if isinstance(entry, dict):
+            part_kind = entry.get("part_kind")
+            face_index = entry.get("face_index")
+        elif isinstance(entry, list | tuple) and len(entry) == 2:
+            part_kind, face_index = entry
+        else:
+            raise ValueError(
+                "Each removed stair face requires a part kind and face index."
+            )
+        if not isinstance(part_kind, str):
+            raise ValueError("A removed stair face part kind must be a string.")
+        normalized_part_kind = part_kind.strip().lower()
+        if normalized_part_kind not in STAIR_REMOVABLE_PART_KINDS:
+            raise ValueError("A removed stair face has an unknown part kind.")
+        if (
+            isinstance(face_index, bool)
+            or not isinstance(face_index, int)
+            or face_index < 0
+        ):
+            raise ValueError(
+                "A removed stair face index must be a non-negative integer."
+            )
+        face_key = (normalized_part_kind, int(face_index))
+        if face_key not in normalized:
+            normalized.append(face_key)
+    return tuple(sorted(normalized))
+
+
+def _normalize_stair_removed_face_topology_fingerprints(
+    value: object,
+) -> tuple[tuple[str, str], ...]:
+    """Return one canonical source-topology fingerprint per stair part."""
+
+    if not isinstance(value, list | tuple):
+        raise ValueError("Stair face topology fingerprints must contain a list.")
+
+    normalized_by_part: dict[str, str] = {}
+    for entry in value:
+        if isinstance(entry, dict):
+            part_kind = entry.get("part_kind")
+            fingerprint = entry.get("fingerprint")
+        elif isinstance(entry, list | tuple) and len(entry) == 2:
+            part_kind, fingerprint = entry
+        else:
+            raise ValueError(
+                "Each stair face topology fingerprint requires a part kind "
+                "and fingerprint."
+            )
+        if not isinstance(part_kind, str):
+            raise ValueError("A stair face topology part kind must be a string.")
+        normalized_part_kind = part_kind.strip().lower()
+        if normalized_part_kind not in STAIR_REMOVABLE_PART_KINDS:
+            raise ValueError("A stair face topology has an unknown part kind.")
+        if not isinstance(fingerprint, str):
+            raise ValueError("A stair face topology fingerprint must be a string.")
+        normalized_fingerprint = fingerprint.strip().lower()
+        if (
+            len(normalized_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in normalized_fingerprint
+            )
+        ):
+            raise ValueError(
+                "A stair face topology fingerprint must be a SHA-256 hex value."
+            )
+        previous = normalized_by_part.get(normalized_part_kind)
+        if previous is not None and previous != normalized_fingerprint:
+            raise ValueError(
+                "A stair part cannot have conflicting topology fingerprints."
+            )
+        normalized_by_part[normalized_part_kind] = normalized_fingerprint
+    return tuple(sorted(normalized_by_part.items()))
 
 
 def _migrate_legacy_stair_centerline(

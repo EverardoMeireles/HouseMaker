@@ -394,6 +394,7 @@ def build_level_wall_orientation_resolver(
     edges: Sequence[Edge] | None = None,
     *,
     floor_footprint: BaseGeometry | None = None,
+    additional_floor_coherency_geometry: BaseGeometry | None = None,
 ) -> WallOrientationResolver:
     """Build one indexed world-space resolver shared by walls and windows."""
 
@@ -429,7 +430,11 @@ def build_level_wall_orientation_resolver(
     resolved_footprint = (
         floor_footprint
         if floor_footprint is not None
-        else _build_level_world_floor_footprint(level, point_to_world)
+        else _build_level_world_floor_footprint(
+            level,
+            point_to_world,
+            additional_floor_coherency_geometry,
+        )
     )
     orientation_footprint = resolved_footprint
     if orientation_footprint is None and lines:
@@ -523,6 +528,7 @@ def _build_level_transforms(
 def _build_level_world_floor_footprint(
     level: LevelData,
     point_transform: LevelPointTransform,
+    additional_coherency_geometry: BaseGeometry | None = None,
 ) -> BaseGeometry | None:
     """Build the gap-closed floor footprint in transformed level coordinates."""
 
@@ -539,6 +545,7 @@ def _build_level_world_floor_footprint(
         closing_radius_meters=(
             OUTER_ENVELOPE_CLOSING_RADIUS_METERS * _get_valid_level_scale(level)
         ),
+        additional_coherency_geometry=additional_coherency_geometry,
     )
 
 

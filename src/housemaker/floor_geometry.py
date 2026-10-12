@@ -39,24 +39,37 @@ def build_level_floor_mesh(
     floor_base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
     point_to_world_xy: PointToWorld,
+    *,
+    additional_opening_geometry: BaseGeometry | None = None,
 ) -> trimesh.Trimesh | None:
-    """Build one upward slab from the level's anchored structural base."""
+    """Build one upward slab from the level's anchored structural base.
+
+    Opening perimeters may complete an otherwise interrupted structural
+    shell, but their areas are still removed after that shell is recovered.
+    This lets a stairwell close the surrounding hallway without filling the
+    stairwell itself.
+    """
 
     footprint = build_level_floor_footprint(
         level,
         blueprint_size_pixels,
         point_to_world_xy,
+        additional_coherency_geometry=additional_opening_geometry,
     )
     if footprint is None:
         return None
 
-    open_space_geometry = build_level_open_space_geometry(
+    explicit_opening_geometry = build_level_open_space_geometry(
         level,
         blueprint_size_pixels,
         point_to_world_xy,
     )
-    if open_space_geometry is not None:
-        footprint = footprint.difference(open_space_geometry)
+    opening_geometry = _union_polygon_geometries(
+        explicit_opening_geometry,
+        additional_opening_geometry,
+    )
+    if opening_geometry is not None:
+        footprint = footprint.difference(opening_geometry)
         if (
             footprint.is_empty
             or float(footprint.area) <= GEOMETRY_EPSILON
@@ -77,16 +90,29 @@ def build_level_floor_footprint(
     point_to_world_xy: PointToWorld,
     *,
     closing_radius_meters: float = OUTER_ENVELOPE_CLOSING_RADIUS_METERS,
+    additional_coherency_geometry: BaseGeometry | None = None,
 ) -> BaseGeometry | None:
-    """Return the filled outer envelope of the level's structural walls."""
+    """Return the floor shell completed by walls and opening perimeters."""
 
-    structural_lines = _build_structural_lines(
+    structural_lines = list(
+        _build_structural_lines(
+            level,
+            blueprint_size_pixels,
+            point_to_world_xy,
+        )
+    )
+    if not structural_lines:
+        return None
+    explicit_opening_geometry = build_level_open_space_geometry(
         level,
         blueprint_size_pixels,
         point_to_world_xy,
     )
-    if not structural_lines:
-        return None
+    coherency_geometry = _union_polygon_geometries(
+        explicit_opening_geometry,
+        additional_coherency_geometry,
+    )
+    structural_lines.extend(_build_polygon_boundary_lines(coherency_geometry))
     return _build_outer_wall_envelope(
         structural_lines,
         closing_radius_meters,
@@ -135,6 +161,46 @@ def build_level_open_space_geometry(
     if geometry.is_empty or float(geometry.area) <= GEOMETRY_EPSILON:
         return None
     return geometry
+
+
+# ### Slab opening helpers ###
+def _union_polygon_geometries(
+    *geometries: BaseGeometry | None,
+) -> BaseGeometry | None:
+    """Return the valid polygonal union of optional slab openings."""
+
+    polygons = tuple(
+        part
+        for geometry in geometries
+        if geometry is not None and not geometry.is_empty
+        for part in shapely.get_parts(shapely.make_valid(geometry))
+        if isinstance(part, Polygon)
+        and not part.is_empty
+        and float(part.area) > GEOMETRY_EPSILON
+    )
+    if not polygons:
+        return None
+    union = shapely.union_all(polygons)
+    if union.is_empty or float(union.area) <= GEOMETRY_EPSILON:
+        return None
+    return union
+
+
+def _build_polygon_boundary_lines(
+    geometry: BaseGeometry | None,
+) -> tuple[LineString, ...]:
+    """Return valid polygon rings as temporary floor-coherency linework."""
+
+    if geometry is None or geometry.is_empty:
+        return ()
+    boundary = shapely.make_valid(geometry).boundary
+    return tuple(
+        LineString(part.coords)
+        for part in shapely.get_parts(boundary)
+        if isinstance(part, LineString)
+        and not part.is_empty
+        and float(part.length) > GEOMETRY_EPSILON
+    )
 
 
 # ### Structural footprint helpers ###

@@ -2054,6 +2054,326 @@ class DoorwayTests(unittest.TestCase):
         )
         return workspace, doorway_position
 
+    def test_workspace_delays_new_doorway_mesh_until_timer_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=0.1,
+            )
+            workspace.current_level.doorways.clear()
+            _add_wall(
+                workspace.current_level.vertex_data,
+                (10.0, 50.0),
+                (90.0, 50.0),
+            )
+            workspace._reset_viewer_doorway_snapshots()
+            committed_doorways = workspace._viewer_doorways_by_level_index[
+                workspace.current_level.index
+            ]
+            placement_position = _image_position(workspace.canvas, 50.0, 50.0)
+
+            with patch.object(
+                workspace,
+                "_schedule_viewer_preview_refresh",
+                wraps=workspace._schedule_viewer_preview_refresh,
+            ) as schedule_refresh:
+                workspace.canvas.start_doorway_placement(
+                    DoorwayPreset(width_meters=0.9, height_meters=2.1)
+                )
+                _send_hover_move(workspace.canvas, placement_position)
+                QTest.mouseClick(
+                    workspace.canvas,
+                    Qt.MouseButton.LeftButton,
+                    pos=placement_position,
+                )
+                _qt_application.processEvents()
+
+                self.assertEqual(len(workspace.current_level.doorways), 1)
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    committed_doorways,
+                )
+                self.assertEqual(
+                    workspace._pending_doorway_mesh_level_index,
+                    workspace.current_level.index,
+                )
+                self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
+                self.assertIsNotNone(
+                    workspace.viewer._doorway_preview_outline_positions
+                )
+                schedule_refresh.assert_not_called()
+
+                workspace._commit_pending_doorway_mesh_update()
+
+                schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+            self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
+            self.assertIsNone(workspace._pending_doorway_mesh_level_index)
+            self.assertEqual(
+                workspace._viewer_doorways_by_level_index[
+                    workspace.current_level.index
+                ],
+                tuple(workspace.current_level.doorways),
+            )
+
+    def test_workspace_keeps_multiple_new_doorways_pending_until_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=0.1,
+            )
+            workspace.current_level.doorways.clear()
+            workspace._reset_viewer_doorway_snapshots()
+            committed_doorways = workspace._viewer_doorways_by_level_index[
+                workspace.current_level.index
+            ]
+            first_doorway = DoorwayData(
+                center_x=30.0,
+                center_y=50.0,
+                width_meters=0.9,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=0.0,
+            )
+            second_doorway = DoorwayData(
+                center_x=70.0,
+                center_y=50.0,
+                width_meters=0.9,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=0.0,
+            )
+
+            with patch.object(
+                workspace,
+                "_schedule_viewer_preview_refresh",
+                wraps=workspace._schedule_viewer_preview_refresh,
+            ) as schedule_refresh:
+                workspace.current_level.doorways.append(first_doorway)
+                workspace.canvas.selected_doorway_index = 0
+                workspace._handle_doorways_changed()
+                workspace.current_level.doorways.append(second_doorway)
+                workspace.canvas.selected_doorway_index = 1
+                workspace._handle_doorways_changed()
+
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    committed_doorways,
+                )
+                self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
+                schedule_refresh.assert_not_called()
+
+                workspace._commit_pending_doorway_mesh_update()
+
+                schedule_refresh.assert_called_once_with(preserve_camera=True)
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    tuple(workspace.current_level.doorways),
+                )
+
+    def test_workspace_keeps_new_doorway_pending_after_an_uncommitted_edit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=0.1,
+            )
+            committed_doorways = workspace._viewer_doorways_by_level_index[
+                workspace.current_level.index
+            ]
+            edited_doorway = DoorwayData(
+                center_x=55.0,
+                center_y=50.0,
+                width_meters=0.9,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=0.0,
+            )
+            new_doorway = DoorwayData(
+                center_x=75.0,
+                center_y=50.0,
+                width_meters=0.9,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=0.0,
+            )
+
+            with patch.object(
+                workspace,
+                "_schedule_viewer_preview_refresh",
+                wraps=workspace._schedule_viewer_preview_refresh,
+            ) as schedule_refresh:
+                workspace.current_level.doorways[0] = edited_doorway
+                workspace.canvas.selected_doorway_index = 0
+                workspace._handle_doorway_dimension_preview_changed()
+                workspace.current_level.doorways.append(new_doorway)
+                workspace.canvas.selected_doorway_index = 1
+                workspace._handle_doorways_changed()
+
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    committed_doorways,
+                )
+                self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
+                schedule_refresh.assert_not_called()
+
+                workspace._commit_pending_doorway_mesh_update()
+
+                schedule_refresh.assert_called_once_with(preserve_camera=True)
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    (edited_doorway, new_doorway),
+                )
+
+    def test_workspace_delays_shift_bridge_placement_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=0.1,
+            )
+            workspace.current_level.doorways.clear()
+            vertex_data = workspace.current_level.vertex_data
+            left_outer = vertex_data.add_vertex(10.0, 50.0)
+            left_gap = vertex_data.add_vertex(40.0, 50.0)
+            right_gap = vertex_data.add_vertex(60.0, 50.0)
+            right_outer = vertex_data.add_vertex(90.0, 50.0)
+            vertex_data.add_edge(left_outer.id, left_gap.id)
+            vertex_data.add_edge(right_gap.id, right_outer.id)
+            workspace._reset_viewer_doorway_snapshots()
+            placement_position = _image_position(workspace.canvas, 50.0, 50.0)
+
+            with (
+                patch.object(
+                    workspace,
+                    "_schedule_viewer_preview_refresh",
+                    wraps=workspace._schedule_viewer_preview_refresh,
+                ) as schedule_refresh,
+                patch.object(
+                    workspace,
+                    "_reconcile_canvas_surface_edit_and_refresh",
+                    wraps=workspace._reconcile_canvas_surface_edit_and_refresh,
+                ) as reconcile_geometry,
+            ):
+                workspace.canvas.start_doorway_placement(
+                    DoorwayPreset(width_meters=0.9, height_meters=2.1)
+                )
+                _send_hover_move(
+                    workspace.canvas,
+                    placement_position,
+                    Qt.KeyboardModifier.ShiftModifier,
+                )
+                QTest.mouseClick(
+                    workspace.canvas,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.ShiftModifier,
+                    pos=placement_position,
+                )
+                _qt_application.processEvents()
+
+                self.assertTrue(vertex_data.has_edge(left_gap.id, right_gap.id))
+                self.assertTrue(
+                    workspace._pending_doorway_bridge_topology_change
+                )
+                self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    (),
+                )
+                schedule_refresh.assert_not_called()
+                reconcile_geometry.assert_not_called()
+
+                workspace._commit_pending_doorway_mesh_update()
+
+                reconcile_geometry.assert_called_once_with()
+
+            self.assertFalse(
+                workspace._pending_doorway_bridge_topology_change
+            )
+            self.assertEqual(
+                workspace._viewer_doorways_by_level_index[
+                    workspace.current_level.index
+                ],
+                tuple(workspace.current_level.doorways),
+            )
+
+    def test_deleting_pending_bridge_reconciles_its_retained_wall_edge(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=0.1,
+            )
+            workspace.current_level.doorways.clear()
+            vertex_data = workspace.current_level.vertex_data
+            left_outer = vertex_data.add_vertex(10.0, 50.0)
+            left_gap = vertex_data.add_vertex(40.0, 50.0)
+            right_gap = vertex_data.add_vertex(60.0, 50.0)
+            right_outer = vertex_data.add_vertex(90.0, 50.0)
+            vertex_data.add_edge(left_outer.id, left_gap.id)
+            vertex_data.add_edge(right_gap.id, right_outer.id)
+            workspace._reset_viewer_doorway_snapshots()
+            placement_position = _image_position(workspace.canvas, 50.0, 50.0)
+
+            with patch.object(
+                workspace,
+                "_reconcile_canvas_surface_edit_and_refresh",
+                wraps=workspace._reconcile_canvas_surface_edit_and_refresh,
+            ) as reconcile_geometry:
+                workspace.canvas.start_doorway_placement(
+                    DoorwayPreset(width_meters=0.9, height_meters=2.1)
+                )
+                _send_hover_move(
+                    workspace.canvas,
+                    placement_position,
+                    Qt.KeyboardModifier.ShiftModifier,
+                )
+                QTest.mouseClick(
+                    workspace.canvas,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.ShiftModifier,
+                    pos=placement_position,
+                )
+                _qt_application.processEvents()
+
+                self.assertTrue(vertex_data.has_edge(left_gap.id, right_gap.id))
+                self.assertTrue(
+                    workspace._pending_doorway_bridge_topology_change
+                )
+                reconcile_geometry.assert_not_called()
+
+                QTest.keyClick(workspace.canvas, Qt.Key.Key_Delete)
+                _qt_application.processEvents()
+
+                self.assertEqual(workspace.current_level.doorways, [])
+                self.assertTrue(vertex_data.has_edge(left_gap.id, right_gap.id))
+                self.assertFalse(
+                    workspace._pending_doorway_bridge_topology_change
+                )
+                self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    (),
+                )
+                reconcile_geometry.assert_called_once_with()
+
     def test_workspace_delays_doorway_move_mesh_until_release_timer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace, _ = self._build_workspace_with_committed_doorway(

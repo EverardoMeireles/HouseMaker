@@ -315,6 +315,58 @@ class WallMirrorProjectionTests(unittest.TestCase):
 
 # ### Removal and reconciliation tests ###
 class WallMirrorRemovalTests(unittest.TestCase):
+    def test_reconcile_collapses_a_deleted_straight_mirror_vertex(self) -> None:
+        levels = create_default_levels()
+        source = levels[2]
+        first = source.vertex_data.add_vertex(100.0, 100.0)
+        middle = source.vertex_data.add_vertex(150.0, 100.0)
+        last = source.vertex_data.add_vertex(220.0, 100.0)
+        source.vertex_data.add_edge(first.id, middle.id)
+        source.vertex_data.add_edge(middle.id, last.id)
+        mirrored = mirror_wall_vertex_group(
+            levels,
+            (),
+            source.index,
+            (first.id, middle.id, last.id),
+            source.index + 1,
+        )
+        target = levels[source.index + 1]
+        target_ids = dict(mirrored.source_to_target_vertex_ids)
+        target_middle = target.vertex_data.get_vertex(target_ids[middle.id])
+        target_last = target.vertex_data.get_vertex(target_ids[last.id])
+        assert target_middle is not None and target_last is not None
+        doorway = DoorwayData(
+            center_x=(target_middle.x + target_last.x) / 2.0,
+            center_y=target_middle.y,
+            width_meters=0.9,
+            height_meters=2.1,
+            rotation_degrees=90.0,
+        )
+        target.doorways.append(doorway)
+
+        replacement_edges = source.vertex_data.build_collinear_deletion_bridges(
+            (middle.id,)
+        )
+        source.vertex_data.delete_vertex(middle.id)
+        for edge in replacement_edges:
+            source.vertex_data.add_edge(
+                edge.start_vertex_id,
+                edge.end_vertex_id,
+            )
+        reconciled = reconcile_wall_mirror_topology(levels, mirrored.links)
+
+        self.assertEqual(len(reconciled.links), 2)
+        self.assertIsNone(
+            target.vertex_data.get_vertex(target_ids[middle.id])
+        )
+        self.assertTrue(
+            target.vertex_data.has_edge(
+                target_ids[first.id],
+                target_ids[last.id],
+            )
+        )
+        self.assertEqual(target.doorways, [doorway])
+
     def test_removing_mirrored_wall_also_removes_its_doorway(self) -> None:
         levels, source_index, (first_id, second_id, _third_id) = (
             _build_three_vertex_source()

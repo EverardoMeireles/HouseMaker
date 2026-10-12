@@ -173,6 +173,8 @@ SELECTED_OPEN_SPACE_EDGE_COLOR = QColor("#f6c85f")
 PENDING_OPEN_SPACE_FILL_COLOR = QColor(255, 209, 102, 64)
 PENDING_OPEN_SPACE_EDGE_COLOR = QColor("#ffd166")
 OPEN_SPACE_HIT_TOLERANCE_SCREEN = 8.0
+OPEN_SPACE_CORNER_RADIUS_SCREEN = 8.0
+OPEN_SPACE_CORNER_HIT_RADIUS_SCREEN = 14.0
 PLACED_OBJECT_FILL_COLOR = QColor(46, 229, 157, 72)
 PLACED_OBJECT_EDGE_COLOR = QColor("#2ee59d")
 PLACED_OBJECT_SELECTED_EDGE_COLOR = QColor("#f6c85f")
@@ -261,8 +263,9 @@ class _BlueprintImageCacheEntry:
 
 @dataclass(frozen=True)
 class SnapGuide:
-    source_vertex_id: int
+    source_vertex_id: int | None
     axis: str
+    source_point: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -280,10 +283,11 @@ class CenterSnapCandidate:
 
 @dataclass(frozen=True)
 class AxisSnapCandidate:
-    source_vertex_id: int
+    source_vertex_id: int | None
     axis: str
     value: float
     distance: float
+    source_point: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -317,6 +321,15 @@ class WindowWallFrame:
 class WindowHit:
     window_index: int
     width_side_sign: float = 0.0
+
+
+@dataclass(frozen=True)
+class OpenSpaceCornerHit:
+    """One editable corner of the currently selected open space."""
+
+    open_space_id: str
+    x_side_sign: int
+    y_side_sign: int
 
 
 @dataclass(frozen=True)
@@ -530,9 +543,11 @@ class BlueprintCanvas(QWidget):
     wall_vertex_added = Signal()
     wall_vertices_deleted = Signal(object)
     wall_vertex_interaction_changed = Signal(bool)
+    wall_vertex_chain_changed = Signal(bool)
     rooms_changed = Signal()
     doorways_changed = Signal()
     open_spaces_changed = Signal()
+    open_space_corner_edit_committed = Signal()
     open_space_placement_changed = Signal(bool)
     doorway_dimension_preview_changed = Signal()
     doorway_move_drag_started = Signal()
@@ -676,6 +691,13 @@ class BlueprintCanvas(QWidget):
         self._open_space_drag_start_image: QPointF | None = None
         self._open_space_drag_current_image: QPointF | None = None
         self._open_space_drag_press_widget: QPointF | None = None
+        self._open_space_drag_preview_guides: list[SnapGuide] = []
+        self._pressed_open_space_corner: OpenSpaceCornerHit | None = None
+        self._open_space_corner_drag_initial: OpenSpaceData | None = None
+        self._open_space_corner_drag_press_widget: QPointF | None = None
+        self._open_space_corner_drag_preview_point: tuple[float, float] | None = None
+        self._open_space_corner_drag_preview_guides: list[SnapGuide] = []
+        self._open_space_corner_drag_active = False
         self._plan_image_erase_active = False
         self._plan_image_erase_output_path: Path | None = None
         self._plan_image_erase_baseline_image: QImage | None = None
@@ -779,7 +801,7 @@ class BlueprintCanvas(QWidget):
             self.active_vertex_id is not None
             and self.active_vertex_id not in known_vertex_ids
         ):
-            self.active_vertex_id = None
+            self._set_active_vertex_id(None)
             self.preview_point = None
             self.preview_guides = []
             changed = True
@@ -1073,7 +1095,7 @@ class BlueprintCanvas(QWidget):
         self._reset_vertex_selection_gesture()
         self._push_undo_state(CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS)
         self.vertex_data.copy_from(preview.to_vertex_data())
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.set_selected_vertex_ids(())
         self.preview_point = None
         self.preview_guides = []
@@ -1781,6 +1803,7 @@ class BlueprintCanvas(QWidget):
 
         if self.blueprint_image is None:
             return False
+        self._cancel_open_space_corner_drag()
         self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
@@ -1792,7 +1815,7 @@ class BlueprintCanvas(QWidget):
         self._cancel_stair_placement_for_other_mode()
         self._reset_doorway_placement()
         self._reset_doorway_pointer_state()
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.selected_vertex_id = None
         self._set_selected_doorway_index(None)
         self.selected_stair_index = None
@@ -1838,6 +1861,7 @@ class BlueprintCanvas(QWidget):
         self._open_space_drag_start_image = None
         self._open_space_drag_current_image = None
         self._open_space_drag_press_widget = None
+        self._open_space_drag_preview_guides = []
 
     # ### Stair context and placement ###
     def set_stair_context(
@@ -1884,7 +1908,7 @@ class BlueprintCanvas(QWidget):
         self._reset_doorway_placement()
         self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.selected_vertex_id = None
         self.selected_open_space_id = None
         self.selected_stair_index = None
@@ -2087,7 +2111,7 @@ class BlueprintCanvas(QWidget):
         self._reset_vertex_selection_gesture()
         self.cancel_open_space_placement()
         self._cancel_stair_placement_for_other_mode()
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.selected_vertex_id = None
         self.selected_open_space_id = None
         self._set_selected_doorway_index(None)
@@ -2144,7 +2168,7 @@ class BlueprintCanvas(QWidget):
         self._level_comparison_overlay = None
         self._generated_wall_preview = None
         self._wall_mirror_vertex_ids = frozenset()
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.selected_vertex_id = None
         self.selected_open_space_id = None
         self.preview_point = None
@@ -2162,6 +2186,7 @@ class BlueprintCanvas(QWidget):
         self._reset_stair_drag()
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
+        self._reset_open_space_corner_drag()
         if not preserve_view:
             self._reset_view()
         if self._is_stair_placement_active():
@@ -2197,7 +2222,7 @@ class BlueprintCanvas(QWidget):
         self.doorways.extend(copy.deepcopy(snapshot.doorways))
         self.open_spaces.clear()
         self.open_spaces.extend(snapshot.open_spaces)
-        self.active_vertex_id = snapshot.active_vertex_id
+        self._set_active_vertex_id(snapshot.active_vertex_id)
         selected_vertex_ids = snapshot.selected_vertex_ids
         if not selected_vertex_ids and snapshot.selected_vertex_id is not None:
             selected_vertex_ids = (snapshot.selected_vertex_id,)
@@ -2207,6 +2232,7 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self._reset_doorway_placement()
         self._reset_open_space_drag()
+        self._reset_open_space_corner_drag()
         self._set_open_space_placement_active(False)
         self._set_selected_doorway_index(None)
         self._reset_pointer_state()
@@ -2288,6 +2314,13 @@ class BlueprintCanvas(QWidget):
         if (
             event.key() == Qt.Key.Key_Escape
             and self._cancel_placed_object_edit_drag(restore_initial=True)
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._cancel_open_space_corner_drag()
         ):
             event.accept()
             return
@@ -2483,6 +2516,13 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._cancel_open_space_corner_drag()
+        ):
+            event.accept()
+            return
+
         if event.button() == Qt.MouseButton.RightButton:
             if self.cancel_open_space_placement():
                 event.accept()
@@ -2556,8 +2596,11 @@ class BlueprintCanvas(QWidget):
         if self._open_space_placement_active:
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
-                self._open_space_drag_start_image = QPointF(image_point)
-                self._open_space_drag_current_image = QPointF(image_point)
+                preview = self._build_open_space_snap_preview(image_point)
+                snapped_point = QPointF(*preview.point)
+                self._open_space_drag_start_image = QPointF(snapped_point)
+                self._open_space_drag_current_image = QPointF(snapped_point)
+                self._open_space_drag_preview_guides = preview.guides
                 self._open_space_drag_press_widget = QPointF(event.position())
                 self.update()
             event.accept()
@@ -2585,6 +2628,26 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        open_space_corner_hit = (
+            None
+            if self.active_vertex_id is not None
+            else self._find_selected_open_space_corner_at(event.position())
+        )
+        if open_space_corner_hit is not None:
+            self._clear_placed_object_selection_for_structural_interaction()
+            self._clear_active_vertex_chain_for_selection()
+            self.selected_stair_index = None
+            self.selected_stair_endpoint_name = None
+            self._set_selected_window_id(None)
+            self._set_selected_doorway_index(None)
+            self.selected_vertex_id = None
+            self._begin_open_space_corner_drag(
+                open_space_corner_hit,
+                event.position(),
+            )
+            event.accept()
+            return
+
         light_profile = self._find_directional_light_profile_at(
             event.position()
         )
@@ -2608,7 +2671,7 @@ class BlueprintCanvas(QWidget):
         open_space = self._find_open_space_at(event.position())
         self.selected_open_space_id = None
 
-        if not (
+        if self.active_vertex_id is None and not (
             event.modifiers() & Qt.KeyboardModifier.ShiftModifier
             and not event.modifiers() & Qt.KeyboardModifier.AltModifier
         ):
@@ -2712,7 +2775,7 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        if open_space is not None:
+        if open_space is not None and self.active_vertex_id is None:
             self.selected_open_space_id = open_space.open_space_id
             self.selected_stair_index = None
             self.selected_stair_endpoint_name = None
@@ -2792,9 +2855,11 @@ class BlueprintCanvas(QWidget):
                 self._open_space_drag_start_image is not None
                 and event.buttons() & Qt.MouseButton.LeftButton
             ):
-                self._open_space_drag_current_image = (
+                preview = self._build_open_space_snap_preview(
                     self._widget_to_image_clamped(event.position())
                 )
+                self._open_space_drag_current_image = QPointF(*preview.point)
+                self._open_space_drag_preview_guides = preview.guides
                 self.update()
             event.accept()
             return
@@ -2832,6 +2897,14 @@ class BlueprintCanvas(QWidget):
                     event.modifiers(),
                 )
             self.update()
+            event.accept()
+            return
+
+        if (
+            self._pressed_open_space_corner is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self._move_open_space_corner_drag(event.position())
             event.accept()
             return
 
@@ -2965,6 +3038,16 @@ class BlueprintCanvas(QWidget):
                 and self._open_space_placement_active
             ):
                 self._finish_open_space_drag(event.position())
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self._pressed_open_space_corner is not None
+            ):
+                self._move_open_space_corner_drag(event.position())
+                self._finish_open_space_corner_drag()
+                self._update_edit_hover_cursor(event.position())
                 event.accept()
                 return
 
@@ -3114,6 +3197,7 @@ class BlueprintCanvas(QWidget):
         self._paint_stairs(painter)
         self._paint_pending_stair_placement(painter)
         self._paint_pending_open_space(painter)
+        self._paint_selected_open_space_corners(painter)
         self._paint_camera_indicator(painter)
         self._paint_level_comparison_overlay(painter)
         self._paint_placed_object_profiles(painter)
@@ -3196,7 +3280,10 @@ class BlueprintCanvas(QWidget):
             self.update()
             return False
 
-        end_image = self._widget_to_image_clamped(widget_point)
+        end_preview = self._build_open_space_snap_preview(
+            self._widget_to_image_clamped(widget_point)
+        )
+        end_image = QPointF(*end_preview.point)
         drag_distance = math.hypot(
             widget_point.x() - press_widget.x(),
             widget_point.y() - press_widget.y(),
@@ -3228,6 +3315,200 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    def _build_open_space_snap_preview(
+        self,
+        image_point: QPointF,
+    ) -> SnapPreview:
+        """Align one rectangle corner with nearby wall and stair points."""
+
+        raw_point = self._clamp_image_point(
+            image_point.x(),
+            image_point.y(),
+        )
+        point_preview = self._build_open_space_point_snap_preview(raw_point)
+        if point_preview is not None:
+            return point_preview
+
+        candidates = self._select_nearest_axis_snap_candidates(
+            (
+                *self._find_axis_snap_candidates(raw_point),
+                *self._find_stair_axis_snap_candidates(raw_point),
+            )
+        )
+        return self._build_axis_only_preview(raw_point, candidates)
+
+    def _build_open_space_point_snap_preview(
+        self,
+        raw_point: tuple[float, float],
+    ) -> SnapPreview | None:
+        """Snap directly to the nearest wall vertex or same-level stair point."""
+
+        tolerance = self._screen_distance_to_image(AXIS_SNAP_TOLERANCE_SCREEN)
+        candidates: list[
+            tuple[
+                float,
+                int,
+                int,
+                tuple[float, float],
+                int | None,
+            ]
+        ] = []
+        for vertex in self.vertex_data.vertices:
+            point = (vertex.x, vertex.y)
+            distance = self._point_distance(raw_point, point)
+            if distance <= tolerance:
+                candidates.append((distance, 0, vertex.id, point, vertex.id))
+
+        for index, point in enumerate(self._get_same_level_stair_snap_points()):
+            distance = self._point_distance(raw_point, point)
+            if distance <= tolerance:
+                candidates.append((distance, 1, index, point, None))
+
+        if not candidates:
+            return None
+
+        _distance, _source_priority, _source_order, point, vertex_id = min(
+            candidates,
+            key=lambda candidate: candidate[:3],
+        )
+        guide_point = None if vertex_id is not None else point
+        return SnapPreview(
+            point=self._clamp_image_point(*point),
+            guides=[
+                SnapGuide(
+                    source_vertex_id=vertex_id,
+                    source_point=guide_point,
+                    axis=axis,
+                )
+                for axis in ("x", "y")
+            ],
+        )
+
+    def _begin_open_space_corner_drag(
+        self,
+        hit: OpenSpaceCornerHit,
+        widget_point: QPointF,
+    ) -> None:
+        """Arm one selected corner for a preview-only resize drag."""
+
+        initial = next(
+            (
+                open_space
+                for open_space in self.open_spaces
+                if open_space.open_space_id == hit.open_space_id
+            ),
+            None,
+        )
+        self._reset_open_space_corner_drag()
+        if initial is None:
+            return
+        self._pressed_open_space_corner = hit
+        self._open_space_corner_drag_initial = initial
+        self._open_space_corner_drag_press_widget = QPointF(widget_point)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    def _move_open_space_corner_drag(self, widget_point: QPointF) -> None:
+        """Update a snapped rectangle preview without changing project data."""
+
+        press_widget = self._open_space_corner_drag_press_widget
+        if self._pressed_open_space_corner is None or press_widget is None:
+            return
+        if not self._open_space_corner_drag_active:
+            self._open_space_corner_drag_active = (
+                _qpoint_distance(widget_point, press_widget)
+                >= DRAG_THRESHOLD_SCREEN
+            )
+        if not self._open_space_corner_drag_active:
+            return
+
+        preview = self._build_open_space_snap_preview(
+            self._widget_to_image_clamped(widget_point)
+        )
+        self._open_space_corner_drag_preview_point = preview.point
+        self._open_space_corner_drag_preview_guides = preview.guides
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.update()
+
+    def _finish_open_space_corner_drag(self) -> bool:
+        """Commit one immutable resized rectangle after pointer release."""
+
+        hit = self._pressed_open_space_corner
+        initial = self._open_space_corner_drag_initial
+        preview_point = self._open_space_corner_drag_preview_point
+        was_active = self._open_space_corner_drag_active
+        self._reset_open_space_corner_drag()
+        if not was_active or hit is None or initial is None or preview_point is None:
+            self.update()
+            return False
+
+        open_space_index = next(
+            (
+                index
+                for index, open_space in enumerate(self.open_spaces)
+                if open_space.open_space_id == hit.open_space_id
+            ),
+            None,
+        )
+        if open_space_index is None or self.open_spaces[open_space_index] != initial:
+            self.update()
+            return False
+
+        opposite_x = (
+            initial.maximum_x if hit.x_side_sign < 0 else initial.minimum_x
+        )
+        opposite_y = (
+            initial.maximum_y if hit.y_side_sign < 0 else initial.minimum_y
+        )
+        minimum_x, maximum_x = sorted((opposite_x, preview_point[0]))
+        minimum_y, maximum_y = sorted((opposite_y, preview_point[1]))
+        if maximum_x - minimum_x <= 1e-6 or maximum_y - minimum_y <= 1e-6:
+            self.update()
+            return False
+
+        candidate = OpenSpaceData(
+            open_space_id=initial.open_space_id,
+            minimum_x=minimum_x,
+            minimum_y=minimum_y,
+            maximum_x=maximum_x,
+            maximum_y=maximum_y,
+        )
+        if candidate == initial:
+            self.update()
+            return False
+
+        self._push_undo_state(CANVAS_SNAPSHOT_ACTION_OPEN_SPACE)
+        self.open_spaces[open_space_index] = candidate
+        self.selected_open_space_id = candidate.open_space_id
+        # Arm the shared topology debounce before generic change listeners run.
+        self.open_space_corner_edit_committed.emit()
+        self.open_spaces_changed.emit()
+        self.geometry_changed.emit()
+        self.update()
+        return True
+
+    def _cancel_open_space_corner_drag(self) -> bool:
+        """Discard one transient corner preview without touching the model."""
+
+        had_drag = self._reset_open_space_corner_drag()
+        if not had_drag:
+            return False
+        self.unsetCursor()
+        self.update()
+        return True
+
+    def _reset_open_space_corner_drag(self) -> bool:
+        """Clear every pointer field used by open-space corner editing."""
+
+        had_drag = self._pressed_open_space_corner is not None
+        self._pressed_open_space_corner = None
+        self._open_space_corner_drag_initial = None
+        self._open_space_corner_drag_press_widget = None
+        self._open_space_corner_drag_preview_point = None
+        self._open_space_corner_drag_preview_guides = []
+        self._open_space_corner_drag_active = False
+        return had_drag
+
     def _delete_selected_open_space(self) -> bool:
         selected_id = self.selected_open_space_id
         if selected_id is None:
@@ -3246,6 +3527,7 @@ class BlueprintCanvas(QWidget):
             return False
 
         self._push_undo_state(CANVAS_SNAPSHOT_ACTION_OPEN_SPACE)
+        self._reset_open_space_corner_drag()
         del self.open_spaces[open_space_index]
         self.selected_open_space_id = None
         self.open_spaces_changed.emit()
@@ -3257,7 +3539,7 @@ class BlueprintCanvas(QWidget):
         self,
         widget_point: QPointF,
     ) -> OpenSpaceData | None:
-        """Hit only a rectangle border so its interior remains editable."""
+        """Return the topmost open space containing the pointer."""
 
         for open_space in reversed(self.open_spaces):
             rect = self._open_space_widget_rect(open_space)
@@ -3267,26 +3549,112 @@ class BlueprintCanvas(QWidget):
                 OPEN_SPACE_HIT_TOLERANCE_SCREEN,
                 OPEN_SPACE_HIT_TOLERANCE_SCREEN,
             )
-            if not hit_rect.contains(widget_point):
-                continue
-            edge_distance = min(
-                abs(widget_point.x() - rect.left()),
-                abs(widget_point.x() - rect.right()),
-                abs(widget_point.y() - rect.top()),
-                abs(widget_point.y() - rect.bottom()),
-            )
-            if edge_distance <= OPEN_SPACE_HIT_TOLERANCE_SCREEN:
+            if hit_rect.contains(widget_point):
                 return open_space
         return None
 
+    def _find_selected_open_space_corner_at(
+        self,
+        widget_point: QPointF,
+    ) -> OpenSpaceCornerHit | None:
+        """Return the nearest visible handle of the selected rectangle."""
+
+        selected_id = self.selected_open_space_id
+        selected = next(
+            (
+                open_space
+                for open_space in self.open_spaces
+                if open_space.open_space_id == selected_id
+            ),
+            None,
+        )
+        if selected is None:
+            return None
+
+        closest_hit: OpenSpaceCornerHit | None = None
+        closest_distance = OPEN_SPACE_CORNER_HIT_RADIUS_SCREEN
+        for hit, image_point in self._get_open_space_corner_points(selected):
+            distance = _qpoint_distance(
+                widget_point,
+                self._image_to_widget(*image_point),
+            )
+            if distance <= closest_distance:
+                closest_hit = hit
+                closest_distance = distance
+        return closest_hit
+
+    def _get_open_space_corner_points(
+        self,
+        open_space: OpenSpaceData,
+    ) -> tuple[tuple[OpenSpaceCornerHit, tuple[float, float]], ...]:
+        """Return four stable handle identities and their displayed points."""
+
+        minimum_x, minimum_y, maximum_x, maximum_y = (
+            self._get_open_space_display_bounds(open_space)
+        )
+        return tuple(
+            (
+                OpenSpaceCornerHit(
+                    open_space_id=open_space.open_space_id,
+                    x_side_sign=x_side_sign,
+                    y_side_sign=y_side_sign,
+                ),
+                (
+                    minimum_x if x_side_sign < 0 else maximum_x,
+                    minimum_y if y_side_sign < 0 else maximum_y,
+                ),
+            )
+            for x_side_sign, y_side_sign in (
+                (-1, -1),
+                (1, -1),
+                (1, 1),
+                (-1, 1),
+            )
+        )
+
+    def _get_open_space_display_bounds(
+        self,
+        open_space: OpenSpaceData,
+    ) -> tuple[float, float, float, float]:
+        """Return persisted bounds or the active corner-drag preview bounds."""
+
+        hit = self._pressed_open_space_corner
+        initial = self._open_space_corner_drag_initial
+        preview_point = self._open_space_corner_drag_preview_point
+        if (
+            hit is None
+            or initial is None
+            or preview_point is None
+            or hit.open_space_id != open_space.open_space_id
+        ):
+            return (
+                open_space.minimum_x,
+                open_space.minimum_y,
+                open_space.maximum_x,
+                open_space.maximum_y,
+            )
+
+        opposite_x = (
+            initial.maximum_x if hit.x_side_sign < 0 else initial.minimum_x
+        )
+        opposite_y = (
+            initial.maximum_y if hit.y_side_sign < 0 else initial.minimum_y
+        )
+        minimum_x, maximum_x = sorted((opposite_x, preview_point[0]))
+        minimum_y, maximum_y = sorted((opposite_y, preview_point[1]))
+        return minimum_x, minimum_y, maximum_x, maximum_y
+
     def _open_space_widget_rect(self, open_space: OpenSpaceData) -> QRectF:
+        minimum_x, minimum_y, maximum_x, maximum_y = (
+            self._get_open_space_display_bounds(open_space)
+        )
         minimum = self._image_to_widget(
-            open_space.minimum_x,
-            open_space.minimum_y,
+            minimum_x,
+            minimum_y,
         )
         maximum = self._image_to_widget(
-            open_space.maximum_x,
-            open_space.maximum_y,
+            maximum_x,
+            maximum_y,
         )
         return QRectF(minimum, maximum).normalized()
 
@@ -3323,6 +3691,46 @@ class BlueprintCanvas(QWidget):
         painter.setPen(pen)
         painter.setBrush(PENDING_OPEN_SPACE_FILL_COLOR)
         painter.drawRect(QRectF(start_widget, end_widget).normalized())
+        painter.restore()
+        self._paint_guides(
+            painter,
+            (end_image.x(), end_image.y()),
+            self._open_space_drag_preview_guides,
+        )
+
+    def _paint_selected_open_space_corners(self, painter: QPainter) -> None:
+        """Paint prominent corner handles above walls, vertices, and stairs."""
+
+        selected = next(
+            (
+                open_space
+                for open_space in self.open_spaces
+                if open_space.open_space_id == self.selected_open_space_id
+            ),
+            None,
+        )
+        if selected is None:
+            return
+
+        preview_point = self._open_space_corner_drag_preview_point
+        if preview_point is not None:
+            self._paint_guides(
+                painter,
+                preview_point,
+                self._open_space_corner_drag_preview_guides,
+            )
+
+        handle_pen = QPen(VERTEX_OUTLINE_COLOR, 2.5)
+        handle_pen.setCosmetic(True)
+        painter.save()
+        painter.setPen(handle_pen)
+        painter.setBrush(SELECTED_OPEN_SPACE_EDGE_COLOR)
+        for _hit, image_point in self._get_open_space_corner_points(selected):
+            painter.drawEllipse(
+                self._image_to_widget(*image_point),
+                OPEN_SPACE_CORNER_RADIUS_SCREEN,
+                OPEN_SPACE_CORNER_RADIUS_SCREEN,
+            )
         painter.restore()
 
     # ### First-person camera indicator painting ###
@@ -3504,12 +3912,22 @@ class BlueprintCanvas(QWidget):
                 closest_distance = distance
         return closest_profile
 
+    # ### Wall vertex chains ###
+    def _set_active_vertex_id(self, vertex_id: int | None) -> None:
+        """Update the open wall chain and report only lifecycle transitions."""
+
+        was_active = self.active_vertex_id is not None
+        self.active_vertex_id = vertex_id
+        is_active = vertex_id is not None
+        if is_active != was_active:
+            self.wall_vertex_chain_changed.emit(is_active)
+
     def _apply_active_chain(self) -> None:
         if self.active_vertex_id is None:
             return
 
         self._push_undo_state()
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.preview_point = None
         self.preview_guides = []
         self._reset_pointer_state()
@@ -3518,7 +3936,7 @@ class BlueprintCanvas(QWidget):
     def _clear_active_vertex_chain_for_selection(self) -> None:
         """Leave drawing mode before Shift changes the vertex selection."""
 
-        self.active_vertex_id = None
+        self._set_active_vertex_id(None)
         self.preview_point = None
         self.preview_guides = []
         self._reset_pointer_state()
@@ -3527,7 +3945,7 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = vertex.id
 
         if self.active_vertex_id is None:
-            self.active_vertex_id = vertex.id
+            self._set_active_vertex_id(vertex.id)
             self.preview_point = (vertex.x, vertex.y)
             self.preview_guides = []
             return
@@ -3536,14 +3954,14 @@ class BlueprintCanvas(QWidget):
             return
 
         if self.vertex_data.has_edge(self.active_vertex_id, vertex.id):
-            self.active_vertex_id = vertex.id
+            self._set_active_vertex_id(vertex.id)
             self.preview_point = (vertex.x, vertex.y)
             self.preview_guides = []
             return
 
         self._push_undo_state()
         self.vertex_data.add_edge(self.active_vertex_id, vertex.id)
-        self.active_vertex_id = vertex.id
+        self._set_active_vertex_id(vertex.id)
         self.preview_point = (vertex.x, vertex.y)
         self.preview_guides = []
         self.geometry_changed.emit()
@@ -3555,7 +3973,7 @@ class BlueprintCanvas(QWidget):
         if self.active_vertex_id is not None:
             self.vertex_data.add_edge(self.active_vertex_id, new_vertex.id)
 
-        self.active_vertex_id = new_vertex.id
+        self._set_active_vertex_id(new_vertex.id)
         self.selected_vertex_id = new_vertex.id
         self.preview_point = point
         self.preview_guides = []
@@ -3597,7 +4015,7 @@ class BlueprintCanvas(QWidget):
         if self.active_vertex_id is not None:
             self.vertex_data.add_edge(self.active_vertex_id, new_vertex.id)
 
-        self.active_vertex_id = new_vertex.id
+        self._set_active_vertex_id(new_vertex.id)
         self.selected_vertex_id = new_vertex.id
         self.preview_point = point
         self.preview_guides = []
@@ -3831,11 +4249,165 @@ class BlueprintCanvas(QWidget):
             image_point=image_point,
             modifiers=modifiers,
             base_vertex=base_vertex,
+            extra_axis_candidates=self._find_stair_axis_snap_candidates(
+                (image_point.x(), image_point.y())
+            ),
         )
         return StairPointTarget(
             point=preview.point,
             guides=preview.guides,
         )
+
+    def _find_stair_axis_snap_candidates(
+        self,
+        point: tuple[float, float],
+    ) -> list[AxisSnapCandidate]:
+        """Find straight alignment guides to previously placed stair points."""
+
+        return self._find_reference_point_axis_snap_candidates(
+            point,
+            self._get_same_level_stair_snap_points(),
+        )
+
+    def _find_open_space_axis_snap_candidates(
+        self,
+        point: tuple[float, float],
+    ) -> list[AxisSnapCandidate]:
+        """Find straight alignment guides to persisted open-space corners."""
+
+        source_points = tuple(
+            dict.fromkeys(
+                corner_point
+                for open_space in self.open_spaces
+                for _corner_hit, corner_point in self._get_open_space_corner_points(
+                    open_space
+                )
+            )
+        )
+        return self._find_reference_point_axis_snap_candidates(
+            point,
+            source_points,
+        )
+
+    def _find_reference_point_axis_snap_candidates(
+        self,
+        point: tuple[float, float],
+        source_points: Iterable[tuple[float, float]],
+    ) -> list[AxisSnapCandidate]:
+        """Find the nearest horizontal and vertical reference-point guides."""
+
+        tolerance = self._screen_distance_to_image(AXIS_SNAP_TOLERANCE_SCREEN)
+        point_x, point_y = self._clamp_image_point(*point)
+        best_x_match: tuple[
+            tuple[float, float],
+            tuple[float, float],
+        ] | None = None
+        best_y_match: tuple[
+            tuple[float, float],
+            tuple[float, float],
+        ] | None = None
+
+        for source_point in source_points:
+            x_distance = abs(point_x - source_point[0])
+            total_distance = self._point_distance((point_x, point_y), source_point)
+            x_key = (x_distance, total_distance)
+            if x_distance <= tolerance and (
+                best_x_match is None or x_key < best_x_match[0]
+            ):
+                best_x_match = (x_key, source_point)
+
+            y_distance = abs(point_y - source_point[1])
+            y_key = (y_distance, total_distance)
+            if y_distance <= tolerance and (
+                best_y_match is None or y_key < best_y_match[0]
+            ):
+                best_y_match = (y_key, source_point)
+
+        candidates: list[AxisSnapCandidate] = []
+        if best_x_match is not None:
+            candidates.append(
+                AxisSnapCandidate(
+                    source_vertex_id=None,
+                    source_point=best_x_match[1],
+                    axis="x",
+                    value=best_x_match[1][0],
+                    distance=best_x_match[0][0],
+                )
+            )
+        if best_y_match is not None:
+            candidates.append(
+                AxisSnapCandidate(
+                    source_vertex_id=None,
+                    source_point=best_y_match[1],
+                    axis="y",
+                    value=best_y_match[1][1],
+                    distance=best_y_match[0][0],
+                )
+            )
+        return candidates
+
+    def _get_same_level_stair_snap_points(
+        self,
+    ) -> tuple[tuple[float, float], ...]:
+        """Return existing and draft stair points owned by the visible level."""
+
+        level = self.level_context
+        if level is None:
+            return ()
+
+        points: list[tuple[float, float]] = []
+        pending_point = self.pending_stair_point
+        if pending_point is not None and pending_point.level_index == level.index:
+            points.append((pending_point.x, pending_point.y))
+        placements = [
+            placement
+            for raw_stair in self.stairs
+            if (placement := _coerce_stair_placement(raw_stair)) is not None
+        ]
+        if self.pending_stair_draft is not None:
+            placements.append(self.pending_stair_draft)
+
+        for placement in placements:
+            for _section_name, section in _get_stair_sections(placement):
+                if section.level_index != level.index:
+                    continue
+                points.extend(
+                    (
+                        self._resolve_stair_canvas_point(
+                            section.a_x,
+                            section.a_y,
+                            section.a_vertex_id,
+                        ),
+                        self._resolve_stair_canvas_point(
+                            section.b_x,
+                            section.b_y,
+                            section.b_vertex_id,
+                        ),
+                    )
+                )
+
+        pending_placement = self.pending_stair_placement
+        if (
+            self.pending_stair_draft is None
+            and pending_placement is not None
+            and pending_placement.start_level_index == level.index
+        ):
+            points.extend(
+                (
+                    self._resolve_stair_canvas_point(
+                        pending_placement.start_a_x,
+                        pending_placement.start_a_y,
+                        pending_placement.start_a_vertex_id,
+                    ),
+                    self._resolve_stair_canvas_point(
+                        pending_placement.start_b_x,
+                        pending_placement.start_b_y,
+                        pending_placement.start_b_vertex_id,
+                    ),
+                )
+            )
+
+        return tuple(dict.fromkeys(points))
 
     def _find_stair_hit(self, widget_point: QPointF) -> StairHit | None:
         level = self.level_context
@@ -4488,6 +5060,9 @@ class BlueprintCanvas(QWidget):
     def _update_edit_hover_cursor(self, widget_point: QPointF) -> None:
         """Show movement feedback for editable points and doorways."""
 
+        if self._find_selected_open_space_corner_at(widget_point) is not None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
         if self._find_directional_light_profile_at(widget_point) is not None:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             return
@@ -5088,7 +5663,7 @@ class BlueprintCanvas(QWidget):
         self._reset_doorway_placement()
         self.unsetCursor()
         if bridge_edge_added:
-            self.geometry_changed.emit()
+            self.doorway_bridge_edges_added.emit()
         self.doorways_changed.emit()
         self.update()
 
@@ -6184,7 +6759,7 @@ class BlueprintCanvas(QWidget):
         return True
 
     def _delete_selected_vertices(self) -> None:
-        """Delete every selected vertex as one undoable topology change."""
+        """Delete selected vertices and collapse safe straight wall joints."""
 
         existing_vertex_ids = {
             vertex.id for vertex in self.vertex_data.vertices
@@ -6200,19 +6775,35 @@ class BlueprintCanvas(QWidget):
 
         self._push_undo_state(CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION)
         deleted_vertex_id_set = set(deleted_vertex_ids)
+        removed_edges = tuple(
+            edge
+            for edge in self.vertex_data.edges
+            if edge.start_vertex_id in deleted_vertex_id_set
+            or edge.end_vertex_id in deleted_vertex_id_set
+        )
+        replacement_edges = self.vertex_data.build_collinear_deletion_bridges(
+            deleted_vertex_id_set
+        )
         removed_doorway_indices = doorway_indices_on_removed_wall_edges(
             self.vertex_data,
             self.doorways,
-            (
-                edge
-                for edge in self.vertex_data.edges
-                if edge.start_vertex_id in deleted_vertex_id_set
-                or edge.end_vertex_id in deleted_vertex_id_set
-            ),
+            removed_edges,
         )
         self.vertex_data.delete_vertices(deleted_vertex_id_set)
+        for replacement_edge in replacement_edges:
+            self.vertex_data.add_edge(
+                replacement_edge.start_vertex_id,
+                replacement_edge.end_vertex_id,
+            )
+        retained_doorway_indices = doorway_indices_on_removed_wall_edges(
+            self.vertex_data,
+            self.doorways,
+            replacement_edges,
+        )
+        removed_doorway_indices.difference_update(retained_doorway_indices)
         self._remove_vertices_from_rooms(deleted_vertex_id_set)
-        if removed_doorway_indices:
+        doorways_changed = bool(removed_doorway_indices)
+        if doorways_changed:
             self.doorways[:] = [
                 doorway
                 for index, doorway in enumerate(self.doorways)
@@ -6220,13 +6811,12 @@ class BlueprintCanvas(QWidget):
             ]
             self._set_selected_doorway_index(None)
             self._reset_doorway_pointer_state()
-            self.doorways_changed.emit()
 
         if (
             self.active_vertex_id is not None
             and self.vertex_data.get_vertex(self.active_vertex_id) is None
         ):
-            self.active_vertex_id = None
+            self._set_active_vertex_id(None)
             self.preview_point = None
 
         self.set_selected_vertex_ids(())
@@ -6234,6 +6824,8 @@ class BlueprintCanvas(QWidget):
         self._reset_pointer_state()
         self.update()
         self.wall_vertices_deleted.emit(deleted_vertex_ids)
+        if doorways_changed:
+            self.doorways_changed.emit()
         self.geometry_changed.emit()
 
     def _remove_vertices_from_rooms(
@@ -6298,6 +6890,14 @@ class BlueprintCanvas(QWidget):
             image_point=image_point,
             modifiers=modifiers,
             base_vertex=base_vertex,
+            extra_axis_candidates=(
+                *self._find_stair_axis_snap_candidates(
+                    (image_point.x(), image_point.y())
+                ),
+                *self._find_open_space_axis_snap_candidates(
+                    (image_point.x(), image_point.y())
+                ),
+            ),
         )
 
     def _build_connection_preview_from_base(
@@ -6305,6 +6905,7 @@ class BlueprintCanvas(QWidget):
         image_point: QPointF,
         modifiers: Qt.KeyboardModifier,
         base_vertex: Vertex | None,
+        extra_axis_candidates: Iterable[AxisSnapCandidate] = (),
     ) -> SnapPreview:
         raw_x, raw_y = self._clamp_image_point(image_point.x(), image_point.y())
         raw_point = (raw_x, raw_y)
@@ -6314,6 +6915,22 @@ class BlueprintCanvas(QWidget):
         if center_candidate is not None:
             return self._build_center_snap_preview(center_candidate)
 
+        extra_candidates = self._select_nearest_axis_snap_candidates(
+            extra_axis_candidates
+        )
+        if extra_candidates:
+            axis_candidates = extra_candidates
+            if base_vertex is not None:
+                axis_candidates = self._select_nearest_axis_snap_candidates(
+                    [
+                        *extra_candidates,
+                        *self._find_axis_snap_candidates(
+                            raw_point,
+                            excluded_vertex_ids={base_vertex.id},
+                        ),
+                    ]
+                )
+            return self._build_axis_only_preview(raw_point, axis_candidates)
         if base_vertex is None:
             return SnapPreview(point=raw_point, guides=[])
 
@@ -6337,6 +6954,23 @@ class BlueprintCanvas(QWidget):
 
         return SnapPreview(point=angle_snapped_point, guides=[])
 
+    @staticmethod
+    def _select_nearest_axis_snap_candidates(
+        candidates: Iterable[AxisSnapCandidate],
+    ) -> list[AxisSnapCandidate]:
+        """Keep only the nearest candidate for each straight alignment axis."""
+
+        best_by_axis: dict[str, AxisSnapCandidate] = {}
+        for candidate in candidates:
+            current = best_by_axis.get(candidate.axis)
+            if current is None or candidate.distance < current.distance:
+                best_by_axis[candidate.axis] = candidate
+        return [
+            best_by_axis[axis]
+            for axis in ("x", "y")
+            if axis in best_by_axis
+        ]
+
     def _build_drag_preview(
         self,
         image_point: QPointF,
@@ -6350,9 +6984,14 @@ class BlueprintCanvas(QWidget):
         if center_candidate is not None:
             return self._build_center_snap_preview(center_candidate)
 
-        axis_candidates = self._find_axis_snap_candidates(
-            raw_point,
-            excluded_vertex_ids={dragged_vertex_id},
+        axis_candidates = self._select_nearest_axis_snap_candidates(
+            (
+                *self._find_axis_snap_candidates(
+                    raw_point,
+                    excluded_vertex_ids={dragged_vertex_id},
+                ),
+                *self._find_open_space_axis_snap_candidates(raw_point),
+            )
         )
         return self._build_axis_only_preview(raw_point, axis_candidates)
 
@@ -6594,24 +7233,27 @@ class BlueprintCanvas(QWidget):
         excluded_ids = excluded_vertex_ids or set()
         tolerance = self._screen_distance_to_image(AXIS_SNAP_TOLERANCE_SCREEN)
         point_x, point_y = point
-        best_x_match: tuple[float, Vertex] | None = None
-        best_y_match: tuple[float, Vertex] | None = None
+        best_x_match: tuple[tuple[float, float, int], Vertex] | None = None
+        best_y_match: tuple[tuple[float, float, int], Vertex] | None = None
 
         for vertex in self.vertex_data.vertices:
             if vertex.id in excluded_ids:
                 continue
 
             x_distance = abs(point_x - vertex.x)
+            total_distance = self._point_distance(point, (vertex.x, vertex.y))
+            x_key = (x_distance, total_distance, vertex.id)
             if x_distance <= tolerance and (
-                best_x_match is None or x_distance < best_x_match[0]
+                best_x_match is None or x_key < best_x_match[0]
             ):
-                best_x_match = (x_distance, vertex)
+                best_x_match = (x_key, vertex)
 
             y_distance = abs(point_y - vertex.y)
+            y_key = (y_distance, total_distance, vertex.id)
             if y_distance <= tolerance and (
-                best_y_match is None or y_distance < best_y_match[0]
+                best_y_match is None or y_key < best_y_match[0]
             ):
-                best_y_match = (y_distance, vertex)
+                best_y_match = (y_key, vertex)
 
         candidates: list[AxisSnapCandidate] = []
         if best_x_match is not None:
@@ -6620,7 +7262,7 @@ class BlueprintCanvas(QWidget):
                     source_vertex_id=best_x_match[1].id,
                     axis="x",
                     value=best_x_match[1].x,
-                    distance=best_x_match[0],
+                    distance=best_x_match[0][0],
                 )
             )
 
@@ -6630,7 +7272,7 @@ class BlueprintCanvas(QWidget):
                     source_vertex_id=best_y_match[1].id,
                     axis="y",
                     value=best_y_match[1].y,
-                    distance=best_y_match[0],
+                    distance=best_y_match[0][0],
                 )
             )
 
@@ -6769,6 +7411,7 @@ class BlueprintCanvas(QWidget):
                             SnapGuide(
                                 source_vertex_id=axis_candidate.source_vertex_id,
                                 axis=axis_candidate.axis,
+                                source_point=axis_candidate.source_point,
                             )
                         ],
                     ),
@@ -6799,6 +7442,7 @@ class BlueprintCanvas(QWidget):
                 SnapGuide(
                     source_vertex_id=axis_candidate.source_vertex_id,
                     axis=axis_candidate.axis,
+                    source_point=axis_candidate.source_point,
                 )
             )
 
@@ -8114,27 +8758,32 @@ class BlueprintCanvas(QWidget):
         )
 
         for guide in guides:
-            source_vertex = self.vertex_data.get_vertex(guide.source_vertex_id)
-            if source_vertex is None:
+            source_point = guide.source_point
+            if source_point is None and guide.source_vertex_id is not None:
+                source_vertex = self.vertex_data.get_vertex(guide.source_vertex_id)
+                if source_vertex is not None:
+                    source_point = (source_vertex.x, source_vertex.y)
+            if source_point is None:
                 continue
+            source_x, source_y = source_point
 
             if guide.axis == "center":
                 painter.drawLine(
-                    self._image_to_widget(source_vertex.x, source_vertex.y),
+                    self._image_to_widget(source_x, source_y),
                     preview_widget_point,
                 )
                 continue
 
             if guide.axis == "x":
                 painter.drawLine(
-                    self._image_to_widget(source_vertex.x, source_vertex.y),
-                    self._image_to_widget(source_vertex.x, preview_point[1]),
+                    self._image_to_widget(source_x, source_y),
+                    self._image_to_widget(source_x, preview_point[1]),
                 )
                 continue
 
             painter.drawLine(
-                self._image_to_widget(source_vertex.x, source_vertex.y),
-                self._image_to_widget(preview_point[0], source_vertex.y),
+                self._image_to_widget(source_x, source_y),
+                self._image_to_widget(preview_point[0], source_y),
             )
 
     def _paint_preview_edge(self, painter: QPainter) -> None:

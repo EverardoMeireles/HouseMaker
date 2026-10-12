@@ -14,7 +14,14 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.blueprint_canvas import BlueprintCanvas
-from housemaker.models import RoomData, VertexData
+from housemaker.models import (
+    DoorwayData,
+    LevelData,
+    OpenSpaceData,
+    RoomData,
+    StairData,
+    VertexData,
+)
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -110,6 +117,121 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
         self.assertEqual((vertex.x, vertex.y), (25.0, 40.0))
         self.assertEqual(self.canvas.active_vertex_id, vertex.id)
         self.assertEqual(self.canvas.selected_vertex_id, vertex.id)
+
+    def test_active_wall_chain_snaps_new_vertex_to_same_level_stair_point(
+        self,
+    ) -> None:
+        base_vertex = self.canvas.vertex_data.add_vertex(15.0, 15.0)
+        self.canvas.active_vertex_id = base_vertex.id
+        self.canvas.selected_vertex_id = base_vertex.id
+        level = LevelData(index=2, name="Ground")
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=60.0,
+            start_a_y=40.0,
+            start_b_x=85.0,
+            start_b_y=40.0,
+            end_level_index=3,
+            end_a_x=60.0,
+            end_a_y=80.0,
+            end_b_x=85.0,
+            end_b_y=80.0,
+        )
+        self.canvas.set_stair_context((stair,), level)
+        hover_point = QPointF(60.8, 40.6)
+
+        preview = self.canvas._build_connection_preview(
+            hover_point,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertEqual(preview.point, (60.0, 40.0))
+        self.assertEqual(
+            [guide.source_point for guide in preview.guides],
+            [(60.0, 40.0), (60.0, 40.0)],
+        )
+
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            pos=self.canvas._image_to_widget(
+                hover_point.x(),
+                hover_point.y(),
+            ).toPoint(),
+        )
+
+        created_vertex = self.canvas.vertex_data.vertices[-1]
+        self.assertEqual((created_vertex.x, created_vertex.y), preview.point)
+        self.assertTrue(
+            self.canvas.vertex_data.has_edge(base_vertex.id, created_vertex.id)
+        )
+        self.assertIsNone(self.canvas.selected_stair_index)
+
+    def test_active_wall_chain_snaps_new_vertex_to_open_space_corner(
+        self,
+    ) -> None:
+        base_vertex = self.canvas.vertex_data.add_vertex(15.0, 15.0)
+        self.canvas.active_vertex_id = base_vertex.id
+        self.canvas.selected_vertex_id = base_vertex.id
+        open_space = OpenSpaceData("opening-a", 60.0, 40.0, 85.0, 80.0)
+        self.canvas.open_spaces.append(open_space)
+        self.canvas.selected_open_space_id = open_space.open_space_id
+        hover_point = QPointF(60.8, 40.6)
+
+        preview = self.canvas._build_connection_preview(
+            hover_point,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertEqual(preview.point, (60.0, 40.0))
+        self.assertEqual(
+            [guide.source_point for guide in preview.guides],
+            [(60.0, 40.0), (60.0, 40.0)],
+        )
+
+        QTest.mouseClick(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            pos=self.canvas._image_to_widget(
+                hover_point.x(),
+                hover_point.y(),
+            ).toPoint(),
+        )
+
+        created_vertex = self.canvas.vertex_data.vertices[-1]
+        self.assertEqual((created_vertex.x, created_vertex.y), preview.point)
+        self.assertTrue(
+            self.canvas.vertex_data.has_edge(base_vertex.id, created_vertex.id)
+        )
+        self.assertEqual(self.canvas.open_spaces, [open_space])
+
+    def test_wall_vertex_preview_ignores_other_level_stair_points(self) -> None:
+        base_vertex = self.canvas.vertex_data.add_vertex(15.0, 40.0)
+        self.canvas.active_vertex_id = base_vertex.id
+        level = LevelData(index=2, name="Ground")
+        other_level_stair = StairData(
+            start_level_index=3,
+            start_a_x=60.0,
+            start_a_y=40.0,
+            start_b_x=85.0,
+            start_b_y=40.0,
+            end_level_index=4,
+            end_a_x=60.0,
+            end_a_y=80.0,
+            end_b_x=85.0,
+            end_b_y=80.0,
+        )
+        self.canvas.set_stair_context((other_level_stair,), level)
+
+        preview = self.canvas._build_connection_preview(
+            QPointF(60.8, 40.6),
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertNotEqual(preview.point, (60.0, 40.0))
+        self.assertTrue(
+            all(guide.source_point is None for guide in preview.guides)
+        )
 
     def test_blank_add_interaction_wraps_the_mutation_events(self) -> None:
         events: list[str] = []
@@ -256,6 +378,110 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
         )
         self.assertIsNone(self.canvas.vertex_data.get_vertex(vertex.id))
 
+    def test_delete_straight_degree_two_vertex_connects_its_neighbors(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(10.0, 40.0)
+        middle = vertex_data.add_vertex(40.0, 40.0)
+        last = vertex_data.add_vertex(90.0, 40.0)
+        vertex_data.add_edge(first.id, middle.id)
+        vertex_data.add_edge(middle.id, last.id)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.set_selected_vertex_ids((middle.id,))
+
+        self.canvas._delete_selected_vertices()
+
+        self.assertIsNone(vertex_data.get_vertex(middle.id))
+        self.assertTrue(vertex_data.has_edge(first.id, last.id))
+        self.assertEqual(len(vertex_data.edges), 1)
+
+    def test_delete_straight_vertex_keeps_doorway_and_undo_restores_chain(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(10.0, 40.0)
+        middle = vertex_data.add_vertex(40.0, 40.0)
+        last = vertex_data.add_vertex(90.0, 40.0)
+        vertex_data.add_edge(first.id, middle.id)
+        vertex_data.add_edge(middle.id, last.id)
+        doorway = DoorwayData(
+            center_x=65.0,
+            center_y=40.0,
+            width_meters=0.9,
+            height_meters=2.1,
+            rotation_degrees=90.0,
+        )
+        self.canvas.vertex_data = vertex_data
+        self.canvas.doorways.append(doorway)
+        self.canvas.set_selected_vertex_ids((middle.id,))
+
+        self.canvas._delete_selected_vertices()
+
+        self.assertEqual(self.canvas.doorways, [doorway])
+        self.assertTrue(vertex_data.has_edge(first.id, last.id))
+
+        self.canvas.undo_last_step()
+
+        self.assertEqual(self.canvas.doorways, [doorway])
+        self.assertIsNotNone(vertex_data.get_vertex(middle.id))
+        self.assertTrue(vertex_data.has_edge(first.id, middle.id))
+        self.assertTrue(vertex_data.has_edge(middle.id, last.id))
+        self.assertFalse(vertex_data.has_edge(first.id, last.id))
+
+    def test_delete_corner_degree_two_vertex_does_not_connect_its_neighbors(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(10.0, 40.0)
+        corner = vertex_data.add_vertex(40.0, 40.0)
+        last = vertex_data.add_vertex(40.0, 90.0)
+        vertex_data.add_edge(first.id, corner.id)
+        vertex_data.add_edge(corner.id, last.id)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.set_selected_vertex_ids((corner.id,))
+
+        self.canvas._delete_selected_vertices()
+
+        self.assertIsNone(vertex_data.get_vertex(corner.id))
+        self.assertFalse(vertex_data.has_edge(first.id, last.id))
+        self.assertEqual(vertex_data.edges, [])
+
+    def test_delete_branch_vertex_does_not_connect_its_neighbors(self) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(10.0, 40.0)
+        branch = vertex_data.add_vertex(40.0, 40.0)
+        second = vertex_data.add_vertex(90.0, 40.0)
+        third = vertex_data.add_vertex(40.0, 90.0)
+        for neighbor in (first, second, third):
+            vertex_data.add_edge(branch.id, neighbor.id)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.set_selected_vertex_ids((branch.id,))
+
+        self.canvas._delete_selected_vertices()
+
+        self.assertIsNone(vertex_data.get_vertex(branch.id))
+        self.assertEqual(vertex_data.edges, [])
+
+    def test_delete_straight_vertex_keeps_one_existing_neighbor_edge(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(10.0, 40.0)
+        middle = vertex_data.add_vertex(40.0, 40.0)
+        last = vertex_data.add_vertex(90.0, 40.0)
+        vertex_data.add_edge(first.id, middle.id)
+        vertex_data.add_edge(middle.id, last.id)
+        vertex_data.add_edge(last.id, first.id)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.set_selected_vertex_ids((middle.id,))
+
+        self.canvas._delete_selected_vertices()
+
+        self.assertIsNone(vertex_data.get_vertex(middle.id))
+        self.assertTrue(vertex_data.has_edge(first.id, last.id))
+        self.assertEqual(len(vertex_data.edges), 1)
+
     def test_delete_removes_the_full_vertex_selection_in_one_action(self) -> None:
         vertex_data = VertexData()
         first = vertex_data.add_vertex(10.0, 10.0)
@@ -381,6 +607,41 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
 
         self.assertEqual(events, ["geometry_changed"])
         self.assertEqual(interaction_states, [True, False])
+
+    def test_dragged_wall_vertex_snaps_to_open_space_corner(self) -> None:
+        dragged_vertex = self.canvas.vertex_data.add_vertex(25.0, 40.0)
+        self.canvas.open_spaces.append(
+            OpenSpaceData("opening-a", 60.0, 40.0, 85.0, 80.0)
+        )
+        hover_point = QPointF(60.8, 40.6)
+
+        preview = self.canvas._build_drag_preview(
+            hover_point,
+            dragged_vertex.id,
+        )
+
+        self.assertEqual(preview.point, (60.0, 40.0))
+        self.assertEqual(
+            [guide.source_point for guide in preview.guides],
+            [(60.0, 40.0), (60.0, 40.0)],
+        )
+
+        _drag_canvas(
+            self.canvas,
+            self.canvas._image_to_widget(
+                dragged_vertex.x,
+                dragged_vertex.y,
+            ).toPoint(),
+            self.canvas._image_to_widget(
+                hover_point.x(),
+                hover_point.y(),
+            ).toPoint(),
+        )
+
+        moved_vertex = self.canvas.vertex_data.get_vertex(dragged_vertex.id)
+        self.assertIsNotNone(moved_vertex)
+        assert moved_vertex is not None
+        self.assertEqual((moved_vertex.x, moved_vertex.y), preview.point)
 
     def test_new_vertex_press_without_movement_emits_no_geometry_change(
         self,

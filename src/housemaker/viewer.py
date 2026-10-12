@@ -3856,6 +3856,22 @@ class _VertexRectangleSelectionResult:
 
 
 # ### Canvas rectangle-selection background models ###
+class _CanvasTargetSelectionRasterResult(tuple):
+    """Two-value raster result with optional per-face stair details."""
+
+    stair_face_indices: tuple[tuple[str, tuple[int, ...]], ...]
+
+    def __new__(
+        cls,
+        surface_ids: tuple[str, ...],
+        object_ids: tuple[str, ...],
+        stair_face_indices: tuple[tuple[str, tuple[int, ...]], ...] = (),
+    ) -> "_CanvasTargetSelectionRasterResult":
+        instance = super().__new__(cls, (surface_ids, object_ids))
+        instance.stair_face_indices = stair_face_indices
+        return instance
+
+
 @dataclass(frozen=True)
 class _CanvasRectangleSelectionTask:
     """Immutable visible-target input for one Canvas box selection."""
@@ -3863,7 +3879,7 @@ class _CanvasRectangleSelectionTask:
     request_revision: int
     geometry_revision: int
     projected_targets: tuple[
-        tuple[str, str, np.ndarray, np.ndarray],
+        tuple[str, str, np.ndarray, np.ndarray, np.ndarray],
         ...,
     ]
     rectangle: tuple[int, int, int, int]
@@ -3879,6 +3895,7 @@ class _CanvasRectangleSelectionResult:
     surface_ids: tuple[str, ...]
     object_ids: tuple[str, ...]
     additive: bool
+    stair_face_indices: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
 
 # ### Tour overlay models ###
@@ -4366,6 +4383,7 @@ class GlbViewerWidget(QWidget):
     tour_edit_finished = Signal(str, str, object, object, bool)
     canvas_surface_selection_changed = Signal(object)
     canvas_stair_part_selection_changed = Signal(object)
+    canvas_stair_face_deletion_requested = Signal(object)
     canvas_stair_deletion_requested = Signal(object)
     canvas_stair_preview_cancelled = Signal()
     architectural_trim_placement_requested = Signal(object)
@@ -4721,6 +4739,10 @@ class GlbViewerWidget(QWidget):
         self._canvas_stair_part_targets: dict[str, PreviewStairPart] = {}
         self._selected_canvas_stair_part_ids: tuple[str, ...] = ()
         self._canvas_stair_part_selection_items: list[gl.GLLinePlotItem] = []
+        self._selected_canvas_stair_face_refs: tuple[tuple[str, int], ...] = ()
+        self._canvas_stair_face_selection_item: _WireframeOverlayMeshItem | None = (
+            None
+        )
         self._highlighted_canvas_stair_part_ids: tuple[str, ...] = ()
         self._atlas_stair_part_highlight_items: list[gl.GLLinePlotItem] = []
         self._canvas_stair_preview_stair_index: int | None = None
@@ -4982,6 +5004,7 @@ class GlbViewerWidget(QWidget):
         self._selected_directional_light_id = normalized_id
         self._invalidate_directional_light_projection_collision_cache()
         if normalized_id is not None:
+            self.set_selected_canvas_stair_face_refs(())
             self._set_selected_canvas_opening_key(None)
             self.set_selected_placed_object_ids(())
             self.set_selected_canvas_surface_ids(())
@@ -6561,6 +6584,9 @@ class GlbViewerWidget(QWidget):
                 and self._canvas_stair_part_is_visible(part)
             )
         )
+        self.set_selected_canvas_stair_face_refs(
+            self._selected_canvas_stair_face_refs
+        )
         self.set_selected_architectural_trim_part_ids(
             semantic_id
             for semantic_id in self._selected_architectural_trim_part_ids
@@ -6609,6 +6635,7 @@ class GlbViewerWidget(QWidget):
         self._invalidate_canvas_rectangle_selection_requests()
         self._apply_render_display_options()
         self._refresh_canvas_stair_part_selection_outlines()
+        self._refresh_canvas_stair_face_selection_overlay()
         self._refresh_atlas_stair_part_highlight_outlines()
         self.view.update()
 
@@ -6659,7 +6686,25 @@ class GlbViewerWidget(QWidget):
         )
         preview_hides_original = self._get_preview_hidden_stair_index() is not None
         self._cancel_canvas_rectangle_selection()
+        previous_targets = self._canvas_stair_part_targets
+        retained_face_refs = tuple(
+            (semantic_id, source_face_index)
+            for semantic_id, source_face_index in (
+                self._selected_canvas_stair_face_refs
+            )
+            if (
+                semantic_id in previous_targets
+                and semantic_id in normalized_targets
+                and previous_targets[
+                    semantic_id
+                ].source_topology_fingerprint
+                == normalized_targets[
+                    semantic_id
+                ].source_topology_fingerprint
+            )
+        )
         self._canvas_stair_part_targets = normalized_targets
+        self.set_selected_canvas_stair_face_refs(retained_face_refs)
         self.set_selected_canvas_stair_part_ids(
             semantic_id
             for semantic_id in self._selected_canvas_stair_part_ids
@@ -6689,6 +6734,55 @@ class GlbViewerWidget(QWidget):
         """Return selected stable semantic stair-part IDs in pick order."""
 
         return self._selected_canvas_stair_part_ids
+
+    def get_selected_canvas_stair_face_refs(self) -> tuple[tuple[str, int], ...]:
+        """Return rectangle-selected canonical stair faces in pick order."""
+
+        return self._selected_canvas_stair_face_refs
+
+    def set_selected_canvas_stair_face_refs(self, face_refs: object) -> bool:
+        """Select known individual stair faces without selecting their group."""
+
+        self._invalidate_external_canvas_rectangle_selection()
+        try:
+            requested_refs = tuple(face_refs)  # type: ignore[arg-type]
+        except TypeError:
+            return False
+        normalized_refs: list[tuple[str, int]] = []
+        for raw_ref in requested_refs:
+            if not isinstance(raw_ref, tuple | list) or len(raw_ref) != 2:
+                continue
+            semantic_id = str(raw_ref[0]).strip()
+            try:
+                source_face_index = int(raw_ref[1])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            part = self._canvas_stair_part_targets.get(semantic_id)
+            face_ref = (semantic_id, source_face_index)
+            if (
+                part is None
+                or not self._canvas_stair_part_is_visible(part)
+                or source_face_index not in part.source_face_indices
+                or face_ref in normalized_refs
+            ):
+                continue
+            normalized_refs.append(face_ref)
+        normalized = tuple(normalized_refs)
+        if normalized:
+            self.set_selected_directional_light_id(None)
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+            self.set_selected_architectural_trim_part_ids(())
+            self.set_selected_canvas_surface_ids(())
+            if self._selected_canvas_stair_part_ids:
+                self._selected_canvas_stair_part_ids = ()
+                self._refresh_canvas_stair_part_selection_outlines()
+                self.canvas_stair_part_selection_changed.emit(())
+        if normalized == self._selected_canvas_stair_face_refs:
+            return False
+        self._selected_canvas_stair_face_refs = normalized
+        self._refresh_canvas_stair_face_selection_overlay()
+        return True
 
     def get_canvas_stair_part_target(
         self,
@@ -6752,6 +6846,9 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            if self._selected_canvas_stair_face_refs:
+                self._selected_canvas_stair_face_refs = ()
+                self._refresh_canvas_stair_face_selection_overlay()
             self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
@@ -6800,6 +6897,9 @@ class GlbViewerWidget(QWidget):
             return False
         if normalized_id is None and additive:
             return False
+
+        if self._selected_canvas_stair_face_refs:
+            self.set_selected_canvas_stair_face_refs(())
 
         selected_ids = list(self._selected_canvas_stair_part_ids)
         if normalized_id is None:
@@ -7107,6 +7207,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_canvas_stair_face_refs(())
             self.set_selected_directional_light_id(None)
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
@@ -7465,6 +7566,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_canvas_stair_face_refs(())
             self.set_selected_directional_light_id(None)
             self.set_selected_canvas_stair_part_ids(())
             self.set_selected_architectural_trim_part_ids(())
@@ -8048,6 +8150,7 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_opening_edit_drag()
         self._selected_canvas_opening_key = normalized_key
         if normalized_key is not None:
+            self.set_selected_canvas_stair_face_refs(())
             self.set_selected_directional_light_id(None)
             if self.is_window_placement_active():
                 self.cancel_window_placement(status_message=None)
@@ -8491,6 +8594,13 @@ class GlbViewerWidget(QWidget):
             self.set_selected_directional_light_id(None)
             self.directional_light_deletion_requested.emit(selected_light_id)
             return
+        selected_stair_face_refs = self._selected_canvas_stair_face_refs
+        if self._window_editing_enabled and selected_stair_face_refs:
+            self.set_selected_canvas_stair_face_refs(())
+            self.canvas_stair_face_deletion_requested.emit(
+                selected_stair_face_refs
+            )
+            return
         selected_stair_ids = tuple(
             dict.fromkeys(
                 part.stair_id
@@ -8591,6 +8701,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_canvas_stair_face_refs(())
             self.set_selected_directional_light_id(None)
             self.set_selected_canvas_stair_part_ids(())
             self.set_selected_architectural_trim_part_ids(())
@@ -13037,7 +13148,10 @@ class GlbViewerWidget(QWidget):
         end: QPointF,
     ) -> (
         tuple[
-            tuple[tuple[str, str, np.ndarray, np.ndarray], ...],
+            tuple[
+                tuple[str, str, np.ndarray, np.ndarray, np.ndarray],
+                ...,
+            ],
             tuple[int, int, int, int],
         ]
         | None
@@ -13133,17 +13247,35 @@ class GlbViewerWidget(QWidget):
         if captured is None:
             return None
         projected_geometry, rectangle = captured
+        logical_indices_by_geometry = getattr(
+            projected_geometry,
+            "logical_face_indices_by_geometry",
+            None,
+        )
+        projected_geometry = tuple(projected_geometry)
+        if logical_indices_by_geometry is None:
+            logical_indices_by_geometry = tuple(
+                np.arange(len(faces), dtype=np.int64)
+                for _vertices, faces in projected_geometry
+            )
         return (
             tuple(
-                (target_type, target_id, projected_vertices, faces)
+                (
+                    target_type,
+                    target_id,
+                    projected_vertices,
+                    faces,
+                    source_face_indices,
+                )
                 for (
                     target_type,
                     target_id,
                     _vertices,
                     _faces,
-                ), (projected_vertices, faces) in zip(
+                ), (projected_vertices, faces), source_face_indices in zip(
                     target_geometry,
                     projected_geometry,
+                    logical_indices_by_geometry,
                     strict=True,
                 )
             ),
@@ -13255,6 +13387,24 @@ class GlbViewerWidget(QWidget):
                 if semantic_id in visible_stair_part_ids
             )
         )
+        stair_face_refs: list[tuple[str, int]] = []
+        for semantic_id, local_face_indices in result.stair_face_indices:
+            part = self._canvas_stair_part_targets.get(semantic_id)
+            if (
+                part is None
+                or semantic_id not in visible_stair_part_ids
+                or self._canvas_stair_part_is_preview_hidden(part)
+            ):
+                continue
+            for local_face_index in local_face_indices:
+                if not 0 <= local_face_index < len(part.source_face_indices):
+                    continue
+                face_ref = (
+                    semantic_id,
+                    part.source_face_indices[local_face_index],
+                )
+                if face_ref not in stair_face_refs:
+                    stair_face_refs.append(face_ref)
         surface_ids = tuple(
             dict.fromkeys(
                 surface_id
@@ -13293,6 +13443,18 @@ class GlbViewerWidget(QWidget):
             )
             self.set_selected_architectural_trim_part_ids(
                 tuple(dict.fromkeys((*current_trim_part_ids, *trim_part_ids)))
+            )
+            return
+        if stair_face_refs:
+            current_stair_face_refs = (
+                self._selected_canvas_stair_face_refs if result.additive else ()
+            )
+            self.set_selected_canvas_stair_face_refs(
+                tuple(
+                    dict.fromkeys(
+                        (*current_stair_face_refs, *stair_face_refs)
+                    )
+                )
             )
             return
         if stair_part_ids:
@@ -14366,6 +14528,52 @@ class GlbViewerWidget(QWidget):
             if item in self.view.items:
                 self.view.removeItem(item)
         self._canvas_stair_part_selection_items = []
+
+    def _refresh_canvas_stair_face_selection_overlay(self) -> None:
+        """Highlight only the stair triangles captured by a rectangle drag."""
+
+        self._remove_canvas_stair_face_selection_overlay()
+        if self.model is None or not self._selected_canvas_stair_face_refs:
+            return
+        selected_triangles: list[np.ndarray] = []
+        for semantic_id, source_face_index in self._selected_canvas_stair_face_refs:
+            part = self._canvas_stair_part_targets.get(semantic_id)
+            if (
+                part is None
+                or not self._canvas_stair_part_is_visible(part)
+                or self._canvas_stair_part_is_preview_hidden(part)
+            ):
+                continue
+            try:
+                local_face_index = part.source_face_indices.index(source_face_index)
+            except ValueError:
+                continue
+            vertices = np.asarray(part.mesh.vertices, dtype=float)
+            faces = np.asarray(part.mesh.faces, dtype=np.int64)
+            selected_triangles.append(vertices[faces[local_face_index]])
+        if not selected_triangles:
+            return
+        selected_vertices = np.ascontiguousarray(
+            np.asarray(selected_triangles, dtype=np.float32).reshape((-1, 3)),
+            dtype=np.float32,
+        )
+        selected_faces = np.arange(
+            len(selected_vertices),
+            dtype=np.int32,
+        ).reshape((-1, 3))
+        item = _build_face_selection_item(selected_vertices, selected_faces)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._canvas_stair_face_selection_item = item
+        self.view.update()
+
+    def _remove_canvas_stair_face_selection_overlay(self) -> None:
+        """Remove the individual-face overlay without changing selection."""
+
+        item = self._canvas_stair_face_selection_item
+        if item is not None and item in self.view.items:
+            self.view.removeItem(item)
+        self._canvas_stair_face_selection_item = None
 
     def _refresh_atlas_stair_part_highlight_outlines(self) -> None:
         """Render non-selecting green Atlas highlights for stair parts."""
@@ -17359,6 +17567,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_vertex_selection_items()
             self._refresh_canvas_surface_selection_outlines()
             self._refresh_canvas_stair_part_selection_outlines()
+            self._refresh_canvas_stair_face_selection_overlay()
             self._refresh_architectural_trim_selection_outlines()
             self._refresh_canvas_face_orientation_item()
             self._refresh_canvas_extrudable_face_outlines()
@@ -17517,6 +17726,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_vertex_selection_items()
         self._refresh_canvas_surface_selection_outlines()
         self._refresh_canvas_stair_part_selection_outlines()
+        self._refresh_canvas_stair_face_selection_overlay()
         self._refresh_architectural_trim_selection_outlines()
         self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
@@ -20432,6 +20642,7 @@ class GlbViewerWidget(QWidget):
         self._canvas_surface_selection_items = []
         self._canvas_surface_selection_vertex_item = None
         self._canvas_stair_part_selection_items = []
+        self._canvas_stair_face_selection_item = None
         self._architectural_trim_selection_items = []
         self._atlas_architectural_trim_part_highlight_items = []
         self._architectural_trim_gizmo_items = []
@@ -22192,54 +22403,178 @@ def _get_visible_projected_faces_at_point(
 
 
 def _rasterize_canvas_target_selection(
-    projected_targets: Sequence[tuple[str, str, np.ndarray, np.ndarray]],
+    projected_targets: Sequence[tuple],
     rectangle: QRect,
     *,
     cancel_event: threading.Event | None = None,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> _CanvasTargetSelectionRasterResult:
     """Depth-test a box and return visible surface and object target IDs."""
 
+    surface_ids, object_ids, stair_face_indices = (
+        _rasterize_canvas_target_selection_with_stair_faces(
+            projected_targets,
+            rectangle,
+            cancel_event=cancel_event,
+        )
+    )
+    visible_surface_ids = tuple(
+        dict.fromkeys(
+            (
+                *surface_ids,
+                *(semantic_id for semantic_id, _indices in stair_face_indices),
+            )
+        )
+    )
+    return _CanvasTargetSelectionRasterResult(
+        visible_surface_ids,
+        object_ids,
+        stair_face_indices,
+    )
+
+
+def _rasterize_canvas_target_selection_with_stair_faces(
+    projected_targets: Sequence[tuple],
+    rectangle: QRect,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[tuple[str, tuple[int, ...]], ...],
+]:
+    """Depth-test a box while retaining individual visible stair triangles."""
+
+    normalized_targets = tuple(
+        _normalize_canvas_projected_selection_target(target)
+        for target in projected_targets
+    )
     projected_geometry = tuple(
         (projected_vertices, faces)
-        for _target_type, _target_id, projected_vertices, faces in projected_targets
-    )
-    logical_target_indices = tuple(
-        np.full(len(faces), target_index, dtype=np.int64)
-        for target_index, (
+        for (
             _target_type,
             _target_id,
-            _projected_vertices,
+            projected_vertices,
             faces,
-        ) in enumerate(projected_targets)
+            _source_face_indices,
+        ) in normalized_targets
     )
+    logical_target_indices: list[np.ndarray] = []
+    logical_targets: dict[int, tuple[str, str, int | None]] = {}
+    next_logical_index = 0
+    for (
+        target_type,
+        target_id,
+        _projected_vertices,
+        faces,
+        source_face_indices,
+    ) in normalized_targets:
+        face_count = len(faces)
+        if target_type == CANVAS_SELECTION_TARGET_STAIR_PART:
+            logical_index_by_source_face: dict[int, int] = {}
+            logical_indices = np.empty(face_count, dtype=np.int64)
+            for clipped_face_index, source_face_index in enumerate(
+                source_face_indices
+            ):
+                normalized_source_index = int(source_face_index)
+                logical_index = logical_index_by_source_face.get(
+                    normalized_source_index
+                )
+                if logical_index is None:
+                    logical_index = next_logical_index
+                    next_logical_index += 1
+                    logical_index_by_source_face[
+                        normalized_source_index
+                    ] = logical_index
+                    logical_targets[logical_index] = (
+                        target_type,
+                        target_id,
+                        normalized_source_index,
+                    )
+                logical_indices[clipped_face_index] = logical_index
+        else:
+            logical_indices = np.full(
+                face_count,
+                next_logical_index,
+                dtype=np.int64,
+            )
+            logical_targets[next_logical_index] = (
+                target_type,
+                target_id,
+                None,
+            )
+            next_logical_index += 1
+        logical_target_indices.append(logical_indices)
     selected_target_indices = _rasterize_face_selection(
         projected_geometry,
         rectangle,
         cancel_event=cancel_event,
-        logical_face_indices_by_geometry=logical_target_indices,
+        logical_face_indices_by_geometry=tuple(logical_target_indices),
         depth_tie_epsilon=CANVAS_SELECTION_DEPTH_TIE_EPSILON,
     )
     surface_ids: list[str] = []
     object_ids: list[str] = []
-    for target_index, (target_type, target_id, _vertices, _faces) in enumerate(
-        projected_targets
-    ):
-        if target_index not in selected_target_indices:
+    stair_faces_by_id: dict[str, list[int]] = {}
+    for logical_index in sorted(selected_target_indices):
+        logical_target = logical_targets.get(logical_index)
+        if logical_target is None:
             continue
+        target_type, target_id, face_index = logical_target
         if target_type == CANVAS_SELECTION_TARGET_OBJECT:
             if target_id not in object_ids:
                 object_ids.append(target_id)
+        elif target_type == CANVAS_SELECTION_TARGET_STAIR_PART:
+            if face_index is not None:
+                stair_faces_by_id.setdefault(target_id, []).append(face_index)
         elif (
             target_type
             in {
                 CANVAS_SELECTION_TARGET_SURFACE,
-                CANVAS_SELECTION_TARGET_STAIR_PART,
                 CANVAS_SELECTION_TARGET_ARCHITECTURAL_TRIM_PART,
             }
             and target_id not in surface_ids
         ):
             surface_ids.append(target_id)
-    return tuple(surface_ids), tuple(object_ids)
+    return (
+        tuple(surface_ids),
+        tuple(object_ids),
+        tuple(
+            (semantic_id, tuple(face_indices))
+            for semantic_id, face_indices in stair_faces_by_id.items()
+        ),
+    )
+
+
+def _normalize_canvas_projected_selection_target(
+    raw_target: tuple,
+) -> tuple[str, str, np.ndarray, np.ndarray, np.ndarray]:
+    """Return one target with clipped faces mapped to source face indices."""
+
+    if len(raw_target) == 4:
+        target_type, target_id, projected_vertices, faces = raw_target
+        source_face_indices = np.arange(len(faces), dtype=np.int64)
+    elif len(raw_target) == 5:
+        (
+            target_type,
+            target_id,
+            projected_vertices,
+            faces,
+            source_face_indices,
+        ) = raw_target
+    else:
+        raise ValueError("Canvas selection targets require four or five values.")
+    normalized_faces = np.asarray(faces, dtype=np.int64)
+    normalized_source_indices = np.asarray(source_face_indices, dtype=np.int64)
+    if normalized_source_indices.shape != (len(normalized_faces),):
+        raise ValueError(
+            "Canvas selection source face indices must match clipped faces."
+        )
+    return (
+        str(target_type),
+        str(target_id),
+        np.asarray(projected_vertices, dtype=float),
+        normalized_faces,
+        normalized_source_indices,
+    )
 
 
 def _run_canvas_rectangle_selection_task(
@@ -22252,11 +22587,22 @@ def _run_canvas_rectangle_selection_task(
     if cancel_event.is_set():
         return
     try:
-        surface_ids, object_ids = _rasterize_canvas_target_selection(
+        raster_result = _rasterize_canvas_target_selection(
             task.projected_targets,
             QRect(*task.rectangle),
             cancel_event=cancel_event,
         )
+        surface_ids, object_ids = raster_result
+        stair_face_indices = getattr(raster_result, "stair_face_indices", ())
+        if stair_face_indices:
+            stair_semantic_ids = {
+                semantic_id for semantic_id, _face_indices in stair_face_indices
+            }
+            surface_ids = tuple(
+                surface_id
+                for surface_id in surface_ids
+                if surface_id not in stair_semantic_ids
+            )
     except Exception:
         return
     if cancel_event.is_set():
@@ -22270,6 +22616,7 @@ def _run_canvas_rectangle_selection_task(
         surface_ids=surface_ids,
         object_ids=object_ids,
         additive=task.additive,
+        stair_face_indices=stair_face_indices,
     )
     try:
         viewer._canvas_rectangle_selection_completed.emit(result)
@@ -24296,6 +24643,11 @@ def _canvas_stair_parts_match_geometry(
             or first.stair_index != second.stair_index
             or first.part_kind != second.part_kind
             or first.level_indices != second.level_indices
+            or first.source_face_indices != second.source_face_indices
+            or (
+                first.source_topology_fingerprint
+                != second.source_topology_fingerprint
+            )
         ):
             return False
         first_vertices = np.asarray(first.mesh.vertices, dtype=float)

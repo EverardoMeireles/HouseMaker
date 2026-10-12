@@ -325,6 +325,160 @@ class StairGeometryTests(unittest.TestCase):
             & _face_coordinates(targets_by_kind[STAIR_PART_TREADS].mesh)
         )
 
+    def test_removed_stair_faces_keep_stable_source_indices_in_preview_and_export(
+        self,
+    ) -> None:
+        ground_level = _build_level(2, "Ground")
+        upper_level = _build_level(3, "Story")
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=0.0,
+            start_a_y=0.0,
+            start_b_x=0.0,
+            start_b_y=50.0,
+            end_level_index=3,
+            end_a_x=200.0,
+            end_a_y=0.0,
+            end_b_x=200.0,
+            end_b_y=50.0,
+            stringer_placement=STAIR_STRINGER_BOTH,
+        )
+        levels = [ground_level, upper_level]
+        original = next(
+            part
+            for part in build_canvas_stair_part_targets(levels, [stair])
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        removed_source_index = original.source_face_indices[len(original.mesh.faces) // 2]
+
+        revised_stair = replace(
+            stair,
+            removed_face_indices=((STAIR_PART_TREADS, removed_source_index),),
+            removed_face_topology_fingerprints=(
+                (
+                    STAIR_PART_TREADS,
+                    original.source_topology_fingerprint,
+                ),
+            ),
+        )
+        revised = next(
+            part
+            for part in build_canvas_stair_part_targets(levels, [revised_stair])
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        exported = next(
+            named_mesh.mesh
+            for named_mesh in build_stair_meshes(levels, [revised_stair])
+            if named_mesh.mesh.metadata["housemaker_stair_part"]
+            == STAIR_PART_TREADS
+        )
+
+        self.assertEqual(len(revised.mesh.faces), len(original.mesh.faces) - 1)
+        self.assertNotIn(removed_source_index, revised.source_face_indices)
+        self.assertEqual(
+            revised.source_face_indices,
+            tuple(
+                source_index
+                for source_index in original.source_face_indices
+                if source_index != removed_source_index
+            ),
+        )
+        self.assertEqual(len(exported.faces), len(revised.mesh.faces))
+
+        translated_levels = [
+            _build_level(
+                2,
+                "Ground",
+                offset_x_meters=8.0,
+                offset_y_meters=-3.0,
+            ),
+            _build_level(
+                3,
+                "Story",
+                offset_x_meters=8.0,
+                offset_y_meters=-3.0,
+            ),
+        ]
+        translated = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                translated_levels,
+                [revised_stair],
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        self.assertEqual(
+            translated.source_topology_fingerprint,
+            original.source_topology_fingerprint,
+        )
+        self.assertEqual(len(translated.mesh.faces), len(original.mesh.faces) - 1)
+
+    def test_removed_stair_faces_are_ignored_after_topology_changes(self) -> None:
+        ground_level = _build_level(2, "Ground")
+        upper_level = _build_level(3, "Story")
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=0.0,
+            start_a_y=0.0,
+            start_b_x=0.0,
+            start_b_y=50.0,
+            end_level_index=3,
+            end_a_x=200.0,
+            end_a_y=0.0,
+            end_b_x=200.0,
+            end_b_y=50.0,
+        )
+        original = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                [ground_level, upper_level],
+                [stair],
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        removed_source_index = original.source_face_indices[0]
+        stair_with_removed_face = replace(
+            stair,
+            removed_face_indices=((STAIR_PART_TREADS, removed_source_index),),
+            removed_face_topology_fingerprints=(
+                (
+                    STAIR_PART_TREADS,
+                    original.source_topology_fingerprint,
+                ),
+            ),
+        )
+        ground_level.height_meters += 0.35
+
+        changed_baseline = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                [ground_level, upper_level],
+                [stair],
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        changed_with_stale_removal = next(
+            part
+            for part in build_canvas_stair_part_targets(
+                [ground_level, upper_level],
+                [stair_with_removed_face],
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+
+        self.assertNotEqual(
+            original.source_topology_fingerprint,
+            changed_baseline.source_topology_fingerprint,
+        )
+        self.assertEqual(
+            changed_with_stale_removal.source_face_indices,
+            changed_baseline.source_face_indices,
+        )
+        self.assertEqual(
+            len(changed_with_stale_removal.mesh.faces),
+            len(changed_baseline.mesh.faces),
+        )
+
     def test_supported_risers_contain_only_exposed_step_bands(self) -> None:
         ground_level = _build_level(2, "Ground")
         ground_level.height_meters = 0.52

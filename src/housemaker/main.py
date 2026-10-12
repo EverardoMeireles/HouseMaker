@@ -322,7 +322,6 @@ from housemaker.scene_export import (
 )
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
-    DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
 )
@@ -1563,11 +1562,10 @@ class BlueprintWorkspace(QWidget):
         self._viewer_floor_thickness_by_level_index: dict[int, float] = {}
         self._reset_viewer_doorway_snapshots()
         self._mesh_edit_update_delay_seconds = DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
-        self._wall_vertex_update_delay_seconds = (
-            DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
-        )
         self._pending_wall_vertex_mesh_update = False
         self._pending_wall_vertex_doorway_level_indices: set[int] = set()
+        self._pending_open_space_corner_mesh_update = False
+        self._pending_deleted_wall_cleanup = False
         self._is_canvas_wall_vertex_interaction_active = False
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
@@ -1660,7 +1658,7 @@ class BlueprintWorkspace(QWidget):
         self._wall_vertex_update_timer = QTimer(self)
         self._wall_vertex_update_timer.setSingleShot(True)
         self._wall_vertex_update_timer.setInterval(
-            round(self._wall_vertex_update_delay_seconds * 1000.0)
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
         )
         self._wall_vertex_update_timer.timeout.connect(
             self._commit_pending_wall_vertex_update
@@ -2344,9 +2342,6 @@ class BlueprintWorkspace(QWidget):
         self._set_mesh_edit_update_delay_seconds(
             generation_settings.mesh_edit_update_delay_seconds
         )
-        self._set_wall_vertex_update_delay_seconds(
-            generation_settings.wall_vertex_update_delay_seconds
-        )
         self._set_canvas_3d_navigation_shortcut(
             generation_settings.canvas_3d_navigation_toggle_hotkey
         )
@@ -2582,6 +2577,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_stair_part_selection_changed.connect(
             self._handle_canvas_stair_part_selection_changed
+        )
+        self.viewer.canvas_stair_face_deletion_requested.connect(
+            self._handle_canvas_stair_face_deletion_requested
         )
         self.viewer.architectural_trim_placement_requested.connect(
             self._handle_architectural_trim_placement_requested
@@ -4146,11 +4144,17 @@ class BlueprintWorkspace(QWidget):
         self.canvas.wall_vertex_interaction_changed.connect(
             self._handle_canvas_wall_vertex_interaction_changed
         )
+        self.canvas.wall_vertex_chain_changed.connect(
+            self._handle_canvas_wall_vertex_chain_changed
+        )
         self.canvas.selected_vertices_changed.connect(
             self._handle_canvas_selected_vertex_changed
         )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
         self.canvas.open_spaces_changed.connect(self._handle_open_spaces_changed)
+        self.canvas.open_space_corner_edit_committed.connect(
+            self._handle_open_space_corner_edit_committed
+        )
         self.canvas.open_space_placement_changed.connect(
             self._handle_open_space_placement_changed
         )
@@ -4746,7 +4750,12 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Commit one validated window model to the active Canvas consumer."""
 
-        wall_targets = tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+        wall_targets = tuple(
+            build_fixed_surfaces(
+                self._build_viewer_preview_levels(),
+                stairs=self.stairs,
+            )
+        )
         if not self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
             self._set_canvas_viewer_targets(wall_targets)
             self._sync_viewer_architectural_trim_placed_object_bindings(
@@ -4956,7 +4965,7 @@ class BlueprintWorkspace(QWidget):
         """Reuse structural surfaces for one exact scene revision."""
 
         if levels is not self.levels:
-            return tuple(build_base_fixed_surfaces(levels))
+            return tuple(build_base_fixed_surfaces(levels, stairs=self.stairs))
         if self._is_applying_project_state:
             if self._project_apply_base_surfaces is None:
                 all_included_levels = tuple(
@@ -4966,6 +4975,7 @@ class BlueprintWorkspace(QWidget):
                 surfaces = tuple(
                     build_base_fixed_surfaces(
                         all_included_levels,
+                        stairs=self.stairs,
                         clip_open_spaces=False,
                     )
                 )
@@ -4975,7 +4985,12 @@ class BlueprintWorkspace(QWidget):
                 }
             return self._project_apply_base_surfaces
         if self._base_fixed_surfaces_cache_revision != self._viewer_preview_revision:
-            surfaces = tuple(build_base_fixed_surfaces(self.levels))
+            surfaces = tuple(
+                build_base_fixed_surfaces(
+                    self.levels,
+                    stairs=self.stairs,
+                )
+            )
             self._base_fixed_surfaces_cache = surfaces
             self._base_fixed_surfaces_cache_by_id = {
                 surface.surface_id: surface for surface in surfaces
@@ -5000,6 +5015,7 @@ class BlueprintWorkspace(QWidget):
             self._project_apply_fixed_surfaces = tuple(
                 build_fixed_surfaces(
                     all_included_levels,
+                    stairs=self.stairs,
                     base_surfaces=self._get_base_fixed_surface_snapshot(
                         self.levels
                     ),
@@ -5200,7 +5216,10 @@ class BlueprintWorkspace(QWidget):
 
         undo_state = self._capture_canvas_topology_undo_state()
         try:
-            structural_surfaces = build_base_fixed_surfaces(self.levels)
+            structural_surfaces = build_base_fixed_surfaces(
+                self.levels,
+                stairs=self.stairs,
+            )
             trim = add_architectural_trim(
                 level,
                 raw_request,
@@ -5790,7 +5809,10 @@ class BlueprintWorkspace(QWidget):
         if len(wall_surfaces_by_id) != len(host_surface_ids):
             fallback_surfaces = {
                 surface.surface_id: surface
-                for surface in build_base_fixed_surfaces((owner_level,))
+                for surface in build_base_fixed_surfaces(
+                    (owner_level,),
+                    stairs=self.stairs,
+                )
             }
             for surface_id in host_surface_ids:
                 if surface_id in fallback_surfaces:
@@ -6050,7 +6072,10 @@ class BlueprintWorkspace(QWidget):
                 surface = next(
                     (
                         candidate
-                        for candidate in build_fixed_surfaces(self.levels)
+                        for candidate in build_fixed_surfaces(
+                            self.levels,
+                            stairs=self.stairs,
+                        )
                         if candidate.surface_id == normalized_surface_id
                     ),
                     None,
@@ -6260,6 +6285,11 @@ class BlueprintWorkspace(QWidget):
             CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
             CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
         }
+        if tracks_surface_bindings:
+            # A second edit can join the same delayed mesh-rebuild window. Close
+            # the preceding undo transaction against the still-live bindings
+            # before capturing the next transaction's baseline.
+            self._finalize_blueprint_surface_binding_undo_state()
         assignments = (
             self.surface_texture_generation.snapshot_assignments()
             if tracks_surface_bindings
@@ -6600,6 +6630,11 @@ class BlueprintWorkspace(QWidget):
         if not self._canvas_undo_stack:
             self.viewer.set_surface_tools_status("No Canvas action to undo.")
             return
+        # A topology edit may still be waiting for the shared mesh timer. Its
+        # assignments have not been reconciled yet, so the current bindings are
+        # also its valid post-edit bindings. Finalizing here prevents an early
+        # Ctrl+Z from treating those unchanged bindings as an unsafe conflict.
+        self._finalize_blueprint_surface_binding_undo_state()
         state = self._canvas_undo_stack[-1]
         skipped_texture_bindings = 0
         self._is_restoring_canvas_undo = True
@@ -7224,6 +7259,9 @@ class BlueprintWorkspace(QWidget):
         level = self._get_level_by_index(state.level_index)
         if level is None:
             raise ValueError("The Canvas level in this undo step no longer exists.")
+        restorable_assignment_ids = (
+            self._find_restorable_blueprint_surface_binding_ids(state)
+        )
         if state.level_offsets_meters is not None:
             (
                 level.offset_x_meters,
@@ -7277,19 +7315,20 @@ class BlueprintWorkspace(QWidget):
         if other_doorways_changed or state.architectural_trims_by_level:
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
-        return self._restore_blueprint_surface_bindings(state)
+        return self._restore_blueprint_surface_bindings(
+            state,
+            restorable_assignment_ids=restorable_assignment_ids,
+        )
 
-    def _restore_blueprint_surface_bindings(
+    def _find_restorable_blueprint_surface_binding_ids(
         self,
         state: _CanvasBlueprintUndoState,
-    ) -> int:
-        """Restore hole-affected targets without replacing newer texture data."""
+    ) -> frozenset[str]:
+        """Identify safe bindings before restoring their previous geometry."""
 
         expected_after = state.assignment_targets_after
         if expected_after is None:
-            return len(state.assignments)
-        if not state.assignments:
-            return 0
+            return frozenset()
         expected_by_id = {
             assignment.assignment_id: assignment for assignment in expected_after
         }
@@ -7297,8 +7336,8 @@ class BlueprintWorkspace(QWidget):
             assignment.assignment_id: assignment
             for assignment in self.surface_texture_generation.snapshot_assignments()
         }
-        restorable_assignments = tuple(
-            assignment
+        return frozenset(
+            assignment.assignment_id
             for assignment in state.assignments
             if (
                 assignment.assignment_id in expected_by_id
@@ -7310,7 +7349,26 @@ class BlueprintWorkspace(QWidget):
                 )
             )
         )
-        restorable_assignment_ids = {
+
+    def _restore_blueprint_surface_bindings(
+        self,
+        state: _CanvasBlueprintUndoState,
+        *,
+        restorable_assignment_ids: frozenset[str],
+    ) -> int:
+        """Restore hole-affected targets without replacing newer texture data."""
+
+        expected_after = state.assignment_targets_after
+        if expected_after is None:
+            return len(state.assignments)
+        if not state.assignments:
+            return 0
+        restorable_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if assignment.assignment_id in restorable_assignment_ids
+        )
+        restored_assignment_ids = {
             assignment.assignment_id for assignment in restorable_assignments
         }
         self.surface_texture_generation.restore_assignment_target_snapshot(
@@ -7334,7 +7392,7 @@ class BlueprintWorkspace(QWidget):
         restored_assignments_by_id = {
             assignment.assignment_id: assignment
             for assignment in self.surface_texture_generation.snapshot_assignments()
-            if assignment.assignment_id in restorable_assignment_ids
+            if assignment.assignment_id in restored_assignment_ids
         }
         live_sources: dict[str, AtlasObjectTextureSource] = {}
         for assignment in restored_assignments_by_id.values():
@@ -9485,7 +9543,12 @@ class BlueprintWorkspace(QWidget):
         if cache_is_current:
             assert cached_model is not None
             self._set_canvas_viewer_targets(
-                tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+                tuple(
+                    build_fixed_surfaces(
+                        self._build_viewer_preview_levels(),
+                        stairs=self.stairs,
+                    )
+                )
             )
             self._sync_viewer_architectural_trim_placed_object_bindings(
                 cached_model
@@ -14767,7 +14830,11 @@ class BlueprintWorkspace(QWidget):
             generated_trim_keys,
         )
         exported_surface_ids = {
-            surface.surface_id for surface in build_fixed_surfaces(export_levels)
+            surface.surface_id
+            for surface in build_fixed_surfaces(
+                export_levels,
+                stairs=self.stairs,
+            )
         }
         exported_surface_ids.update(
             semantic_id
@@ -16567,6 +16634,7 @@ class BlueprintWorkspace(QWidget):
             self._architectural_trim_mesh_update_timer,
             self._level_transform_mesh_update_timer,
             self._stair_point_mesh_update_timer,
+            self._wall_vertex_update_timer,
         )
         active_timers = tuple(timer.isActive() for timer in timers)
         self._mesh_edit_update_delay_seconds = normalized_delay
@@ -16574,26 +16642,6 @@ class BlueprintWorkspace(QWidget):
             timer.setInterval(interval_milliseconds)
             if was_active:
                 timer.start()
-
-    def _set_wall_vertex_update_delay_seconds(
-        self,
-        delay_seconds: float,
-    ) -> None:
-        """Apply the independent wall-vertex rebuild debounce interval."""
-
-        normalized_delay = float(delay_seconds)
-        if normalized_delay <= 0.0:
-            raise ValueError("Wall vertex update delay must be positive.")
-        if normalized_delay == self._wall_vertex_update_delay_seconds:
-            return
-
-        was_active = self._wall_vertex_update_timer.isActive()
-        self._wall_vertex_update_delay_seconds = normalized_delay
-        self._wall_vertex_update_timer.setInterval(
-            max(1, round(normalized_delay * 1000.0))
-        )
-        if was_active:
-            self._wall_vertex_update_timer.start()
 
     def _stage_pending_canvas_opening_snapshots(self) -> None:
         """Stage all stable live openings without refreshing during a drag."""
@@ -18530,7 +18578,12 @@ class BlueprintWorkspace(QWidget):
                     self._is_syncing_canvas_scene_selection = False
             else:
                 self._set_canvas_viewer_targets(
-                    tuple(build_fixed_surfaces(preview_levels)),
+                    tuple(
+                        build_fixed_surfaces(
+                            preview_levels,
+                            stairs=self.stairs,
+                        )
+                    ),
                     preview_levels=preview_levels,
                 )
                 self._sync_viewer_architectural_trim_placed_object_bindings(
@@ -20043,6 +20096,8 @@ class BlueprintWorkspace(QWidget):
             starting_step_edge_points=parameters.starting_step_edge_points,
             stringer_placement=parameters.stringer_placement,
             legacy_part_layout=False,
+            removed_face_indices=(),
+            removed_face_topology_fingerprints=(),
         )
 
     def _handle_stair_parameter_changed(self, _value: object = None) -> None:
@@ -20396,11 +20451,21 @@ class BlueprintWorkspace(QWidget):
     def _handle_open_spaces_changed(self) -> None:
         """Keep hole UI current and retire unrelated delayed mesh work."""
 
-        if self._pending_wall_vertex_mesh_update:
+        if (
+            self._pending_wall_vertex_mesh_update
+            and not self._pending_open_space_corner_mesh_update
+        ):
             self._commit_pending_wall_vertex_update()
         if self._pending_doorway_mesh_level_index is not None:
             self._commit_pending_doorway_mesh_update()
         self._update_open_space_controls()
+
+    def _handle_open_space_corner_edit_committed(self) -> None:
+        """Debounce the 3D rebuild after a 2D opening corner is released."""
+
+        self._pending_open_space_corner_mesh_update = True
+        self._pending_wall_vertex_mesh_update = True
+        self._restart_pending_wall_vertex_update_if_idle()
 
     def _handle_open_space_placement_changed(self, active: bool) -> None:
         """Keep the side-panel tool state synchronized with the Canvas."""
@@ -22731,22 +22796,48 @@ class BlueprintWorkspace(QWidget):
         )
 
     def _handle_doorways_changed(self) -> None:
-        """Commit structural doorway changes without a debounce delay."""
+        """Route placement through the debounce and commit other changes now."""
 
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
         self.current_level.doorways = self.canvas.doorways
+        if self._pending_wall_vertex_mesh_update:
+            self._pending_wall_vertex_doorway_level_indices.add(
+                self.current_level.index
+            )
+            self._restart_pending_wall_vertex_update_if_idle()
+            return
         placements_changed = self._reconcile_door_placements()
-        next_snapshot = self._copy_doorways(self.current_level.doorways)
-        snapshot_changed = bool(
-            self._viewer_doorways_by_level_index.get(self.current_level.index)
-            != next_snapshot
+        committed_snapshot = self._viewer_doorways_by_level_index.get(
+            self.current_level.index
         )
+        next_snapshot = self._copy_doorways(self.current_level.doorways)
+        selected_index = self.canvas.selected_doorway_index
+        committed_count = (
+            0 if committed_snapshot is None else len(committed_snapshot)
+        )
+        is_new_placement = (
+            committed_snapshot is not None
+            and len(next_snapshot) > committed_count
+            and selected_index == len(next_snapshot) - 1
+        )
+        if is_new_placement:
+            self._handle_doorway_dimension_preview_changed()
+            return
+
+        snapshot_changed = bool(
+            committed_snapshot != next_snapshot
+        )
+        topology_changed = self._pending_doorway_bridge_topology_change
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
-        if not snapshot_changed and not placements_changed:
+        if not snapshot_changed and not placements_changed and not topology_changed:
             return
         self._viewer_doorways_by_level_index[self.current_level.index] = next_snapshot
-        self._schedule_viewer_preview_refresh()
+        if topology_changed:
+            self._sync_canvas_wall_mirror_state()
+            self._reconcile_canvas_surface_edit_and_refresh()
+        else:
+            self._schedule_viewer_preview_refresh()
 
     def _handle_doorway_move_drag_started(self) -> None:
         """Hold the old wall mesh while a doorway is moving in the Canvas."""
@@ -23075,6 +23166,8 @@ class BlueprintWorkspace(QWidget):
             if section_name in ("start", "end"):
                 candidate = replace(
                     stair,
+                    removed_face_indices=(),
+                    removed_face_topology_fingerprints=(),
                     **{
                         f"{section_name}_{key}": value
                         for key, value in coordinates.items()
@@ -23088,7 +23181,12 @@ class BlueprintWorkspace(QWidget):
                 sections[section_index] = replace(
                     sections[section_index], **coordinates
                 )
-                candidate = replace(stair, intermediate_sections=tuple(sections))
+                candidate = replace(
+                    stair,
+                    intermediate_sections=tuple(sections),
+                    removed_face_indices=(),
+                    removed_face_topology_fingerprints=(),
+                )
             else:
                 return
             if candidate == stair:
@@ -23132,6 +23230,115 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_stair_delete_requested(self, stair_index: int) -> None:
         self._delete_stair_at_index(stair_index)
+
+    def _handle_canvas_stair_face_deletion_requested(
+        self,
+        raw_face_refs: object,
+    ) -> None:
+        """Persist rectangle-selected stair triangle exclusions as one edit."""
+
+        try:
+            requested_refs = tuple(raw_face_refs)  # type: ignore[arg-type]
+        except TypeError:
+            return
+        removals_by_stair_index: dict[int, dict[str, set[int]]] = {}
+        fingerprints_by_stair_index: dict[int, dict[str, str]] = {}
+        for raw_ref in requested_refs:
+            if not isinstance(raw_ref, tuple | list) or len(raw_ref) != 2:
+                continue
+            semantic_id = str(raw_ref[0]).strip()
+            try:
+                source_face_index = int(raw_ref[1])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            target = self._canvas_stair_part_targets_by_id.get(semantic_id)
+            if (
+                target is None
+                or source_face_index not in target.source_face_indices
+                or not 0 <= target.stair_index < len(self.stairs)
+                or not target.source_topology_fingerprint
+            ):
+                continue
+            stair_removals = removals_by_stair_index.setdefault(
+                target.stair_index,
+                {},
+            )
+            stair_removals.setdefault(target.part_kind, set()).add(
+                source_face_index
+            )
+            fingerprints_by_stair_index.setdefault(target.stair_index, {})[
+                target.part_kind
+            ] = target.source_topology_fingerprint
+        if not removals_by_stair_index:
+            return
+
+        candidate_stairs = list(self.stairs)
+        for stair_index, removals_by_part in removals_by_stair_index.items():
+            stair = candidate_stairs[stair_index]
+            existing_faces_by_part: dict[str, set[int]] = {}
+            for part_kind, face_index in stair.removed_face_indices:
+                existing_faces_by_part.setdefault(part_kind, set()).add(
+                    face_index
+                )
+            fingerprints_by_part = dict(
+                stair.removed_face_topology_fingerprints
+            )
+            for part_kind, removals in removals_by_part.items():
+                current_fingerprint = fingerprints_by_stair_index[stair_index][
+                    part_kind
+                ]
+                if fingerprints_by_part.get(part_kind) != current_fingerprint:
+                    existing_faces_by_part[part_kind] = set()
+                existing_faces_by_part.setdefault(part_kind, set()).update(
+                    removals
+                )
+                fingerprints_by_part[part_kind] = current_fingerprint
+            removed_faces = tuple(
+                sorted(
+                    (part_kind, face_index)
+                    for part_kind, face_indices in existing_faces_by_part.items()
+                    for face_index in face_indices
+                )
+            )
+            retained_part_kinds = {
+                part_kind for part_kind, _face_index in removed_faces
+            }
+            candidate_stairs[stair_index] = replace(
+                stair,
+                removed_face_indices=removed_faces,
+                removed_face_topology_fingerprints=tuple(
+                    sorted(
+                        (part_kind, fingerprint)
+                        for part_kind, fingerprint in fingerprints_by_part.items()
+                        if part_kind in retained_part_kinds
+                    )
+                ),
+            )
+        try:
+            build_stair_meshes(
+                self.levels,
+                tuple(
+                    candidate_stairs[stair_index]
+                    for stair_index in sorted(removals_by_stair_index)
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            self.stair_status_label.setText(
+                f"Stair faces were not deleted: {error}"
+            )
+            return
+
+        undo_state = self._capture_canvas_stairs_undo_state()
+        self._record_canvas_undo_state(undo_state)
+        self.stairs = candidate_stairs
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        self._finalize_canvas_stairs_undo_state(undo_state)
+        self.stair_status_label.setText(
+            "Selected stair faces deleted. Press Ctrl+Z to restore them."
+        )
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_canvas_stair_deletion_requested(
         self,
@@ -23187,9 +23394,6 @@ class BlueprintWorkspace(QWidget):
         self._generation_settings = settings
         self._set_mesh_edit_update_delay_seconds(
             settings.mesh_edit_update_delay_seconds
-        )
-        self._set_wall_vertex_update_delay_seconds(
-            settings.wall_vertex_update_delay_seconds
         )
         self._set_canvas_3d_navigation_shortcut(
             settings.canvas_3d_navigation_toggle_hotkey
@@ -23250,13 +23454,10 @@ class BlueprintWorkspace(QWidget):
         self,
         _vertex_ids: object,
     ) -> None:
-        """Retire deleted surfaces now and debounce their 3D mesh rebuild."""
+        """Stage vertex removal for one delayed, atomic 3D mesh rebuild."""
 
+        self._pending_deleted_wall_cleanup = True
         self._pending_wall_vertex_mesh_update = True
-        self._sync_canvas_wall_mirror_state()
-        self._remove_architectural_trims_without_host_walls()
-        self._reconcile_surface_assignments_with_scene()
-        self._finalize_blueprint_surface_binding_undo_state()
         self._restart_pending_wall_vertex_update_if_idle()
 
     def _remove_architectural_trims_without_host_walls(self) -> tuple[str, ...]:
@@ -23264,7 +23465,10 @@ class BlueprintWorkspace(QWidget):
 
         live_wall_ids = {
             surface.surface_id
-            for surface in build_base_fixed_surfaces(self.levels)
+            for surface in build_base_fixed_surfaces(
+                self.levels,
+                stairs=self.stairs,
+            )
             if surface.surface_type == SURFACE_TYPE_WALL
         }
         removed_trim_ids: set[str] = set()
@@ -23308,24 +23512,33 @@ class BlueprintWorkspace(QWidget):
         self._is_canvas_wall_vertex_interaction_active = bool(active)
         self._restart_pending_wall_vertex_update_if_idle()
 
+    def _handle_canvas_wall_vertex_chain_changed(self, _active: bool) -> None:
+        """Re-evaluate delayed mesh work when wall placement starts or stops."""
+
+        self._restart_pending_wall_vertex_update_if_idle()
+
     def _restart_pending_wall_vertex_update_if_idle(self) -> None:
-        """Run the wall debounce only after the pointer interaction ends."""
+        """Run the topology debounce after pointer and chain editing end."""
 
         if (
             not self._pending_wall_vertex_mesh_update
             or self._is_canvas_wall_vertex_interaction_active
+            or self.canvas.active_vertex_id is not None
         ):
             self._wall_vertex_update_timer.stop()
             return
         self._wall_vertex_update_timer.start()
 
     def _commit_pending_wall_vertex_update(self) -> None:
-        """Reconcile and rebuild once after a wall-vertex editing burst."""
+        """Rebuild once after a wall-vertex or open-space editing burst."""
 
         self._wall_vertex_update_timer.stop()
         if not self._pending_wall_vertex_mesh_update:
             return
         self._pending_wall_vertex_mesh_update = False
+        self._pending_open_space_corner_mesh_update = False
+        remove_orphaned_trims = self._pending_deleted_wall_cleanup
+        self._pending_deleted_wall_cleanup = False
         doorway_level_indices = self._pending_wall_vertex_doorway_level_indices
         self._pending_wall_vertex_doorway_level_indices = set()
         for level_index in doorway_level_indices:
@@ -23334,13 +23547,19 @@ class BlueprintWorkspace(QWidget):
                 self._viewer_doorways_by_level_index[level_index] = self._copy_doorways(
                     level.doorways
                 )
+        if doorway_level_indices:
+            self._reconcile_door_placements()
+        if remove_orphaned_trims:
+            self._remove_architectural_trims_without_host_walls()
         self._reconcile_canvas_surface_edit_and_refresh()
 
     def _cancel_pending_wall_vertex_update(self) -> None:
-        """Discard a wall-vertex timer when its project context is retired."""
+        """Discard delayed topology work when its project context is retired."""
 
         self._wall_vertex_update_timer.stop()
         self._pending_wall_vertex_mesh_update = False
+        self._pending_open_space_corner_mesh_update = False
+        self._pending_deleted_wall_cleanup = False
         self._pending_wall_vertex_doorway_level_indices.clear()
         self._is_canvas_wall_vertex_interaction_active = False
 

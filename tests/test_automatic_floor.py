@@ -16,7 +16,7 @@ from housemaker.floor_geometry import (
     _build_wall_linework_clusters,
 )
 from housemaker.glb import convert_to_glb
-from housemaker.models import LevelData, VertexData
+from housemaker.models import LevelData, OpenSpaceData, StairData, VertexData
 
 
 # ### Fixture helpers ###
@@ -86,6 +86,29 @@ def _build_level_from_segments(
         name="Ground",
         vertex_data=vertex_data,
     )
+
+
+def _build_interrupted_hallway_level(
+    *,
+    index: int = 2,
+    name: str = "Ground",
+) -> LevelData:
+    """Build a hallway whose open side must be supplied by a slab opening.
+
+    The opening's upper corner meets the middle of the top wall, matching the
+    topology of the reported project rather than a pre-split wall endpoint.
+    """
+
+    level = _build_level_from_segments(
+        (
+            ((50.0, 0.0), (200.0, 0.0)),
+            ((200.0, 0.0), (200.0, 400.0)),
+            ((200.0, 400.0), (100.0, 400.0)),
+        )
+    )
+    level.index = index
+    level.name = name
+    return level
 
 
 # ### Mesh inspection helpers ###
@@ -1031,6 +1054,82 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
             index=2,
             name="Ground",
             vertex_data=vertex_data,
+        )
+
+        model = convert_to_glb([level])
+
+        self.assertNotIn("l2_ground_floor", model.scene.geometry)
+
+    def test_open_space_edge_closes_hallway_at_wall_interior_without_filling_void(
+        self,
+    ) -> None:
+        level = _build_interrupted_hallway_level()
+        level.open_spaces.append(
+            OpenSpaceData(
+                "stairwell",
+                minimum_x=0.0,
+                minimum_y=0.0,
+                maximum_x=100.0,
+                maximum_y=400.0,
+            )
+        )
+
+        floor_mesh = convert_to_glb([level]).scene.geometry[
+            "l2_ground_floor"
+        ]
+        floor_cap = _get_horizontal_cap_geometry(floor_mesh, 1.0)
+
+        self.assertAlmostEqual(float(floor_cap.area), 16.0)
+        self.assertTrue(floor_cap.contains(shapely.Point(3.0, 4.0)))
+        self.assertFalse(floor_cap.covers(shapely.Point(1.0, 4.0)))
+
+    def test_stair_perimeter_closes_upper_hallway_without_filling_route(
+        self,
+    ) -> None:
+        lower = _build_closed_level(
+            (
+                (-100.0, -100.0),
+                (100.0, -100.0),
+                (100.0, 500.0),
+                (-100.0, 500.0),
+            )
+        )
+        upper = _build_interrupted_hallway_level(index=3, name="Upper")
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=0.0,
+            start_a_y=0.0,
+            start_b_x=0.0,
+            start_b_y=400.0,
+            end_level_index=3,
+            end_a_x=100.0,
+            end_a_y=0.0,
+            end_b_x=100.0,
+            end_b_y=400.0,
+        )
+
+        floor_mesh = convert_to_glb(
+            [lower, upper],
+            stairs=[stair],
+        ).scene.geometry["l3_upper_floor"]
+        floor_cap = _get_horizontal_cap_geometry(floor_mesh, 1.0)
+
+        self.assertAlmostEqual(float(floor_cap.area), 16.0)
+        self.assertTrue(floor_cap.contains(shapely.Point(3.0, 4.0)))
+        self.assertFalse(floor_cap.covers(shapely.Point(1.0, 4.0)))
+
+    def test_isolated_open_space_does_not_create_floor_area(self) -> None:
+        level = _build_level_from_segments(
+            (((0.0, 0.0), (100.0, 0.0)),)
+        )
+        level.open_spaces.append(
+            OpenSpaceData(
+                "isolated-opening",
+                minimum_x=0.0,
+                minimum_y=0.0,
+                maximum_x=100.0,
+                maximum_y=100.0,
+            )
         )
 
         model = convert_to_glb([level])

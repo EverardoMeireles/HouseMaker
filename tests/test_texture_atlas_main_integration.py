@@ -395,6 +395,56 @@ def _add_square_room_to_level(level: LevelData) -> str:
     )
 
 
+def _seed_plain_wall_textures_in_atlas(
+    workspace: BlueprintWorkspace,
+    asset_directory: Path,
+    wall_ids: tuple[str, ...],
+) -> tuple[tuple[SurfaceTextureAssignment, ...], str, tuple[str, ...]]:
+    """Assign one packed texture to each supplied wall surface."""
+
+    assignments = tuple(
+        _wall_texture_assignment(
+            asset_directory,
+            assignment_id=f"delayed-wall-{index}",
+            surface_ids=(wall_id,),
+        )
+        for index, wall_id in enumerate(wall_ids, start=1)
+    )
+    surface_workspace = workspace.surface_texture_generation
+    surface_workspace.set_levels(workspace.levels)
+    surface_workspace.set_data(
+        SurfaceTextureData(assignments=list(assignments))
+    )
+    surface_workspace.reconcile_assignments_with_levels(
+        workspace.levels,
+        emit_signals=False,
+    )
+    assignments = surface_workspace.snapshot_assignments()
+    surface_workspace.data_changed.emit(surface_workspace.get_data())
+
+    atlas_id = "delayed-wall-atlas"
+    atlas_data = TextureAtlasData()
+    atlas_data.create_atlas(
+        "Delayed walls",
+        2048,
+        atlas_id=atlas_id,
+    )
+    atlas_workspace = workspace.texture_atlas_workspace
+    atlas_workspace.set_data(atlas_data)
+    workspace._atlas_generation_signature = None
+    workspace._sync_atlas_object_texture_sources(
+        automatically_assign_scene_textures=False
+    )
+    source_ids = tuple(
+        build_atlas_wall_texture_source_id(assignment.assignment_id)
+        for assignment in assignments
+    )
+    for source_id in source_ids:
+        if not atlas_workspace.assign_source_to_selected_atlas(source_id):
+            raise AssertionError("The delayed wall texture could not be packed.")
+    return assignments, atlas_id, source_ids
+
+
 def _wheel_event(position: QPointF, delta: int) -> QWheelEvent:
     return QWheelEvent(
         position,
@@ -2282,7 +2332,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(any("0 surfaces" in label for label in surface_labels))
 
-    def test_plain_wall_vertex_deletion_reconciles_atlas_immediately(
+    def test_plain_wall_vertex_deletion_reconciles_atlas_after_mesh_delay(
         self,
     ) -> None:
         vertex_data = VertexData()
@@ -2330,6 +2380,16 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.workspace.canvas.selected_vertex_id = start.id
         self.workspace.canvas._delete_selected_vertices()
 
+        pending = surface_workspace.get_assignment(assignment.assignment_id)
+        assert pending is not None
+        self.assertEqual(pending.surface_ids, (wall_id,))
+        pending_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert pending_atlas is not None
+        self.assertIsNotNone(pending_atlas.placement_for_object(source_id))
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+
+        self.workspace._commit_pending_wall_vertex_update()
+
         retained = surface_workspace.get_assignment(assignment.assignment_id)
         assert retained is not None
         self.assertEqual(retained.surface_ids, ())
@@ -2345,6 +2405,134 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         restored_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert restored_atlas is not None
         self.assertIsNotNone(restored_atlas.placement_for_object(source_id))
+
+    def test_pending_wall_vertex_deletion_undo_keeps_live_bindings(self) -> None:
+        vertex_data = VertexData()
+        start = vertex_data.add_vertex(0.0, 0.0)
+        end = vertex_data.add_vertex(100.0, 0.0)
+        vertex_data.add_edge(start.id, end.id)
+        self.workspace.current_level.vertex_data = vertex_data
+        self.workspace.current_level.rooms = []
+        self.workspace._sync_canvas_to_current_level()
+        wall_id = next(
+            surface.surface_id
+            for surface in build_fixed_surfaces(self.workspace.levels)
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        assignments, atlas_id, source_ids = _seed_plain_wall_textures_in_atlas(
+            self.workspace,
+            self.settings.path.parent / "surface_textures",
+            (wall_id,),
+        )
+
+        self.workspace.canvas.set_selected_vertex_ids((start.id,))
+        self.workspace.canvas._delete_selected_vertices()
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertIsNotNone(
+            self.workspace.current_level.vertex_data.get_vertex(start.id)
+        )
+        self.assertEqual(
+            self.workspace.surface_texture_generation.get_assignments(),
+            assignments,
+        )
+        restored_atlas = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+            atlas_id
+        )
+        assert restored_atlas is not None
+        self.assertIsNotNone(restored_atlas.placement_for_object(source_ids[0]))
+        assert self.workspace.viewer.surface_tools_status_label is not None
+        self.assertEqual(
+            self.workspace.viewer.surface_tools_status_label.text(),
+            "Canvas action undone.",
+        )
+
+    def test_two_delayed_vertex_deletions_keep_separate_undo_steps(self) -> None:
+        vertex_data = VertexData()
+        first_start = vertex_data.add_vertex(0.0, 0.0)
+        first_end = vertex_data.add_vertex(100.0, 0.0)
+        second_start = vertex_data.add_vertex(0.0, 100.0)
+        second_end = vertex_data.add_vertex(100.0, 100.0)
+        vertex_data.add_edge(first_start.id, first_end.id)
+        vertex_data.add_edge(second_start.id, second_end.id)
+        self.workspace.current_level.vertex_data = vertex_data
+        self.workspace.current_level.rooms = []
+        self.workspace._sync_canvas_to_current_level()
+        wall_ids = tuple(
+            surface.surface_id
+            for surface in build_fixed_surfaces(self.workspace.levels)
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        self.assertEqual(len(wall_ids), 2)
+        assignments, atlas_id, source_ids = _seed_plain_wall_textures_in_atlas(
+            self.workspace,
+            self.settings.path.parent / "surface_textures",
+            wall_ids,
+        )
+
+        self.workspace.canvas.set_selected_vertex_ids((first_start.id,))
+        self.workspace.canvas._delete_selected_vertices()
+        self.workspace.canvas.set_selected_vertex_ids((second_start.id,))
+        self.workspace.canvas._delete_selected_vertices()
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+        self.workspace._commit_pending_wall_vertex_update()
+
+        reconciled = self.workspace.surface_texture_generation.get_assignments()
+        self.assertTrue(all(not assignment.surface_ids for assignment in reconciled))
+        reconciled_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id(atlas_id)
+        )
+        assert reconciled_atlas is not None
+        self.assertTrue(
+            all(
+                reconciled_atlas.placement_for_object(source_id) is None
+                for source_id in source_ids
+            )
+        )
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(
+            len(self.workspace.current_level.vertex_data.vertices),
+            3,
+        )
+        self.assertEqual(
+            self.workspace.surface_texture_generation.get_assignments(),
+            assignments,
+        )
+        first_undo_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id(atlas_id)
+        )
+        assert first_undo_atlas is not None
+        self.assertTrue(
+            all(
+                first_undo_atlas.placement_for_object(source_id) is not None
+                for source_id in source_ids
+            )
+        )
+        assert self.workspace.viewer.surface_tools_status_label is not None
+        self.assertEqual(
+            self.workspace.viewer.surface_tools_status_label.text(),
+            "Canvas action undone.",
+        )
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(
+            len(self.workspace.current_level.vertex_data.vertices),
+            4,
+        )
+        self.assertEqual(
+            self.workspace.surface_texture_generation.get_assignments(),
+            assignments,
+        )
+        self.assertEqual(
+            self.workspace.viewer.surface_tools_status_label.text(),
+            "Canvas action undone.",
+        )
 
     def test_project_load_reconciles_stale_surface_assignments(self) -> None:
         assignment = _wall_texture_assignment(

@@ -14,7 +14,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import shapely
 from PIL import Image
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from shapely import Point, Polygon
@@ -24,13 +25,26 @@ from housemaker.architectural_surface_edits import insert_surface_vertex
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.glb import convert_to_glb, convert_to_preview_model
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import LevelData, OpenSpaceData, VertexData
+from housemaker.models import LevelData, OpenSpaceData, StairData, VertexData
 from housemaker.project_io import load_project, save_project
 from housemaker.surface_geometry import build_fixed_surfaces
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
+
+
+# ### Event helpers ###
+def _send_drag_move(canvas: BlueprintCanvas, position: QPoint) -> None:
+    event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(position),
+        QPointF(canvas.mapToGlobal(position)),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(canvas, event)
 
 
 # ### Fixture helpers ###
@@ -307,10 +321,16 @@ class OpenSpaceCanvasTests(unittest.TestCase):
 
         self.canvas.selected_open_space_id = None
         center = self.canvas._image_to_widget(55.0, 50.0).toPoint()
-        self.assertIsNone(self.canvas._find_open_space_at(center))
-        border = self.canvas._image_to_widget(20.0, 50.0).toPoint()
-        QTest.mouseClick(self.canvas, Qt.MouseButton.LeftButton, pos=border)
+        self.assertEqual(self.canvas._find_open_space_at(center), open_space)
+        QTest.mouseClick(self.canvas, Qt.MouseButton.LeftButton, pos=center)
         self.assertEqual(self.canvas.selected_open_space_id, open_space.open_space_id)
+        corner = self.canvas._image_to_widget(
+            open_space.minimum_x,
+            open_space.minimum_y,
+        )
+        self.assertIsNotNone(
+            self.canvas._find_selected_open_space_corner_at(corner)
+        )
 
         QTest.keyClick(self.canvas, Qt.Key.Key_Delete)
         self.assertEqual(self.open_spaces, [])
@@ -321,6 +341,305 @@ class OpenSpaceCanvasTests(unittest.TestCase):
         )
         _qt_application.processEvents()
         self.assertEqual(self.open_spaces, [open_space])
+
+    def test_selected_open_space_exposes_four_corner_handles(self) -> None:
+        open_space = OpenSpaceData("opening-a", 20.0, 25.0, 90.0, 75.0)
+        self.open_spaces.append(open_space)
+        self.canvas.selected_open_space_id = open_space.open_space_id
+
+        corners = self.canvas._get_open_space_corner_points(open_space)
+
+        self.assertEqual(len(corners), 4)
+        self.assertEqual(
+            {point for _hit, point in corners},
+            {
+                (20.0, 25.0),
+                (90.0, 25.0),
+                (90.0, 75.0),
+                (20.0, 75.0),
+            },
+        )
+        for expected_hit, image_point in corners:
+            actual_hit = self.canvas._find_selected_open_space_corner_at(
+                self.canvas._image_to_widget(*image_point)
+            )
+            self.assertEqual(actual_hit, expected_hit)
+
+    def test_selected_corner_precedes_overlapping_wall_and_stair_points(
+        self,
+    ) -> None:
+        open_space = OpenSpaceData("opening-a", 20.0, 20.0, 80.0, 80.0)
+        self.open_spaces.append(open_space)
+        self.canvas.selected_open_space_id = open_space.open_space_id
+        vertex = self.canvas.vertex_data.add_vertex(20.0, 20.0)
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=20.0,
+            start_a_y=20.0,
+            start_b_x=40.0,
+            start_b_y=20.0,
+            end_level_index=3,
+            end_a_x=20.0,
+            end_a_y=40.0,
+            end_b_x=40.0,
+            end_b_y=40.0,
+        )
+        self.canvas.set_stair_context((stair,), LevelData(index=2, name="Ground"))
+        corner = self.canvas._image_to_widget(20.0, 20.0).toPoint()
+
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=corner)
+
+        hit = self.canvas._pressed_open_space_corner
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit.open_space_id, open_space.open_space_id)
+        self.assertIsNone(self.canvas.pressed_vertex_id)
+        self.assertIsNone(self.canvas._pressed_stair_hit)
+        self.assertNotEqual(vertex.id, self.canvas.selected_vertex_id)
+        QTest.mouseRelease(self.canvas, Qt.MouseButton.LeftButton, pos=corner)
+
+    def test_corner_drag_previews_and_commits_one_wall_vertex_snap(self) -> None:
+        open_space = OpenSpaceData("opening-a", 20.0, 20.0, 80.0, 80.0)
+        self.open_spaces.append(open_space)
+        self.canvas.selected_open_space_id = open_space.open_space_id
+        target_vertex = self.canvas.vertex_data.add_vertex(10.0, 12.0)
+        changed: list[None] = []
+        geometry_changed: list[None] = []
+        self.canvas.open_spaces_changed.connect(lambda: changed.append(None))
+        self.canvas.geometry_changed.connect(
+            lambda: geometry_changed.append(None)
+        )
+        start = self.canvas._image_to_widget(20.0, 20.0).toPoint()
+        target = self.canvas._image_to_widget(10.8, 12.8).toPoint()
+
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=start)
+        _send_drag_move(self.canvas, target)
+
+        self.assertEqual(self.open_spaces, [open_space])
+        self.assertEqual(
+            self.canvas._open_space_corner_drag_preview_point,
+            (target_vertex.x, target_vertex.y),
+        )
+        self.assertEqual(
+            self.canvas._get_open_space_display_bounds(open_space),
+            (10.0, 12.0, 80.0, 80.0),
+        )
+        self.assertEqual(changed, [])
+        self.assertEqual(geometry_changed, [])
+
+        QTest.mouseRelease(self.canvas, Qt.MouseButton.LeftButton, pos=target)
+
+        self.assertEqual(
+            self.open_spaces,
+            [OpenSpaceData("opening-a", 10.0, 12.0, 80.0, 80.0)],
+        )
+        self.assertEqual(len(self.canvas.undo_stack), 1)
+        self.assertEqual(changed, [None])
+        self.assertEqual(geometry_changed, [None])
+        self.assertIsNone(self.canvas._pressed_open_space_corner)
+        self.assertIsNone(self.canvas._open_space_corner_drag_preview_point)
+
+    def test_corner_drag_snaps_to_same_level_stair_point(self) -> None:
+        open_space = OpenSpaceData("opening-a", 20.0, 20.0, 80.0, 80.0)
+        self.open_spaces.append(open_space)
+        self.canvas.selected_open_space_id = open_space.open_space_id
+        level = LevelData(index=2, name="Ground")
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=10.0,
+            start_a_y=12.0,
+            start_b_x=40.0,
+            start_b_y=12.0,
+            end_level_index=3,
+            end_a_x=10.0,
+            end_a_y=42.0,
+            end_b_x=40.0,
+            end_b_y=42.0,
+        )
+        self.canvas.set_stair_context((stair,), level)
+        start = self.canvas._image_to_widget(20.0, 20.0).toPoint()
+        target = self.canvas._image_to_widget(10.8, 12.8).toPoint()
+
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=start)
+        _send_drag_move(self.canvas, target)
+        QTest.mouseRelease(self.canvas, Qt.MouseButton.LeftButton, pos=target)
+
+        self.assertEqual(
+            self.open_spaces,
+            [OpenSpaceData("opening-a", 10.0, 12.0, 80.0, 80.0)],
+        )
+
+    def test_escape_cancels_corner_drag_without_mutating_or_creating_undo(
+        self,
+    ) -> None:
+        open_space = OpenSpaceData("opening-a", 20.0, 20.0, 80.0, 80.0)
+        self.open_spaces.append(open_space)
+        self.canvas.selected_open_space_id = open_space.open_space_id
+        start = self.canvas._image_to_widget(20.0, 20.0).toPoint()
+        target = self.canvas._image_to_widget(10.0, 12.0).toPoint()
+
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=start)
+        _send_drag_move(self.canvas, target)
+        QTest.keyClick(self.canvas, Qt.Key.Key_Escape)
+
+        self.assertEqual(self.open_spaces, [open_space])
+        self.assertEqual(self.canvas.undo_stack, [])
+        self.assertIsNone(self.canvas._pressed_open_space_corner)
+        self.assertIsNone(self.canvas._open_space_corner_drag_preview_point)
+
+    def test_rectangle_corners_snap_to_nearby_vertices(self) -> None:
+        self.canvas.vertex_data.add_vertex(18.0, 22.0)
+        self.canvas.vertex_data.add_vertex(92.0, 78.0)
+        start = self.canvas._image_to_widget(19.5, 22.5).toPoint()
+        end = self.canvas._image_to_widget(90.5, 77.5).toPoint()
+
+        self.assertTrue(self.canvas.start_open_space_placement())
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=start)
+        snapped_start = self.canvas._open_space_drag_start_image
+        self.assertIsNotNone(snapped_start)
+        assert snapped_start is not None
+        self.assertEqual(
+            (snapped_start.x(), snapped_start.y()),
+            (18.0, 22.0),
+        )
+        _send_drag_move(self.canvas, end)
+        snapped_end = self.canvas._open_space_drag_current_image
+        self.assertIsNotNone(snapped_end)
+        assert snapped_end is not None
+        self.assertEqual((snapped_end.x(), snapped_end.y()), (92.0, 78.0))
+        self.assertEqual(len(self.canvas._open_space_drag_preview_guides), 2)
+        QTest.mouseRelease(self.canvas, Qt.MouseButton.LeftButton, pos=end)
+        _qt_application.processEvents()
+
+        self.assertEqual(len(self.open_spaces), 1)
+        open_space = self.open_spaces[0]
+        self.assertEqual(
+            (
+                open_space.minimum_x,
+                open_space.minimum_y,
+                open_space.maximum_x,
+                open_space.maximum_y,
+            ),
+            (18.0, 22.0, 92.0, 78.0),
+        )
+
+    def test_release_snaps_without_a_final_mouse_move(self) -> None:
+        self.canvas.vertex_data.add_vertex(18.0, 22.0)
+        self.canvas.vertex_data.add_vertex(92.0, 78.0)
+        start = self.canvas._image_to_widget(19.5, 22.5).toPoint()
+        end = self.canvas._image_to_widget(90.5, 77.5).toPoint()
+
+        self.assertTrue(self.canvas.start_open_space_placement())
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseRelease(self.canvas, Qt.MouseButton.LeftButton, pos=end)
+        _qt_application.processEvents()
+
+        self.assertEqual(len(self.open_spaces), 1)
+        open_space = self.open_spaces[0]
+        self.assertEqual(
+            (
+                open_space.minimum_x,
+                open_space.minimum_y,
+                open_space.maximum_x,
+                open_space.maximum_y,
+            ),
+            (18.0, 22.0, 92.0, 78.0),
+        )
+
+    def test_nearby_point_wins_over_mixed_axis_candidates(self) -> None:
+        first_vertex = self.canvas.vertex_data.add_vertex(20.0, 21.0)
+        self.canvas.vertex_data.add_vertex(21.0, 20.0)
+
+        preview = self.canvas._build_open_space_snap_preview(
+            QPointF(20.8, 20.8)
+        )
+
+        self.assertEqual(preview.point, (20.0, 21.0))
+        self.assertEqual(
+            [guide.source_vertex_id for guide in preview.guides],
+            [first_vertex.id, first_vertex.id],
+        )
+
+    def test_axis_guide_uses_the_nearest_aligned_vertex(self) -> None:
+        self.canvas.vertex_data.add_vertex(18.0, 10.0)
+        nearest_vertex = self.canvas.vertex_data.add_vertex(18.0, 90.0)
+
+        preview = self.canvas._build_open_space_snap_preview(
+            QPointF(19.5, 85.0)
+        )
+
+        self.assertEqual(preview.point, (18.0, 85.0))
+        self.assertEqual(len(preview.guides), 1)
+        self.assertEqual(preview.guides[0].source_vertex_id, nearest_vertex.id)
+
+    def test_rectangle_corners_snap_to_same_level_stair_points(self) -> None:
+        level = LevelData(index=2, name="Ground")
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=15.0,
+            start_a_y=18.0,
+            start_b_x=88.0,
+            start_b_y=74.0,
+            end_level_index=3,
+            end_a_x=20.0,
+            end_a_y=20.0,
+            end_b_x=90.0,
+            end_b_y=76.0,
+        )
+        self.canvas.set_stair_context((stair,), level)
+        start = self.canvas._image_to_widget(16.5, 18.5).toPoint()
+        end = self.canvas._image_to_widget(86.5, 73.5).toPoint()
+
+        self.assertTrue(self.canvas.start_open_space_placement())
+        QTest.mousePress(self.canvas, Qt.MouseButton.LeftButton, pos=start)
+        _send_drag_move(self.canvas, end)
+        snapped_end = self.canvas._open_space_drag_current_image
+        self.assertIsNotNone(snapped_end)
+        assert snapped_end is not None
+        self.assertEqual((snapped_end.x(), snapped_end.y()), (88.0, 74.0))
+        self.assertEqual(
+            tuple(
+                guide.source_point
+                for guide in self.canvas._open_space_drag_preview_guides
+            ),
+            ((88.0, 74.0), (88.0, 74.0)),
+        )
+        QTest.mouseRelease(self.canvas, Qt.MouseButton.LeftButton, pos=end)
+        _qt_application.processEvents()
+
+        self.assertEqual(len(self.open_spaces), 1)
+        open_space = self.open_spaces[0]
+        self.assertEqual(
+            (
+                open_space.minimum_x,
+                open_space.minimum_y,
+                open_space.maximum_x,
+                open_space.maximum_y,
+            ),
+            (15.0, 18.0, 88.0, 74.0),
+        )
+
+    def test_open_space_snap_ignores_stair_points_on_other_levels(self) -> None:
+        level = LevelData(index=2, name="Ground")
+        stair = StairData(
+            start_level_index=3,
+            start_a_x=15.0,
+            start_a_y=18.0,
+            start_b_x=88.0,
+            start_b_y=74.0,
+            end_level_index=4,
+            end_a_x=20.0,
+            end_a_y=20.0,
+            end_b_x=90.0,
+            end_b_y=76.0,
+        )
+        self.canvas.set_stair_context((stair,), level)
+        raw_point = QPointF(16.5, 18.5)
+
+        preview = self.canvas._build_open_space_snap_preview(raw_point)
+
+        self.assertEqual(preview.point, (16.5, 18.5))
+        self.assertEqual(preview.guides, [])
 
     def test_comparison_overlay_snapshots_open_spaces(self) -> None:
         comparison = _build_square_level(1, 100.0, image_path=self.image_path)

@@ -55,6 +55,7 @@ from housemaker.viewer import (
     _CanvasRectangleSelectionResult,
     _get_nearest_preview_stair_part_ray_hit,
     _rasterize_canvas_target_selection,
+    _rasterize_canvas_target_selection_with_stair_faces,
     _remove_semantic_stair_faces,
 )
 
@@ -72,6 +73,7 @@ def _build_stair_part(
     stair_id: str = "stair-uuid",
     level_indices: tuple[int, ...] = (0, 1),
     two_components: bool = False,
+    source_topology_fingerprint: str = "",
 ) -> PreviewStairPart:
     mesh = trimesh.creation.box(extents=(1.2, 0.8, 0.24))
     mesh.apply_translation(center)
@@ -90,6 +92,7 @@ def _build_stair_part(
         surface_type=STAIR_PART_SURFACE_TYPE[part_kind],
         mesh=mesh,
         level_indices=level_indices,
+        source_topology_fingerprint=source_topology_fingerprint,
     )
 
 
@@ -565,6 +568,51 @@ class CanvasStairPartViewerTests(unittest.TestCase):
         self.assertEqual(requested, [(treads.stair_id,)])
         self.assertEqual(self.viewer.get_selected_canvas_stair_part_ids(), ())
 
+    def test_delete_rectangle_selected_faces_does_not_request_whole_stair(
+        self,
+    ) -> None:
+        treads = _build_stair_part(
+            STAIR_PART_TREADS,
+            center=(0.0, 0.0, 0.5),
+        )
+        self._install(treads)
+        face_ref = (treads.semantic_id, treads.source_face_indices[0])
+        face_requests: list[object] = []
+        stair_requests: list[object] = []
+        self.viewer.canvas_stair_face_deletion_requested.connect(
+            face_requests.append
+        )
+        self.viewer.canvas_stair_deletion_requested.connect(
+            stair_requests.append
+        )
+        self.viewer.set_selected_canvas_stair_face_refs((face_ref,))
+
+        self.viewer._handle_view_delete_requested()
+
+        self.assertEqual(face_requests, [(face_ref,)])
+        self.assertEqual(stair_requests, [])
+        self.assertEqual(self.viewer.get_selected_canvas_stair_face_refs(), ())
+
+    def test_topology_change_clears_rectangle_selected_stair_faces(self) -> None:
+        original = _build_stair_part(
+            STAIR_PART_TREADS,
+            center=(0.0, 0.0, 0.5),
+            source_topology_fingerprint="a" * 64,
+        )
+        rebuilt = _build_stair_part(
+            STAIR_PART_TREADS,
+            center=(0.0, 0.0, 0.5),
+            source_topology_fingerprint="b" * 64,
+        )
+        self._install(original)
+        self.viewer.set_selected_canvas_stair_face_refs(
+            ((original.semantic_id, original.source_face_indices[0]),)
+        )
+
+        self.viewer.set_canvas_stair_part_targets((rebuilt,))
+
+        self.assertEqual(self.viewer.get_selected_canvas_stair_face_refs(), ())
+
     def test_clicking_any_component_selects_one_part_not_one_step(self) -> None:
         treads = _build_stair_part(
             STAIR_PART_TREADS,
@@ -572,6 +620,9 @@ class CanvasStairPartViewerTests(unittest.TestCase):
             two_components=True,
         )
         self._install(treads)
+        self.viewer.set_selected_canvas_stair_face_refs(
+            ((treads.semantic_id, treads.source_face_indices[0]),)
+        )
 
         with patch.object(
             self.viewer.view,
@@ -587,6 +638,7 @@ class CanvasStairPartViewerTests(unittest.TestCase):
             self.viewer.get_selected_canvas_stair_part_ids(),
             (treads.semantic_id,),
         )
+        self.assertEqual(self.viewer.get_selected_canvas_stair_face_refs(), ())
 
     def test_surface_and_object_selections_clear_stair_parts(self) -> None:
         part = _build_stair_part(
@@ -975,6 +1027,36 @@ class CanvasStairPartViewerTests(unittest.TestCase):
             (treads.semantic_id, risers.semantic_id),
         )
 
+    def test_box_result_selects_individual_stair_face_refs(self) -> None:
+        treads = _build_stair_part(
+            STAIR_PART_TREADS,
+            center=(0.0, 0.0, 0.5),
+        )
+        self._install(treads)
+
+        self.viewer._apply_canvas_rectangle_selection_targets(
+            _CanvasRectangleSelectionResult(
+                request_revision=(
+                    self.viewer._canvas_rectangle_selection_request_revision
+                ),
+                geometry_revision=self.viewer._canvas_selection_geometry_revision,
+                surface_ids=(),
+                object_ids=(),
+                additive=False,
+                stair_face_indices=((treads.semantic_id, (0, 2)),),
+            )
+        )
+
+        self.assertEqual(
+            self.viewer.get_selected_canvas_stair_face_refs(),
+            (
+                (treads.semantic_id, treads.source_face_indices[0]),
+                (treads.semantic_id, treads.source_face_indices[2]),
+            ),
+        )
+        self.assertEqual(self.viewer.get_selected_canvas_stair_part_ids(), ())
+        self.assertIsNotNone(self.viewer._canvas_stair_face_selection_item)
+
     def test_hidden_level_excludes_target_selection_and_preview(self) -> None:
         lower = _build_stair_part(
             STAIR_PART_TREADS,
@@ -1053,6 +1135,55 @@ class CanvasStairPartRasterTests(unittest.TestCase):
 
         self.assertEqual(surface_ids, (semantic_id,))
         self.assertEqual(object_ids, ())
+
+    def test_stair_raster_retains_only_faces_inside_drag_rectangle(self) -> None:
+        semantic_id = "stair:stable-id/part:treads:floor"
+
+        surface_ids, object_ids, stair_faces = (
+            _rasterize_canvas_target_selection_with_stair_faces(
+                (
+                    (
+                        CANVAS_SELECTION_TARGET_STAIR_PART,
+                        semantic_id,
+                        *_projected_quad(-0.2),
+                    ),
+                ),
+                QRect(15, 2, 3, 3),
+            )
+        )
+
+        self.assertEqual(surface_ids, ())
+        self.assertEqual(object_ids, ())
+        self.assertEqual(stair_faces, ((semantic_id, (0,)),))
+
+    def test_stair_raster_retains_source_face_ids_after_clipping(self) -> None:
+        semantic_id = "stair:stable-id/part:treads:floor"
+        vertices, original_faces = _projected_quad(-0.2)
+        clipped_faces = np.asarray(
+            (
+                original_faces[0],
+                original_faces[0],
+                original_faces[1],
+            ),
+            dtype=np.int64,
+        )
+
+        _surface_ids, _object_ids, stair_faces = (
+            _rasterize_canvas_target_selection_with_stair_faces(
+                (
+                    (
+                        CANVAS_SELECTION_TARGET_STAIR_PART,
+                        semantic_id,
+                        vertices,
+                        clipped_faces,
+                        np.asarray((7, 7, 3), dtype=np.int64),
+                    ),
+                ),
+                QRect(15, 2, 3, 3),
+            )
+        )
+
+        self.assertEqual(stair_faces, ((semantic_id, (7,)),))
 
 
 # ### Test entry point ###

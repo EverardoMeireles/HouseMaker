@@ -526,6 +526,140 @@ class StairCanvasTests(unittest.TestCase):
         self.assertIsNotNone(pending)
         self.assertAlmostEqual(pending.start_a_y, pending.start_b_y)  # type: ignore[union-attr]
 
+    def test_first_point_snaps_with_dotted_guide_to_existing_stair_point(
+        self,
+    ) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        canvas.set_stair_context([_four_point_stair_dict()], level)
+        canvas.start_stair_placement()
+        target = _image_position(canvas, 20.8, 45.0)
+
+        QTest.mouseMove(canvas, target)
+
+        preview_point = canvas.pending_stair_preview_point
+        self.assertIsNotNone(preview_point)
+        self.assertAlmostEqual(preview_point[0], 20.0)  # type: ignore[index]
+        self.assertEqual(len(canvas.pending_stair_preview_guides), 1)
+        guide = canvas.pending_stair_preview_guides[0]
+        self.assertEqual(guide.axis, "x")
+        self.assertEqual(guide.source_point, (20.0, 30.0))
+        self.assertIsNone(guide.source_vertex_id)
+
+        QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=target)
+
+        pending_point = canvas.get_pending_stair_point()
+        self.assertIsNotNone(pending_point)
+        self.assertAlmostEqual(pending_point.x, preview_point[0])  # type: ignore[union-attr, index]
+        self.assertAlmostEqual(pending_point.y, preview_point[1])  # type: ignore[union-attr, index]
+
+    def test_second_point_has_straight_guide_to_pending_first_point(self) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        canvas.start_stair_placement()
+        _place_point(canvas, 10.0, 20.0)
+
+        preview = canvas._build_stair_endpoint_preview(
+            QPointF(40.0, 20.8),
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertIsNotNone(preview)
+        self.assertAlmostEqual(preview.point[0], 40.0)  # type: ignore[union-attr]
+        self.assertAlmostEqual(preview.point[1], 20.0)  # type: ignore[union-attr]
+        self.assertEqual(len(preview.guides), 1)  # type: ignore[union-attr]
+        self.assertEqual(preview.guides[0].axis, "y")  # type: ignore[union-attr]
+        self.assertEqual(  # type: ignore[union-attr]
+            preview.guides[0].source_point,
+            (10.0, 20.0),
+        )
+
+    def test_historical_stair_axis_snap_does_not_move_free_coordinate(self) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        canvas.set_stair_context([_four_point_stair_dict()], level)
+        canvas.start_stair_placement()
+        _place_point(canvas, 80.0, 10.0)
+
+        preview = canvas._build_stair_endpoint_preview(
+            QPointF(20.5, 63.0),
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertIsNotNone(preview)
+        self.assertAlmostEqual(preview.point[0], 20.0)  # type: ignore[union-attr]
+        self.assertAlmostEqual(preview.point[1], 63.0)  # type: ignore[union-attr]
+        self.assertEqual(len(preview.guides), 1)  # type: ignore[union-attr]
+        self.assertEqual(preview.guides[0].source_point, (20.0, 30.0))  # type: ignore[union-attr]
+
+    def test_stair_alignment_ignores_points_owned_by_other_levels(self) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        stair = _four_point_stair_dict()
+        stair.update(
+            {
+                "start_a_x": 10.0,
+                "start_a_y": 10.0,
+                "start_b_x": 40.0,
+                "start_b_y": 10.0,
+                "end_a_x": 75.0,
+                "end_a_y": 80.0,
+                "end_b_x": 90.0,
+                "end_b_y": 80.0,
+            }
+        )
+        canvas.set_stair_context([stair], level)
+        canvas.start_stair_placement()
+
+        preview = canvas._build_stair_endpoint_preview(
+            QPointF(75.5, 50.0),
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertIsNotNone(preview)
+        self.assertAlmostEqual(preview.point[0], 75.5)  # type: ignore[union-attr]
+        self.assertAlmostEqual(preview.point[1], 50.0)  # type: ignore[union-attr]
+        self.assertEqual(preview.guides, [])  # type: ignore[union-attr]
+
+    def test_refinement_point_snaps_to_same_level_active_draft_point(self) -> None:
+        start_level = _build_level(2)
+        end_level = _build_level(3)
+        canvas = self._build_canvas(start_level)
+        canvas.start_stair_placement()
+        _place_point(canvas, 10.0, 20.0)
+        _place_point(canvas, 40.0, 20.0)
+        _set_canvas_level(canvas, end_level)
+        _place_point(canvas, 50.0, 80.0)
+        _place_point(canvas, 80.0, 80.0)
+
+        preview = canvas._build_stair_endpoint_preview(
+            QPointF(50.8, 55.0),
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.assertIsNotNone(preview)
+        self.assertAlmostEqual(preview.point[0], 50.0)  # type: ignore[union-attr]
+        self.assertEqual(len(preview.guides), 1)  # type: ignore[union-attr]
+        self.assertEqual(preview.guides[0].source_point, (50.0, 80.0))  # type: ignore[union-attr]
+
+    def test_direct_wall_vertex_hit_precedes_stair_alignment_snap(self) -> None:
+        level = _build_level(2)
+        wall_vertex = level.vertex_data.add_vertex(20.8, 45.0)
+        canvas = self._build_canvas(level)
+        canvas.set_stair_context([_four_point_stair_dict()], level)
+        canvas.start_stair_placement()
+        widget_point = canvas._image_to_widget(wall_vertex.x, wall_vertex.y)
+
+        target = canvas._build_stair_point_target(
+            QPointF(wall_vertex.x, wall_vertex.y),
+            Qt.KeyboardModifier.NoModifier,
+            widget_point,
+        )
+
+        self.assertEqual(target.point, (wall_vertex.x, wall_vertex.y))
+        self.assertEqual(target.vertex_id, wall_vertex.id)
+        self.assertEqual(target.guides, [])
+
     def test_coincident_second_point_is_rejected_and_first_point_is_kept(
         self,
     ) -> None:
