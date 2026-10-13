@@ -136,12 +136,15 @@ class CanvasControlGroupingTests(unittest.TestCase):
             labels={"Arch amount"},
         )
 
-    def test_windows_group_owns_the_shared_add_window_control(self) -> None:
+    def test_window_frames_group_owns_the_shared_add_window_control(self) -> None:
         self._assert_group_contains(
-            "Windows",
+            "Window frames",
             self.workspace.add_window_button,
         )
-        self.assertEqual(self.workspace.add_window_button.text(), "Add window")
+        self.assertEqual(
+            self.workspace.add_window_button.text(),
+            "Add window frame",
+        )
         self.assertTrue(self.workspace.add_window_button.isCheckable())
         self.assertFalse(hasattr(self.workspace.viewer, "add_window_button"))
 

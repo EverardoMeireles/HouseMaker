@@ -12,11 +12,13 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Protocol
 
 import cv2
 import numpy as np
+import trimesh
 from PySide6.QtCore import (
     QObject,
     QSignalBlocker,
@@ -132,9 +134,6 @@ from housemaker.object_face_edit import (
     load_object_face_geometry,
     load_object_face_geometry_from_scene,
 )
-from housemaker.object_reference_editing import (
-    OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE,
-)
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
     AXIS_HALF_SIDE_NEGATIVE,
@@ -160,6 +159,7 @@ from housemaker.object_symmetry import (
     build_symmetric_retexture_proxy_glb,
     build_symmetric_square_pair_texture_variants,
     clip_glb_to_axis_half,
+    split_scene_at_z_up_axis_planes,
 )
 from housemaker.object_texture_variants import (
     ATLAS_MAP_BASE_COLOR,
@@ -479,6 +479,15 @@ def _apportion_integer_percentage(
 
 
 # ### Active operation state ###
+@dataclass(frozen=True)
+class DetachedGeneratedObjectSnapshot:
+    """One temporarily detached record retained for application-level undo."""
+
+    record: GeneratedObjectRecord
+    record_index: int
+    model: GeneratedModel | None
+
+
 @dataclass
 class _ActiveObjectOperation:
     """Track one cancellable transaction until its worker fully exits."""
@@ -610,14 +619,15 @@ def _apply_door_slot_pipeline_metadata(
     pipeline: dict[str, object],
     target: _DoorSlotEditingTarget | None,
 ) -> None:
-    """Keep generated door hardware hidden from ordinary object workflows."""
+    """Keep generated opening hardware hidden from ordinary object workflows."""
 
     if target is None:
         return
-    pipeline["mode"] = "door_component"
+    pipeline["mode"] = f"{target.asset_kind}_component"
     pipeline[DOOR_COMPONENT_PIPELINE_KEY] = {
         "door_id": target.door_id,
         "slot_id": target.slot_id,
+        "asset_kind": target.asset_kind,
     }
     if (
         target.generate_displacement
@@ -859,6 +869,128 @@ def _normalize_door_body_fit_dimensions(
     return normalized[0], normalized[1], normalized[2]
 
 
+def _normalize_door_body_profile_outline(
+    raw_outline: object,
+    fit_dimensions: Sequence[float] | None,
+) -> tuple[tuple[float, float], ...] | None:
+    """Validate one canonical closed X/Z opening profile.
+
+    HouseMaker opening profiles start at the bottom-left corner, cross the
+    bottom edge to the right, follow one monotonic upper chain back to the
+    left, and finish by repeating the first point. Keeping this contract
+    narrow makes the later vertical warp deterministic and prevents a
+    malformed profile from folding generated geometry over itself.
+    """
+
+    if raw_outline is None:
+        return None
+    dimensions = _normalize_door_body_fit_dimensions(fit_dimensions)
+    if dimensions is None:
+        raise ValueError(
+            "A preserved door body profile requires target fit dimensions."
+        )
+    if isinstance(raw_outline, (str, bytes, bytearray)):
+        raise TypeError("Door body profiles must be point sequences.")
+    try:
+        raw_points = tuple(raw_outline)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError("Door body profiles must be point sequences.") from error
+    if len(raw_points) < 5:
+        raise ValueError(
+            "Door body profiles require a closed polygon with four corners."
+        )
+
+    points: list[tuple[float, float]] = []
+    for raw_point in raw_points:
+        if isinstance(raw_point, (str, bytes, bytearray)):
+            raise TypeError("Door body profile points must be X/Z pairs.")
+        try:
+            coordinates = tuple(raw_point)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise TypeError(
+                "Door body profile points must be X/Z pairs."
+            ) from error
+        if len(coordinates) != 2:
+            raise ValueError("Door body profile points must contain X and Z.")
+        normalized_point: list[float] = []
+        for coordinate in coordinates:
+            if isinstance(coordinate, bool):
+                raise TypeError("Door body profile coordinates must be numbers.")
+            try:
+                number = float(coordinate)
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "Door body profile coordinates must be numbers."
+                ) from error
+            if not math.isfinite(number):
+                raise ValueError(
+                    "Door body profile coordinates must be finite."
+                )
+            normalized_point.append(number)
+        points.append((normalized_point[0], normalized_point[1]))
+
+    width, _depth, height = dimensions
+    half_width = width * 0.5
+    tolerance = max(1e-7, max(width, height) * 1e-6)
+    expected_bottom_left = np.asarray((-half_width, 0.0), dtype=float)
+    expected_bottom_right = np.asarray((half_width, 0.0), dtype=float)
+    if not np.allclose(points[0], expected_bottom_left, atol=tolerance, rtol=0.0):
+        raise ValueError(
+            "Door body profiles must begin at the canonical bottom-left corner."
+        )
+    if not np.allclose(points[1], expected_bottom_right, atol=tolerance, rtol=0.0):
+        raise ValueError(
+            "Door body profiles must cross the canonical bottom edge first."
+        )
+    if not np.allclose(points[-1], points[0], atol=tolerance, rtol=0.0):
+        raise ValueError("Door body profiles must be closed.")
+    for first, second in pairwise(points):
+        if np.linalg.norm(np.subtract(second, first)) <= tolerance:
+            raise ValueError("Door body profiles cannot contain zero-length edges.")
+
+    upper_chain = points[2:-1]
+    if len(upper_chain) < 2:
+        raise ValueError("Door body profiles require a measurable upper edge.")
+    if not math.isclose(
+        upper_chain[0][0],
+        half_width,
+        abs_tol=tolerance,
+    ) or not math.isclose(
+        upper_chain[-1][0],
+        -half_width,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "Door body profile upper edges must span the full target width."
+        )
+    if any(
+        current[0] > previous[0] + tolerance
+        for previous, current in pairwise(upper_chain)
+    ):
+        raise ValueError(
+            "Door body profile upper edges must progress from right to left."
+        )
+    if any(
+        x < -half_width - tolerance
+        or x > half_width + tolerance
+        or z <= tolerance
+        or z > height + tolerance
+        for x, z in upper_chain
+    ):
+        raise ValueError(
+            "Door body profile upper edges must stay inside the target bounds."
+        )
+    if not math.isclose(
+        max(point[1] for point in upper_chain),
+        height,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "Door body profiles must reach the target opening height."
+        )
+    return tuple(points)
+
+
 def _normalize_architectural_trim_fit_dimensions(
     raw_dimensions: object,
 ) -> tuple[float, float, float] | None:
@@ -995,6 +1127,7 @@ class GenerationRequest:
         architectural_trim_kind: str | None = None,
         cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL,
         door_body_fit_dimensions: Sequence[float] | None = None,
+        door_body_profile_outline: Sequence[Sequence[float]] | None = None,
         door_side_duplication: DoorSideDuplication | None = None,
     ) -> None:
         self.frame_index = int(frame_index)
@@ -1048,6 +1181,12 @@ class GenerationRequest:
         self.door_body_fit_dimensions = _normalize_door_body_fit_dimensions(
             door_body_fit_dimensions
         )
+        self.door_body_profile_outline = (
+            _normalize_door_body_profile_outline(
+                door_body_profile_outline,
+                self.door_body_fit_dimensions,
+            )
+        )
         if (
             self.architectural_trim_fit_dimensions is not None
             and self.door_body_fit_dimensions is not None
@@ -1069,7 +1208,7 @@ class GenerationRequest:
             )
         if self.geometry_only and self.door_body_fit_dimensions is not None:
             raise ValueError(
-                "Door displacement generation requires a textured model."
+                "Door body generation requires a textured model."
             )
 
 @dataclass(frozen=True)
@@ -1630,20 +1769,27 @@ class TextureRegenerationOutcome:
 
 @dataclass(frozen=True)
 class _DoorSlotEditingTarget:
-    """Named routing state for one door slot edited in Generation."""
+    """Named routing state for one door or window slot edited in Generation."""
 
     door_id: str
     slot_id: str
     object_id: str
     object_name: str
     slot_display_name: str
+    asset_kind: str = "door"
     side_duplication: DoorSideDuplication | None = None
     side_duplication_allowed: bool = True
     generate_displacement: bool = False
+    preserve_profile: bool = False
     door_body_fit_dimensions: tuple[float, float, float] | None = None
+    door_body_profile_outline: tuple[tuple[float, float], ...] | None = None
     generation_ready: bool = False
 
     def __post_init__(self) -> None:
+        normalized_asset_kind = str(self.asset_kind).strip().lower()
+        if normalized_asset_kind not in {"door", "window"}:
+            raise ValueError("Opening component kind must be door or window.")
+        object.__setattr__(self, "asset_kind", normalized_asset_kind)
         if self.side_duplication is not None and not isinstance(
             self.side_duplication,
             DoorSideDuplication,
@@ -1662,6 +1808,17 @@ class _DoorSlotEditingTarget:
             "door_body_fit_dimensions",
             normalized_fit_dimensions,
         )
+        if not isinstance(self.preserve_profile, bool):
+            raise TypeError("Door profile-preservation state must be boolean.")
+        normalized_profile_outline = _normalize_door_body_profile_outline(
+            self.door_body_profile_outline,
+            normalized_fit_dimensions,
+        )
+        object.__setattr__(
+            self,
+            "door_body_profile_outline",
+            normalized_profile_outline,
+        )
         if not isinstance(self.side_duplication_allowed, bool):
             raise TypeError("Door side-duplication availability must be boolean.")
         if not body_slot and self.side_duplication is not None:
@@ -1678,9 +1835,19 @@ class _DoorSlotEditingTarget:
             )
         if not body_slot and normalized_fit_dimensions is not None:
             raise ValueError("Only a door body can have fit dimensions.")
+        if not body_slot and self.preserve_profile:
+            raise ValueError(
+                "Profile preservation can only be enabled for a door body."
+            )
+        if not body_slot and normalized_profile_outline is not None:
+            raise ValueError("Only a door body can have a preserved profile.")
         if self.generate_displacement and normalized_fit_dimensions is None:
             raise ValueError(
-                "Door displacement generation requires body fit dimensions."
+                "Door body generation requires fit dimensions."
+            )
+        if self.preserve_profile and normalized_profile_outline is None:
+            raise ValueError(
+                "Door profile preservation requires a canonical outline."
             )
         if not isinstance(self.generation_ready, bool):
             raise TypeError("Door slot generation readiness must be boolean.")
@@ -4124,13 +4291,16 @@ class GenerationWorkspace(QWidget):
     operation_started = Signal(str, str, object)
     operation_finished = Signal(str)
     generation_batch_started = Signal(object)
-    reference_edit_state_changed = Signal()
     external_glb_import_completed = Signal(object, object)
     external_glb_import_failed = Signal(str)
+    opening_component_generation_completed = Signal(object, object)
     door_slot_editing_changed = Signal(bool)
     architectural_trim_editing_changed = Signal(bool)
     door_slot_generation_status_changed = Signal(str)
     door_side_duplication_changed = Signal(str, object)
+    opening_generate_displacement_changed = Signal(str, str, bool)
+    opening_preserve_profile_changed = Signal(str, str, bool)
+    controls_synced = Signal()
 
     def __init__(
         self,
@@ -4179,10 +4349,7 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_mask_signature: (
             tuple[int, tuple[int, ...], str] | None
         ) = None
-        self._accepted_reference_edits: dict[int, np.ndarray] = {}
         self._temporary_object_reference_bgra: np.ndarray | None = None
-        self._reference_edit_signature_cache_key: tuple[int, int] | None = None
-        self._reference_edit_signature_cache_value: tuple[object, ...] | None = None
         self._generation_thread: QThread | None = None
         self._generation_worker: (
             GenerationWorker
@@ -4249,93 +4416,11 @@ class GenerationWorkspace(QWidget):
         self._store_current_frame_strokes()
         return self._data.clone()
 
-    def build_object_reference_edit_inputs(
-        self,
-    ) -> tuple[np.ndarray, tuple[object, ...]]:
-        """Snapshot one selected object and its stable input identity."""
-
-        source_bgra = self.video_view.build_reference_edit_source()
-        signature = self._build_object_reference_edit_signature(
-            source_bgra,
-        )
-        self._reference_edit_signature_cache_key = (
-            self._current_reference_edit_cache_key()
-        )
-        self._reference_edit_signature_cache_value = signature
-        return source_bgra, signature
-
-    def accept_object_reference_edit(
-        self,
-        signature: tuple[object, ...],
-        edited_bgra: np.ndarray,
-    ) -> bool:
-        """Use an immutable square reference until its video frame is left."""
-
-        normalized_signature = tuple(signature)
-        try:
-            current_source = self.video_view.build_reference_edit_source()
-        except ValueError:
-            return False
-        current_signature = self._build_object_reference_edit_signature(
-            current_source,
-        )
-        edited = np.asarray(edited_bgra)
-        if (
-            current_signature != normalized_signature
-            or edited.ndim != 3
-            or edited.shape[2] != 4
-            or edited.shape != OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE
-            or edited.dtype != np.uint8
-            or edited.size == 0
-            or not np.any(edited[:, :, 3] > 0)
-        ):
-            return False
-        frame_index = int(normalized_signature[0])
-        self._accepted_reference_edits[frame_index] = (
-            np.ascontiguousarray(edited).copy()
-        )
-        self.reference_edit_state_changed.emit()
-        return True
-
-    def get_current_object_reference_edit_signature(
-        self,
-    ) -> tuple[object, ...] | None:
-        """Return a stable identity for the current frame and object mask."""
-
-        cache_key = self._current_reference_edit_cache_key()
-        if self._reference_edit_signature_cache_key == cache_key:
-            return self._reference_edit_signature_cache_value
-        try:
-            source_bgra = self.video_view.build_reference_edit_source()
-        except ValueError:
-            self._reference_edit_signature_cache_key = cache_key
-            self._reference_edit_signature_cache_value = None
-            return None
-        signature = self._build_object_reference_edit_signature(
-            source_bgra,
-        )
-        self._reference_edit_signature_cache_key = cache_key
-        self._reference_edit_signature_cache_value = signature
-        return signature
-
-    def get_current_accepted_object_reference(self) -> np.ndarray | None:
-        """Return the accepted square while its video frame remains active."""
-
-        edited = self._accepted_reference_edits.get(
-            int(self._data.current_frame_index)
-        )
-        return None if edited is None else edited.copy()
-
-    def has_current_accepted_object_reference(self) -> bool:
-        """Report whether generation currently has a matching accepted edit."""
-
-        return self._has_cached_reference_edit_for_current_frame()
-
     def set_temporary_object_reference(
         self,
         reference_bgra: np.ndarray,
     ) -> None:
-        """Use an external image without replacing the loaded video state."""
+        """Use an external image and return to ordinary object generation."""
 
         reference = np.asarray(reference_bgra)
         if (
@@ -4349,13 +4434,10 @@ class GenerationWorkspace(QWidget):
         if not np.any(reference[:, :, 3] > 0):
             raise ValueError("The object reference is fully transparent.")
 
+        self.clear_door_slot_editing_target()
         self._temporary_object_reference_bgra = (
             np.ascontiguousarray(reference).copy()
         )
-        self._discard_reference_edits_for_frame(
-            self._data.current_frame_index
-        )
-        self.reference_edit_state_changed.emit()
         self._sync_controls()
 
     def clear_temporary_object_reference(self) -> bool:
@@ -4365,7 +4447,6 @@ class GenerationWorkspace(QWidget):
             return False
         self._temporary_object_reference_bgra = None
         self.video_view.clear_reference_preview()
-        self.reference_edit_state_changed.emit()
         self._sync_controls()
         return True
 
@@ -4392,11 +4473,10 @@ class GenerationWorkspace(QWidget):
         return np.ascontiguousarray(reference).copy()
 
     def _has_current_object_generation_reference(self) -> bool:
-        """Report whether an external, edited, or painted source is active."""
+        """Report whether an external image or painted source is active."""
 
         return bool(
             self.has_temporary_object_reference()
-            or self.has_current_accepted_object_reference()
             or self.video_view.has_selection()
         )
 
@@ -4406,63 +4486,12 @@ class GenerationWorkspace(QWidget):
         temporary_reference = self.get_temporary_object_reference()
         if temporary_reference is not None:
             return temporary_reference
-
-        accepted_reference = self.get_current_accepted_object_reference()
-        if accepted_reference is not None:
-            return accepted_reference
         return self.video_view.build_selected_object_crop()
 
-    def discard_object_reference_before_frame_change(
-        self,
-        next_frame_index: int,
-    ) -> bool:
-        """Expire temporary input, and accepted edits when leaving a frame."""
+    def clear_temporary_object_reference_for_video_navigation(self) -> bool:
+        """Expire a temporary image whenever video navigation takes over."""
 
-        did_discard = self.clear_temporary_object_reference()
-        current_frame_index = self._displayed_frame_index
-        if (
-            current_frame_index is None
-            or int(current_frame_index) == int(next_frame_index)
-        ):
-            return did_discard
-        self._reference_edit_signature_cache_key = None
-        self._reference_edit_signature_cache_value = None
-        did_discard_accepted = self._discard_reference_edits_for_frame(
-            current_frame_index
-        )
-        if did_discard_accepted:
-            self.reference_edit_state_changed.emit()
-        return did_discard or did_discard_accepted
-
-    def _has_cached_reference_edit_for_current_frame(self) -> bool:
-        frame_index = int(self._data.current_frame_index)
-        return frame_index in self._accepted_reference_edits
-
-    def _discard_reference_edits_for_frame(self, frame_index: int) -> bool:
-        normalized_frame_index = int(frame_index)
-        if normalized_frame_index not in self._accepted_reference_edits:
-            return False
-        self._accepted_reference_edits.pop(normalized_frame_index, None)
-        return True
-
-    def _current_reference_edit_cache_key(self) -> tuple[int, int]:
-        return (
-            int(self._data.current_frame_index),
-            self.video_view.get_reference_edit_input_revision(),
-        )
-
-    def _build_object_reference_edit_signature(
-        self,
-        source_bgra: np.ndarray,
-    ) -> tuple[object, ...]:
-        """Fingerprint exact pixel inputs so stale AI edits cannot be reused."""
-
-        source = np.ascontiguousarray(source_bgra)
-        return (
-            int(self._data.current_frame_index),
-            tuple(int(value) for value in source.shape),
-            hashlib.sha256(source.tobytes()).hexdigest(),
-        )
+        return self.clear_temporary_object_reference()
 
     def get_shared_controls(self) -> GenerationSharedControls:
         """Expose the canonical controls shared by both generation pipelines."""
@@ -4512,14 +4541,18 @@ class GenerationWorkspace(QWidget):
         door_id: str,
         slot_id: str,
         model: GeneratedModel,
+        asset_kind: str = "door",
     ) -> GeneratedObjectRecord:
-        """Persist one exact procedural door component outside normal object UI."""
+        """Persist one exact opening component outside normal object UI."""
 
         normalized_object_id = str(object_id).strip()
         normalized_door_id = str(door_id).strip()
         normalized_slot_id = str(slot_id).strip()
+        normalized_asset_kind = str(asset_kind).strip().lower()
         if not normalized_object_id or not normalized_door_id or not normalized_slot_id:
             raise ValueError("Door component identities cannot be empty.")
+        if normalized_asset_kind not in {"door", "window"}:
+            raise ValueError("Opening component kind must be door or window.")
         if self._find_generated_object_record(normalized_object_id) is not None:
             raise ValueError("The door component object ID is already in use.")
         if not isinstance(model, GeneratedModel) or not model.glb_bytes:
@@ -4529,7 +4562,7 @@ class GenerationWorkspace(QWidget):
         import_generated_glb(bytes(model.glb_bytes))
         asset_key = hashlib.sha256(normalized_object_id.encode("utf-8")).hexdigest()
         asset_path = self._persist_meshy_named_asset(
-            f"door-{asset_key}.glb",
+            f"{normalized_asset_kind}-{asset_key}.glb",
             bytes(model.glb_bytes),
         )
         record = GeneratedObjectRecord(
@@ -4537,10 +4570,11 @@ class GenerationWorkspace(QWidget):
             frame_index=0,
             object_name=str(object_name).strip(),
             pipeline={
-                "mode": "door_component",
+                "mode": f"{normalized_asset_kind}_component",
                 DOOR_COMPONENT_PIPELINE_KEY: {
                     "door_id": normalized_door_id,
                     "slot_id": normalized_slot_id,
+                    "asset_kind": normalized_asset_kind,
                 },
                 LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
             },
@@ -4552,6 +4586,152 @@ class GenerationWorkspace(QWidget):
         self._cache_generated_model(record, model)
         self._emit_data_changed()
         return record
+
+    def clone_door_component_model(
+        self,
+        *,
+        source_object_id: str,
+        target_object_id: str,
+        object_name: str,
+        door_id: str,
+        slot_id: str,
+        asset_kind: str = "door",
+    ) -> GeneratedObjectRecord:
+        """Create an independently replaceable component sharing source assets."""
+
+        normalized_source_id = str(source_object_id).strip()
+        normalized_target_id = str(target_object_id).strip()
+        normalized_door_id = str(door_id).strip()
+        normalized_slot_id = str(slot_id).strip()
+        normalized_asset_kind = str(asset_kind).strip().lower()
+        if not all(
+            (
+                normalized_source_id,
+                normalized_target_id,
+                normalized_door_id,
+                normalized_slot_id,
+            )
+        ):
+            raise ValueError("Door component clone identities cannot be empty.")
+        if normalized_asset_kind not in {"door", "window"}:
+            raise ValueError("Opening component kind must be door or window.")
+        if self._find_generated_object_record(normalized_target_id) is not None:
+            raise ValueError("The cloned component object ID is already in use.")
+        source = self._find_generated_object_record(normalized_source_id)
+        if source is None or not is_door_component_record(source):
+            raise ValueError("The copied door component model is unavailable.")
+        model = self.get_generated_object_model(normalized_source_id)
+        if model is None:
+            raise ValueError("The copied door component GLB is unavailable.")
+        pipeline = copy.deepcopy(source.pipeline)
+        pipeline["mode"] = f"{normalized_asset_kind}_component"
+        pipeline[DOOR_COMPONENT_PIPELINE_KEY] = {
+            "door_id": normalized_door_id,
+            "slot_id": normalized_slot_id,
+            "asset_kind": normalized_asset_kind,
+        }
+        record = replace(
+            source,
+            object_id=normalized_target_id,
+            object_name=str(object_name).strip(),
+            pipeline=pipeline,
+        )
+        self._data.generated_objects.append(record)
+        self._cache_generated_model(record, model)
+        self._emit_data_changed()
+        return record
+
+    def detach_door_component_model_for_undo(
+        self,
+        object_id: str,
+    ) -> DetachedGeneratedObjectSnapshot | None:
+        """Detach one unused opening component while preserving it for undo."""
+
+        normalized_object_id = str(object_id).strip()
+        record_index = next(
+            (
+                index
+                for index, record in enumerate(self._data.generated_objects)
+                if record.object_id == normalized_object_id
+            ),
+            None,
+        )
+        if record_index is None:
+            return None
+        record = self._data.generated_objects[record_index]
+        if not is_door_component_record(record):
+            raise ValueError("Only door or window components can be detached for undo.")
+        if self._object_has_active_mutation_job(normalized_object_id):
+            raise RuntimeError(
+                "An opening component cannot be replaced while its generation "
+                "job is active."
+            )
+        if any(
+            instance.source_object_id == normalized_object_id
+            for instance in self._data.object_instances
+        ):
+            raise RuntimeError(
+                "An instanced opening component cannot be detached for undo."
+            )
+
+        model = self.get_generated_object_model(normalized_object_id)
+        self._data.generated_objects.pop(record_index)
+        self._generated_model_cache.pop(normalized_object_id, None)
+        self._generated_model_cache_revisions.pop(normalized_object_id, None)
+        self._discard_object_face_geometry_cache(normalized_object_id)
+        if (
+            self._door_slot_editing_target is not None
+            and self._door_slot_editing_target.object_id == normalized_object_id
+        ):
+            self.clear_door_slot_editing_target()
+        if self._selected_object_id == normalized_object_id:
+            self._select_generated_object(None)
+        self.generated_object_deleted.emit(normalized_object_id)
+        self._emit_data_changed()
+        self._emit_placeable_objects_changed()
+        self._sync_controls()
+        return DetachedGeneratedObjectSnapshot(
+            record=record,
+            record_index=record_index,
+            model=model,
+        )
+
+    def restore_detached_door_component_model(
+        self,
+        snapshot: DetachedGeneratedObjectSnapshot,
+    ) -> bool:
+        """Restore an exact component record detached by an undoable edit."""
+
+        if not isinstance(snapshot, DetachedGeneratedObjectSnapshot):
+            raise TypeError("Opening component undo requires a detached snapshot.")
+        record = snapshot.record
+        if not is_door_component_record(record):
+            raise ValueError("The detached record is not an opening component.")
+        if self._find_generated_object_record(record.object_id) is not None:
+            return False
+        record_index = min(
+            max(int(snapshot.record_index), 0),
+            len(self._data.generated_objects),
+        )
+        self._data.generated_objects.insert(record_index, record)
+        if snapshot.model is not None:
+            self._cache_generated_model(record, snapshot.model)
+        self._emit_data_changed()
+        self._emit_placeable_objects_changed()
+        self._sync_controls()
+        return True
+
+    def discard_detached_door_component_model(
+        self,
+        snapshot: DetachedGeneratedObjectSnapshot,
+    ) -> bool:
+        """Delete files retained only by an undo snapshot that is being dropped."""
+
+        if not isinstance(snapshot, DetachedGeneratedObjectSnapshot):
+            raise TypeError("Opening component cleanup requires a detached snapshot.")
+        if self._find_generated_object_record(snapshot.record.object_id) is not None:
+            return False
+        return not self._delete_unreferenced_object_assets(snapshot.record)
 
     def register_architectural_trim_component_model(
         self,
@@ -4612,10 +4792,13 @@ class GenerationWorkspace(QWidget):
         object_id: str,
         object_name: str,
         slot_display_name: str,
+        asset_kind: str = "door",
         side_duplication: DoorSideDuplication | None = None,
         side_duplication_allowed: bool = True,
         generate_displacement: bool = False,
+        preserve_profile: bool = False,
         door_body_fit_dimensions: Sequence[float] | None = None,
+        door_body_profile_outline: Sequence[Sequence[float]] | None = None,
         generation_ready: bool = True,
         announce_generation: bool | None = None,
         defer_file_backed_preview: bool = False,
@@ -4627,6 +4810,7 @@ class GenerationWorkspace(QWidget):
         normalized_object_id = str(object_id).strip()
         normalized_object_name = str(object_name).strip()
         normalized_slot_display_name = str(slot_display_name).strip()
+        normalized_asset_kind = str(asset_kind).strip().lower()
         if not all(
             (
                 normalized_door_id,
@@ -4636,6 +4820,8 @@ class GenerationWorkspace(QWidget):
                 normalized_slot_display_name,
             )
         ):
+            return False
+        if normalized_asset_kind not in {"door", "window"}:
             return False
         record = self._find_generated_object_record(normalized_object_id)
         if record is not None and not is_door_component_record(record):
@@ -4647,6 +4833,7 @@ class GenerationWorkspace(QWidget):
             object_id=normalized_object_id,
             object_name=normalized_object_name,
             slot_display_name=normalized_slot_display_name,
+            asset_kind=normalized_asset_kind,
             side_duplication=side_duplication,
             side_duplication_allowed=bool(
                 side_duplication_allowed
@@ -4656,8 +4843,17 @@ class GenerationWorkspace(QWidget):
                 generate_displacement
                 and is_door_body_slot(normalized_slot_id)
             ),
+            preserve_profile=bool(
+                preserve_profile
+                and is_door_body_slot(normalized_slot_id)
+            ),
             door_body_fit_dimensions=(
                 door_body_fit_dimensions
+                if is_door_body_slot(normalized_slot_id)
+                else None
+            ),
+            door_body_profile_outline=(
+                door_body_profile_outline
                 if is_door_body_slot(normalized_slot_id)
                 else None
             ),
@@ -4667,6 +4863,7 @@ class GenerationWorkspace(QWidget):
             previous_target is not None
             and previous_target.door_id == next_target.door_id
             and previous_target.slot_id == next_target.slot_id
+            and previous_target.asset_kind == next_target.asset_kind
         )
         if announce_generation is not None:
             self._door_slot_generation_prompt_visible = bool(
@@ -4784,6 +4981,12 @@ class GenerationWorkspace(QWidget):
             and target.slot_id == str(slot_id).strip()
             and target.generation_ready
         )
+
+    def active_opening_component_kind(self) -> str | None:
+        """Return whether Generation currently edits a door or window part."""
+
+        target = self._door_slot_editing_target
+        return None if target is None else target.asset_kind
 
     def clear_door_slot_editing_target(self) -> None:
         """Return Generation to its ordinary generated-object context."""
@@ -5546,10 +5749,7 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_id = None
         self._latest_generation_batch_member_ids.clear()
         self._latest_generation_batch_mask_signature = None
-        self._accepted_reference_edits.clear()
         self._temporary_object_reference_bgra = None
-        self._reference_edit_signature_cache_key = None
-        self._reference_edit_signature_cache_value = None
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = GenerationData() if data is None else data.clone()
@@ -6985,11 +7185,12 @@ class GenerationWorkspace(QWidget):
         if (
             is_door_body_slot(target.slot_id)
             and not target.generate_displacement
+            and not target.preserve_profile
             and not side_duplication_rebuild
         ):
             self.status_label.setText(
-                "Enable Generate displacement to replace the fitted door "
-                "body geometry."
+                "Enable Generate displacement or Preserve door profile to "
+                "replace the fitted door body geometry."
             )
             return False
         if (
@@ -7353,10 +7554,7 @@ class GenerationWorkspace(QWidget):
         self._data.video_metadata = next_source.metadata
         self._data.current_frame_index = 0
         self._data.frame_strokes = {}
-        self._accepted_reference_edits.clear()
         self._temporary_object_reference_bgra = None
-        self._reference_edit_signature_cache_key = None
-        self._reference_edit_signature_cache_value = None
         self._sync_video_controls()
         self.show_frame(0)
         self.status_label.setText(
@@ -7377,7 +7575,12 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(str(error))
             return
 
-        self.discard_object_reference_before_frame_change(safe_index)
+        if (
+            self._displayed_frame_index is not None
+            and self._displayed_frame_index != safe_index
+        ):
+            self.clear_door_slot_editing_target()
+        self.clear_temporary_object_reference_for_video_navigation()
         self._data.current_frame_index = safe_index
         self._displayed_frame_index = safe_index
         self.video_view.set_frame(
@@ -7399,6 +7602,7 @@ class GenerationWorkspace(QWidget):
         if target is not None and is_door_body_slot(target.slot_id):
             if (
                 target.generate_displacement
+                or target.preserve_profile
                 or self._door_body_side_duplication_requires_rebuild(target)
             ):
                 self._start_door_slot_model_generation(target)
@@ -8366,6 +8570,38 @@ class GenerationWorkspace(QWidget):
         )
         buttons_layout.addWidget(self.side_door_duplication_checkbox)
 
+        self.generate_displacement_checkbox = QCheckBox(
+            "Generate displacement"
+        )
+        self.generate_displacement_checkbox.setObjectName(
+            "generate_door_displacement_checkbox"
+        )
+        self.generate_displacement_checkbox.setChecked(True)
+        self.generate_displacement_checkbox.setToolTip(
+            "Make Generate replace the selected door or window body's "
+            "geometry so raised and recessed details are retained."
+        )
+        self.generate_displacement_checkbox.toggled.connect(
+            self._handle_generate_displacement_changed
+        )
+        buttons_layout.addWidget(self.generate_displacement_checkbox)
+
+        self.preserve_door_profile_checkbox = QCheckBox(
+            "Preserve door profile"
+        )
+        self.preserve_door_profile_checkbox.setObjectName(
+            "preserve_door_profile_checkbox"
+        )
+        self.preserve_door_profile_checkbox.setChecked(False)
+        self.preserve_door_profile_checkbox.setToolTip(
+            "Keep the outer silhouette and extremities of the door or "
+            "window profile that created this body."
+        )
+        self.preserve_door_profile_checkbox.toggled.connect(
+            self._handle_preserve_door_profile_changed
+        )
+        buttons_layout.addWidget(self.preserve_door_profile_checkbox)
+
         self.generate_button = QPushButton("Generate")
         self.generate_button.setMinimumHeight(38)
         self.generate_button.setToolTip(
@@ -8524,7 +8760,6 @@ class GenerationWorkspace(QWidget):
             self.video_view.get_strokes(),
         )
         self._emit_data_changed()
-        self.reference_edit_state_changed.emit()
         self._sync_controls()
 
     # ### Active operation helpers ###
@@ -9275,12 +9510,15 @@ class GenerationWorkspace(QWidget):
                     ),
                 ):
                     raise ValueError(
-                        "Door displacement generation requires a newly "
+                        "Door body generation requires a newly "
                         "generated textured model."
                     )
                 texture_variants = _fit_generated_door_body_texture_variants(
                     texture_variants,
                     generation_request.door_body_fit_dimensions,
+                    profile_outline=(
+                        generation_request.door_body_profile_outline
+                    ),
                 )
             if (
                 generation_request is not None
@@ -9540,6 +9778,11 @@ class GenerationWorkspace(QWidget):
             self.generation_completed.emit(record, generated_model)
         else:
             self.generated_object_changed.emit(record, generated_model)
+        if is_door_component_record(record):
+            self.opening_component_generation_completed.emit(
+                record,
+                generated_model,
+            )
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(
                 runtime,
@@ -9698,6 +9941,11 @@ class GenerationWorkspace(QWidget):
             self.generation_completed.emit(record, saved.preview_model)
         else:
             self.generated_object_changed.emit(record, saved.preview_model)
+        if is_door_component_record(record):
+            self.opening_component_generation_completed.emit(
+                record,
+                saved.preview_model,
+            )
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(
                 runtime,
@@ -10005,6 +10253,11 @@ class GenerationWorkspace(QWidget):
         self._emit_data_changed()
         self.texture_regeneration_completed.emit(replacement, preview_model)
         self.generated_object_changed.emit(replacement, preview_model)
+        if is_door_component_record(replacement):
+            self.opening_component_generation_completed.emit(
+                replacement,
+                preview_model,
+            )
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(
                 runtime,
@@ -10145,6 +10398,11 @@ class GenerationWorkspace(QWidget):
             replacement,
             saved.preview_model,
         )
+        if is_door_component_record(replacement):
+            self.opening_component_generation_completed.emit(
+                replacement,
+                saved.preview_model,
+            )
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(runtime, status)
 
@@ -10423,6 +10681,7 @@ class GenerationWorkspace(QWidget):
             and is_door_body_slot(door_slot_target.slot_id)
             and (
                 door_slot_target.generate_displacement
+                or door_slot_target.preserve_profile
                 or self._door_body_side_duplication_requires_rebuild(
                     door_slot_target
                 )
@@ -10437,6 +10696,21 @@ class GenerationWorkspace(QWidget):
                 or is_door_body_slot(door_slot_target.slot_id)
             )
         )
+        if (
+            symmetric_division_enabled
+            and door_slot_target is not None
+            and door_slot_target.preserve_profile
+            and door_slot_target.door_body_profile_outline is not None
+            and not _door_body_profile_is_x_symmetric(
+                door_slot_target.door_body_profile_outline
+            )
+        ):
+            self.status_label.setText(
+                "Symmetric division cannot preserve this asymmetric door "
+                "profile. Disable Symmetric division or Preserve door "
+                "profile."
+            )
+            return None
         architectural_trim_uv_texture_domain = (
             ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
             if (
@@ -10507,6 +10781,15 @@ class GenerationWorkspace(QWidget):
                 if door_slot_target is not None and rebuild_door_body
                 else None
             ),
+            door_body_profile_outline=(
+                door_slot_target.door_body_profile_outline
+                if (
+                    door_slot_target is not None
+                    and rebuild_door_body
+                    and door_slot_target.preserve_profile
+                )
+                else None
+            ),
             door_side_duplication=(
                 door_slot_target.side_duplication
                 if door_slot_target is not None and rebuild_door_body
@@ -10524,10 +10807,7 @@ class GenerationWorkspace(QWidget):
         template = self._build_generation_request(geometry_only=geometry_only)
         if template is None:
             return ()
-        if (
-            self.has_temporary_object_reference()
-            or self.has_current_accepted_object_reference()
-        ):
+        if self.has_temporary_object_reference():
             selected_crops = (template.selected_object_bgra,)
         else:
             selected_crops = self.video_view.build_selected_object_crops()
@@ -10560,6 +10840,9 @@ class GenerationWorkspace(QWidget):
                 ),
                 door_body_fit_dimensions=(
                     template.door_body_fit_dimensions
+                ),
+                door_body_profile_outline=(
+                    template.door_body_profile_outline
                 ),
                 door_side_duplication=template.door_side_duplication,
             )
@@ -10854,6 +11137,48 @@ class GenerationWorkspace(QWidget):
         )
         self._sync_controls()
 
+    def _handle_generate_displacement_changed(self, checked: bool) -> None:
+        """Persist displacement generation for the active opening body."""
+
+        target = self._door_slot_editing_target
+        if target is None or not is_door_body_slot(target.slot_id):
+            self._sync_controls()
+            return
+        requested = bool(checked)
+        if target.generate_displacement == requested:
+            return
+        self._door_slot_editing_target = replace(
+            target,
+            generate_displacement=requested,
+        )
+        self.opening_generate_displacement_changed.emit(
+            target.asset_kind,
+            target.door_id,
+            requested,
+        )
+        self._sync_controls()
+
+    def _handle_preserve_door_profile_changed(self, checked: bool) -> None:
+        """Persist exact-profile generation for the active opening body."""
+
+        target = self._door_slot_editing_target
+        if target is None or not is_door_body_slot(target.slot_id):
+            self._sync_controls()
+            return
+        requested = bool(checked)
+        if target.preserve_profile == requested:
+            return
+        self._door_slot_editing_target = replace(
+            target,
+            preserve_profile=requested,
+        )
+        self.opening_preserve_profile_changed.emit(
+            target.asset_kind,
+            target.door_id,
+            requested,
+        )
+        self._sync_controls()
+
     # ### Control synchronization ###
     def _sync_controls(self) -> None:
         door_slot_mode = self._door_slot_editing_target is not None
@@ -10886,6 +11211,7 @@ class GenerationWorkspace(QWidget):
                     self._door_slot_editing_target.slot_id
                 )
                 or self._door_slot_editing_target.generate_displacement
+                or self._door_slot_editing_target.preserve_profile
                 or self._door_body_side_duplication_requires_rebuild()
             )
             and not self._object_has_active_mutation_job(
@@ -10930,6 +11256,33 @@ class GenerationWorkspace(QWidget):
             side_duplication_visible
         )
         del side_duplication_blocker
+
+        opening_target = self._door_slot_editing_target
+        displacement_blocker = QSignalBlocker(
+            self.generate_displacement_checkbox
+        )
+        self.generate_displacement_checkbox.setChecked(
+            True
+            if opening_target is None
+            else bool(
+                door_body_slot_mode and opening_target.generate_displacement
+            )
+        )
+        self.generate_displacement_checkbox.setEnabled(door_body_slot_mode)
+        del displacement_blocker
+
+        preserve_profile_blocker = QSignalBlocker(
+            self.preserve_door_profile_checkbox
+        )
+        self.preserve_door_profile_checkbox.setChecked(
+            bool(
+                door_body_slot_mode
+                and opening_target is not None
+                and opening_target.preserve_profile
+            )
+        )
+        self.preserve_door_profile_checkbox.setEnabled(door_body_slot_mode)
+        del preserve_profile_blocker
         mask_tool_is_available = (
             has_video
             and not has_temporary_reference
@@ -11050,6 +11403,7 @@ class GenerationWorkspace(QWidget):
                     door_body_slot_mode
                     and self._door_slot_editing_target is not None
                     and not self._door_slot_editing_target.generate_displacement
+                    and not self._door_slot_editing_target.preserve_profile
                     and not self._door_body_side_duplication_requires_rebuild()
                 )
                 else door_slot_can_generate_model
@@ -11072,6 +11426,7 @@ class GenerationWorkspace(QWidget):
         )
         if not self._shared_control_state_managed_externally:
             self.video_view.set_interaction_enabled(mask_tool_is_available)
+        self.controls_synced.emit()
 
     def _selected_object_has_complete_texture_uvs(
         self,
@@ -12458,25 +12813,480 @@ def _pack_architectural_trim_texture_variants(
     )
 
 
+# ### Door body profile helpers ###
+def _door_body_profile_upper_heights(
+    x_coordinates: np.ndarray,
+    profile_outline: tuple[tuple[float, float], ...],
+) -> np.ndarray:
+    """Interpolate the single-valued upper edge of a canonical profile."""
+
+    upper_chain = np.asarray(profile_outline[2:-1], dtype=float)
+    ascending_chain = upper_chain[::-1]
+    return np.interp(
+        np.asarray(x_coordinates, dtype=float),
+        ascending_chain[:, 0],
+        ascending_chain[:, 1],
+    )
+
+
+def _door_body_profile_is_x_symmetric(
+    profile_outline: tuple[tuple[float, float], ...],
+) -> bool:
+    """Return whether vertical division can reproduce this full profile."""
+
+    upper_chain = np.asarray(profile_outline[2:-1], dtype=float)[::-1]
+    sample_coordinates = np.unique(
+        np.concatenate((upper_chain[:, 0], -upper_chain[:, 0]))
+    )
+    minimum_x = float(upper_chain[0, 0])
+    maximum_x = float(upper_chain[-1, 0])
+    sample_coordinates = sample_coordinates[
+        (sample_coordinates >= minimum_x)
+        & (sample_coordinates <= maximum_x)
+    ]
+    heights = np.interp(
+        sample_coordinates,
+        upper_chain[:, 0],
+        upper_chain[:, 1],
+    )
+    mirrored_heights = np.interp(
+        -sample_coordinates,
+        upper_chain[:, 0],
+        upper_chain[:, 1],
+    )
+    tolerance = max(
+        1e-7,
+        float(np.max(np.abs(upper_chain[:, 1]))) * 1e-6,
+    )
+    return bool(np.allclose(heights, mirrored_heights, rtol=0.0, atol=tolerance))
+
+
+def _door_body_profile_split_planes(
+    fit_dimensions: tuple[float, float, float],
+    profile_outline: tuple[tuple[float, float], ...],
+) -> tuple[float, ...]:
+    """Return every interior plane needed by the authored upper profile.
+
+    Supplying all breakpoints is deliberate: the splitter itself leaves a
+    plane-aligned edge untouched, while an unrelated vertex at the same X
+    coordinate must not make us skip a coarse face which still crosses the
+    profile breakpoint.
+    """
+
+    width, _depth, _height = fit_dimensions
+    half_width = width * 0.5
+    tolerance = max(1e-7, max(fit_dimensions) * 1e-6)
+    upper_chain = np.asarray(profile_outline[2:-1], dtype=float)
+    split_coordinates: list[float] = []
+    for coordinate, _profile_height in upper_chain:
+        normalized_coordinate = float(coordinate)
+        if (
+            -half_width + tolerance < normalized_coordinate < half_width - tolerance
+            and not any(
+                math.isclose(
+                    normalized_coordinate,
+                    known_coordinate,
+                    abs_tol=tolerance,
+                )
+                for known_coordinate in split_coordinates
+            )
+        ):
+            split_coordinates.append(normalized_coordinate)
+    return tuple(sorted(split_coordinates))
+
+
+def _projected_mesh_envelopes(
+    coordinates: np.ndarray,
+    triangles: np.ndarray,
+    *,
+    coordinate_axis: int,
+    envelope_axis: int,
+    tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return projected mesh limits where triangles cross each coordinate."""
+
+    queries = np.asarray(coordinates, dtype=float)
+    source_triangles = np.asarray(triangles, dtype=float)
+    if (
+        coordinate_axis not in {0, 1, 2}
+        or envelope_axis not in {0, 1, 2}
+        or coordinate_axis == envelope_axis
+    ):
+        raise ValueError("Door silhouette projection axes are invalid.")
+    if queries.ndim != 1 or not np.all(np.isfinite(queries)):
+        raise ValueError("Door silhouette coordinates are invalid.")
+    if (
+        source_triangles.ndim != 3
+        or source_triangles.shape[1:] != (3, 3)
+        or not len(source_triangles)
+        or not np.all(np.isfinite(source_triangles))
+    ):
+        raise ValueError("Door silhouette triangles are invalid.")
+
+    edge_starts = source_triangles[:, (0, 1, 2), :].reshape((-1, 3))
+    edge_ends = source_triangles[:, (1, 2, 0), :].reshape((-1, 3))
+    start_coordinates = edge_starts[:, coordinate_axis]
+    end_coordinates = edge_ends[:, coordinate_axis]
+    coordinate_deltas = end_coordinates - start_coordinates
+    minimum_coordinates = np.minimum(start_coordinates, end_coordinates)
+    maximum_coordinates = np.maximum(start_coordinates, end_coordinates)
+    nonparallel = np.abs(coordinate_deltas) > tolerance
+    unique_queries, inverse_indices = np.unique(
+        queries,
+        return_inverse=True,
+    )
+    unique_lower_limits = np.empty_like(unique_queries)
+    unique_upper_limits = np.empty_like(unique_queries)
+
+    for query_index, query_coordinate in enumerate(unique_queries):
+        crossing = (
+            nonparallel
+            & (query_coordinate >= minimum_coordinates - tolerance)
+            & (query_coordinate <= maximum_coordinates + tolerance)
+        )
+        crossing_factors = np.clip(
+            (query_coordinate - start_coordinates[crossing])
+            / coordinate_deltas[crossing],
+            0.0,
+            1.0,
+        )
+        crossing_values = edge_starts[crossing, envelope_axis] + (
+            crossing_factors
+            * (
+                edge_ends[crossing, envelope_axis]
+                - edge_starts[crossing, envelope_axis]
+            )
+        )
+        parallel = (
+            ~nonparallel
+            & (np.abs(query_coordinate - start_coordinates) <= tolerance)
+        )
+        parallel_values = np.concatenate(
+            (
+                edge_starts[parallel, envelope_axis],
+                edge_ends[parallel, envelope_axis],
+            )
+        )
+        intersections = np.concatenate((crossing_values, parallel_values))
+        if not len(intersections) or not np.all(np.isfinite(intersections)):
+            raise ValueError(
+                "The generated door body has an incomplete projected silhouette."
+            )
+        unique_lower_limits[query_index] = float(np.min(intersections))
+        unique_upper_limits[query_index] = float(np.max(intersections))
+    return (
+        unique_lower_limits[inverse_indices],
+        unique_upper_limits[inverse_indices],
+    )
+
+
+def _normalize_door_body_lateral_silhouette(
+    scene: trimesh.Scene,
+    fit_dimensions: tuple[float, float, float],
+) -> None:
+    """Fit every generated side contour to the authored slab width.
+
+    A global bounding-box fit leaves Meshy's small lateral tapers intact.  On
+    paired leaves those tapers become a visible center gap.  This horizontal
+    cage uses the projected mesh envelope at each existing vertex height, so
+    lateral boundary vertices land exactly on the authored side planes while
+    interior relief, depth, triangles, UVs, materials, and images are retained.
+    """
+
+    if not isinstance(scene, trimesh.Scene):
+        raise TypeError("Door silhouette preservation requires a mesh scene.")
+    width, _depth, _height = fit_dimensions
+    half_width = width * 0.5
+    tolerance = max(1e-8, max(fit_dimensions) * 1e-7)
+    geometry_records: list[
+        tuple[trimesh.Trimesh, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
+    world_triangles: list[np.ndarray] = []
+    referenced_geometry_names: set[object] = set()
+
+    for node_name in sorted(scene.graph.nodes_geometry, key=str):
+        node_transform, geometry_name = scene.graph.get(node_name)
+        if geometry_name in referenced_geometry_names:
+            raise ValueError(
+                "Door silhouette preservation does not support geometry "
+                "shared by multiple scene nodes."
+            )
+        referenced_geometry_names.add(geometry_name)
+        geometry = scene.geometry.get(geometry_name)
+        if not isinstance(geometry, trimesh.Trimesh):
+            continue
+        local_vertices = np.asarray(geometry.vertices, dtype=float)
+        faces = np.asarray(geometry.faces, dtype=np.int64)
+        if (
+            local_vertices.ndim != 2
+            or local_vertices.shape[1:] != (3,)
+            or not len(local_vertices)
+            or not np.all(np.isfinite(local_vertices))
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or not len(faces)
+            or np.any(faces < 0)
+            or np.any(faces >= len(local_vertices))
+        ):
+            raise ValueError(
+                "The generated door body contains invalid silhouette geometry."
+            )
+        z_up_transform = (
+            GLTF_Y_UP_TO_Z_UP_TRANSFORM
+            @ np.asarray(node_transform, dtype=float)
+        )
+        if z_up_transform.shape != (4, 4) or not np.all(
+            np.isfinite(z_up_transform)
+        ):
+            raise ValueError(
+                "The generated door body contains an invalid node transform."
+            )
+        try:
+            inverse_z_up_transform = np.linalg.inv(z_up_transform)
+        except np.linalg.LinAlgError as error:
+            raise ValueError(
+                "The generated door body contains a non-invertible node."
+            ) from error
+        world_vertices = trimesh.transform_points(
+            local_vertices,
+            z_up_transform,
+        )
+        geometry_records.append(
+            (
+                geometry,
+                world_vertices,
+                inverse_z_up_transform,
+                faces,
+            )
+        )
+        world_triangles.append(world_vertices[faces])
+
+    if not geometry_records:
+        raise ValueError(
+            "Door silhouette preservation found no usable mesh geometry."
+        )
+    combined_triangles = np.concatenate(world_triangles, axis=0)
+    for (
+        geometry,
+        world_vertices,
+        inverse_transform,
+        _faces,
+    ) in geometry_records:
+        left_limits, right_limits = _projected_mesh_envelopes(
+            world_vertices[:, 2],
+            combined_triangles,
+            coordinate_axis=2,
+            envelope_axis=0,
+            tolerance=tolerance,
+        )
+        spans = right_limits - left_limits
+        if np.any(~np.isfinite(spans)) or np.any(spans <= tolerance):
+            raise ValueError(
+                "The generated door body has no measurable lateral silhouette."
+            )
+        horizontal_factors = np.clip(
+            (world_vertices[:, 0] - left_limits) / spans,
+            0.0,
+            1.0,
+        )
+        world_vertices[:, 0] = (
+            -half_width + horizontal_factors * width
+        )
+        fitted_local_vertices = trimesh.transform_points(
+            world_vertices,
+            inverse_transform,
+        )
+        if not np.all(np.isfinite(fitted_local_vertices)):
+            raise ValueError(
+                "The preserved door silhouette produced invalid geometry."
+            )
+        geometry.vertices = fitted_local_vertices
+
+
+def _apply_door_body_profile_to_scene(
+    scene: trimesh.Scene,
+    fit_dimensions: tuple[float, float, float],
+    profile_outline: tuple[tuple[float, float], ...],
+) -> None:
+    """Cage fitted scene vertices under one exact X/Z profile in place.
+
+    X already follows the authored lateral silhouette.  At every X coordinate,
+    this maps the generated projected bottom and top boundaries to zero and the
+    authored upper profile respectively.  Y retains Meshy's depth relief.
+    Local vertex order, triangles, UVs, materials, images, and node metadata
+    are left untouched.
+    """
+
+    if not isinstance(scene, trimesh.Scene):
+        raise TypeError("Door profile preservation requires a mesh scene.")
+    width, depth, height = fit_dimensions
+    half_width = width * 0.5
+    tolerance = max(1e-7, max(fit_dimensions) * 1e-6)
+    referenced_geometry_names: set[object] = set()
+    geometry_records: list[
+        tuple[trimesh.Trimesh, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
+    world_triangles: list[np.ndarray] = []
+    output_world_vertices: list[np.ndarray] = []
+
+    for node_name in sorted(scene.graph.nodes_geometry, key=str):
+        node_transform, geometry_name = scene.graph.get(node_name)
+        if geometry_name in referenced_geometry_names:
+            raise ValueError(
+                "Door profile preservation does not support geometry shared "
+                "by multiple scene nodes."
+            )
+        referenced_geometry_names.add(geometry_name)
+        geometry = scene.geometry.get(geometry_name)
+        if not isinstance(geometry, trimesh.Trimesh):
+            continue
+        local_vertices = np.asarray(geometry.vertices, dtype=float)
+        faces = np.asarray(geometry.faces, dtype=np.int64)
+        if (
+            local_vertices.ndim != 2
+            or local_vertices.shape[1:] != (3,)
+            or not len(local_vertices)
+            or not np.all(np.isfinite(local_vertices))
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or not len(faces)
+            or np.any(faces < 0)
+            or np.any(faces >= len(local_vertices))
+        ):
+            raise ValueError(
+                "The generated door body contains invalid profile geometry."
+            )
+        z_up_transform = (
+            GLTF_Y_UP_TO_Z_UP_TRANSFORM
+            @ np.asarray(node_transform, dtype=float)
+        )
+        if z_up_transform.shape != (4, 4) or not np.all(
+            np.isfinite(z_up_transform)
+        ):
+            raise ValueError(
+                "The generated door body contains an invalid node transform."
+            )
+        try:
+            inverse_z_up_transform = np.linalg.inv(z_up_transform)
+        except np.linalg.LinAlgError as error:
+            raise ValueError(
+                "The generated door body contains a non-invertible node."
+            ) from error
+
+        world_vertices = trimesh.transform_points(
+            local_vertices,
+            z_up_transform,
+        )
+        if (
+            np.min(world_vertices[:, 0]) < -half_width - tolerance
+            or np.max(world_vertices[:, 0]) > half_width + tolerance
+            or np.min(world_vertices[:, 2]) < -tolerance
+            or np.max(world_vertices[:, 2]) > height + tolerance
+        ):
+            raise ValueError(
+                "The fitted door body extends outside its canonical profile "
+                "bounds."
+            )
+        geometry_records.append(
+            (
+                geometry,
+                world_vertices,
+                inverse_z_up_transform,
+                faces,
+            )
+        )
+        world_triangles.append(world_vertices[faces])
+
+    if not geometry_records:
+        raise ValueError(
+            "Door profile preservation found no usable mesh geometry."
+        )
+    combined_triangles = np.concatenate(world_triangles, axis=0)
+    for (
+        geometry,
+        world_vertices,
+        inverse_transform,
+        _faces,
+    ) in geometry_records:
+        safe_x = np.clip(world_vertices[:, 0], -half_width, half_width)
+        lower_heights, upper_source_heights = _projected_mesh_envelopes(
+            safe_x,
+            combined_triangles,
+            coordinate_axis=0,
+            envelope_axis=2,
+            tolerance=tolerance,
+        )
+        source_height_spans = upper_source_heights - lower_heights
+        if np.any(~np.isfinite(source_height_spans)) or np.any(
+            source_height_spans <= tolerance
+        ):
+            raise ValueError(
+                "The generated door body has no measurable vertical silhouette."
+            )
+        normalized_heights = np.clip(
+            (world_vertices[:, 2] - lower_heights) / source_height_spans,
+            0.0,
+            1.0,
+        )
+        upper_heights = _door_body_profile_upper_heights(
+            safe_x,
+            profile_outline,
+        )
+        world_vertices[:, 2] = normalized_heights * upper_heights
+        warped_local_vertices = trimesh.transform_points(
+            world_vertices,
+            inverse_transform,
+        )
+        if not np.all(np.isfinite(warped_local_vertices)):
+            raise ValueError(
+                "The preserved door body profile produced invalid geometry."
+            )
+        geometry.vertices = warped_local_vertices
+        output_world_vertices.append(world_vertices)
+
+    combined_vertices = np.vstack(output_world_vertices)
+    output_upper_heights = _door_body_profile_upper_heights(
+        np.clip(combined_vertices[:, 0], -half_width, half_width),
+        profile_outline,
+    )
+    if (
+        np.min(combined_vertices[:, 0]) < -half_width - tolerance
+        or np.max(combined_vertices[:, 0]) > half_width + tolerance
+        or np.min(combined_vertices[:, 1]) < -depth * 0.5 - tolerance
+        or np.max(combined_vertices[:, 1]) > depth * 0.5 + tolerance
+        or np.min(combined_vertices[:, 2]) < -tolerance
+        or np.any(combined_vertices[:, 2] > output_upper_heights + tolerance)
+    ):
+        raise ValueError(
+            "The generated door body could not be constrained to its profile."
+        )
+
+
 def _fit_generated_door_body_texture_variants(
     variants: PersistableObjectTextureVariants,
     fit_dimensions: Sequence[float],
     *,
+    profile_outline: Sequence[Sequence[float]] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> PersistableObjectTextureVariants:
     """Fit full generated geometry before any authored-half processing.
 
-    The transform changes only vertex positions. UV coordinates and every
-    embedded texture remain untouched, so Meshy's geometric relief survives
-    while the body keeps the doorway's exact width, thickness, and height.
+    UV coordinates and every embedded texture remain visually unchanged, so
+    Meshy's geometric relief survives while the body keeps the doorway's
+    exact width, thickness, and height. Missing interior profile breakpoints
+    are inserted by attribute-preserving triangle splitting before the warp.
     """
 
     dimensions = _normalize_door_body_fit_dimensions(fit_dimensions)
     if dimensions is None:
         raise ValueError("Door body fit dimensions are unavailable.")
+    normalized_profile_outline = _normalize_door_body_profile_outline(
+        profile_outline,
+        dimensions,
+    )
     source_glbs = variants.glb_by_resolution
     if not source_glbs:
-        raise ValueError("Door displacement generation has no texture variants.")
+        raise ValueError("Door body generation has no texture variants.")
     canonical_resolution = max(source_glbs)
     canonical_model = import_generated_glb(
         source_glbs[canonical_resolution]
@@ -12508,11 +13318,34 @@ def _fit_generated_door_body_texture_variants(
     )
 
     fitted_glbs: dict[int, bytes] = {}
+    profile_topology_changed_by_resolution: dict[int, bool] = {}
     for resolution, source_glb in source_glbs.items():
         _raise_if_generation_cancelled(cancel_event)
         source_model = import_generated_glb(source_glb)
         fitted_scene = copy.deepcopy(source_model.scene)
         fitted_scene.apply_transform(gltf_transform)
+        if normalized_profile_outline is not None:
+            _normalize_door_body_lateral_silhouette(
+                fitted_scene,
+                dimensions,
+            )
+            profile_split_planes = _door_body_profile_split_planes(
+                dimensions,
+                normalized_profile_outline,
+            )
+            profile_topology_changed_by_resolution[resolution] = bool(
+                profile_split_planes
+                and split_scene_at_z_up_axis_planes(
+                    fitted_scene,
+                    axis=0,
+                    plane_coordinates=profile_split_planes,
+                )
+            )
+            _apply_door_body_profile_to_scene(
+                fitted_scene,
+                dimensions,
+                normalized_profile_outline,
+            )
         exported = fitted_scene.export(file_type="glb")
         if not isinstance(exported, bytes) or not exported:
             raise ValueError("The fitted door body could not be serialized.")
@@ -12539,6 +13372,21 @@ def _fit_generated_door_body_texture_variants(
     )
     if not np.allclose(fitted_bottom_center, 0.0, atol=1e-7):
         raise ValueError("The fitted door body anchor is invalid.")
+    if normalized_profile_outline is not None:
+        for resolution, source_glb in source_glbs.items():
+            fitted_uv_fingerprint = build_uv_fingerprint(
+                fitted_glbs[resolution]
+            )
+            if (
+                not profile_topology_changed_by_resolution.get(
+                    resolution,
+                    False,
+                )
+                and fitted_uv_fingerprint != build_uv_fingerprint(source_glb)
+            ):
+                raise ValueError(
+                    "Door profile preservation changed the generated UV layout."
+                )
     _raise_if_generation_cancelled(cancel_event)
     return replace(variants, glb_by_resolution=fitted_glbs)
 
@@ -14185,12 +15033,13 @@ def _prepare_and_persist_object_generation(
                 ),
             ):
                 raise ValueError(
-                    "Door displacement generation requires a newly generated "
+                    "Door body generation requires a newly generated "
                     "textured model."
                 )
             texture_variants = _fit_generated_door_body_texture_variants(
                 texture_variants,
                 request.door_body_fit_dimensions,
+                profile_outline=request.door_body_profile_outline,
                 cancel_event=cancel_event,
             )
             _raise_if_generation_cancelled(cancel_event)

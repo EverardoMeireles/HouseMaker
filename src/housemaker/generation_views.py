@@ -47,7 +47,6 @@ class VideoInpaintView(QWidget):
         self._mask = np.empty((0, 0), dtype=np.uint8)
         self._mask_overlay_image = QImage()
         self._strokes: list[MaskStroke] = []
-        self._reference_edit_input_revision = 0
         self._reference_preview_bgra: np.ndarray | None = None
         self._reference_preview_image = QImage()
         self._active_points: list[MaskPoint] = []
@@ -76,7 +75,6 @@ class VideoInpaintView(QWidget):
             self._mask = np.empty((0, 0), dtype=np.uint8)
             self._mask_overlay_image = QImage()
             self._strokes = []
-            self._mark_reference_edit_inputs_changed()
             self.update()
             self.frame_changed.emit()
             return
@@ -86,7 +84,6 @@ class VideoInpaintView(QWidget):
         self._frame_image = _bgr_array_to_qimage(self._frame_bgr)
         self._strokes = list(strokes or [])
         self._rebuild_mask()
-        self._mark_reference_edit_inputs_changed()
         self.update()
         self.frame_changed.emit()
 
@@ -99,7 +96,6 @@ class VideoInpaintView(QWidget):
         self._cancel_active_stroke()
         self._strokes = list(strokes)
         self._rebuild_mask()
-        self._mark_reference_edit_inputs_changed()
         self.update()
 
     def get_strokes(self) -> list[MaskStroke]:
@@ -107,11 +103,6 @@ class VideoInpaintView(QWidget):
 
     def get_mask(self) -> np.ndarray:
         return self._mask.copy()
-
-    def get_reference_edit_input_revision(self) -> int:
-        """Return a cheap identity for the frame and object selection."""
-
-        return int(self._reference_edit_input_revision)
 
     def get_frame_bgr(self) -> np.ndarray | None:
         if self._frame_bgr is None:
@@ -193,7 +184,6 @@ class VideoInpaintView(QWidget):
             return
         self._strokes = []
         self._rebuild_mask()
-        self._mark_reference_edit_inputs_changed()
         self.strokes_changed.emit([])
         self.update()
 
@@ -253,7 +243,6 @@ class VideoInpaintView(QWidget):
             return 0
         self._strokes.extend(fills)
         self._rebuild_mask()
-        self._mark_reference_edit_inputs_changed()
         self.strokes_changed.emit(self.get_strokes())
         self.update()
         return len(fills)
@@ -307,64 +296,6 @@ class VideoInpaintView(QWidget):
                 crops.append(crop)
         return tuple(crops)
 
-    def build_reference_edit_source(
-        self,
-        padding_ratio: float = 0.08,
-    ) -> np.ndarray:
-        """Return one selected-object BGRA crop for whole-object editing.
-
-        Semantic reference editing is intentionally limited to one connected
-        object. This avoids applying one generated reconstruction across the
-        unrelated crops used by multi-object generation.
-        """
-
-        if self._frame_bgr is None or not self.has_selection():
-            raise ValueError(
-                "Reference editing requires one selected object."
-            )
-        selected_mask = np.where(self._mask > 0, 255, 0).astype(np.uint8)
-        component_count, _labels = cv2.connectedComponents(
-            selected_mask,
-            connectivity=8,
-        )
-        object_count = component_count - 1
-        if object_count != 1:
-            raise ValueError(
-                "Reference editing requires exactly one connected object "
-                f"blob; found {object_count}."
-            )
-        return _build_masked_frame_crop(
-            self._frame_bgr,
-            selected_mask,
-            padding_ratio,
-        )
-
-    def build_context_overlay(self) -> np.ndarray:
-        """Return the full frame with a translucent colored selection overlay."""
-
-        if self._frame_bgr is None:
-            return np.empty((0, 0, 3), dtype=np.uint8)
-        result = self._frame_bgr.copy()
-        selected = self._mask > 0
-        if not np.any(selected):
-            return result
-        overlay_bgr = np.asarray(
-            (MASK_OVERLAY_RGB[2], MASK_OVERLAY_RGB[1], MASK_OVERLAY_RGB[0]),
-            dtype=float,
-        )
-        result[selected] = np.clip(
-            result[selected].astype(float) * 0.55 + overlay_bgr * 0.45,
-            0.0,
-            255.0,
-        ).astype(np.uint8)
-        contours, _ = cv2.findContours(
-            np.where(selected, 255, 0).astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        cv2.drawContours(result, contours, -1, (255, 215, 95), 2)
-        return np.ascontiguousarray(result)
-
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -398,7 +329,6 @@ class VideoInpaintView(QWidget):
             if point is not None:
                 self._cancel_active_stroke()
                 if self._append_enclosed_fill(point):
-                    self._mark_reference_edit_inputs_changed()
                     self.strokes_changed.emit(self.get_strokes())
                 self.update()
                 event.accept()
@@ -438,7 +368,6 @@ class VideoInpaintView(QWidget):
         self._strokes.append(self._build_active_stroke())
         self._active_points = []
         self._rebuild_mask()
-        self._mark_reference_edit_inputs_changed()
         self.strokes_changed.emit(self.get_strokes())
         self.update()
         event.accept()
@@ -582,9 +511,6 @@ class VideoInpaintView(QWidget):
             return
         self._active_points = []
         self._rebuild_mask()
-
-    def _mark_reference_edit_inputs_changed(self) -> None:
-        self._reference_edit_input_revision += 1
 
     def _get_display_image(self) -> QImage:
         if not self._reference_preview_image.isNull():

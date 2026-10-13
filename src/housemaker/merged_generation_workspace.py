@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -14,31 +14,20 @@ from PySide6.QtCore import (
     QByteArray,
     QIODevice,
     QMimeData,
-    QRect,
     Qt,
     QThread,
     QTimer,
     Signal,
     Slot,
 )
-from PySide6.QtGui import (
-    QColor,
-    QImage,
-    QKeySequence,
-    QPainter,
-    QPaintEvent,
-    QPen,
-    QShortcut,
-)
+from PySide6.QtGui import QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -58,9 +47,9 @@ from housemaker.ceiling_height_estimation import (
     format_ceiling_height_estimate,
     infer_ceiling_height,
 )
+from housemaker.door_state import is_door_body_slot
 from housemaker.generation_jobs import (
     JOB_STATUS_RUNNING,
-    GenerationJob,
     GenerationJobManager,
 )
 from housemaker.generation_state import (
@@ -69,76 +58,31 @@ from housemaker.generation_state import (
     MaskStroke,
 )
 from housemaker.generation_workspace import (
-    GENERATION_JOB_KIND_FACE_EDIT,
-    GENERATION_JOB_KIND_MODEL,
-    GENERATION_JOB_KIND_TEXTURE,
     GenerationWorkspace,
-)
-from housemaker.object_reference_editing import (
-    DEFAULT_OBJECT_REFERENCE_EDIT_MODEL,
-    OBJECT_REFERENCE_EDIT_MODEL_OPTIONS,
-    OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE,
-    SUPPORTED_OBJECT_REFERENCE_EDIT_MODELS,
-    ObjectReferenceEditingCancelled,
-    ObjectReferenceEditingError,
-    edit_object_reference,
-    object_reference_edit_model_requires_api_key,
 )
 from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
 from housemaker.surface_texture_state import SurfaceTextureData
-from housemaker.surface_texture_workspace import (
-    SURFACE_TEXTURE_JOB_KIND,
-    SurfaceTextureGenerationWorkspace,
-)
+from housemaker.surface_texture_workspace import SurfaceTextureGenerationWorkspace
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoMetadata, probe_video
 
 # ### Constants ###
-SURFACE_OUTLINE_COLOR = QColor("#388cff")
-OBJECT_OUTLINE_COLOR = QColor("#34b878")
-WORKFLOW_OUTLINE_WIDTH = 2
-WORKFLOW_OUTLINE_INSET = 3
-OBJECT_WORKFLOW_OUTLINE_PADDING = 5
 WORKFLOW_SECTION_SPACING = 10
+GENERATION_CONTROLS_PADDING = 10
 CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS = 100
 CEILING_HEIGHT_NOT_ESTIMATED_TEXT = "Ceiling height: Not estimated"
-OBJECT_REFERENCE_EDIT_JOB_KIND = "object_reference_edit"
 DOOR_SLOT_GENERATION_BLINK_INTERVAL_MILLISECONDS = 500
 DOOR_SLOT_GENERATION_ACTIVE_STYLE = "color: #ff3030; font-weight: 700;"
 DOOR_SLOT_GENERATION_HIDDEN_STYLE = (
     "color: rgba(255, 48, 48, 0); font-weight: 700;"
 )
-OBJECT_REFERENCE_EDIT_STATUS_EMPTY = (
-    "Select one object, describe the change, then click Edit reference."
-)
-OBJECT_REFERENCE_EDIT_SOURCE_MASK = "mask"
-OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY = "temporary"
-ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION = (
-    "Isolate the complete architectural trim component. Show it in a clean "
-    "orthographic view aligned to its longest dimension. Remove the wall, "
-    "ceiling, room, scenery, and perspective distortion. Preserve its relief, "
-    "profile, proportions, material, and surface detail."
-)
-OBJECT_REFERENCE_EDIT_PROMPT_PRESETS = (
-    "show me a front of it",
-    "slightly rotated to the left",
-    "slightly rotated to the right",
-    "slightly isometric",
-    "top-down view",
-)
 REFERENCE_IMAGE_FILE_FILTER = (
     "Image files (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff);;"
     "All files (*.*)"
 )
-CANCELLABLE_GENERATION_JOB_KINDS = frozenset(
-    {
-        GENERATION_JOB_KIND_MODEL,
-        GENERATION_JOB_KIND_TEXTURE,
-        GENERATION_JOB_KIND_FACE_EDIT,
-        SURFACE_TEXTURE_JOB_KIND,
-        CEILING_HEIGHT_JOB_KIND,
-        OBJECT_REFERENCE_EDIT_JOB_KIND,
-    }
-)
+GENERATION_ACTION_GENERATE = "generate"
+GENERATION_ACTION_GEOMETRY = "generate_geometry"
+GENERATION_ACTION_OBJECT_TEXTURE = "generate_object_texture"
+GENERATION_ACTION_SURFACE_TEXTURE = "generate_surface_texture"
 
 
 # ### Ceiling-height inference jobs ###
@@ -202,158 +146,21 @@ class _CeilingHeightInferenceRuntime:
     cancel_requested: bool = False
 
 
-# ### Object-reference editing jobs ###
-ObjectReferenceEditor = Callable[..., np.ndarray]
-
-
-class _ObjectReferenceEditThread(QThread):
-    """Generate one immutable square reference away from the GUI thread."""
-
-    def __init__(
-        self,
-        source_bgra: np.ndarray,
-        prompt: str,
-        model: str,
-        api_key: str,
-        editor: ObjectReferenceEditor,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._source_bgra = np.ascontiguousarray(source_bgra).copy()
-        self._prompt = str(prompt)
-        self._model = str(model)
-        self._api_key = str(api_key)
-        self._editor = editor
-        self.result: np.ndarray | None = None
-        self.error_message: str | None = None
-        self.was_cancelled = False
-
-    def run(self) -> None:  # type: ignore[override]
-        try:
-            try:
-                result = self._editor(
-                    self._source_bgra,
-                    self._prompt,
-                    api_key=self._api_key,
-                    model=self._model,
-                    cancellation_check=self.isInterruptionRequested,
-                )
-            except ObjectReferenceEditingCancelled:
-                self.was_cancelled = True
-                return
-            except ObjectReferenceEditingError as error:
-                if self.isInterruptionRequested():
-                    self.was_cancelled = True
-                else:
-                    self.error_message = str(error)
-                return
-            except Exception:  # noqa: BLE001 - redact worker/provider internals.
-                if self.isInterruptionRequested():
-                    self.was_cancelled = True
-                else:
-                    self.error_message = "Object reference editing failed."
-                return
-            if self.isInterruptionRequested():
-                self.was_cancelled = True
-                return
-            prepared_result = np.asarray(result)
-            if (
-                prepared_result.dtype != np.uint8
-                or prepared_result.shape != OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE
-                or prepared_result.ndim != 3
-                or prepared_result.shape[2] != 4
-                or not np.any(prepared_result[:, :, 3] > 0)
-            ):
-                self.error_message = (
-                    "Object reference editing returned an invalid image."
-                )
-                return
-            self.result = np.ascontiguousarray(prepared_result).copy()
-        finally:
-            self._api_key = ""
-            self._model = ""
-            self._prompt = ""
-            self._source_bgra = np.empty((0, 0, 4), dtype=np.uint8)
-
-
-@dataclass
-class _ObjectReferenceEditRuntime:
-    """GUI-owned lifecycle and stale-input guard for one reference edit."""
-
-    signature: tuple[object, ...]
-    source_kind: str
-    model: str
-    prompt: str
-    job_id: str
-    thread: _ObjectReferenceEditThread
-    cancel_requested: bool = False
-
-
+# ### Temporary generation references ###
 @dataclass
 class _TemporaryObjectReferenceSession:
     """Keep one external reference coherent across same-frame refreshes."""
 
-    source_bgra: np.ndarray
     active_bgra: np.ndarray
     source_label: str
-    revision: int
     generation_data_identity: int
     video_source: object | None
     frame_index: int | None
 
 
-# ### Overlapping workflow outlines ###
-class _WorkflowControlsRow(QWidget):
-    """Draw Surface and Object workflow bounds around two visible columns."""
-
-    def __init__(
-        self,
-        shared_controls: QWidget,
-        object_controls: QWidget,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setObjectName("merged_generation_controls_row")
-        self._shared_controls = shared_controls
-        self._object_controls = object_controls
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(WORKFLOW_SECTION_SPACING)
-        layout.addWidget(shared_controls, 1)
-        layout.addWidget(object_controls, 2)
-
-    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        blue_bounds = self._shared_controls.geometry().adjusted(
-            -WORKFLOW_OUTLINE_INSET,
-            -WORKFLOW_OUTLINE_INSET,
-            WORKFLOW_OUTLINE_INSET,
-            WORKFLOW_OUTLINE_INSET,
-        )
-        painter.setPen(QPen(SURFACE_OUTLINE_COLOR, WORKFLOW_OUTLINE_WIDTH))
-        painter.drawRoundedRect(blue_bounds, 5, 5)
-
-        green_bounds = _combined_widget_bounds(
-            self._shared_controls,
-            self._object_controls,
-        ).adjusted(
-            -WORKFLOW_OUTLINE_INSET + OBJECT_WORKFLOW_OUTLINE_PADDING,
-            -WORKFLOW_OUTLINE_INSET + OBJECT_WORKFLOW_OUTLINE_PADDING,
-            WORKFLOW_OUTLINE_INSET - OBJECT_WORKFLOW_OUTLINE_PADDING,
-            WORKFLOW_OUTLINE_INSET - OBJECT_WORKFLOW_OUTLINE_PADDING,
-        )
-        painter.setPen(QPen(OBJECT_OUTLINE_COLOR, WORKFLOW_OUTLINE_WIDTH))
-        painter.drawRoundedRect(green_bounds, 5, 5)
-
-
 # ### Merged generation workspace ###
 class MergedGenerationWorkspace(QWidget):
-    """Present Surface and Object generation around one reference editor."""
+    """Present Surface and Object generation around shared reference media."""
 
     current_video_frame_changed = Signal()
     ceiling_height_estimate_changed = Signal(object)
@@ -366,7 +173,6 @@ class MergedGenerationWorkspace(QWidget):
         parent: QWidget | None = None,
         *,
         ceiling_height_estimator: CeilingHeightEstimator | None = None,
-        object_reference_editor: ObjectReferenceEditor | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("merged_generation_workspace")
@@ -380,21 +186,16 @@ class MergedGenerationWorkspace(QWidget):
         )
         self._ceiling_height_frame_revision = 0
         self._ceiling_height_runtime: _CeilingHeightInferenceRuntime | None = None
-        self._object_reference_editor = (
-            edit_object_reference
-            if object_reference_editor is None
-            else object_reference_editor
-        )
-        self._object_reference_edit_runtime: (
-            _ObjectReferenceEditRuntime | None
-        ) = None
         self._temporary_object_reference_session: (
             _TemporaryObjectReferenceSession | None
         ) = None
-        self._temporary_object_reference_revision = 0
         self._door_slot_editing_active = False
         self._door_slot_generation_name = ""
         self._door_slot_generation_blink_visible = True
+        self._generation_action_job_ids: dict[str, tuple[str, ...]] = {}
+        self._generation_action_buttons: dict[str, QPushButton] = {}
+        self._generation_action_default_text: dict[str, str] = {}
+        self._generation_action_default_tooltips: dict[str, str] = {}
         self._is_shutdown = False
 
         self.surface_workspace.setParent(self)
@@ -433,15 +234,8 @@ class MergedGenerationWorkspace(QWidget):
             )
         except (RuntimeError, TypeError):
             pass
-        runtimes = tuple(
-            runtime
-            for runtime in (
-                self._ceiling_height_runtime,
-                self._object_reference_edit_runtime,
-            )
-            if runtime is not None
-        )
-        for runtime in runtimes:
+        runtime = self._ceiling_height_runtime
+        if runtime is not None:
             runtime.cancel_requested = True
             runtime.thread.requestInterruption()
             self.job_manager.set_cancel_callback(runtime.job_id, None)
@@ -449,12 +243,10 @@ class MergedGenerationWorkspace(QWidget):
                 runtime.job_id,
                 stage="Cancelled during shutdown",
             )
-        for runtime in runtimes:
             while runtime.thread.isRunning():
                 runtime.thread.wait(CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS)
             runtime.thread.deleteLater()
         self._ceiling_height_runtime = None
-        self._object_reference_edit_runtime = None
 
     def set_clear_mask_hotkey(self, hotkey: str) -> None:
         """Apply the selected Generation-only Clear mask keymapping."""
@@ -491,7 +283,7 @@ class MergedGenerationWorkspace(QWidget):
         generation: GenerationData | None,
         surface: SurfaceTextureData | None,
     ) -> tuple[GenerationData, SurfaceTextureData]:
-        """Migrate two legacy reference editors into one deterministic state."""
+        """Migrate two legacy media states into one deterministic state."""
 
         object_data = GenerationData() if generation is None else generation.clone()
         surface_data = SurfaceTextureData() if surface is None else surface.clone()
@@ -515,18 +307,6 @@ class MergedGenerationWorkspace(QWidget):
         surface_data.frame_strokes = copy.deepcopy(frame_strokes)
         return object_data, surface_data
 
-    @Slot()
-    def cancel_latest_generation_job(self) -> bool:
-        """Cancel only the newest active job represented by the shared controls."""
-
-        job = self._latest_cancellable_job()
-        if job is None:
-            self._sync_cancel_button()
-            return False
-        accepted = self.job_manager.cancel_job(job.job_id)
-        self._sync_cancel_button()
-        return accepted
-
     def _adopt_shared_controls(self) -> None:
         """Install the Object-owned controls and migrate legacy duplicates."""
 
@@ -544,7 +324,7 @@ class MergedGenerationWorkspace(QWidget):
         self.pbr_map_control = objects.pbr_map_control
         self.pbr_map_checkboxes = objects.pbr_map_checkboxes
         self.ai_prompt_edit = objects.ai_prompt_edit
-        self.cancel_button = objects.cancel_operation_button
+        objects.cancel_operation_button.hide()
 
         if surface.video_view is self.video_view:
             return
@@ -604,10 +384,18 @@ class MergedGenerationWorkspace(QWidget):
 
         self.shared_controls = self._build_shared_controls()
         self.object_controls = self._build_object_controls()
-        self.controls_row = _WorkflowControlsRow(
-            self.shared_controls,
-            self.object_controls,
+        self.controls_row = QWidget()
+        self.controls_row.setObjectName("merged_generation_controls_row")
+        controls_row_layout = QHBoxLayout(self.controls_row)
+        controls_row_layout.setContentsMargins(
+            GENERATION_CONTROLS_PADDING,
+            GENERATION_CONTROLS_PADDING,
+            GENERATION_CONTROLS_PADDING,
+            GENERATION_CONTROLS_PADDING,
         )
+        controls_row_layout.setSpacing(WORKFLOW_SECTION_SPACING)
+        controls_row_layout.addWidget(self.shared_controls, 1)
+        controls_row_layout.addWidget(self.object_controls, 2)
         self.controls_scroll = QScrollArea()
         self.controls_scroll.setObjectName("merged_generation_controls_scroll")
         self.controls_scroll.setWidgetResizable(True)
@@ -630,7 +418,7 @@ class MergedGenerationWorkspace(QWidget):
         root_layout.addWidget(self.controls_scroll)
 
     def _build_shared_controls(self) -> QWidget:
-        section, layout = _build_controls_section("Shared", "shared")
+        section, layout = _build_controls_section("shared")
 
         shared_column, shared_layout = _build_controls_column(
             "merged_generation_shared_primary_column"
@@ -723,12 +511,6 @@ class MergedGenerationWorkspace(QWidget):
             _build_labeled_inline_control("AI prompt", self.ai_prompt_edit)
         )
 
-        self.cancel_button.setObjectName("cancel_generation_job_button")
-        self.cancel_button.setText("Cancel")
-        self.cancel_button.setToolTip(
-            "Cancel the newest active generation or frame-analysis job."
-        )
-        material_layout.addWidget(self.cancel_button)
         shared_layout.addWidget(self.shared_material_section)
         shared_layout.addStretch(1)
 
@@ -738,10 +520,7 @@ class MergedGenerationWorkspace(QWidget):
 
     def _build_object_controls(self) -> QWidget:
         objects = self.object_workspace
-        section, layout = _build_controls_section(
-            "Object generation",
-            "object",
-        )
+        section, layout = _build_controls_section("object")
 
         primary_column, primary_layout = _build_controls_column(
             "merged_generation_object_primary_column"
@@ -783,88 +562,6 @@ class MergedGenerationWorkspace(QWidget):
         editing_layout.addWidget(face_actions)
         primary_layout.addWidget(self.object_editing_section)
 
-        self.reference_editing_section, reference_edit_layout = (
-            _build_boxed_section(
-                "Reference editing",
-                "merged_generation_object_reference_editing_section",
-            )
-        )
-        self.reference_edit_model_combo = QComboBox()
-        self.reference_edit_model_combo.setObjectName(
-            "object_reference_edit_model"
-        )
-        for label, model_id in OBJECT_REFERENCE_EDIT_MODEL_OPTIONS:
-            self.reference_edit_model_combo.addItem(label, model_id)
-        default_model_index = self.reference_edit_model_combo.findData(
-            DEFAULT_OBJECT_REFERENCE_EDIT_MODEL
-        )
-        self.reference_edit_model_combo.setCurrentIndex(default_model_index)
-        self.reference_edit_model_combo.setToolTip(
-            "Choose the AI model used to edit the selected object. Qwen runs "
-            "locally; the other choices use the configured OpenAI API key."
-        )
-        reference_edit_layout.addWidget(
-            _build_labeled_inline_control(
-                "Model",
-                self.reference_edit_model_combo,
-            )
-        )
-        self.reference_edit_prompt_preset_combo = QComboBox()
-        self.reference_edit_prompt_preset_combo.setObjectName(
-            "object_reference_edit_prompt_preset"
-        )
-        self.reference_edit_prompt_preset_combo.addItem(
-            "Append view instruction...",
-            None,
-        )
-        for preset in OBJECT_REFERENCE_EDIT_PROMPT_PRESETS:
-            self.reference_edit_prompt_preset_combo.addItem(preset, preset)
-        self.reference_edit_prompt_preset_combo.setCurrentIndex(0)
-        self.reference_edit_prompt_preset_combo.setToolTip(
-            "Append a reusable camera-view instruction to the edit prompt."
-        )
-        reference_edit_layout.addWidget(
-            _build_labeled_inline_control(
-                "View preset",
-                self.reference_edit_prompt_preset_combo,
-            )
-        )
-        self.reference_edit_prompt = QLineEdit()
-        self.reference_edit_prompt.setObjectName(
-            "object_reference_edit_prompt"
-        )
-        self.reference_edit_prompt.setPlaceholderText(
-            "Example: Remove the cover and reconstruct a bare wooden tabletop"
-        )
-        self.reference_edit_prompt.setMaxLength(2_000)
-        self.reference_edit_prompt.setClearButtonEnabled(True)
-        reference_edit_layout.addWidget(
-            _build_labeled_inline_control(
-                "Edit instruction",
-                self.reference_edit_prompt,
-            )
-        )
-
-        self.edit_reference_button = QPushButton("Edit reference")
-        self.edit_reference_button.setObjectName(
-            "edit_object_reference_button"
-        )
-        self.edit_reference_button.setToolTip(
-            "Use the current object mask and edit instruction to generate a "
-            "new 1024x1024 AI object reference and use it automatically. "
-            "Click again to retry, or move the frame slider to undo."
-        )
-        reference_edit_layout.addWidget(self.edit_reference_button)
-        self.reference_edit_status_label = QLabel(
-            OBJECT_REFERENCE_EDIT_STATUS_EMPTY
-        )
-        self.reference_edit_status_label.setObjectName(
-            "object_reference_edit_status_label"
-        )
-        self.reference_edit_status_label.setWordWrap(True)
-        reference_edit_layout.addWidget(self.reference_edit_status_label)
-        primary_layout.addWidget(self.reference_editing_section)
-
         self.object_creation_section, creation_layout = _build_boxed_section(
             "",
             "merged_generation_object_creation_section",
@@ -897,9 +594,45 @@ class MergedGenerationWorkspace(QWidget):
         generation_settings_layout = QHBoxLayout(generation_settings)
         generation_settings_layout.setContentsMargins(0, 0, 0, 0)
         generation_settings_layout.setSpacing(6)
-        generation_settings_layout.addWidget(objects.symmetric_division_checkbox)
-        generation_settings_layout.addWidget(
+
+        self.division_options_section, division_options_layout = (
+            _build_boxed_section(
+                "Division",
+                "merged_generation_division_options_section",
+            )
+        )
+        division_options_row = QWidget()
+        division_options_row_layout = QHBoxLayout(division_options_row)
+        division_options_row_layout.setContentsMargins(0, 0, 0, 0)
+        division_options_row_layout.setSpacing(6)
+        division_options_row_layout.addWidget(
+            objects.symmetric_division_checkbox
+        )
+        division_options_row_layout.addWidget(
             objects.side_door_duplication_checkbox
+        )
+        division_options_layout.addWidget(division_options_row)
+        generation_settings_layout.addWidget(self.division_options_section)
+
+        self.opening_profile_options_section, profile_options_layout = (
+            _build_boxed_section(
+                "Door / window profile",
+                "merged_generation_opening_profile_options_section",
+            )
+        )
+        profile_options_row = QWidget()
+        profile_options_row_layout = QHBoxLayout(profile_options_row)
+        profile_options_row_layout.setContentsMargins(0, 0, 0, 0)
+        profile_options_row_layout.setSpacing(6)
+        profile_options_row_layout.addWidget(
+            objects.generate_displacement_checkbox
+        )
+        profile_options_row_layout.addWidget(
+            objects.preserve_door_profile_checkbox
+        )
+        profile_options_layout.addWidget(profile_options_row)
+        generation_settings_layout.addWidget(
+            self.opening_profile_options_section
         )
         generation_settings_layout.addStretch(1)
         generation_settings_layout.addWidget(objects.meshy_target_polycount_control)
@@ -984,28 +717,10 @@ class MergedGenerationWorkspace(QWidget):
         self.infer_ceiling_height_button.clicked.connect(
             self._start_ceiling_height_inference
         )
-        self.edit_reference_button.clicked.connect(
-            self._start_object_reference_edit
-        )
-        self.reference_edit_prompt_preset_combo.activated.connect(
-            self._append_reference_edit_prompt_preset
-        )
-        self.reference_edit_prompt.textChanged.connect(
-            self._handle_reference_edit_inputs_changed
-        )
-        self.reference_edit_model_combo.currentTextChanged.connect(
-            self._handle_reference_edit_inputs_changed
-        )
 
         self.video_view.strokes_changed.connect(surface._handle_video_strokes_changed)
         self.video_view.strokes_changed.connect(self.sync_shared_controls)
-        self.video_view.strokes_changed.connect(
-            self._handle_reference_edit_inputs_changed
-        )
         self.video_view.frame_changed.connect(self._handle_video_frame_changed)
-        objects.reference_edit_state_changed.connect(
-            self._handle_object_reference_state_changed
-        )
         objects.door_slot_editing_changed.connect(
             self._handle_door_slot_editing_changed
         )
@@ -1018,6 +733,8 @@ class MergedGenerationWorkspace(QWidget):
         objects.door_slot_generation_status_changed.connect(
             self._handle_door_slot_generation_status_changed
         )
+        objects.controls_synced.connect(self._sync_generation_action_buttons)
+        surface.controls_synced.connect(self._sync_generation_action_buttons)
         try:
             self.seekbar.valueChanged.disconnect()
         except (RuntimeError, TypeError):
@@ -1026,34 +743,163 @@ class MergedGenerationWorkspace(QWidget):
         for checkbox in self.pbr_map_checkboxes.values():
             checkbox.toggled.connect(surface._handle_pbr_map_toggled)
 
-        try:
-            self.cancel_button.clicked.disconnect()
-        except (RuntimeError, TypeError):
-            pass
-        self.cancel_button.clicked.connect(self.cancel_latest_generation_job)
+        self._connect_generation_action_buttons()
         self.job_manager.job_added.connect(self._handle_job_changed)
         self.job_manager.job_updated.connect(self._handle_job_changed)
-        self.job_manager.jobs_cleared.connect(self._sync_cancel_button)
+        self.job_manager.jobs_cleared.connect(self._sync_generation_action_buttons)
 
         objects._sync_controls()
         surface._sync_controls()
         self._sync_generation_texture_context()
+
+    def _connect_generation_action_buttons(self) -> None:
+        """Route each generation action through its own cancellable job group."""
+
+        objects = self.object_workspace
+        actions = {
+            GENERATION_ACTION_GENERATE: objects.generate_button,
+            GENERATION_ACTION_GEOMETRY: objects.generate_geometry_button,
+            GENERATION_ACTION_OBJECT_TEXTURE: objects.generate_texture_button,
+            GENERATION_ACTION_SURFACE_TEXTURE: self.surface_workspace.generate_button,
+        }
+        self._generation_action_buttons = actions
+        self._generation_action_default_text = {
+            action: button.text() for action, button in actions.items()
+        }
+        self._generation_action_default_tooltips = {
+            action: button.toolTip() for action, button in actions.items()
+        }
+        for action, button in actions.items():
+            try:
+                button.clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            button.clicked.connect(
+                partial(self._handle_generation_action_clicked, action)
+            )
+
+    @Slot(str, bool)
+    def _handle_generation_action_clicked(
+        self,
+        action: str,
+        _checked: bool = False,
+    ) -> None:
+        """Start one action or cancel only the jobs launched by its last click."""
+
+        if self._generation_action_has_pending_jobs(action):
+            self._cancel_generation_action(action)
+            return
+
+        previous_job_ids = {job.job_id for job in self.job_manager.jobs()}
+        self._start_generation_action(action)
+        created_job_ids = tuple(
+            job.job_id
+            for job in self.job_manager.jobs()
+            if job.job_id not in previous_job_ids and not job.is_finished
+        )
+        if created_job_ids:
+            self._generation_action_job_ids[action] = created_job_ids
+        self._sync_generation_action_buttons()
+
+    def _start_generation_action(self, action: str) -> None:
+        """Invoke the current backend method for one visible action button."""
+
+        if action == GENERATION_ACTION_GENERATE:
+            self.object_workspace.generate()
+            return
+        if action == GENERATION_ACTION_GEOMETRY:
+            self.object_workspace.generate_geometry()
+            return
+        if action == GENERATION_ACTION_OBJECT_TEXTURE:
+            self.object_workspace.generate_selected_object_texture()
+            return
+        if action == GENERATION_ACTION_SURFACE_TEXTURE:
+            self.surface_workspace.generate()
+            return
+        raise ValueError(f"Unknown generation action: {action}")
+
+    def _generation_action_has_pending_jobs(self, action: str) -> bool:
+        """Return whether the action still owns a running or cancelling job."""
+
+        return any(
+            job is not None and not job.is_finished
+            for job_id in self._generation_action_job_ids.get(action, ())
+            for job in (self.job_manager.get_job(job_id),)
+        )
+
+    def _cancel_generation_action(self, action: str) -> bool:
+        """Cancel every still-running job produced by one action click."""
+
+        accepted = False
+        for job_id in self._generation_action_job_ids.get(action, ()):
+            job = self.job_manager.get_job(job_id)
+            if job is None or job.status != JOB_STATUS_RUNNING:
+                continue
+            accepted = self.job_manager.cancel_job(job_id) or accepted
+        self._sync_generation_action_buttons()
+        return accepted
+
+    @Slot()
+    def _sync_generation_action_buttons(self) -> None:
+        """Keep each action's label and availability aligned with its own jobs."""
+
+        for action, button in self._generation_action_buttons.items():
+            job_ids = self._generation_action_job_ids.get(action, ())
+            pending_jobs = tuple(
+                job
+                for job_id in job_ids
+                if (
+                    (job := self.job_manager.get_job(job_id)) is not None
+                    and not job.is_finished
+                )
+            )
+            if not pending_jobs:
+                self._generation_action_job_ids.pop(action, None)
+                button.setText(self._generation_action_default_text[action])
+                button.setToolTip(
+                    self._generation_action_default_tooltips[action]
+                )
+                continue
+
+            button.setText("Cancel")
+            button.setEnabled(
+                any(job.status == JOB_STATUS_RUNNING for job in pending_jobs)
+            )
+            job_count = len(pending_jobs)
+            button.setToolTip(
+                "Cancel this generation job."
+                if job_count == 1
+                else f"Cancel all {job_count} jobs from this generation batch."
+            )
 
     @Slot(bool)
     def _handle_door_slot_editing_changed(self, active: bool) -> None:
         """Keep shared analysis controls out of the door-slot workflow."""
 
         self._door_slot_editing_active = bool(active)
+        self._sync_opening_generation_sections()
         self.sync_shared_controls()
+
+    def _sync_opening_generation_sections(self) -> None:
+        """Show opening-only options solely for the slot that can use them."""
+
+        target = self.object_workspace._door_slot_editing_target
+        body_slot_is_active = bool(
+            target is not None and is_door_body_slot(target.slot_id)
+        )
+        non_body_slot_is_active = bool(
+            target is not None and not body_slot_is_active
+        )
+        self.division_options_section.setVisible(
+            not non_body_slot_is_active
+        )
+        self.opening_profile_options_section.setVisible(body_slot_is_active)
 
     @Slot(bool)
     def _handle_architectural_trim_editing_changed(self, active: bool) -> None:
-        """Offer a repeat-module edit instruction without replacing user text."""
+        """Refresh the texture route after trim selection changes."""
 
-        if bool(active) and not self.reference_edit_prompt.text().strip():
-            self.reference_edit_prompt.setText(
-                ARCHITECTURAL_TRIM_REFERENCE_EDIT_INSTRUCTION
-            )
+        del active
         self._sync_generation_texture_context()
 
     @Slot(object)
@@ -1083,28 +929,24 @@ class MergedGenerationWorkspace(QWidget):
             else self.object_workspace.generate_texture_button
         )
         self.generate_texture_stack.setCurrentWidget(target_button)
-
-    @Slot()
-    def _handle_object_reference_state_changed(self) -> None:
-        """Keep the visible preview identical to the active generation input."""
-
-        self._sync_object_reference_preview()
-        self.sync_shared_controls()
+        self._sync_generation_action_buttons()
 
     @Slot(str)
     def _handle_door_slot_generation_status_changed(
         self,
         slot_name: str,
     ) -> None:
-        """Blink the exact in-flight door slot beside the Generation heading."""
+        """Blink the exact in-flight opening slot beside Generation."""
 
         self._door_slot_generation_name = str(slot_name).strip()
         if not self._door_slot_generation_name:
             self._door_slot_generation_blink_timer.stop()
             self.door_slot_generation_indicator.hide()
             return
+        asset_kind = self.object_workspace.active_opening_component_kind()
+        asset_label = "window" if asset_kind == "window" else "door"
         self.door_slot_generation_indicator.setText(
-            f"- Generating the door's {self._door_slot_generation_name}"
+            f"- Generating the {asset_label}'s {self._door_slot_generation_name}"
         )
         self._door_slot_generation_blink_visible = True
         self.door_slot_generation_indicator.setStyleSheet(
@@ -1135,17 +977,6 @@ class MergedGenerationWorkspace(QWidget):
         self._restore_temporary_reference_after_same_frame_refresh()
         self._sync_object_reference_preview()
         self._ceiling_height_frame_revision += 1
-        reference_runtime = self._object_reference_edit_runtime
-        if (
-            reference_runtime is not None
-            and self._get_current_reference_edit_signature(
-                reference_runtime.source_kind
-            )
-            != reference_runtime.signature
-        ):
-            reference_runtime.cancel_requested = True
-            if not self.job_manager.cancel_job(reference_runtime.job_id):
-                reference_runtime.thread.requestInterruption()
         runtime = self._ceiling_height_runtime
         if runtime is not None:
             runtime.cancel_requested = True
@@ -1154,7 +985,6 @@ class MergedGenerationWorkspace(QWidget):
         self.ceiling_height_result_label.setText(
             CEILING_HEIGHT_NOT_ESTIMATED_TEXT
         )
-        self._sync_object_reference_status()
         self.current_video_frame_changed.emit()
         self.sync_shared_controls()
 
@@ -1290,7 +1120,7 @@ class MergedGenerationWorkspace(QWidget):
             self.sync_shared_controls()
             thread.deleteLater()
 
-    # ### Object-reference editing ###
+    # ### Temporary generation references ###
     def _remember_temporary_object_reference(
         self,
         reference_bgra: np.ndarray,
@@ -1300,13 +1130,10 @@ class MergedGenerationWorkspace(QWidget):
         """Start one external-reference session bound to the current frame."""
 
         reference = np.ascontiguousarray(reference_bgra).copy()
-        self._temporary_object_reference_revision += 1
         objects = self.object_workspace
         session = _TemporaryObjectReferenceSession(
-            source_bgra=reference.copy(),
             active_bgra=reference,
             source_label=str(source_label).strip() or "Temporary image",
-            revision=self._temporary_object_reference_revision,
             generation_data_identity=id(objects._data),
             video_source=objects._video_source,
             frame_index=(
@@ -1391,293 +1218,7 @@ class MergedGenerationWorkspace(QWidget):
             self._adopt_untracked_temporary_reference()
             self.video_view.set_reference_preview_bgra(temporary_reference)
             return
-        accepted_reference = (
-            self.object_workspace.get_current_accepted_object_reference()
-        )
-        if accepted_reference is not None:
-            self.video_view.set_reference_preview_bgra(accepted_reference)
-            return
         self.video_view.clear_reference_preview()
-
-    def _sync_object_reference_status(self) -> None:
-        """Describe the same reference source shown by the shared preview."""
-
-        if self.object_workspace.has_temporary_object_reference():
-            session = self._adopt_untracked_temporary_reference()
-            source_label = (
-                "Temporary image" if session is None else session.source_label
-            )
-            self.reference_edit_status_label.setText(
-                f"{source_label} is active for Object and Surface generation."
-            )
-            return
-        if self.object_workspace.has_current_accepted_object_reference():
-            self.reference_edit_status_label.setText(
-                "Accepted edit active for this frame."
-            )
-            return
-        self.reference_edit_status_label.setText(
-            OBJECT_REFERENCE_EDIT_STATUS_EMPTY
-        )
-
-    def _build_temporary_reference_edit_inputs(
-        self,
-    ) -> tuple[np.ndarray, tuple[object, ...]] | None:
-        """Return the original external image so Edit remains a true retry."""
-
-        session = self._adopt_untracked_temporary_reference()
-        if session is None or not self._temporary_reference_session_matches_context(
-            session
-        ):
-            return None
-        return session.source_bgra.copy(), (
-            OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY,
-            session.revision,
-        )
-
-    def _get_current_reference_edit_signature(
-        self,
-        source_kind: str,
-    ) -> tuple[object, ...] | None:
-        """Resolve the current signature through the runtime's source path."""
-
-        if source_kind == OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY:
-            inputs = self._build_temporary_reference_edit_inputs()
-            return None if inputs is None else inputs[1]
-        return self.object_workspace.get_current_object_reference_edit_signature()
-
-    @Slot(int)
-    def _append_reference_edit_prompt_preset(self, index: int) -> None:
-        """Append one reusable view phrase without turning it into state."""
-
-        preset = self.reference_edit_prompt_preset_combo.itemData(int(index))
-        self.reference_edit_prompt_preset_combo.setCurrentIndex(0)
-        if not isinstance(preset, str) or not preset.strip():
-            return
-        current_prompt = self.reference_edit_prompt.text().strip()
-        separator = " " if current_prompt.endswith(",") else ", "
-        next_prompt = (
-            preset.strip()
-            if not current_prompt
-            else f"{current_prompt}{separator}{preset.strip()}"
-        )
-        if len(next_prompt) > self.reference_edit_prompt.maxLength():
-            self.reference_edit_status_label.setText(
-                "The view preset would exceed the edit instruction limit."
-            )
-            return
-        self.reference_edit_prompt.setText(next_prompt)
-
-    @Slot(object)
-    def _handle_reference_edit_inputs_changed(self, _value: object) -> None:
-        """Cancel stale work without discarding an accepted frame edit."""
-
-        if self.object_workspace.has_current_accepted_object_reference():
-            self.reference_edit_status_label.setText(
-                "Edited reference remains active. Click Edit reference to replace "
-                "it, or move the frame slider to undo."
-            )
-        elif self.object_workspace.has_temporary_object_reference():
-            self.reference_edit_status_label.setText(
-                "Temporary reference remains active. Click Edit reference to "
-                "replace its edited result."
-            )
-        else:
-            self.reference_edit_status_label.setText(
-                OBJECT_REFERENCE_EDIT_STATUS_EMPTY
-            )
-        runtime = self._object_reference_edit_runtime
-        if runtime is not None:
-            runtime.cancel_requested = True
-            if not self.job_manager.cancel_job(runtime.job_id):
-                runtime.thread.requestInterruption()
-        self.sync_shared_controls()
-
-    @Slot()
-    def _start_object_reference_edit(self) -> None:
-        """Generate one square reference from the selected masked object."""
-
-        if self._is_shutdown or self._object_reference_edit_runtime is not None:
-            return
-        prompt = self.reference_edit_prompt.text().strip()
-        if not prompt:
-            self.reference_edit_status_label.setText(
-                "Enter how the selected object should be changed."
-            )
-            return
-        model = str(self.reference_edit_model_combo.currentData() or "")
-        if model not in SUPPORTED_OBJECT_REFERENCE_EDIT_MODELS:
-            self.reference_edit_status_label.setText(
-                "Choose a supported object reference editing model."
-            )
-            return
-        api_key = (
-            self.object_workspace.get_runtime_settings().openai_api_key.strip()
-        )
-        if object_reference_edit_model_requires_api_key(model) and not api_key:
-            self.reference_edit_status_label.setText(
-                "Add an OpenAI API key in Settings before editing a reference."
-            )
-            return
-        temporary_inputs = self._build_temporary_reference_edit_inputs()
-        if temporary_inputs is None:
-            source_kind = OBJECT_REFERENCE_EDIT_SOURCE_MASK
-            try:
-                source_bgra, signature = (
-                    self.object_workspace.build_object_reference_edit_inputs()
-                )
-            except ValueError as error:
-                self.reference_edit_status_label.setText(str(error))
-                return
-        else:
-            source_kind = OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY
-            source_bgra, signature = temporary_inputs
-
-        thread = _ObjectReferenceEditThread(
-            source_bgra,
-            prompt,
-            model,
-            api_key,
-            self._object_reference_editor,
-            parent=self,
-        )
-        job = self.job_manager.create_job(
-            kind=OBJECT_REFERENCE_EDIT_JOB_KIND,
-            requested_name="",
-            default_name="Object reference edit",
-            stage="Preparing square object reference (10%)",
-        )
-        runtime = _ObjectReferenceEditRuntime(
-            signature=signature,
-            source_kind=source_kind,
-            model=model,
-            prompt=prompt,
-            job_id=job.job_id,
-            thread=thread,
-        )
-        self._object_reference_edit_runtime = runtime
-        self.job_manager.set_cancel_callback(
-            job.job_id,
-            partial(self._cancel_object_reference_edit, job.job_id),
-        )
-        thread.finished.connect(
-            partial(
-                self._handle_object_reference_edit_finished,
-                job.job_id,
-                thread,
-            )
-        )
-        self.reference_edit_status_label.setText(
-            "Generating a 1024x1024 object reference..."
-        )
-        self.job_manager.update_job(
-            job.job_id,
-            stage="Generating edited object reference (20%)",
-        )
-        self.sync_shared_controls()
-        thread.start()
-
-    def _cancel_object_reference_edit(self, job_id: str) -> bool:
-        runtime = self._object_reference_edit_runtime
-        if runtime is None or runtime.job_id != str(job_id):
-            return False
-        runtime.cancel_requested = True
-        runtime.thread.requestInterruption()
-        self.sync_shared_controls()
-        return True
-
-    def _handle_object_reference_edit_finished(
-        self,
-        job_id: str,
-        thread: _ObjectReferenceEditThread,
-    ) -> None:
-        """Atomically accept a successful result from still-current inputs."""
-
-        runtime = self._object_reference_edit_runtime
-        try:
-            if (
-                runtime is None
-                or runtime.job_id != job_id
-                or runtime.thread is not thread
-            ):
-                return
-            self.job_manager.set_cancel_callback(job_id, None)
-            current_signature = self._get_current_reference_edit_signature(
-                runtime.source_kind
-            )
-            is_stale = (
-                current_signature != runtime.signature
-                or self.reference_edit_model_combo.currentData() != runtime.model
-                or self.reference_edit_prompt.text().strip() != runtime.prompt
-            )
-            if (
-                self._is_shutdown
-                or runtime.cancel_requested
-                or thread.was_cancelled
-                or is_stale
-            ):
-                stage = (
-                    "Ignored after the reference inputs changed"
-                    if is_stale
-                    else "Cancelled"
-                )
-                self.job_manager.mark_cancelled(job_id, stage=stage)
-                if not self._is_shutdown:
-                    self.reference_edit_status_label.setText(stage + ".")
-                return
-            if thread.error_message is not None or thread.result is None:
-                message = thread.error_message or (
-                    "Object reference editing returned no image."
-                )
-                self.job_manager.fail_job(job_id, stage=f"Failed: {message}")
-                self.reference_edit_status_label.setText(
-                    f"Reference edit failed: {message}"
-                )
-                return
-
-            if runtime.source_kind == OBJECT_REFERENCE_EDIT_SOURCE_TEMPORARY:
-                session = self._temporary_object_reference_session
-                if session is None:
-                    accepted = False
-                else:
-                    session.active_bgra = np.ascontiguousarray(
-                        thread.result
-                    ).copy()
-                    self.object_workspace.set_temporary_object_reference(
-                        session.active_bgra
-                    )
-                    self.surface_workspace.set_temporary_reference(
-                        session.active_bgra
-                    )
-                    accepted = True
-            else:
-                accepted = self.object_workspace.accept_object_reference_edit(
-                    runtime.signature,
-                    thread.result,
-                )
-            if not accepted:
-                message = (
-                    "The selected object changed before the edited reference "
-                    "could be applied."
-                )
-                self.job_manager.fail_job(job_id, stage=f"Failed: {message}")
-                self.reference_edit_status_label.setText(message)
-                return
-            self.video_view.set_reference_preview_bgra(thread.result)
-            self.reference_edit_status_label.setText(
-                "Edited reference active for the next Meshy request. Click "
-                "Edit reference again to retry, or move the frame slider to "
-                "undo."
-            )
-            self.job_manager.complete_job(
-                job_id,
-                stage="Reference edit accepted",
-            )
-        finally:
-            if runtime is not None and runtime.thread is thread:
-                self._object_reference_edit_runtime = None
-            self.sync_shared_controls()
-            thread.deleteLater()
 
     @Slot()
     def _handle_load_video_clicked(self) -> None:
@@ -1801,16 +1342,7 @@ class MergedGenerationWorkspace(QWidget):
             if self.object_workspace._video_source is not None
             else f"{source_label} is active for Object and Surface generation."
         )
-        if (
-            self.object_workspace._architectural_trim_editing_target is not None
-            and np.all(active_reference[:, :, 3] == 255)
-        ):
-            message += (
-                " This is an unmasked scene image; click Edit reference first "
-                "to isolate and straighten one repeating trim module."
-            )
         self.object_workspace.status_label.setText(message)
-        self.reference_edit_status_label.setText(message)
         self.sync_shared_controls()
 
     @Slot(int)
@@ -1851,8 +1383,9 @@ class MergedGenerationWorkspace(QWidget):
             or int(current_object_frame_index) != safe_index
         )
         if object_frame_is_changing:
+            objects.clear_door_slot_editing_target()
             self._clear_temporary_object_reference_session()
-            objects.discard_object_reference_before_frame_change(safe_index)
+            objects.clear_temporary_object_reference_for_video_navigation()
             surface.clear_temporary_reference()
         for workspace in (objects, surface):
             workspace._data.current_frame_index = safe_index
@@ -1865,7 +1398,7 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot(object)
     def _handle_job_changed(self, _job: object) -> None:
-        self._sync_cancel_button()
+        self._sync_generation_action_buttons()
 
     @Slot()
     def sync_shared_controls(self) -> None:
@@ -1879,27 +1412,18 @@ class MergedGenerationWorkspace(QWidget):
         has_untracked_object_job = bool(
             objects._generation_thread is not None and not objects._object_job_runtimes
         )
-        reference_edit_is_running = self._object_reference_edit_runtime is not None
-        shared_reference_controls_are_available = (
-            not has_untracked_object_job and not reference_edit_is_running
-        )
+        shared_reference_controls_are_available = not has_untracked_object_job
         video_editor_is_available = (
             has_video and shared_reference_controls_are_available
-        )
-        accepted_edit_is_available = (
-            objects.has_current_accepted_object_reference()
         )
         temporary_reference_is_available = (
             objects.has_temporary_object_reference()
         )
         inpainting_is_available = (
             video_editor_is_available
-            and not accepted_edit_is_available
             and not temporary_reference_is_available
         )
-        reference_media_changes_are_available = (
-            not has_untracked_object_job and not reference_edit_is_running
-        )
+        reference_media_changes_are_available = not has_untracked_object_job
         self.load_video_button.setEnabled(reference_media_changes_are_available)
         self.load_reference_image_button.setEnabled(
             reference_media_changes_are_available
@@ -1910,7 +1434,6 @@ class MergedGenerationWorkspace(QWidget):
         )
         self.copy_inpaint_button.setEnabled(
             objects.has_temporary_object_reference()
-            or accepted_edit_is_available
             or self.video_view.has_selection()
         )
         self.seekbar.setEnabled(video_editor_is_available)
@@ -1923,42 +1446,6 @@ class MergedGenerationWorkspace(QWidget):
         self.pbr_map_control.setEnabled(not has_untracked_object_job)
         self.ai_prompt_edit.setEnabled(not has_untracked_object_job)
         self.video_view.set_interaction_enabled(inpainting_is_available)
-        has_object_mask = self.video_view.has_selection()
-        has_edit_prompt = bool(self.reference_edit_prompt.text().strip())
-        has_openai_key = bool(
-            objects.get_runtime_settings().openai_api_key.strip()
-        )
-        selected_reference_model = str(
-            self.reference_edit_model_combo.currentData() or ""
-        )
-        has_reference_edit_credentials = (
-            selected_reference_model in SUPPORTED_OBJECT_REFERENCE_EDIT_MODELS
-            and (
-                not object_reference_edit_model_requires_api_key(
-                    selected_reference_model
-                )
-                or has_openai_key
-            )
-        )
-        self.edit_reference_button.setEnabled(
-            shared_reference_controls_are_available
-            and (temporary_reference_is_available or has_object_mask)
-            and has_edit_prompt
-            and has_reference_edit_credentials
-        )
-        reference_edit_inputs_are_available = (
-            shared_reference_controls_are_available
-            and (has_video or temporary_reference_is_available)
-        )
-        self.reference_edit_prompt.setEnabled(
-            reference_edit_inputs_are_available
-        )
-        self.reference_edit_prompt_preset_combo.setEnabled(
-            reference_edit_inputs_are_available
-        )
-        self.reference_edit_model_combo.setEnabled(
-            reference_edit_inputs_are_available
-        )
         ceiling_inference_is_running = self._ceiling_height_runtime is not None
         self.infer_ceiling_height_button.setEnabled(
             not self._is_shutdown
@@ -1971,30 +1458,8 @@ class MergedGenerationWorkspace(QWidget):
             if ceiling_inference_is_running
             else "Infer ceiling height"
         )
+        self._sync_opening_generation_sections()
         self._sync_generation_texture_context()
-        self._sync_cancel_button()
-
-    @Slot()
-    def _sync_cancel_button(self) -> None:
-        job = self._latest_cancellable_job()
-        self.cancel_button.setEnabled(job is not None)
-        if job is None:
-            self.cancel_button.setToolTip(
-                "There is no active generation or frame-analysis job."
-            )
-            return
-        self.cancel_button.setToolTip(f'Cancel the newest active job: "{job.name}".')
-
-    def _latest_cancellable_job(self) -> GenerationJob | None:
-        return next(
-            (
-                job
-                for job in reversed(self.job_manager.jobs())
-                if job.kind in CANCELLABLE_GENERATION_JOB_KINDS
-                and job.status == JOB_STATUS_RUNNING
-            ),
-            None,
-        )
 
 
 # ### Reference image helpers ###
@@ -2095,19 +1560,12 @@ def _build_labeled_view(title: str, view: QWidget) -> QWidget:
     return wrapper
 
 
-def _build_controls_section(
-    title: str,
-    kind: str,
-) -> tuple[QWidget, QGridLayout]:
+def _build_controls_section(kind: str) -> tuple[QWidget, QGridLayout]:
     section = QWidget()
     section.setObjectName(f"merged_generation_{kind}_controls")
     outer_layout = QVBoxLayout(section)
-    outer_layout.setContentsMargins(8, 7, 8, 7)
+    outer_layout.setContentsMargins(0, 0, 0, 0)
     outer_layout.setSpacing(5)
-    title_label = QLabel(title)
-    title_label.setObjectName(f"merged_generation_{kind}_title")
-    title_label.setStyleSheet("font-weight: 600;")
-    outer_layout.addWidget(title_label)
 
     fields = QWidget()
     fields.setObjectName(f"merged_generation_{kind}_fields")
@@ -2148,10 +1606,6 @@ def _build_labeled_inline_control(label: str, control: QWidget) -> QWidget:
     layout.addWidget(QLabel(label))
     layout.addWidget(control, 1)
     return wrapper
-
-
-def _combined_widget_bounds(first: QWidget, second: QWidget) -> QRect:
-    return first.geometry().united(second.geometry())
 
 
 def _unique_widgets(widgets: Iterable[QWidget]) -> tuple[QWidget, ...]:

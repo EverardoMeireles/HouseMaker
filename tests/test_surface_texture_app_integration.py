@@ -38,7 +38,6 @@ from housemaker.surface_texture_state import (
 from housemaker.surface_texture_workspace import SurfaceTextureRequest
 from housemaker.video_source import VideoMetadata
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -221,7 +220,7 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
                 "3D scene",
                 "Atlas",
                 "Generation",
-                "Doors",
+                "Doors and Windows",
                 "Tour",
                 "Settings",
             ],

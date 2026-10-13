@@ -41,6 +41,7 @@ from housemaker.settings_widget import (
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
     DEFAULT_CLEAR_MASK_HOTKEY,
+    DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
@@ -48,17 +49,20 @@ from housemaker.settings_widget import (
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
+    DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     GENERATION_DISPLAY_SCREEN_SETTING_KEY,
     HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
     IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+    MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
     MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
     MESH_EDIT_UPDATE_DELAY_STEP_SECONDS,
     MESHY_API_KEY_ENVIRONMENT_VARIABLE,
     MESHY_API_KEY_SETTING_KEY,
+    MIN_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
@@ -81,6 +85,7 @@ from housemaker.settings_widget import (
     read_automatic_atlas_texture_sort_by_pbr,
     read_canvas_3d_navigation_toggle_hotkey,
     read_clear_mask_hotkey,
+    read_doors_and_windows_point_light_intensity,
     read_first_person_navigation_mode,
     read_generation_display_screen_id,
     read_hide_stair_mesh_when_previewing,
@@ -163,6 +168,7 @@ class SettingsWidgetTests(unittest.TestCase):
                         widget.unused_face_removal_checkbox,
                         widget.use_uv_raycast_for_object_generation_checkbox,
                         widget.minimum_face_visibility_percentage_spinbox,
+                        widget.doors_and_windows_point_light_intensity_spinbox,
                     ),
                 ),
                 (
@@ -236,7 +242,87 @@ class SettingsWidgetTests(unittest.TestCase):
                 )[0],
                 2,
             )
+            self.assertEqual(
+                object_generation_form.getWidgetPosition(
+                    widget.doors_and_windows_point_light_intensity_spinbox
+                )[0],
+                3,
+            )
             widget.dispose()
+
+    def test_doors_and_windows_point_light_intensity_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            spinbox = widget.doors_and_windows_point_light_intensity_spinbox
+            emitted: list[bool] = []
+            widget.settings_changed.connect(lambda: emitted.append(True))
+
+            self.assertEqual(
+                spinbox.value(),
+                DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
+            )
+            spinbox.setValue(2.4)
+
+            self.assertEqual(
+                store.get(DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY),
+                2.4,
+            )
+            self.assertEqual(
+                widget.get_settings().doors_and_windows_point_light_intensity,
+                2.4,
+            )
+            self.assertEqual(emitted, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().doors_and_windows_point_light_intensity,
+                2.4,
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_doors_and_windows_point_light_intensity_rejects_bad_values(
+        self,
+    ) -> None:
+        for value in (
+            True,
+            -0.1,
+            MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY + 0.1,
+            float("nan"),
+            "bright",
+        ):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Doors and Windows point light intensity",
+                ):
+                    GenerationServiceSettings(
+                        doors_and_windows_point_light_intensity=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            for value in (
+                True,
+                MIN_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY - 0.1,
+                MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY + 0.1,
+                "bright",
+            ):
+                with self.subTest(persisted_value=value):
+                    store.set(
+                        DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
+                        value,
+                    )
+                    self.assertEqual(
+                        read_doors_and_windows_point_light_intensity(store),
+                        DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
+                    )
 
     def test_first_person_navigation_mode_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

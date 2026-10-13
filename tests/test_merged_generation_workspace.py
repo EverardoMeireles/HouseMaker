@@ -28,6 +28,7 @@ from housemaker.ceiling_height_estimation import (
     CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
 )
+from housemaker.door_state import DOOR_SLOT_BODY, DOOR_SLOT_KNOB
 from housemaker.generation_jobs import JOB_STATUS_CANCELLING, GenerationJobManager
 from housemaker.generation_state import (
     MASK_MODE_PAINT,
@@ -37,11 +38,12 @@ from housemaker.generation_state import (
 )
 from housemaker.generation_workspace import (
     GENERATION_JOB_KIND_MODEL,
+    GENERATION_JOB_KIND_TEXTURE,
     GenerationWorkspace,
 )
 from housemaker.merged_generation_workspace import (
     CEILING_HEIGHT_NOT_ESTIMATED_TEXT,
-    OBJECT_WORKFLOW_OUTLINE_PADDING,
+    GENERATION_CONTROLS_PADDING,
     MergedGenerationWorkspace,
 )
 from housemaker.settings_widget import GenerationServiceSettings
@@ -98,6 +100,88 @@ def _wait_until(predicate, timeout_seconds: float = 3.0) -> bool:
         time.sleep(0.005)
     _qt_application.processEvents()
     return bool(predicate())
+
+
+class _ActionJobGenerationWorkspace(GenerationWorkspace):
+    """Replace provider work with deterministic jobs for action-button tests."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.action_job_ids: dict[str, list[str]] = {}
+        self.cancelled_actions: list[str] = []
+        self.skip_next_action: str | None = None
+        super().__init__(*args, **kwargs)
+
+    def _create_action_jobs(
+        self,
+        action: str,
+        kind: str,
+        *,
+        count: int = 1,
+    ) -> list[str]:
+        if self.skip_next_action == action:
+            self.skip_next_action = None
+            return []
+        manager = self._job_manager
+        assert manager is not None
+        job_ids: list[str] = []
+        for job_index in range(1, count + 1):
+            action_member = f"{action}:{job_index}"
+            job = manager.create_job(
+                kind=kind,
+                requested_name=action_member,
+                default_name=action_member,
+                stage="Running",
+                cancel_callback=(
+                    lambda member=action_member: (
+                        self.cancelled_actions.append(member) or True
+                    )
+                ),
+            )
+            job_ids.append(job.job_id)
+        self.action_job_ids[action] = job_ids
+        return job_ids
+
+    def generate(self) -> None:
+        self._create_action_jobs(
+            "generate",
+            GENERATION_JOB_KIND_MODEL,
+            count=2,
+        )
+
+    def generate_geometry(self) -> None:
+        self._create_action_jobs(
+            "geometry",
+            GENERATION_JOB_KIND_MODEL,
+        )
+
+    def generate_selected_object_texture(self) -> bool:
+        return bool(
+            self._create_action_jobs(
+                "object_texture",
+                GENERATION_JOB_KIND_TEXTURE,
+            )
+        )
+
+
+class _ActionJobSurfaceWorkspace(SurfaceTextureGenerationWorkspace):
+    """Replace Surface provider work with one deterministic managed job."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.action_job_ids: list[str] = []
+        self.cancelled_actions: list[str] = []
+        super().__init__(*args, **kwargs)
+
+    def generate(self) -> None:
+        job = self._job_manager.create_job(
+            kind=SURFACE_TEXTURE_JOB_KIND,
+            requested_name="surface_texture",
+            default_name="surface_texture",
+            stage="Running",
+            cancel_callback=(
+                lambda: self.cancelled_actions.append("surface_texture") or True
+            ),
+        )
+        self.action_job_ids = [job.job_id]
 
 
 # ### Merged workspace tests ###
@@ -174,6 +258,19 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(self.surfaces, "texture_view"))
         self.assertFalse(hasattr(self.surfaces, "delete_texture_button"))
+        self.assertFalse(hasattr(self.workspace, "reference_editing_section"))
+        self.assertIsNone(
+            self.workspace.findChild(
+                QWidget,
+                "merged_generation_object_reference_editing_section",
+            )
+        )
+        self.assertIsNone(
+            self.workspace.findChild(QLabel, "merged_generation_shared_title")
+        )
+        self.assertIsNone(
+            self.workspace.findChild(QLabel, "merged_generation_object_title")
+        )
 
         primary_actions = self.workspace.findChild(
             QWidget,
@@ -317,7 +414,9 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.workspace.infer_ceiling_height_button.click()
         self.assertTrue(started.wait(1.0))
-        self.assertTrue(self.workspace.cancel_button.isEnabled())
+        self.assertEqual(self.objects.generate_geometry_button.text(), "Generate geometry")
+        self.assertEqual(self.objects.generate_texture_button.text(), "Generate texture")
+        self.assertEqual(self.objects.generate_button.text(), "Generate")
 
         self.workspace.video_view.set_frame(
             np.full((8, 12, 3), 210, dtype=np.uint8)
@@ -382,6 +481,16 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.controls_row.height(),
         )
 
+    def test_controls_below_seekbar_have_ten_pixel_padding(self) -> None:
+        controls_layout = self.workspace.controls_row.layout()
+
+        self.assertIsNotNone(controls_layout)
+        assert controls_layout is not None
+        self.assertEqual(
+            controls_layout.getContentsMargins(),
+            (GENERATION_CONTROLS_PADDING,) * 4,
+        )
+
     def test_object_controls_house_projection_allocation_in_second_column(
         self,
     ) -> None:
@@ -442,6 +551,14 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             QWidget,
             "merged_generation_object_generation_settings",
         )
+        division_options = self.workspace.findChild(
+            QWidget,
+            "merged_generation_division_options_section",
+        )
+        profile_options = self.workspace.findChild(
+            QWidget,
+            "merged_generation_opening_profile_options_section",
+        )
         generation_actions = self.workspace.findChild(
             QWidget,
             "merged_generation_object_generation_actions",
@@ -461,6 +578,8 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(primary_actions)
         self.assertIsNotNone(primary_column)
         self.assertIsNotNone(generation_settings)
+        self.assertIsNotNone(division_options)
+        self.assertIsNotNone(profile_options)
         self.assertIsNotNone(generation_actions)
         self.assertIsNotNone(face_actions)
         self.assertIsNotNone(editing_section)
@@ -468,6 +587,8 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         assert primary_actions is not None
         assert primary_column is not None
         assert generation_settings is not None
+        assert division_options is not None
+        assert profile_options is not None
         assert generation_actions is not None
         assert face_actions is not None
         assert editing_section is not None
@@ -492,17 +613,31 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             self.surfaces.generate_button,
         )
         settings_layout = generation_settings.layout()
-        self.assertIs(
-            settings_layout.itemAt(0).widget(),
-            self.objects.symmetric_division_checkbox,
-        )
-        self.assertIs(
-            settings_layout.itemAt(1).widget(),
-            self.objects.side_door_duplication_checkbox,
-        )
+        self.assertIs(settings_layout.itemAt(0).widget(), division_options)
+        self.assertIs(settings_layout.itemAt(1).widget(), profile_options)
         self.assertIs(
             settings_layout.itemAt(3).widget(),
             self.objects.meshy_target_polycount_control,
+        )
+        self.assertTrue(
+            division_options.isAncestorOf(
+                self.objects.symmetric_division_checkbox
+            )
+        )
+        self.assertTrue(
+            division_options.isAncestorOf(
+                self.objects.side_door_duplication_checkbox
+            )
+        )
+        self.assertTrue(
+            profile_options.isAncestorOf(
+                self.objects.generate_displacement_checkbox
+            )
+        )
+        self.assertTrue(
+            profile_options.isAncestorOf(
+                self.objects.preserve_door_profile_checkbox
+            )
         )
         generation_actions_layout = generation_actions.layout()
         self.assertIs(
@@ -542,6 +677,8 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         for generation_control in (
             self.objects.symmetric_division_checkbox,
             self.objects.side_door_duplication_checkbox,
+            self.objects.generate_displacement_checkbox,
+            self.objects.preserve_door_profile_checkbox,
             self.objects.meshy_target_polycount_control,
             self.objects.generate_geometry_button,
             self.objects.generate_texture_button,
@@ -662,13 +799,46 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(prompt_wrapper)
         assert prompt_wrapper is not None
         self.assertTrue(prompt_wrapper.isAncestorOf(self.objects.ai_prompt_edit))
-        self.assertIs(
-            material_layout.itemAt(2).widget(),
-            self.workspace.cancel_button,
+        self.assertEqual(material_layout.count(), 2)
+        self.assertEqual(
+            material_layout.indexOf(self.objects.cancel_operation_button),
+            -1,
         )
 
-    def test_object_outline_has_five_pixel_inner_padding(self) -> None:
-        self.assertEqual(OBJECT_WORKFLOW_OUTLINE_PADDING, 5)
+    def test_opening_generation_sections_follow_the_active_slot(self) -> None:
+        division = self.workspace.division_options_section
+        profile = self.workspace.opening_profile_options_section
+
+        self.assertFalse(division.isHidden())
+        self.assertTrue(profile.isHidden())
+
+        self.assertTrue(
+            self.objects.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id=DOOR_SLOT_BODY,
+                object_id="door-body",
+                object_name="Body",
+                slot_display_name="Body",
+            )
+        )
+        self.assertFalse(division.isHidden())
+        self.assertFalse(profile.isHidden())
+
+        self.assertTrue(
+            self.objects.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id=DOOR_SLOT_KNOB,
+                object_id="door-handle",
+                object_name="Handle",
+                slot_display_name="Handle",
+            )
+        )
+        self.assertTrue(division.isHidden())
+        self.assertTrue(profile.isHidden())
+
+        self.objects.clear_door_slot_editing_target()
+        self.assertFalse(division.isHidden())
+        self.assertTrue(profile.isHidden())
 
     def test_seek_stores_each_shared_frame_without_cross_frame_overwrite(self) -> None:
         video_path = Path(self.temporary_directory.name) / "source.avi"
@@ -690,6 +860,30 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.objects.get_data().frame_strokes[1], [second_stroke])
         self.assertEqual(self.surfaces.get_data().frame_strokes[1], [second_stroke])
         self.assertEqual(self.workspace.video_view.get_strokes(), [first_stroke])
+
+    def test_seek_exits_opening_slot_only_when_the_frame_changes(self) -> None:
+        video_path = Path(self.temporary_directory.name) / "source.avi"
+        _write_test_video(video_path)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.assertTrue(
+            self.objects.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id=DOOR_SLOT_BODY,
+                object_id="door-body",
+                object_name="Body",
+                slot_display_name="Body",
+            )
+        )
+
+        self.workspace._handle_seekbar_changed(0)
+        self.assertIsNotNone(self.objects._door_slot_editing_target)
+
+        self.workspace._handle_seekbar_changed(1)
+        self.assertIsNone(self.objects._door_slot_editing_target)
+        self.assertTrue(
+            self.workspace.opening_profile_options_section.isHidden()
+        )
 
     def test_clear_mask_keymapping_uses_shared_button_and_can_be_disabled(self) -> None:
         video_path = Path(self.temporary_directory.name) / "source.avi"
@@ -719,45 +913,6 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.workspace.set_clear_mask_hotkey("")
         self.assertFalse(self.workspace.clear_mask_shortcut.isEnabled())
         self.assertTrue(self.workspace.video_view.has_selection())
-
-    def test_cancel_targets_newest_relevant_job_only(self) -> None:
-        cancelled: list[str] = []
-        first = self.job_manager.create_job(
-            kind=GENERATION_JOB_KIND_MODEL,
-            requested_name="Object",
-            default_name="Object",
-            stage="Running",
-            cancel_callback=lambda: cancelled.append("object") or True,
-        )
-        self.job_manager.create_job(
-            kind="Atlas ambient occlusion",
-            requested_name="AO",
-            default_name="AO",
-            stage="Running",
-            cancel_callback=lambda: cancelled.append("ao") or True,
-        )
-        second = self.job_manager.create_job(
-            kind=SURFACE_TEXTURE_JOB_KIND,
-            requested_name="Surface",
-            default_name="Surface",
-            stage="Running",
-            cancel_callback=lambda: cancelled.append("surface") or True,
-        )
-        self.objects._sync_controls()
-
-        self.assertTrue(self.workspace.cancel_button.isEnabled())
-
-        self.assertTrue(self.workspace.cancel_latest_generation_job())
-
-        self.assertEqual(cancelled, ["surface"])
-        self.assertEqual(
-            self.job_manager.get_job(second.job_id).status,
-            JOB_STATUS_CANCELLING,
-        )
-        self.assertEqual(
-            self.job_manager.get_job(first.job_id).status,
-            "running",
-        )
 
     def test_project_migration_merges_legacy_masks_for_the_same_video(self) -> None:
         metadata = VideoMetadata(
@@ -798,6 +953,168 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(merged_surface.frame_strokes, merged_object.frame_strokes)
         self.assertIsNot(merged_object.frame_strokes, merged_surface.frame_strokes)
+
+
+# ### Generation action cancellation tests ###
+class GenerationActionCancellationUiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temporary_directory.name)
+        self.job_manager = GenerationJobManager()
+        self.objects = _ActionJobGenerationWorkspace(
+            asset_directory=root / "objects",
+            job_manager=self.job_manager,
+        )
+        self.surfaces = _ActionJobSurfaceWorkspace(
+            asset_directory=root / "surfaces",
+            application_settings=ApplicationSettingsStore(root / "settings.json"),
+            job_manager=self.job_manager,
+            shared_controls=self.objects.get_shared_controls(),
+        )
+        self.workspace = MergedGenerationWorkspace(
+            self.surfaces,
+            self.objects,
+            self.job_manager,
+        )
+
+    def tearDown(self) -> None:
+        self.workspace.shutdown()
+        self.surfaces.shutdown()
+        self.objects.shutdown()
+        self.workspace.close()
+        _qt_application.processEvents()
+        self.temporary_directory.cleanup()
+
+    def _enable_object_actions(self) -> None:
+        self.objects.generate_geometry_button.setEnabled(True)
+        self.objects.generate_texture_button.setEnabled(True)
+        self.objects.generate_button.setEnabled(True)
+
+    def test_object_action_buttons_cancel_only_their_own_launch(self) -> None:
+        self._enable_object_actions()
+
+        self.objects.generate_geometry_button.click()
+        geometry_job_id = self.objects.action_job_ids["geometry"][0]
+        self.assertEqual(self.objects.generate_geometry_button.text(), "Cancel")
+        self.assertEqual(self.objects.generate_button.text(), "Generate")
+        self.objects._sync_controls()
+        self.assertTrue(self.objects.generate_geometry_button.isEnabled())
+        self.objects.generate_button.setEnabled(True)
+
+        self.objects.generate_button.click()
+        generate_job_ids = self.objects.action_job_ids["generate"]
+        self.assertEqual(len(generate_job_ids), 2)
+        self.assertEqual(self.objects.generate_button.text(), "Cancel")
+        self.assertEqual(self.objects.generate_geometry_button.text(), "Cancel")
+
+        job_count = len(self.job_manager.jobs())
+        self.objects.generate_geometry_button.click()
+
+        self.assertEqual(len(self.job_manager.jobs()), job_count)
+        self.assertEqual(self.objects.cancelled_actions, ["geometry:1"])
+        self.assertEqual(
+            self.job_manager.get_job(geometry_job_id).status,
+            JOB_STATUS_CANCELLING,
+        )
+        self.assertTrue(
+            all(
+                self.job_manager.get_job(job_id).status == "running"
+                for job_id in generate_job_ids
+            )
+        )
+        self.assertEqual(self.objects.generate_geometry_button.text(), "Cancel")
+        self.assertEqual(self.objects.generate_button.text(), "Cancel")
+
+        self.job_manager.mark_cancelled(geometry_job_id)
+        self.assertEqual(
+            self.objects.generate_geometry_button.text(),
+            "Generate geometry",
+        )
+        self.assertEqual(self.objects.generate_button.text(), "Cancel")
+
+        self.objects.generate_button.click()
+        self.assertEqual(
+            self.objects.cancelled_actions,
+            ["geometry:1", "generate:1", "generate:2"],
+        )
+        for job_id in generate_job_ids:
+            self.assertEqual(
+                self.job_manager.get_job(job_id).status,
+                JOB_STATUS_CANCELLING,
+            )
+            self.job_manager.mark_cancelled(job_id)
+        self.assertEqual(self.objects.generate_button.text(), "Generate")
+
+    def test_object_texture_button_restores_after_completion(self) -> None:
+        self._enable_object_actions()
+
+        self.objects.generate_texture_button.click()
+        texture_job_id = self.objects.action_job_ids["object_texture"][0]
+
+        self.assertEqual(self.objects.generate_texture_button.text(), "Cancel")
+        self.job_manager.complete_job(texture_job_id)
+        self.assertEqual(
+            self.objects.generate_texture_button.text(),
+            "Generate texture",
+        )
+        self.assertEqual(self.objects.cancelled_actions, [])
+
+    def test_surface_texture_cancel_is_isolated_from_object_texture(self) -> None:
+        self._enable_object_actions()
+        self.surfaces.generate_button.setEnabled(True)
+        self.workspace.generate_texture_stack.setCurrentWidget(
+            self.surfaces.generate_button
+        )
+
+        self.surfaces.generate_button.click()
+        surface_job_id = self.surfaces.action_job_ids[0]
+        self.workspace.generate_texture_stack.setCurrentWidget(
+            self.objects.generate_texture_button
+        )
+        self.objects.generate_texture_button.click()
+        object_job_id = self.objects.action_job_ids["object_texture"][0]
+
+        self.assertEqual(self.surfaces.generate_button.text(), "Cancel")
+        self.assertEqual(self.objects.generate_texture_button.text(), "Cancel")
+        self.surfaces._sync_controls()
+        self.assertTrue(self.surfaces.generate_button.isEnabled())
+
+        self.surfaces.generate_button.click()
+
+        self.assertEqual(
+            self.surfaces.cancelled_actions,
+            ["surface_texture"],
+        )
+        self.assertEqual(self.objects.cancelled_actions, [])
+        self.assertEqual(
+            self.job_manager.get_job(surface_job_id).status,
+            JOB_STATUS_CANCELLING,
+        )
+        self.assertEqual(
+            self.job_manager.get_job(object_job_id).status,
+            "running",
+        )
+        self.assertEqual(self.objects.generate_texture_button.text(), "Cancel")
+
+        self.job_manager.mark_cancelled(surface_job_id)
+        self.job_manager.complete_job(object_job_id)
+        self.assertEqual(
+            self.surfaces.generate_button.text(),
+            "Generate texture",
+        )
+        self.assertEqual(
+            self.objects.generate_texture_button.text(),
+            "Generate texture",
+        )
+
+    def test_failed_action_validation_does_not_turn_button_into_cancel(self) -> None:
+        self._enable_object_actions()
+        self.objects.skip_next_action = "geometry"
+
+        self.objects.generate_geometry_button.click()
+
+        self.assertEqual(self.objects.action_job_ids, {})
+        self.assertEqual(self.objects.generate_geometry_button.text(), "Generate geometry")
 
 
 if __name__ == "__main__":

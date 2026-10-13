@@ -443,7 +443,11 @@ class GenerationCancellationTests(unittest.TestCase):
         self.assertEqual(record.object_id, "door-knob")
         self.assertEqual(
             record.pipeline[DOOR_COMPONENT_PIPELINE_KEY],
-            {"door_id": "door-1", "slot_id": "door_knob"},
+            {
+                "door_id": "door-1",
+                "slot_id": "door_knob",
+                "asset_kind": "door",
+            },
         )
         self.assertEqual(self.workspace.get_generated_object_ids(), ())
         self.assertEqual(self.workspace.get_placeable_object_names_by_id(), {})

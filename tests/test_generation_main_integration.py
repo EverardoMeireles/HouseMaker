@@ -124,7 +124,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 "3D scene",
                 "Atlas",
                 "Generation",
-                "Doors",
+                "Doors and Windows",
                 "Tour",
                 "Settings",
             ],
@@ -135,7 +135,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "3D scene": True,
             "Atlas": False,
             "Generation": False,
-            "Doors": False,
+            "Doors and Windows": False,
             "Tour": False,
             "Settings": False,
         }
@@ -295,8 +295,11 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 merged.ai_prompt_edit
             )
         )
-        self.assertTrue(
-            merged.shared_material_section.isAncestorOf(merged.cancel_button)
+        self.assertTrue(generation.cancel_operation_button.isHidden())
+        self.assertFalse(
+            merged.shared_material_section.isAncestorOf(
+                generation.cancel_operation_button
+            )
         )
 
         shared_fields = merged.shared_controls.findChild(
@@ -317,7 +320,6 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             merged.mask_mode_control,
             merged.clear_mask_button,
             merged.ai_prompt_edit,
-            merged.cancel_button,
         ):
             with self.subTest(
                 shared_control=(
@@ -674,6 +676,20 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             GenerationServiceSettings(
                 meshy_api_key="meshy-session-test",
             ),
+        )
+
+    def test_point_light_intensity_updates_the_doors_preview_live(self) -> None:
+        settings_widget = self.workspace.settings_widget
+
+        settings_widget.doors_and_windows_point_light_intensity_spinbox.setValue(
+            3.2
+        )
+        _qt_application.processEvents()
+        doors_preview = self.workspace.doors_workspace.preview_viewer
+
+        self.assertEqual(
+            doors_preview.get_point_light_intensity(),
+            3.2,
         )
 
     def test_save_passes_generation_data_without_legacy_sync_state(self) -> None:

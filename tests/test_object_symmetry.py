@@ -43,6 +43,7 @@ from housemaker.object_symmetry import (
     build_symmetric_retexture_proxy_glb,
     build_symmetric_square_pair_texture_variants,
     clip_glb_to_axis_half,
+    split_scene_at_z_up_axis_planes,
 )
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
@@ -841,6 +842,156 @@ class AxisHalfTests(unittest.TestCase):
             SymmetricRetextureProxyTests._sorted_rows(uv_sets[0]),
             SymmetricRetextureProxyTests._sorted_rows(uv_sets[1]),
             atol=1e-7,
+        )
+
+
+# ### Attribute-preserving plane split tests ###
+class AxisPlaneSplitTests(unittest.TestCase):
+    def test_vertex_colors_are_linearly_interpolated(self) -> None:
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(
+                ((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                dtype=float,
+            ),
+            faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+            process=False,
+        )
+        mesh.visual = trimesh.visual.ColorVisuals(
+            mesh=mesh,
+            vertex_colors=np.asarray(
+                (
+                    (255, 0, 0, 255),
+                    (0, 0, 255, 255),
+                    (0, 255, 0, 255),
+                ),
+                dtype=np.uint8,
+            ),
+        )
+        scene = trimesh.Scene()
+        scene.add_geometry(mesh, geom_name="color-geometry", node_name="color-node")
+
+        changed = split_scene_at_z_up_axis_planes(
+            scene,
+            axis=0,
+            plane_coordinates=(0.25,),
+        )
+
+        self.assertEqual(changed, 1)
+        output = scene.geometry["color-geometry"]
+        vertices = np.asarray(output.vertices, dtype=float)
+        colors = np.asarray(output.visual.vertex_colors, dtype=np.uint8)
+        lower_split = np.flatnonzero(
+            np.all(
+                np.isclose(vertices, (0.25, 0.0, 0.0), atol=1e-12),
+                axis=1,
+            )
+        )
+        upper_split = np.flatnonzero(
+            np.all(
+                np.isclose(vertices, (0.25, 0.75, 0.0), atol=1e-12),
+                axis=1,
+            )
+        )
+        self.assertEqual(len(lower_split), 1)
+        self.assertEqual(len(upper_split), 1)
+        np.testing.assert_array_equal(
+            colors[lower_split[0]],
+            (96, 0, 159, 255),
+        )
+        np.testing.assert_array_equal(
+            colors[upper_split[0]],
+            (0, 191, 64, 255),
+        )
+
+    def test_constant_material_and_scene_graph_are_preserved(self) -> None:
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(
+                ((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                dtype=float,
+            ),
+            faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+            process=False,
+        )
+        mesh.visual = TextureVisuals(
+            material=PBRMaterial(
+                name="constant-profile-material",
+                baseColorFactor=(25, 50, 75, 255),
+            )
+        )
+        scene = trimesh.Scene()
+        transform = trimesh.transformations.translation_matrix((2.0, 0.0, 0.0))
+        scene.add_geometry(
+            mesh,
+            geom_name="profile-geometry",
+            node_name="profile-node",
+            transform=transform,
+        )
+
+        changed = split_scene_at_z_up_axis_planes(
+            scene,
+            axis=0,
+            plane_coordinates=(2.25,),
+        )
+
+        self.assertEqual(changed, 1)
+        output_transform, output_geometry_name = scene.graph.get("profile-node")
+        self.assertEqual(output_geometry_name, "profile-geometry")
+        np.testing.assert_allclose(output_transform, transform, atol=1e-12)
+        output = scene.geometry["profile-geometry"]
+        self.assertIsInstance(output.visual, TextureVisuals)
+        self.assertEqual(output.visual.material.name, "constant-profile-material")
+        np.testing.assert_array_equal(
+            output.visual.material.baseColorFactor,
+            (25, 50, 75, 255),
+        )
+
+    def test_coincident_disconnected_faces_are_not_welded(self) -> None:
+        one_triangle = np.asarray(
+            ((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            dtype=float,
+        )
+        mesh = trimesh.Trimesh(
+            vertices=np.vstack((one_triangle, one_triangle)),
+            faces=np.asarray(((0, 1, 2), (3, 4, 5)), dtype=np.int64),
+            process=False,
+        )
+        mesh.visual = TextureVisuals(
+            uv=np.asarray(
+                (
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (0.5, 1.0),
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (0.5, 1.0),
+                ),
+                dtype=float,
+            ),
+            material=PBRMaterial(
+                baseColorTexture=Image.new("RGBA", (2, 2), (90, 80, 70, 255))
+            ),
+        )
+        scene = trimesh.Scene()
+        scene.add_geometry(
+            mesh,
+            geom_name="coincident-geometry",
+            node_name="coincident-node",
+        )
+
+        changed = split_scene_at_z_up_axis_planes(
+            scene,
+            axis=0,
+            plane_coordinates=(0.25,),
+        )
+
+        self.assertEqual(changed, 1)
+        output = scene.geometry["coincident-geometry"]
+        self.assertEqual(len(output.faces), 6)
+        self.assertEqual(len(output.vertices), 10)
+        self.assertTrue(
+            set(np.asarray(output.faces[:3]).reshape(-1)).isdisjoint(
+                set(np.asarray(output.faces[3:]).reshape(-1))
+            )
         )
 
 

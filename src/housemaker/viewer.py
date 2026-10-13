@@ -41,6 +41,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid as is_valid_qt_object
 
 from housemaker.architectural_trim import (
     TRIM_HANDLE_CORNER_RADIUS,
@@ -74,6 +76,7 @@ from housemaker.camera_indicators import (
 from housemaker.camera_models import CameraPose
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
+    CANVAS_OPENING_WINDOW,
     CanvasOpeningBounds,
     CanvasOpeningEdit,
     CanvasOpeningReference,
@@ -161,6 +164,9 @@ MOUSE_WHEEL_DELTA_PER_STEP = 120
 DEFAULT_AMBIENT_LIGHT_INTENSITY = 0.5
 MIN_AMBIENT_LIGHT_INTENSITY = 0.0
 MAX_AMBIENT_LIGHT_INTENSITY = 1.0
+DEFAULT_POINT_LIGHT_INTENSITY = 1.0
+MIN_POINT_LIGHT_INTENSITY = 0.0
+MAX_POINT_LIGHT_INTENSITY = 10.0
 ORBITING_POINT_LIGHT_UPDATE_INTERVAL_MILLISECONDS = 33
 ORBITING_POINT_LIGHT_PERIOD_MILLISECONDS = 8_000
 ORBITING_POINT_LIGHT_RADIUS_SCALE = 1.6
@@ -171,6 +177,9 @@ ORBITING_POINT_LIGHT_MARKER_MINIMUM_RADIUS_METERS = 0.04
 ORBITING_POINT_LIGHT_MARKER_ROWS = 12
 ORBITING_POINT_LIGHT_MARKER_COLUMNS = 24
 ORBITING_POINT_LIGHT_MARKER_COLOR = (1.0, 1.0, 1.0, 1.0)
+HOVER_POINT_LIGHT_OFFSET_SCALE = 0.08
+HOVER_POINT_LIGHT_MINIMUM_OFFSET_METERS = 0.08
+HOVER_POINT_LIGHT_MAXIMUM_OFFSET_METERS = 0.75
 AMBIENT_LIT_SHADER_NAME = "housemaker_ambient_lit"
 # Export assets retain their source resolution; only interactive GL previews
 # are capped so a base color plus PBR set cannot consume hundreds of MiB.
@@ -203,7 +212,7 @@ FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
 FIRST_PERSON_FRAME_OVERLAY_OPACITY = 0.5
-WINDOW_EDITOR_PANEL_WIDTH = 190
+CANVAS_TOOLS_PANEL_WIDTH = 190
 WINDOW_PREVIEW_OFFSET_METERS = 0.006
 CANVAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
 CANVAS_SURFACE_SELECTION_VERTEX_COLOR = (0.78, 0.56, 0.14, 1.0)
@@ -227,6 +236,9 @@ CANVAS_STAIR_PREVIEW_UPDATE_INTERVAL_MILLISECONDS = 50
 ATLAS_SURFACE_HIGHLIGHT_COLOR = (0.20, 0.86, 0.38, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
+GLASS_AREA_PREVIEW_COLOR = (0.18, 0.72, 1.0, 1.0)
+GLASS_AREA_PREVIEW_WIDTH_PIXELS = 4.0
+GLASS_AREA_MINIMUM_NORMALIZED_SPAN = 1e-4
 DOORWAY_PREVIEW_OUTLINE_COLOR = (1.0, 0.72, 0.18, 0.98)
 DOORWAY_PREVIEW_OUTLINE_WIDTH = 3.0
 SYMMETRIC_PREVIEW_MIN_OPACITY = 0.12
@@ -248,6 +260,7 @@ OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR = (0.12, 1.0, 0.55, 0.95)
 DOOR_PLACEMENT_PREVIEW_COLORS = {
     "body": (1.0, 0.78, 0.08, 0.38),
     "door_knob": (0.10, 0.46, 1.0, 0.42),
+    "handle": (0.10, 0.46, 1.0, 0.42),
 }
 DOOR_PLACEMENT_PREVIEW_EDGE_ALPHA = 0.96
 TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
@@ -266,6 +279,7 @@ TRANSFORM_GIZMO_ROTATE = "rotate"
 TRANSFORM_GIZMO_SCALE = "scale"
 PLACED_OBJECT_GIZMO_TRANSFORM = "transform"
 PLACED_OBJECT_GIZMO_SCALE = "scale"
+PLACED_OBJECT_ROTATION_SNAP_DEGREES = 10.0
 PLACED_OBJECT_SCALE_FACTOR_PER_WHEEL_STEP = 1.1
 PLACED_OBJECT_MIN_SCALE = 0.05
 PLACED_OBJECT_MAX_SCALE = 20.0
@@ -382,12 +396,14 @@ CANVAS_OPENING_ARCH_SIZE_PIXELS = 24.0
 CANVAS_OPENING_ARCH_GUIDE_WIDTH = 3.0
 CANVAS_OPENING_HANDLE_HIT_RADIUS_PIXELS = 20.0
 CANVAS_OPENING_HANDLE_MIN_HIT_RADIUS_METERS = 0.04
-CANVAS_DOOR_CREATE_COLOR = (0.16, 0.88, 0.42, 1.0)
-CANVAS_DOOR_CREATE_ICON_COLOR = (1.0, 1.0, 1.0, 1.0)
-CANVAS_DOOR_CREATE_SIZE_PIXELS = 34.0
-CANVAS_DOOR_CREATE_HIT_RADIUS_PIXELS = 24.0
-CANVAS_DOOR_CREATE_MIN_HIT_RADIUS_METERS = 0.05
-CANVAS_DOOR_CREATE_MINIMUM_OFFSET_METERS = 0.14
+CANVAS_OPENING_CREATE_COLOR = (0.16, 0.88, 0.42, 1.0)
+CANVAS_OPENING_CREATE_ICON_COLOR = (1.0, 1.0, 1.0, 1.0)
+CANVAS_OPENING_CREATE_SIZE_PIXELS = 34.0
+CANVAS_OPENING_CREATE_HIT_RADIUS_PIXELS = 24.0
+CANVAS_OPENING_CREATE_MIN_HIT_RADIUS_METERS = 0.05
+CANVAS_OPENING_CREATE_MINIMUM_OFFSET_METERS = 0.14
+# Compatibility alias retained for callers that only style doorway controls.
+CANVAS_DOOR_CREATE_SIZE_PIXELS = CANVAS_OPENING_CREATE_SIZE_PIXELS
 CANVAS_OPENING_OVERLAY_DEPTH_VALUE = 10_000.0
 CANVAS_OPENING_OVERLAY_GL_OPTIONS = {
     GL.GL_DEPTH_TEST: False,
@@ -561,6 +577,7 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     uniform float u_base_color_alpha;
     uniform float u_ambient_light;
     uniform float u_point_light_enabled;
+    uniform float u_point_light_intensity;
     uniform vec3 u_point_light_position_view;
     uniform float u_opacity;
     uniform float u_color_balance_enabled;
@@ -669,7 +686,7 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
         float point_diffuse = max(
             dot(surface_normal, point_light_direction),
             0.0
-        ) * u_point_light_enabled;
+        ) * u_point_light_enabled * u_point_light_intensity;
         float illumination = min(
             1.0,
             u_ambient_light + diffuse * 0.65 + point_diffuse * 0.45
@@ -727,7 +744,9 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
         float point_specular = pow(
             max(dot(surface_normal, point_half_direction), 0.0),
             point_shininess
-        ) * (1.0 - roughness * 0.72) * u_point_light_enabled;
+        ) * (1.0 - roughness * 0.72)
+            * u_point_light_enabled
+            * u_point_light_intensity;
         vec3 point_reflection_color = mix(
             vec3(0.08),
             base_color.rgb,
@@ -2556,6 +2575,7 @@ class TexturedMeshItem(GLGraphicsItem):
         translucent: bool = False,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
         point_light_world_position: Sequence[float] | None = None,
+        point_light_intensity: float = DEFAULT_POINT_LIGHT_INTENSITY,
         draw_ranges: Sequence[_TextureDrawRange] | None = None,
     ) -> None:
         super().__init__()
@@ -2646,6 +2666,9 @@ class TexturedMeshItem(GLGraphicsItem):
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
         self._point_light_world_position = _normalize_optional_world_position(
             point_light_world_position
+        )
+        self._point_light_intensity = _normalize_point_light_intensity(
+            point_light_intensity
         )
         self._color_balance_preview_settings = TextureColorBalanceSettings()
         self._tangents: np.ndarray | None = None
@@ -2786,6 +2809,26 @@ class TexturedMeshItem(GLGraphicsItem):
         """Return the current optional point-light position."""
 
         return self._point_light_world_position
+
+    def set_point_light_intensity(
+        self,
+        intensity: float,
+        *,
+        request_update: bool = True,
+    ) -> None:
+        """Set the scalar contribution of the optional preview point light."""
+
+        normalized = _normalize_point_light_intensity(intensity)
+        if math.isclose(normalized, self._point_light_intensity):
+            return
+        self._point_light_intensity = normalized
+        if request_update:
+            self.update()
+
+    def get_point_light_intensity(self) -> float:
+        """Return the current finite preview point-light intensity."""
+
+        return self._point_light_intensity
 
     def set_texture_color_balance_preview(
         self,
@@ -3103,6 +3146,12 @@ class TexturedMeshItem(GLGraphicsItem):
             self._shader_program,
             "u_point_light_enabled",
             float(self._point_light_world_position is not None),
+            self._uniform_locations,
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_point_light_intensity",
+            self._point_light_intensity,
             self._uniform_locations,
         )
         _set_vector3_uniform(
@@ -4303,6 +4352,96 @@ class DoorPlacementPreviewCandidate:
         object.__setattr__(self, "mirrored_transform", mirrored_transform)
 
 
+@dataclass(frozen=True)
+class GlassAreaPlacementRequest:
+    """One front-view rectangle to cut through a door or window body."""
+
+    asset_kind: str
+    asset_id: str
+    body_object_id: str
+    normalized_x_bounds: tuple[float, float]
+    normalized_z_bounds: tuple[float, float]
+
+    def __post_init__(self) -> None:
+        normalized_kind = str(self.asset_kind).strip().lower()
+        normalized_asset_id = str(self.asset_id).strip()
+        normalized_body_id = str(self.body_object_id).strip()
+        if not normalized_kind or not normalized_asset_id or not normalized_body_id:
+            raise ValueError("Glass-area placement requires asset and body IDs.")
+        x_bounds = _normalize_glass_area_axis_bounds(
+            self.normalized_x_bounds,
+            "X",
+        )
+        z_bounds = _normalize_glass_area_axis_bounds(
+            self.normalized_z_bounds,
+            "Z",
+        )
+        object.__setattr__(self, "asset_kind", normalized_kind)
+        object.__setattr__(self, "asset_id", normalized_asset_id)
+        object.__setattr__(self, "body_object_id", normalized_body_id)
+        object.__setattr__(self, "normalized_x_bounds", x_bounds)
+        object.__setattr__(self, "normalized_z_bounds", z_bounds)
+
+
+def _normalize_glass_area_axis_bounds(
+    raw_bounds: object,
+    axis_name: str,
+) -> tuple[float, float]:
+    """Validate one ordered normalized glass-area interval."""
+
+    try:
+        values = tuple(float(value) for value in raw_bounds)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Glass-area {axis_name} bounds must contain two finite values."
+        ) from error
+    if len(values) != 2 or not all(math.isfinite(value) for value in values):
+        raise ValueError(
+            f"Glass-area {axis_name} bounds must contain two finite values."
+        )
+    minimum, maximum = values
+    if (
+        minimum < 0.0
+        or maximum > 1.0
+        or maximum - minimum < GLASS_AREA_MINIMUM_NORMALIZED_SPAN
+    ):
+        raise ValueError(
+            f"Glass-area {axis_name} bounds must be ordered inside 0..1."
+        )
+    return minimum, maximum
+
+
+def _normalize_glass_area_profile_bounds(
+    raw_bounds: Sequence[float] | None,
+) -> np.ndarray | None:
+    """Return optional full-profile X/Z bounds used by half-mesh editors."""
+
+    if raw_bounds is None:
+        return None
+    if isinstance(raw_bounds, (str, bytes, bytearray)):
+        raise TypeError("Glass-area profile bounds must contain four numbers.")
+    try:
+        values = tuple(float(value) for value in raw_bounds)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "Glass-area profile bounds must contain four finite numbers."
+        ) from error
+    if len(values) != 4 or not all(math.isfinite(value) for value in values):
+        raise ValueError(
+            "Glass-area profile bounds must contain four finite numbers."
+        )
+    minimum_x, maximum_x, minimum_z, maximum_z = values
+    if maximum_x <= minimum_x or maximum_z <= minimum_z:
+        raise ValueError("Glass-area profile bounds must have positive spans.")
+    return np.asarray(
+        (
+            (minimum_x, 0.0, minimum_z),
+            (maximum_x, 0.0, maximum_z),
+        ),
+        dtype=float,
+    )
+
+
 def _normalize_door_placement_preview_transform(raw_transform: object) -> np.ndarray:
     """Return one immutable finite 4x4 placement transform."""
 
@@ -4342,6 +4481,7 @@ class GlbViewerWidget(QWidget):
     window_placement_changed = Signal(bool)
     window_undo_requested = Signal()
     door_creation_requested = Signal(object)
+    window_fixture_creation_requested = Signal(object)
     canvas_opening_selection_changed = Signal(object)
     canvas_opening_edit_started = Signal(object)
     canvas_opening_edit_preview_changed = Signal(object)
@@ -4358,6 +4498,13 @@ class GlbViewerWidget(QWidget):
     placed_object_removal_requested = Signal(str)
     placed_object_instance_requested = Signal(object)
     placed_object_transform_changed = Signal(str, object, object)
+    placed_object_transform_preview_changed = Signal(
+        str,
+        object,
+        object,
+        object,
+    )
+    placed_object_rotation_preview_changed = Signal(str, object)
     placed_object_scales_changed = Signal(object)
     placed_object_axis_scales_changed = Signal(str, object)
     placed_object_selection_changed = Signal(object)
@@ -4367,6 +4514,10 @@ class GlbViewerWidget(QWidget):
     object_placement_cancelled = Signal(str)
     door_placement_requested = Signal(str, object, bool)
     door_placement_cancelled = Signal(str)
+    window_fixture_placement_requested = Signal(str, object, bool)
+    window_fixture_placement_cancelled = Signal(str)
+    glass_area_placement_requested = Signal(object)
+    glass_area_placement_cancelled = Signal(str, str)
     tour_point_placed = Signal(str, object)
     tour_point_placement_cancelled = Signal(str)
     tour_curve_finished = Signal(object)
@@ -4427,6 +4578,8 @@ class GlbViewerWidget(QWidget):
         symmetric_preview_fade_enabled: bool = True,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
         orbiting_point_light_with_pbr: bool = False,
+        hover_point_light_enabled: bool = False,
+        point_light_intensity: float = DEFAULT_POINT_LIGHT_INTENSITY,
     ) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
@@ -4477,6 +4630,12 @@ class GlbViewerWidget(QWidget):
         self._orbiting_point_light_phase = 0.0
         self._orbiting_point_light_position: tuple[float, float, float] | None = (
             None
+        )
+        self._hover_point_light_enabled = bool(hover_point_light_enabled)
+        self._hover_point_light_input_connected = False
+        self._hover_point_light_position: tuple[float, float, float] | None = None
+        self._point_light_intensity = _normalize_point_light_intensity(
+            point_light_intensity
         )
         self._orbiting_point_light_marker_item: gl.GLMeshItem | None = None
         self._orbiting_point_light_marker_radius: float | None = None
@@ -4565,6 +4724,7 @@ class GlbViewerWidget(QWidget):
         self._object_placement_preview_root: GLGraphicsItem | None = None
         self._object_placement_preview_items: list[gl.GLMeshItem] = []
         self._door_placement_door_id: str | None = None
+        self._door_placement_opening_kind: str | None = None
         self._door_placement_compatible_opening_keys: frozenset[str] = frozenset()
         self._door_placement_mirrored_horizontally = False
         self._door_placement_press_position: QPointF | None = None
@@ -4575,6 +4735,14 @@ class GlbViewerWidget(QWidget):
         self._door_placement_hover_opening_key: str | None = None
         self._door_placement_preview_root: GLGraphicsItem | None = None
         self._door_placement_preview_items: list[gl.GLMeshItem] = []
+        self._glass_area_asset_kind: str | None = None
+        self._glass_area_asset_id: str | None = None
+        self._glass_area_body_object_id: str | None = None
+        self._glass_area_profile_bounds: np.ndarray | None = None
+        self._glass_area_first_local_point: np.ndarray | None = None
+        self._glass_area_preview_request: GlassAreaPlacementRequest | None = None
+        self._glass_area_preview_plane_y: float | None = None
+        self._glass_area_preview_item: gl.GLLinePlotItem | None = None
         self._tour_point_placement_kind: str | None = None
         self._tour_point_placement_repeat = False
         self._tour_point_vertical_offset_meters = 0.0
@@ -4666,8 +4834,8 @@ class GlbViewerWidget(QWidget):
         self._selected_canvas_opening_key: str | None = None
         self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
         self._canvas_opening_gizmo_items: list[GLGraphicsItem] = []
-        self._canvas_door_creation_items: list[GLGraphicsItem] = []
-        self._canvas_door_creation_pressed_reference: (
+        self._canvas_opening_creation_items: list[GLGraphicsItem] = []
+        self._canvas_opening_creation_pressed_reference: (
             CanvasOpeningReference | None
         ) = None
         self._canvas_surface_edit_targets: dict[
@@ -4707,6 +4875,7 @@ class GlbViewerWidget(QWidget):
         )
         self.object_transform_status_label: QLabel | None = None
         self.surface_tools_status_label: QLabel | None = None
+        self.scene_wireframe_checkbox: QCheckBox | None = None
         self._surface_tools_status_override: str | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
         self._canvas_surface_targets: dict[str, FixedSurface] = {}
@@ -4799,8 +4968,10 @@ class GlbViewerWidget(QWidget):
         self._window_drag_first_world: tuple[float, float, float] | None = None
         self._window_preview_placement: WallWindowPlacement | None = None
         self._window_preview_is_valid = False
-        self._window_undo_available = False
         self._window_preview_item: gl.GLMeshItem | None = None
+        self.canvas_tools_panel: QWidget | None = None
+        # Compatibility aliases remain temporarily while Main drops the old
+        # Window-tools wiring. No window controls are rendered in this panel.
         self.window_tools_panel: QWidget | None = None
         self.window_tools_status_label: QLabel | None = None
         self.undo_window_button: QPushButton | None = None
@@ -4856,6 +5027,7 @@ class GlbViewerWidget(QWidget):
         self._orbiting_point_light_timer.timeout.connect(
             self._tick_orbiting_point_light_animation
         )
+        self._continuous_preview_animation_closed = False
         self._ambient_shader = _build_ambient_shader(self._ambient_light_intensity)
         application = QApplication.instance()
         if application is not None:
@@ -4868,6 +5040,8 @@ class GlbViewerWidget(QWidget):
 
         self._build_ui()
         self._connect_tour_input()
+        self._connect_hover_point_light_input()
+        self._connect_rectangle_placement_input()
         self.undo_shortcut: QShortcut | None = None
         if self._window_editing_enabled:
             self.undo_shortcut = QShortcut(
@@ -5725,7 +5899,7 @@ class GlbViewerWidget(QWidget):
         viewport_layout = QStackedLayout(viewport_container)
         self._populate_viewport_stack(viewport_layout)
         root_layout.addWidget(viewport_container, 1)
-        root_layout.addWidget(self._build_window_tools_panel())
+        root_layout.addWidget(self._build_canvas_tools_panel())
 
     def _populate_viewport_stack(self, layout: QStackedLayout) -> None:
         """Create the shared viewport and crosshair inside *layout*."""
@@ -5839,6 +6013,11 @@ class GlbViewerWidget(QWidget):
     def _continuous_preview_animation_allowed(self) -> bool:
         """Return whether this viewer can currently present animation frames."""
 
+        if (
+            not is_valid_qt_object(self)
+            or self._continuous_preview_animation_closed
+        ):
+            return False
         if not self.isVisible():
             return False
         window = self.window()
@@ -5871,6 +6050,8 @@ class GlbViewerWidget(QWidget):
     def _sync_continuous_preview_animation_timers(self) -> None:
         """Run continuous effects only while their viewer can display them."""
 
+        if not is_valid_qt_object(self):
+            return
         if not self._continuous_preview_animation_allowed():
             self._symmetric_preview_timer.stop()
             self._canvas_stair_preview_timer.stop()
@@ -5888,6 +6069,8 @@ class GlbViewerWidget(QWidget):
     def _tick_symmetric_preview_animation(self) -> None:
         """Advance symmetric fading only while its viewer is active."""
 
+        if not is_valid_qt_object(self):
+            return
         if not self._continuous_preview_animation_allowed():
             self._symmetric_preview_timer.stop()
             return
@@ -5896,6 +6079,8 @@ class GlbViewerWidget(QWidget):
     def _tick_canvas_stair_preview_animation(self) -> None:
         """Advance stair fading only while its viewer is active."""
 
+        if not is_valid_qt_object(self):
+            return
         if not self._continuous_preview_animation_allowed():
             self._canvas_stair_preview_timer.stop()
             return
@@ -5904,6 +6089,8 @@ class GlbViewerWidget(QWidget):
     def _tick_orbiting_point_light_animation(self) -> None:
         """Advance PBR lighting only while its viewer is active."""
 
+        if not is_valid_qt_object(self):
+            return
         if not self._continuous_preview_animation_allowed():
             self._orbiting_point_light_timer.stop()
             return
@@ -5922,35 +6109,23 @@ class GlbViewerWidget(QWidget):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """Invalidate daemon work before this viewer closes or is destroyed."""
 
+        self._continuous_preview_animation_closed = True
         self._invalidate_face_rectangle_selection_requests()
         self._cancel_canvas_rectangle_selection()
+        self._symmetric_preview_timer.stop()
+        self._canvas_stair_preview_timer.stop()
         self._orbiting_point_light_timer.stop()
         super().closeEvent(event)
 
-    def _build_window_tools_panel(self) -> QWidget:
+    def _build_canvas_tools_panel(self) -> QWidget:
         """Build the Canvas-only controls that travel with the 3D viewer."""
 
         panel = QWidget()
-        panel.setObjectName("canvas-window-tools-panel")
-        panel.setFixedWidth(WINDOW_EDITOR_PANEL_WIDTH)
+        panel.setObjectName("canvas-tools-panel")
+        panel.setFixedWidth(CANVAS_TOOLS_PANEL_WIDTH)
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(12, 12, 12, 12)
         panel_layout.setSpacing(10)
-
-        title_label = QLabel("Window tools")
-        title_label.setObjectName("canvas-window-tools-title")
-        panel_layout.addWidget(title_label)
-
-        self.undo_window_button = QPushButton("Undo window")
-        self.undo_window_button.setObjectName("canvas-undo-window-button")
-        self.undo_window_button.setEnabled(False)
-        self.undo_window_button.clicked.connect(self._handle_undo_window_button_clicked)
-        panel_layout.addWidget(self.undo_window_button)
-
-        self.window_tools_status_label = QLabel("Select one wall.")
-        self.window_tools_status_label.setObjectName("canvas-window-tools-status")
-        self.window_tools_status_label.setWordWrap(True)
-        panel_layout.addWidget(self.window_tools_status_label)
 
         trim_title_label = QLabel("Architectural trim")
         trim_title_label.setObjectName("canvas-architectural-trim-title")
@@ -6016,6 +6191,19 @@ class GlbViewerWidget(QWidget):
         )
         panel_layout.addWidget(self.canvas_level_visibility_list)
 
+        self.scene_wireframe_checkbox = QCheckBox("Wireframe")
+        self.scene_wireframe_checkbox.setObjectName(
+            "canvas-scene-wireframe-checkbox"
+        )
+        self.scene_wireframe_checkbox.setToolTip(
+            "Show or hide wireframe edges on the 3D scene meshes."
+        )
+        self.scene_wireframe_checkbox.setChecked(self._wireframe_enabled)
+        self.scene_wireframe_checkbox.toggled.connect(
+            self.set_wireframe_enabled
+        )
+        panel_layout.addWidget(self.scene_wireframe_checkbox)
+
         self.highlight_floor_button = QPushButton("Highlight floor")
         self.highlight_floor_button.setObjectName("canvas-highlight-floor-button")
         self.highlight_floor_button.setCheckable(True)
@@ -6067,6 +6255,7 @@ class GlbViewerWidget(QWidget):
         self.object_transform_status_label.setWordWrap(True)
         panel_layout.addWidget(self.object_transform_status_label)
         panel_layout.addStretch(1)
+        self.canvas_tools_panel = panel
         self.window_tools_panel = panel
         return panel
 
@@ -7733,21 +7922,21 @@ class GlbViewerWidget(QWidget):
         """Whether pointer input is currently reserved for a new window."""
 
         return bool(
-            self._window_editing_enabled and self.view.is_rectangle_drawing_enabled
+            self._window_editing_enabled
+            and self.view.is_rectangle_drawing_enabled
+            and not self.is_glass_area_placement_active
         )
 
     def set_window_tools_status(self, message: str) -> None:
-        """Show a commit result without exposing the panel's label internals."""
+        """Validate legacy status calls after removal of the visible controls."""
 
         if not isinstance(message, str):
             raise TypeError("A window-tools status message must be text.")
-        self._set_window_tools_status(message)
 
     def set_window_undo_available(self, available: bool) -> None:
-        """Enable undo only while Main owns a committed window history item."""
+        """Accept obsolete Main wiring; shared Ctrl+Z now owns window undo."""
 
-        self._window_undo_available = bool(available)
-        self._sync_window_undo_button()
+        del available
 
     # ### Canvas surface vertex tool API ###
     def is_surface_vertex_placement_active(self) -> bool:
@@ -8038,7 +8227,7 @@ class GlbViewerWidget(QWidget):
                 raise ValueError(f"Duplicate Canvas opening target: {target.key!r}.")
             normalized_targets[target.key] = target
 
-        self._cancel_canvas_door_creation_press()
+        self._cancel_canvas_opening_creation_press()
         self._cancel_canvas_opening_edit_drag()
         selected_key = self._selected_canvas_opening_key
         previous_targets = self._canvas_opening_targets
@@ -8083,9 +8272,9 @@ class GlbViewerWidget(QWidget):
             raise ValueError("The Canvas opening target is no longer available.")
         if self._canvas_opening_edit_drag is not None:
             raise RuntimeError("A Canvas opening target cannot change during a drag.")
-        self._cancel_canvas_door_creation_press()
+        self._cancel_canvas_opening_creation_press()
         if (
-            self.is_door_placement_active
+            self.is_opening_fixture_placement_active
             and target.key in self._door_placement_compatible_opening_keys
             and self._canvas_opening_targets[target.key] != target
         ):
@@ -8146,7 +8335,7 @@ class GlbViewerWidget(QWidget):
         if normalized_key == self._selected_canvas_opening_key:
             return False
 
-        self._cancel_canvas_door_creation_press()
+        self._cancel_canvas_opening_creation_press()
         self._cancel_canvas_opening_edit_drag()
         self._selected_canvas_opening_key = normalized_key
         if normalized_key is not None:
@@ -8189,6 +8378,24 @@ class GlbViewerWidget(QWidget):
     def is_door_placement_active(self) -> bool:
         """Return whether the next compatible doorway click installs a door."""
 
+        return bool(
+            self._door_placement_door_id is not None
+            and self._door_placement_opening_kind == CANVAS_OPENING_DOORWAY
+        )
+
+    @property
+    def is_window_fixture_placement_active(self) -> bool:
+        """Return whether a compatible window-frame click installs a window."""
+
+        return bool(
+            self._door_placement_door_id is not None
+            and self._door_placement_opening_kind == CANVAS_OPENING_WINDOW
+        )
+
+    @property
+    def is_opening_fixture_placement_active(self) -> bool:
+        """Return whether any opening-snapped fixture currently owns input."""
+
         return self._door_placement_door_id is not None
 
     def begin_door_placement(
@@ -8200,19 +8407,52 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm one doorway-snapped placement with wheel-controlled mirroring."""
 
+        return self._begin_opening_fixture_placement(
+            door_id,
+            compatible_opening_keys,
+            opening_kind=CANVAS_OPENING_DOORWAY,
+            preview_candidates=preview_candidates,
+        )
+
+    def begin_window_fixture_placement(
+        self,
+        window_id: str,
+        compatible_window_frame_keys: Sequence[str],
+        *,
+        preview_candidates: Sequence[DoorPlacementPreviewCandidate] = (),
+    ) -> bool:
+        """Arm one frame-snapped window placement with wheel mirroring."""
+
+        return self._begin_opening_fixture_placement(
+            window_id,
+            compatible_window_frame_keys,
+            opening_kind=CANVAS_OPENING_WINDOW,
+            preview_candidates=preview_candidates,
+        )
+
+    def _begin_opening_fixture_placement(
+        self,
+        fixture_id: str,
+        compatible_opening_keys: Sequence[str],
+        *,
+        opening_kind: str,
+        preview_candidates: Sequence[DoorPlacementPreviewCandidate],
+    ) -> bool:
+        """Arm shared colored placement feedback for one opening kind."""
+
         if not self._window_editing_enabled:
             return False
-        normalized_door_id = str(door_id).strip()
+        normalized_fixture_id = str(fixture_id).strip()
         normalized_keys = frozenset(
             str(key).strip()
             for key in compatible_opening_keys
             if (
                 str(key).strip() in self._canvas_opening_targets
                 and self._canvas_opening_targets[str(key).strip()].reference.kind
-                == CANVAS_OPENING_DOORWAY
+                == opening_kind
             )
         )
-        if not normalized_door_id or not normalized_keys:
+        if not normalized_fixture_id or not normalized_keys:
             return False
         if isinstance(preview_candidates, (str, bytes, bytearray)) or not isinstance(
             preview_candidates,
@@ -8242,7 +8482,8 @@ class GlbViewerWidget(QWidget):
             self.cancel_surface_vertex_placement()
         self._cancel_canvas_rectangle_selection()
         self._cancel_canvas_opening_edit_drag()
-        self._door_placement_door_id = normalized_door_id
+        self._door_placement_door_id = normalized_fixture_id
+        self._door_placement_opening_kind = opening_kind
         self._door_placement_compatible_opening_keys = normalized_keys
         self._door_placement_mirrored_horizontally = False
         self._door_placement_press_position = None
@@ -8256,7 +8497,7 @@ class GlbViewerWidget(QWidget):
         return True
 
     def cancel_door_placement(self) -> bool:
-        """Cancel a pending doorway-snapped door installation."""
+        """Cancel the pending doorway- or frame-snapped fixture."""
 
         return self._clear_door_placement(notify=True)
 
@@ -8266,7 +8507,9 @@ class GlbViewerWidget(QWidget):
         door_id = self._door_placement_door_id
         if door_id is None:
             return False
+        opening_kind = self._door_placement_opening_kind
         self._door_placement_door_id = None
+        self._door_placement_opening_kind = None
         self._door_placement_compatible_opening_keys = frozenset()
         self._door_placement_mirrored_horizontally = False
         self._door_placement_press_position = None
@@ -8280,13 +8523,16 @@ class GlbViewerWidget(QWidget):
         self._sync_projection_camera_input_state()
         self._sync_window_tools_controls()
         if notify:
-            self.door_placement_cancelled.emit(door_id)
+            if opening_kind == CANVAS_OPENING_WINDOW:
+                self.window_fixture_placement_cancelled.emit(door_id)
+            else:
+                self.door_placement_cancelled.emit(door_id)
         return True
 
     def _set_door_placement_status(self, message: str | None = None) -> None:
         """Describe the active door placement and its mirror orientation."""
 
-        if not self.is_door_placement_active:
+        if not self.is_opening_fixture_placement_active:
             return
         if message is not None:
             self._set_window_tools_status(message)
@@ -8294,9 +8540,16 @@ class GlbViewerWidget(QWidget):
         orientation = (
             "mirrored" if self._door_placement_mirrored_horizontally else "normal"
         )
+        if self._door_placement_opening_kind == CANVAS_OPENING_WINDOW:
+            self._set_window_tools_status(
+                "Click a compatible frame to place the window "
+                f"({orientation}). Use the mouse wheel to mirror it "
+                "horizontally. Right-click or Escape cancels."
+            )
+            return
         self._set_window_tools_status(
             f"Click a compatible doorway to place the door ({orientation}). "
-            "Use the mouse wheel to mirror it horizontally; right-click or "
+            "Use the mouse wheel to mirror it horizontally. Right-click or "
             "Escape cancels."
         )
 
@@ -8305,6 +8558,15 @@ class GlbViewerWidget(QWidget):
         position: QPointF,
     ) -> CanvasOpeningTarget | None:
         """Return the nearest visible opening rectangle under the pointer."""
+
+        hit = self._get_door_placement_opening_hit_at(position)
+        return None if hit is None else hit[0]
+
+    def _get_door_placement_opening_hit_at(
+        self,
+        position: QPointF,
+    ) -> tuple[CanvasOpeningTarget, np.ndarray] | None:
+        """Return the visible opening and exact world hit under the pointer."""
 
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
@@ -8331,19 +8593,23 @@ class GlbViewerWidget(QWidget):
         )
         if scene_hit is not None and scene_hit[1] < opening_hit[2] - 1e-9:
             return None
-        return opening_hit[0]
+        return opening_hit[0], opening_hit[1]
 
-    def _update_door_placement_hover(self, position: QPointF) -> bool:
+    def _update_door_placement_hover(
+        self,
+        position: QPointF,
+    ) -> bool:
         """Snap the colored door profile to one compatible hovered doorway."""
 
-        if not self.is_door_placement_active:
+        if not self.is_opening_fixture_placement_active:
             return False
-        target = self._get_door_placement_opening_at(position)
+        hit = self._get_door_placement_opening_hit_at(position)
+        target = None if hit is None else hit[0]
         opening_key = (
             target.key
             if (
                 target is not None
-                and target.reference.kind == CANVAS_OPENING_DOORWAY
+                and target.reference.kind == self._door_placement_opening_kind
                 and target.key in self._door_placement_compatible_opening_keys
                 and target.key in self._door_placement_preview_candidates
             )
@@ -8359,7 +8625,7 @@ class GlbViewerWidget(QWidget):
         """Render the active normal or wheel-mirrored colored door profile."""
 
         self._remove_door_placement_preview_items()
-        if not self.is_door_placement_active or not hasattr(self, "view"):
+        if not self.is_opening_fixture_placement_active or not hasattr(self, "view"):
             return
         opening_key = self._door_placement_hover_opening_key
         candidate = self._door_placement_preview_candidates.get(opening_key or "")
@@ -8424,20 +8690,31 @@ class GlbViewerWidget(QWidget):
         self._door_placement_preview_root = None
         self._door_placement_preview_items = []
 
-    def _commit_door_placement(self, target: CanvasOpeningTarget) -> bool:
-        """Emit one compatible doorway placement without a cancellation event."""
+    def _commit_door_placement(
+        self,
+        target: CanvasOpeningTarget,
+    ) -> bool:
+        """Emit one compatible fixture placement without a cancellation event."""
 
         door_id = self._door_placement_door_id
+        opening_kind = self._door_placement_opening_kind
         if (
             door_id is None
-            or target.reference.kind != CANVAS_OPENING_DOORWAY
+            or target.reference.kind != opening_kind
             or target.key not in self._door_placement_compatible_opening_keys
         ):
             return False
         reference = target.reference
         mirrored = self._door_placement_mirrored_horizontally
         self._clear_door_placement(notify=False)
-        self.door_placement_requested.emit(door_id, reference, mirrored)
+        if opening_kind == CANVAS_OPENING_WINDOW:
+            self.window_fixture_placement_requested.emit(
+                door_id,
+                reference,
+                mirrored,
+            )
+        else:
+            self.door_placement_requested.emit(door_id, reference, mirrored)
         return True
 
     # ### Placed-object transform API ###
@@ -8461,21 +8738,56 @@ class GlbViewerWidget(QWidget):
 
         normalized_object_id = str(object_id).strip()
         group = self._placed_object_render_groups.get(normalized_object_id)
+        if group is None:
+            return False
+        return self.apply_placed_object_full_transform_preview(
+            normalized_object_id,
+            world_position,
+            rotation_degrees,
+            group.preview.axis_scales,
+        )
+
+    def apply_placed_object_full_transform_preview(
+        self,
+        object_id: str,
+        world_position: object,
+        rotation_degrees: object,
+        axis_scales: object,
+    ) -> bool:
+        """Preview position, rotation, and local scale without a commit signal."""
+
+        normalized_object_id = str(object_id).strip()
+        group = self._placed_object_render_groups.get(normalized_object_id)
+        active_drag = self._placed_object_transform_drag
         if (
             group is None
-            or self._placed_object_transform_drag is not None
+            or (
+                active_drag is not None
+                and active_drag.object_id == normalized_object_id
+            )
             or self._placed_object_instance_drag is not None
         ):
             return False
         try:
             normalized_position = tuple(float(value) for value in world_position)
             normalized_rotation = tuple(float(value) for value in rotation_degrees)
+            normalized_axis_scales = tuple(float(value) for value in axis_scales)
             if (
                 len(normalized_position) != 3
                 or len(normalized_rotation) != 3
+                or len(normalized_axis_scales) != 3
                 or not all(
                     math.isfinite(value)
-                    for value in (*normalized_position, *normalized_rotation)
+                    for value in (
+                        *normalized_position,
+                        *normalized_rotation,
+                        *normalized_axis_scales,
+                    )
+                )
+                or any(
+                    value < PLACED_OBJECT_MIN_SCALE
+                    or value > PLACED_OBJECT_MAX_SCALE
+                    for value in normalized_axis_scales
                 )
             ):
                 return False
@@ -8486,7 +8798,7 @@ class GlbViewerWidget(QWidget):
             scaled_rotation = _build_placed_object_scaled_rotation(
                 normalized_rotation,
                 group.preview.scale,
-                group.preview.axis_scales,
+                normalized_axis_scales,
             )
             transform = _build_pivoted_world_transform(
                 normalized_position,
@@ -8506,7 +8818,7 @@ class GlbViewerWidget(QWidget):
             group,
             normalized_position,
             normalized_rotation,
-            group.preview.axis_scales,
+            normalized_axis_scales,
         )
         self._sync_placed_object_selection_rendering()
         self.view.update()
@@ -9485,6 +9797,7 @@ class GlbViewerWidget(QWidget):
             return False
 
         was_active = self.is_window_placement_active()
+        self.cancel_glass_area_placement(notify=False)
         self._clear_architectural_trim_passive_hover()
         self.cancel_directional_light_placement()
         self.set_selected_directional_light_id(None)
@@ -9528,6 +9841,79 @@ class GlbViewerWidget(QWidget):
             self._set_window_tools_status(status_message)
         if was_active:
             self.window_placement_changed.emit(False)
+
+    # ### Reusable glass-area placement API ###
+    @property
+    def is_glass_area_placement_active(self) -> bool:
+        """Whether rectangle input currently defines a preview-body glass cut."""
+
+        return bool(
+            self._glass_area_asset_kind is not None
+            and self._glass_area_asset_id is not None
+            and self._glass_area_body_object_id is not None
+        )
+
+    def begin_glass_area_placement(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        body_object_id: str,
+        *,
+        profile_bounds: Sequence[float] | None = None,
+    ) -> bool:
+        """Arm a normalized X/Z rectangle on one transformed preview body."""
+
+        normalized_kind = str(asset_kind).strip().lower()
+        normalized_asset_id = str(asset_id).strip()
+        normalized_body_id = str(body_object_id).strip()
+        if (
+            not normalized_kind
+            or not normalized_asset_id
+            or normalized_body_id not in self._placed_object_render_groups
+        ):
+            return False
+        try:
+            normalized_profile_bounds = _normalize_glass_area_profile_bounds(
+                profile_bounds
+            )
+        except (TypeError, ValueError):
+            return False
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+        self.cancel_glass_area_placement(notify=False)
+        self.cancel_door_placement()
+        self.cancel_object_placement(notify=False)
+        self._cancel_placed_object_gizmo_drag()
+        self._glass_area_asset_kind = normalized_kind
+        self._glass_area_asset_id = normalized_asset_id
+        self._glass_area_body_object_id = normalized_body_id
+        self._glass_area_profile_bounds = normalized_profile_bounds
+        self._glass_area_first_local_point = None
+        self._glass_area_preview_request = None
+        self._glass_area_preview_plane_y = None
+        self._remove_glass_area_preview_item()
+        self.view.set_rectangle_drawing_enabled(True)
+        return True
+
+    def cancel_glass_area_placement(self, *, notify: bool = True) -> bool:
+        """Disarm glass-area drawing and remove its transient outline."""
+
+        if not self.is_glass_area_placement_active:
+            return False
+        asset_kind = self._glass_area_asset_kind or ""
+        asset_id = self._glass_area_asset_id or ""
+        self.view.set_rectangle_drawing_enabled(False)
+        self._glass_area_asset_kind = None
+        self._glass_area_asset_id = None
+        self._glass_area_body_object_id = None
+        self._glass_area_profile_bounds = None
+        self._glass_area_first_local_point = None
+        self._glass_area_preview_request = None
+        self._glass_area_preview_plane_y = None
+        self._remove_glass_area_preview_item()
+        if notify:
+            self.glass_area_placement_cancelled.emit(asset_kind, asset_id)
+        return True
 
     # ### Tour pointer input ###
     def _connect_tour_input(self) -> None:
@@ -12369,19 +12755,23 @@ class GlbViewerWidget(QWidget):
                     self.view.removeItem(item)
 
     # ### Canvas window editor input ###
-    def _connect_window_editor_input(self) -> None:
-        self.view.viewport_clicked.connect(self._handle_window_wall_pick_requested)
+    def _connect_rectangle_placement_input(self) -> None:
+        """Connect rectangle tools shared by Canvas and asset preview viewers."""
+
         self.view.rectangle_pointer_pressed.connect(self._handle_window_pointer_pressed)
         self.view.rectangle_pointer_moved.connect(self._handle_window_pointer_moved)
         self.view.rectangle_pointer_released.connect(
             self._handle_window_pointer_released
         )
         self.view.rectangle_drawing_cancel_requested.connect(
-            self.cancel_window_placement
+            self._handle_rectangle_drawing_cancel_requested
         )
         self.navigation_mode_changed.connect(
             self._handle_window_navigation_mode_changed
         )
+
+    def _connect_window_editor_input(self) -> None:
+        self.view.viewport_clicked.connect(self._handle_window_wall_pick_requested)
 
     def _connect_placed_object_editor_input(self) -> None:
         """Connect pointer events used by editable placed-model previews."""
@@ -12430,6 +12820,18 @@ class GlbViewerWidget(QWidget):
         self.window_undo_requested.emit()
 
     def _handle_window_navigation_mode_changed(self, _mode: str) -> None:
+        if self.is_glass_area_placement_active:
+            self.cancel_glass_area_placement()
+            return
+        if self.is_window_placement_active():
+            self.cancel_window_placement()
+
+    def _handle_rectangle_drawing_cancel_requested(self) -> None:
+        """Cancel whichever exclusive rectangle-placement mode owns input."""
+
+        if self.is_glass_area_placement_active:
+            self.cancel_glass_area_placement()
+            return
         if self.is_window_placement_active():
             self.cancel_window_placement()
 
@@ -12439,7 +12841,7 @@ class GlbViewerWidget(QWidget):
         *,
         additive: bool | None = None,
     ) -> None:
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             self._handle_door_placement_pick(position)
             return
         directional_light_id = self._pick_directional_light_id(position)
@@ -12623,22 +13025,29 @@ class GlbViewerWidget(QWidget):
         )
 
     def _handle_door_placement_pick(self, position: QPointF) -> None:
-        """Commit only when the click intersects a compatible doorway."""
+        """Commit only when the click intersects a compatible opening."""
 
-        target = self._get_door_placement_opening_at(position)
-        if target is None:
+        hit = self._get_door_placement_opening_hit_at(position)
+        opening_kind = self._door_placement_opening_kind
+        opening_label = (
+            "window frame"
+            if opening_kind == CANVAS_OPENING_WINDOW
+            else "doorway"
+        )
+        if hit is None:
             self._set_door_placement_status(
-                "No doorway was found there. Click a compatible doorway, or "
-                "right-click to cancel."
+                f"No {opening_label} was found there. Click a compatible "
+                f"{opening_label}, or right-click to cancel."
             )
             return
+        target, _world_hit = hit
         if (
-            target.reference.kind != CANVAS_OPENING_DOORWAY
+            target.reference.kind != opening_kind
             or target.key not in self._door_placement_compatible_opening_keys
         ):
             self._set_door_placement_status(
-                "That opening is not compatible with this door. Choose a "
-                "matching doorway."
+                f"That opening is not compatible. Choose a matching "
+                f"{opening_label}."
             )
             return
         self._commit_door_placement(target)
@@ -12794,7 +13203,7 @@ class GlbViewerWidget(QWidget):
             or self._tour_overlay_pointer_pressed
         ):
             return
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             self._door_placement_press_position = QPointF(position)
             self.view.reserve_primary_pointer_drag()
             return
@@ -12842,7 +13251,7 @@ class GlbViewerWidget(QWidget):
             target, handle = trim_handle
             self._begin_architectural_trim_edit_drag(target, handle, position)
             return
-        if self._begin_canvas_door_creation_press(*camera_ray):
+        if self._begin_canvas_opening_creation_press(*camera_ray):
             return
         opening_handle = self._pick_canvas_opening_gizmo_handle(*camera_ray)
         if opening_handle is not None:
@@ -12880,7 +13289,7 @@ class GlbViewerWidget(QWidget):
             return
         if self.is_tour_point_placement_active:
             return
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             self._update_door_placement_hover(position)
             return
         if self._object_placement_pointer_pressed:
@@ -12922,7 +13331,7 @@ class GlbViewerWidget(QWidget):
             return
         if self.is_tour_point_placement_active:
             return
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             press_position = self._door_placement_press_position
             self._door_placement_press_position = None
             self.view.release_primary_pointer_drag()
@@ -12947,8 +13356,8 @@ class GlbViewerWidget(QWidget):
         if self._surface_vertex_click_ack_pending:
             self._finish_surface_vertex_pointer_interaction(position)
             return
-        if self._canvas_door_creation_pressed_reference is not None:
-            self._finish_canvas_door_creation_press(position)
+        if self._canvas_opening_creation_pressed_reference is not None:
+            self._finish_canvas_opening_creation_press(position)
             return
         if self._canvas_opening_edit_drag is not None:
             self._finish_canvas_opening_gizmo_drag(position)
@@ -12987,8 +13396,8 @@ class GlbViewerWidget(QWidget):
         if self._surface_vertex_click_ack_pending:
             self._cancel_surface_vertex_pointer_interaction()
             return
-        if self._canvas_door_creation_pressed_reference is not None:
-            self._cancel_canvas_door_creation_press()
+        if self._canvas_opening_creation_pressed_reference is not None:
+            self._cancel_canvas_opening_creation_press()
             return
         if self._canvas_opening_edit_drag is not None:
             self._cancel_canvas_opening_edit_drag()
@@ -13587,7 +13996,7 @@ class GlbViewerWidget(QWidget):
 
         if self.is_directional_light_placement_active:
             return self._update_directional_light_placement_hover(position)
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             return self._update_door_placement_hover(position)
         if self.is_object_placement_active:
             self._update_object_placement_hover(position)
@@ -13619,7 +14028,7 @@ class GlbViewerWidget(QWidget):
                 self._directional_light_placement_hover_position = None
                 self._refresh_directional_light_placement_hover_item()
             return
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             self._door_placement_hover_opening_key = None
             self._remove_door_placement_preview_items()
         if self.is_object_placement_active:
@@ -13852,6 +14261,9 @@ class GlbViewerWidget(QWidget):
             self.view.removeItem(edge_item)
 
     def _handle_window_pointer_pressed(self, position: QPointF) -> None:
+        if self.is_glass_area_placement_active:
+            self._handle_glass_area_pointer_pressed(position)
+            return
         surface = self._get_selected_window_wall()
         camera_ray = self.view.build_camera_ray(position)
         if surface is None or camera_ray is None:
@@ -13871,9 +14283,15 @@ class GlbViewerWidget(QWidget):
         self._window_preview_is_valid = False
 
     def _handle_window_pointer_moved(self, position: QPointF) -> None:
+        if self.is_glass_area_placement_active:
+            self._handle_glass_area_pointer_moved(position)
+            return
         self._update_window_drag_preview(position)
 
     def _handle_window_pointer_released(self, position: QPointF) -> None:
+        if self.is_glass_area_placement_active:
+            self._handle_glass_area_pointer_released(position)
+            return
         if self._window_drag_first_world is None:
             self.cancel_window_placement(
                 status_message="Start the drag on the selected wall."
@@ -13894,6 +14312,218 @@ class GlbViewerWidget(QWidget):
 
         self.cancel_window_placement(status_message="Window placement ready.")
         self.window_placement_requested.emit(placement)
+
+    def _handle_glass_area_pointer_pressed(self, position: QPointF) -> None:
+        """Capture the first local body point for a glass-area rectangle."""
+
+        hit = self._get_glass_area_local_hit(position)
+        if hit is None:
+            self._glass_area_first_local_point = None
+            self._glass_area_preview_request = None
+            self._remove_glass_area_preview_item()
+            return
+        self._glass_area_first_local_point = hit[0]
+        self._glass_area_preview_plane_y = float(hit[0][1])
+        self._glass_area_preview_request = None
+        self._remove_glass_area_preview_item()
+
+    def _handle_glass_area_pointer_moved(self, position: QPointF) -> None:
+        """Refresh the normalized request and world-space glass outline."""
+
+        self._update_glass_area_drag_preview(position)
+
+    def _handle_glass_area_pointer_released(self, position: QPointF) -> None:
+        """Emit one valid glass-area request and leave rectangle mode."""
+
+        if self._glass_area_first_local_point is None:
+            return
+        self._update_glass_area_drag_preview(position)
+        request = self._glass_area_preview_request
+        if request is None:
+            self._glass_area_first_local_point = None
+            self._glass_area_preview_plane_y = None
+            self._remove_glass_area_preview_item()
+            return
+        self.cancel_glass_area_placement(notify=False)
+        self.glass_area_placement_requested.emit(request)
+
+    def _update_glass_area_drag_preview(self, position: QPointF) -> None:
+        """Project the drag's second corner onto the same transformed body."""
+
+        first_local = self._glass_area_first_local_point
+        if first_local is None:
+            return
+        hit = self._get_glass_area_local_hit(position)
+        if hit is None:
+            self._glass_area_preview_request = None
+            self._remove_glass_area_preview_item()
+            return
+        second_local, local_bounds = hit
+        normalization_bounds = (
+            local_bounds
+            if self._glass_area_profile_bounds is None
+            else self._glass_area_profile_bounds
+        )
+        request = self._build_glass_area_placement_request(
+            first_local,
+            second_local,
+            normalization_bounds,
+        )
+        self._glass_area_preview_request = request
+        if request is None:
+            self._remove_glass_area_preview_item()
+            return
+        self._refresh_glass_area_preview_item(request, normalization_bounds)
+
+    def _get_glass_area_local_hit(
+        self,
+        position: QPointF,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Ray-hit only the active body's current transformed render meshes."""
+
+        body_id = self._glass_area_body_object_id
+        group = self._placed_object_render_groups.get(body_id or "")
+        camera_ray = self.view.build_camera_ray(position)
+        if group is None or camera_ray is None:
+            return None
+        preview = replace(
+            group.preview,
+            placement_transform=group.current_transform,
+        )
+        hit = _get_nearest_preview_placed_object_ray_hit(
+            (preview,),
+            *camera_ray,
+        )
+        local_bounds = _get_preview_placed_object_local_bounds(preview)
+        if hit is None or local_bounds is None:
+            return None
+        try:
+            world_to_local = np.linalg.inv(group.current_transform)
+            local_hit = _transform_point(world_to_local, hit[1])
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+        if not np.all(np.isfinite(local_hit)):
+            return None
+        return local_hit, local_bounds
+
+    def _build_glass_area_placement_request(
+        self,
+        first_local: np.ndarray,
+        second_local: np.ndarray,
+        local_bounds: np.ndarray,
+    ) -> GlassAreaPlacementRequest | None:
+        """Normalize a local X/Z drag against the rendered body's bounds."""
+
+        if local_bounds.shape != (2, 3):
+            return None
+        spans = local_bounds[1] - local_bounds[0]
+        if spans[0] <= 1e-9 or spans[2] <= 1e-9:
+            return None
+        x_values = np.clip(
+            (np.asarray((first_local[0], second_local[0])) - local_bounds[0, 0])
+            / spans[0],
+            0.0,
+            1.0,
+        )
+        z_values = np.clip(
+            (np.asarray((first_local[2], second_local[2])) - local_bounds[0, 2])
+            / spans[2],
+            0.0,
+            1.0,
+        )
+        try:
+            return GlassAreaPlacementRequest(
+                asset_kind=self._glass_area_asset_kind or "",
+                asset_id=self._glass_area_asset_id or "",
+                body_object_id=self._glass_area_body_object_id or "",
+                normalized_x_bounds=(float(np.min(x_values)), float(np.max(x_values))),
+                normalized_z_bounds=(float(np.min(z_values)), float(np.max(z_values))),
+            )
+        except ValueError:
+            return None
+
+    def _refresh_glass_area_preview_item(
+        self,
+        request: GlassAreaPlacementRequest,
+        local_bounds: np.ndarray,
+    ) -> None:
+        """Render the live rectangle on the selected preview-body face."""
+
+        group = self._placed_object_render_groups.get(request.body_object_id)
+        if group is None:
+            self._remove_glass_area_preview_item()
+            return
+        x_min = local_bounds[0, 0] + (
+            request.normalized_x_bounds[0]
+            * (local_bounds[1, 0] - local_bounds[0, 0])
+        )
+        x_max = local_bounds[0, 0] + (
+            request.normalized_x_bounds[1]
+            * (local_bounds[1, 0] - local_bounds[0, 0])
+        )
+        z_min = local_bounds[0, 2] + (
+            request.normalized_z_bounds[0]
+            * (local_bounds[1, 2] - local_bounds[0, 2])
+        )
+        z_max = local_bounds[0, 2] + (
+            request.normalized_z_bounds[1]
+            * (local_bounds[1, 2] - local_bounds[0, 2])
+        )
+        plane_y = float(
+            self._glass_area_preview_plane_y
+            if self._glass_area_preview_plane_y is not None
+            else local_bounds[1, 1]
+        )
+        local_positions = np.asarray(
+            (
+                (x_min, plane_y, z_min),
+                (x_max, plane_y, z_min),
+                (x_max, plane_y, z_max),
+                (x_min, plane_y, z_max),
+                (x_min, plane_y, z_min),
+            ),
+            dtype=float,
+        )
+        world_positions = np.asarray(
+            tuple(
+                _transform_point(group.current_transform, point)
+                for point in local_positions
+            ),
+            dtype=float,
+        )
+        plane_normal = np.asarray(group.current_transform[:3, 1], dtype=float)
+        normal_length = float(np.linalg.norm(plane_normal))
+        if normal_length > 1e-9:
+            world_positions = _offset_points_toward_camera(
+                world_positions,
+                plane_normal / normal_length,
+                self.view.cameraPosition(),
+                WINDOW_PREVIEW_OFFSET_METERS,
+            )
+        item = self._glass_area_preview_item
+        if item is not None and item in self.view.items:
+            item.setData(pos=world_positions)
+        else:
+            self._remove_glass_area_preview_item()
+            item = gl.GLLinePlotItem(
+                pos=world_positions,
+                color=GLASS_AREA_PREVIEW_COLOR,
+                width=GLASS_AREA_PREVIEW_WIDTH_PIXELS,
+                antialias=True,
+            )
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 16.0)
+            self.view.addItem(item)
+            self._glass_area_preview_item = item
+        self.view.update()
+
+    def _remove_glass_area_preview_item(self) -> None:
+        """Remove the transient glass-area outline without changing mode."""
+
+        item = self._glass_area_preview_item
+        self._glass_area_preview_item = None
+        if item is not None and hasattr(self, "view") and item in self.view.items:
+            self.view.removeItem(item)
+            self.view.update()
 
     def _update_window_drag_preview(self, position: QPointF) -> None:
         surface = self._get_selected_window_wall()
@@ -15057,21 +15687,18 @@ class GlbViewerWidget(QWidget):
             )
             return
         self._set_window_tools_status(
-            "Wall selected. Use Add window in the Canvas tab."
+            "Wall selected. Use Add window frame in the Canvas tab."
             if selected
             else "Select one wall."
         )
 
     def _sync_window_undo_button(self) -> None:
-        if self.undo_window_button is None:
-            return
-        self.undo_window_button.setEnabled(
-            self._window_undo_available and not self.is_window_placement_active()
-        )
+        """Compatibility no-op after removal of the dedicated Undo button."""
 
     def _set_window_tools_status(self, message: str) -> None:
-        if self.window_tools_status_label is not None:
-            self.window_tools_status_label.setText(str(message))
+        """Compatibility no-op after removal of the dedicated status label."""
+
+        del message
 
     # ### Canvas surface tool controls ###
     def _sync_surface_tools_controls(self) -> None:
@@ -15257,6 +15884,7 @@ class GlbViewerWidget(QWidget):
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self._invalidate_progressive_texture_updates()
+        self._hover_point_light_position = None
         retained_trim_placement_kind = (
             self._architectural_trim_placement_kind if preserve_camera else None
         )
@@ -15272,6 +15900,7 @@ class GlbViewerWidget(QWidget):
         self.cancel_architectural_trim_placement()
         self.clear_architectural_trim_edit_preview()
         self.clear_face_edit_geometry()
+        self.cancel_glass_area_placement(notify=False)
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._clear_symmetric_preview()
@@ -15306,6 +15935,7 @@ class GlbViewerWidget(QWidget):
 
     def clear_model(self) -> None:
         self._invalidate_progressive_texture_updates()
+        self._hover_point_light_position = None
         self.view.cancel_transient_pointer_interactions()
         self.cancel_tour_point_placement(notify=False)
         self._cancel_canvas_rectangle_selection()
@@ -15318,6 +15948,7 @@ class GlbViewerWidget(QWidget):
         self.cancel_architectural_trim_placement()
         self.clear_architectural_trim_edit_preview()
         self.clear_face_edit_geometry()
+        self.cancel_glass_area_placement(notify=False)
         self.set_selected_placed_object_ids(())
         self._set_selected_canvas_opening_key(None)
         self.set_selected_canvas_stair_part_ids(())
@@ -16401,6 +17032,7 @@ class GlbViewerWidget(QWidget):
                 translucent=actually_fades,
                 pbr_maps_enabled=self._pbr_maps_enabled,
                 point_light_world_position=self._orbiting_point_light_position,
+                point_light_intensity=self._point_light_intensity,
             )
             if not mirrored_texture_data.is_prefab_glass:
                 textured_item.set_texture_color_balance_preview(
@@ -16468,6 +17100,7 @@ class GlbViewerWidget(QWidget):
                 translucent=actually_fades,
                 pbr_maps_enabled=self._pbr_maps_enabled,
                 point_light_world_position=self._orbiting_point_light_position,
+                point_light_intensity=self._point_light_intensity,
             )
             if not texture_mesh_data.is_prefab_glass:
                 textured_item.set_texture_color_balance_preview(
@@ -16901,6 +17534,169 @@ class GlbViewerWidget(QWidget):
         self._progressive_object_texture_bundles.clear()
 
     # ### PBR preview lighting API ###
+    def set_point_light_intensity(self, intensity: float) -> None:
+        """Update preview point-light strength without rebuilding geometry."""
+
+        normalized = _normalize_point_light_intensity(intensity)
+        if math.isclose(normalized, self._point_light_intensity):
+            return
+        self._point_light_intensity = normalized
+        textured_items = self._iter_textured_mesh_items()
+        for textured_item in textured_items:
+            textured_item.set_point_light_intensity(
+                normalized,
+                request_update=False,
+            )
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def get_point_light_intensity(self) -> float:
+        """Return the current preview point-light strength."""
+
+        return self._point_light_intensity
+
+    def is_hover_point_light_active(self) -> bool:
+        """Return whether pointer hover currently owns the preview light."""
+
+        return bool(
+            self._hover_point_light_enabled
+            and self._hover_point_light_position is not None
+        )
+
+    def set_hover_point_light_enabled(self, enabled: bool) -> None:
+        """Enable or disable pointer-following preview lighting."""
+
+        normalized = bool(enabled)
+        if normalized == self._hover_point_light_enabled:
+            return
+        self._hover_point_light_enabled = normalized
+        if normalized:
+            self._connect_hover_point_light_input()
+        else:
+            self._hover_point_light_position = None
+        self._sync_orbiting_point_light()
+
+    def is_hover_point_light_enabled(self) -> bool:
+        """Return whether pointer-following preview lighting is enabled."""
+
+        return self._hover_point_light_enabled
+
+    def get_hover_point_light_position(
+        self,
+    ) -> tuple[float, float, float] | None:
+        """Return the current hover-owned light position, if any."""
+
+        return self._hover_point_light_position
+
+    def _connect_hover_point_light_input(self) -> None:
+        """Connect lightweight pointer tracking for opted-in preview viewers."""
+
+        if (
+            not self._hover_point_light_enabled
+            or self._hover_point_light_input_connected
+        ):
+            return
+        self.view.primary_pointer_hovered.connect(
+            self._handle_hover_point_light_pointer_hovered
+        )
+        self.view.primary_pointer_left.connect(
+            self._handle_hover_point_light_pointer_left
+        )
+        self._hover_point_light_input_connected = True
+
+    def _handle_hover_point_light_pointer_hovered(
+        self,
+        position: QPointF,
+    ) -> None:
+        """Move the preview light just in front of the hovered model surface."""
+
+        if not self._hover_point_light_enabled or self.model is None:
+            self._set_hover_point_light_position(None)
+            return
+        camera_ray = self.view.build_camera_ray(position)
+        hit_point = (
+            None
+            if camera_ray is None
+            else self._get_hover_point_light_hit(*camera_ray)
+        )
+        if hit_point is None:
+            self._set_hover_point_light_position(None)
+            return
+        ray_direction = np.asarray(camera_ray[1], dtype=float)
+        direction_length = float(np.linalg.norm(ray_direction))
+        if direction_length <= 1e-12 or not math.isfinite(direction_length):
+            self._set_hover_point_light_position(None)
+            return
+        ray_direction /= direction_length
+        offset = self._get_hover_point_light_offset()
+        self._set_hover_point_light_position(
+            np.asarray(hit_point, dtype=float) - ray_direction * offset
+        )
+
+    def _handle_hover_point_light_pointer_left(self) -> None:
+        """Return light ownership to the optional PBR orbit on pointer exit."""
+
+        self._set_hover_point_light_position(None)
+
+    def _get_hover_point_light_hit(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> np.ndarray | None:
+        """Return the nearest authored or mirrored model point under the pointer."""
+
+        placed_targets = tuple(
+            replace(
+                group.preview,
+                placement_transform=np.asarray(
+                    group.current_transform,
+                    dtype=float,
+                ).copy(),
+            )
+            for group in self._placed_object_render_groups.values()
+        )
+        placed_hit = _get_nearest_preview_placed_object_ray_hit(
+            placed_targets,
+            ray_origin,
+            ray_direction,
+        )
+        if placed_hit is not None:
+            return np.asarray(placed_hit[1], dtype=float)
+        display_mesh = self._get_display_mesh()
+        if display_mesh is None:
+            return None
+        mesh_hit = _get_nearest_triangle_ray_hit(
+            display_mesh,
+            ray_origin,
+            ray_direction,
+        )
+        return None if mesh_hit is None else np.asarray(mesh_hit[0], dtype=float)
+
+    def _get_hover_point_light_offset(self) -> float:
+        """Scale the camera-facing hover clearance to the current model size."""
+
+        orbit = self._get_orbiting_point_light_geometry()
+        radius = 0.0 if orbit is None else float(orbit[1])
+        return min(
+            max(
+                radius * HOVER_POINT_LIGHT_OFFSET_SCALE,
+                HOVER_POINT_LIGHT_MINIMUM_OFFSET_METERS,
+            ),
+            HOVER_POINT_LIGHT_MAXIMUM_OFFSET_METERS,
+        )
+
+    def _set_hover_point_light_position(
+        self,
+        position: Sequence[float] | None,
+    ) -> None:
+        """Retain one hover position and reconcile it with the orbiting light."""
+
+        normalized = _normalize_optional_world_position(position)
+        if normalized == self._hover_point_light_position:
+            return
+        self._hover_point_light_position = normalized
+        self._sync_orbiting_point_light()
+
     def is_orbiting_point_light_enabled(self) -> bool:
         """Return whether this viewer currently requests its PBR point light."""
 
@@ -16914,13 +17710,26 @@ class GlbViewerWidget(QWidget):
         return self._orbiting_point_light_position
 
     def _sync_orbiting_point_light(self) -> None:
-        """Match animation and draw-item light state to the active PBR maps."""
+        """Give hover priority, then match orbit state to active PBR maps."""
 
         self._orbiting_point_light_enabled = bool(
             self._orbiting_point_light_with_pbr
             and any(self._pbr_maps_enabled.values())
         )
         textured_items = self._iter_textured_mesh_items()
+        if (
+            self._hover_point_light_enabled
+            and self._hover_point_light_position is not None
+            and self.model is not None
+            and textured_items
+        ):
+            self._orbiting_point_light_timer.stop()
+            self._remove_orbiting_point_light_marker()
+            self._set_orbiting_point_light_position(
+                self._hover_point_light_position,
+                textured_items,
+            )
+            return
         if (
             not self._orbiting_point_light_enabled
             or self.model is None
@@ -16932,13 +17741,7 @@ class GlbViewerWidget(QWidget):
             return
 
         self._ensure_orbiting_point_light_marker()
-        if self._orbiting_point_light_position is None:
-            self._update_orbiting_point_light_position(textured_items)
-        else:
-            self._set_orbiting_point_light_position(
-                self._orbiting_point_light_position,
-                textured_items,
-            )
+        self._update_orbiting_point_light_position(textured_items)
         if self._continuous_preview_animation_allowed():
             self._orbiting_point_light_timer.start()
         else:
@@ -16947,6 +17750,9 @@ class GlbViewerWidget(QWidget):
     def _advance_orbiting_point_light(self) -> None:
         """Advance one frame of the slow PBR inspection-light orbit."""
 
+        if self.is_hover_point_light_active():
+            self._sync_orbiting_point_light()
+            return
         if (
             not self._orbiting_point_light_enabled
             or self.model is None
@@ -17284,6 +18090,11 @@ class GlbViewerWidget(QWidget):
         """Show or hide wireframe edges over the current surface display."""
 
         self._wireframe_enabled = bool(enabled)
+        checkbox = self.scene_wireframe_checkbox
+        if checkbox is not None and checkbox.isChecked() != self._wireframe_enabled:
+            previous_blocked = checkbox.blockSignals(True)
+            checkbox.setChecked(self._wireframe_enabled)
+            checkbox.blockSignals(previous_blocked)
         self._apply_render_display_options()
 
     def get_wireframe_enabled(self) -> bool:
@@ -17382,7 +18193,7 @@ class GlbViewerWidget(QWidget):
         normalized_steps = int(steps)
         if normalized_steps == 0:
             return
-        if self.is_door_placement_active:
+        if self.is_opening_fixture_placement_active:
             if abs(normalized_steps) % 2 == 1:
                 self._door_placement_mirrored_horizontally = (
                     not self._door_placement_mirrored_horizontally
@@ -17458,7 +18269,7 @@ class GlbViewerWidget(QWidget):
         )
         self.view.set_overlay_selection_enabled(has_indicators)
         self.view.set_overlay_wheel_steps_enabled(
-            self.is_door_placement_active
+            self.is_opening_fixture_placement_active
             or (has_indicators and self._selected_projection_camera_id is not None)
         )
 
@@ -17630,6 +18441,7 @@ class GlbViewerWidget(QWidget):
                     point_light_world_position=(
                         self._orbiting_point_light_position
                     ),
+                    point_light_intensity=self._point_light_intensity,
                 )
                 if (
                     self._progressive_primary_texture_bundle is not None
@@ -17671,6 +18483,7 @@ class GlbViewerWidget(QWidget):
                     point_light_world_position=(
                         self._orbiting_point_light_position
                     ),
+                    point_light_intensity=self._point_light_intensity,
                 )
                 if (
                     self._progressive_primary_texture_bundle is not None
@@ -17963,6 +18776,7 @@ class GlbViewerWidget(QWidget):
                 double_sided=representative.double_sided,
                 pbr_maps_enabled=self._pbr_maps_enabled,
                 point_light_world_position=self._orbiting_point_light_position,
+                point_light_intensity=self._point_light_intensity,
                 draw_ranges=draw_ranges,
             )
             if representative.progressive_bundle is not None:
@@ -18142,6 +18956,7 @@ class GlbViewerWidget(QWidget):
                 double_sided=texture_data.double_sided,
                 pbr_maps_enabled=self._pbr_maps_enabled,
                 point_light_world_position=self._orbiting_point_light_position,
+                point_light_intensity=self._point_light_intensity,
             )
             textured_item.setParentItem(root_item)
         mesh_item = _WireframeOverlayMeshItem(
@@ -18165,7 +18980,7 @@ class GlbViewerWidget(QWidget):
         """Draw the selected opening outline and its available controls."""
 
         self._remove_canvas_opening_gizmo_items()
-        self._remove_canvas_door_creation_items()
+        self._remove_canvas_opening_creation_items()
         if self._level_transform_preview_level_index is not None:
             if hasattr(self, "view"):
                 self.view.update()
@@ -18279,7 +19094,7 @@ class GlbViewerWidget(QWidget):
                 pxMode=True,
             )
             self._add_canvas_opening_overlay_item(arch_handle_item)
-        self._add_canvas_door_creation_items(target)
+        self._add_canvas_opening_creation_items(target)
         self.view.update()
 
     def _add_canvas_opening_overlay_item(
@@ -18302,14 +19117,14 @@ class GlbViewerWidget(QWidget):
                 self.view.removeItem(item)
         self._canvas_opening_gizmo_items = []
 
-    # ### Canvas door creation control ###
-    def _add_canvas_door_creation_items(
+    # ### Canvas opening-fixture creation control ###
+    def _add_canvas_opening_creation_items(
         self,
         target: CanvasOpeningTarget,
     ) -> None:
-        """Draw a prominent plus beside one selected doorway."""
+        """Draw a prominent plus beside one selected doorway or window frame."""
 
-        local_position = _get_canvas_door_creation_local_position(target)
+        local_position = _get_canvas_opening_creation_local_position(target)
         if local_position is None:
             return
         center = np.asarray(target.local_to_world(*local_position), dtype=float)
@@ -18321,14 +19136,14 @@ class GlbViewerWidget(QWidget):
         )
         background_item = gl.GLScatterPlotItem(
             pos=display_center,
-            color=CANVAS_DOOR_CREATE_COLOR,
-            size=CANVAS_DOOR_CREATE_SIZE_PIXELS,
+            color=CANVAS_OPENING_CREATE_COLOR,
+            size=CANVAS_OPENING_CREATE_SIZE_PIXELS,
             pxMode=True,
         )
-        self._add_canvas_door_creation_overlay_item(background_item)
+        self._add_canvas_opening_creation_overlay_item(background_item)
 
         icon_half_extent = (
-            self._get_canvas_door_creation_hit_radius(target, center) * 0.42
+            self._get_canvas_opening_creation_hit_radius(target, center) * 0.42
         )
         horizontal_ratio = icon_half_extent / target.wall_width_meters
         vertical_ratio = icon_half_extent / target.wall_height_meters
@@ -18353,47 +19168,47 @@ class GlbViewerWidget(QWidget):
         )
         icon_item = gl.GLLinePlotItem(
             pos=display_icon_positions,
-            color=CANVAS_DOOR_CREATE_ICON_COLOR,
+            color=CANVAS_OPENING_CREATE_ICON_COLOR,
             width=4.0,
             antialias=True,
             mode="lines",
         )
-        self._add_canvas_door_creation_overlay_item(icon_item)
+        self._add_canvas_opening_creation_overlay_item(icon_item)
 
-    def _add_canvas_door_creation_overlay_item(
+    def _add_canvas_opening_creation_overlay_item(
         self,
         item: GLGraphicsItem,
     ) -> None:
-        """Render one door-creation icon item above all wall geometry."""
+        """Render one fixture-creation icon item above all wall geometry."""
 
         item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
         item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
         self.view.addItem(item)
-        self._canvas_door_creation_items.append(item)
+        self._canvas_opening_creation_items.append(item)
 
-    def _remove_canvas_door_creation_items(self) -> None:
-        """Remove every visual belonging to the doorway plus control."""
+    def _remove_canvas_opening_creation_items(self) -> None:
+        """Remove every visual belonging to the selected opening's plus."""
 
         if not hasattr(self, "view"):
-            self._canvas_door_creation_items = []
+            self._canvas_opening_creation_items = []
             return
-        for item in self._canvas_door_creation_items:
+        for item in self._canvas_opening_creation_items:
             if item in self.view.items:
                 self.view.removeItem(item)
-        self._canvas_door_creation_items = []
+        self._canvas_opening_creation_items = []
 
-    def _pick_canvas_door_creation_control(
+    def _pick_canvas_opening_creation_control(
         self,
         ray_origin: object,
         ray_direction: object,
     ) -> bool:
-        """Return whether one camera ray hits the selected doorway's plus."""
+        """Return whether one camera ray hits the selected opening's plus."""
 
         target = self._get_selected_canvas_opening_target()
         origin, direction = _normalize_ray(ray_origin, ray_direction)
         if target is None or origin is None or direction is None:
             return False
-        local_position = _get_canvas_door_creation_local_position(target)
+        local_position = _get_canvas_opening_creation_local_position(target)
         if local_position is None:
             return False
         world_position = np.asarray(
@@ -18404,12 +19219,12 @@ class GlbViewerWidget(QWidget):
         if hit is None:
             return False
         distance, _ray_parameter = hit
-        return distance <= self._get_canvas_door_creation_hit_radius(
+        return distance <= self._get_canvas_opening_creation_hit_radius(
             target,
             world_position,
         )
 
-    def _get_canvas_door_creation_hit_radius(
+    def _get_canvas_opening_creation_hit_radius(
         self,
         target: CanvasOpeningTarget,
         world_point: object,
@@ -18425,33 +19240,33 @@ class GlbViewerWidget(QWidget):
             pixel_size = 0.0
         if math.isfinite(pixel_size) and pixel_size > 0.0:
             return max(
-                CANVAS_DOOR_CREATE_MIN_HIT_RADIUS_METERS,
-                pixel_size * CANVAS_DOOR_CREATE_HIT_RADIUS_PIXELS,
+                CANVAS_OPENING_CREATE_MIN_HIT_RADIUS_METERS,
+                pixel_size * CANVAS_OPENING_CREATE_HIT_RADIUS_PIXELS,
             )
         fallback = min(target.wall_width_meters, target.wall_height_meters) * 0.03
-        return max(CANVAS_DOOR_CREATE_MIN_HIT_RADIUS_METERS, fallback)
+        return max(CANVAS_OPENING_CREATE_MIN_HIT_RADIUS_METERS, fallback)
 
-    def _begin_canvas_door_creation_press(
+    def _begin_canvas_opening_creation_press(
         self,
         ray_origin: object,
         ray_direction: object,
     ) -> bool:
-        """Reserve one primary click when it begins on the doorway plus."""
+        """Reserve one primary click when it begins on an opening plus."""
 
-        if not self._pick_canvas_door_creation_control(ray_origin, ray_direction):
+        if not self._pick_canvas_opening_creation_control(ray_origin, ray_direction):
             return False
         target = self._get_selected_canvas_opening_target()
-        if target is None or target.reference.kind != CANVAS_OPENING_DOORWAY:
+        if target is None:
             return False
-        self._canvas_door_creation_pressed_reference = target.reference
+        self._canvas_opening_creation_pressed_reference = target.reference
         self.view.reserve_primary_pointer_drag()
         return True
 
-    def _finish_canvas_door_creation_press(self, position: QPointF) -> bool:
+    def _finish_canvas_opening_creation_press(self, position: QPointF) -> bool:
         """Emit a creation request only when the click ends on the same plus."""
 
-        reference = self._canvas_door_creation_pressed_reference
-        self._canvas_door_creation_pressed_reference = None
+        reference = self._canvas_opening_creation_pressed_reference
+        self._canvas_opening_creation_pressed_reference = None
         if reference is None:
             return False
         camera_ray = self.view.build_camera_ray(position)
@@ -18460,19 +19275,22 @@ class GlbViewerWidget(QWidget):
             camera_ray is not None
             and target is not None
             and target.reference == reference
-            and self._pick_canvas_door_creation_control(*camera_ray)
+            and self._pick_canvas_opening_creation_control(*camera_ray)
         )
         self.view.release_primary_pointer_drag()
         if should_emit:
-            self.door_creation_requested.emit(reference)
+            if reference.kind == CANVAS_OPENING_DOORWAY:
+                self.door_creation_requested.emit(reference)
+            else:
+                self.window_fixture_creation_requested.emit(reference)
         return should_emit
 
-    def _cancel_canvas_door_creation_press(self) -> bool:
+    def _cancel_canvas_opening_creation_press(self) -> bool:
         """Forget a pending plus click and release its pointer reservation."""
 
-        if self._canvas_door_creation_pressed_reference is None:
+        if self._canvas_opening_creation_pressed_reference is None:
             return False
-        self._canvas_door_creation_pressed_reference = None
+        self._canvas_opening_creation_pressed_reference = None
         if hasattr(self, "view"):
             self.view.release_primary_pointer_drag()
         return True
@@ -20307,8 +21125,14 @@ class GlbViewerWidget(QWidget):
                 current_vector,
             )
             drag.previous_rotation_vector = current_vector
+            preview_rotation_delta = drag.accumulated_rotation_degrees
+            if self.view.is_control_modifier_pressed:
+                preview_rotation_delta = _snap_angle_degrees(
+                    preview_rotation_delta,
+                    PLACED_OBJECT_ROTATION_SNAP_DEGREES,
+                )
             delta_rotation = trimesh.transformations.rotation_matrix(
-                math.radians(drag.accumulated_rotation_degrees),
+                math.radians(preview_rotation_delta),
                 drag.axis,
             )[:3, :3]
             world_orientation = delta_rotation @ _build_rotation_matrix(
@@ -20332,11 +21156,41 @@ class GlbViewerWidget(QWidget):
             drag.object_id,
             group.current_transform,
         )
+        previous_preview_rotation = drag.preview_rotation_degrees
         drag.preview_world_position = tuple(float(value) for value in world_position)
         drag.preview_rotation_degrees = tuple(
             float(value) for value in rotation_degrees
         )
         drag.preview_axis_scales = tuple(float(value) for value in axis_scales)
+        self.placed_object_transform_preview_changed.emit(
+            drag.object_id,
+            drag.preview_world_position,
+            drag.preview_rotation_degrees,
+            drag.preview_axis_scales,
+        )
+        if (
+            drag.handle.kind == TRANSFORM_GIZMO_ROTATE
+            and (
+                previous_preview_rotation is None
+                or not np.allclose(
+                    drag.preview_rotation_degrees,
+                    previous_preview_rotation,
+                    atol=1e-9,
+                    rtol=0.0,
+                )
+            )
+        ):
+            self.placed_object_rotation_preview_changed.emit(
+                drag.object_id,
+                drag.preview_rotation_degrees,
+            )
+            if self.object_transform_status_label is not None:
+                self.object_transform_status_label.setText(
+                    _format_placed_object_rotation_status(
+                        drag.preview_rotation_degrees,
+                        snapped=self.view.is_control_modifier_pressed,
+                    )
+                )
         self._remove_transform_gizmo_items()
         self._remove_placed_object_instance_gizmo_items()
         self._build_placed_object_gizmo_items(group)
@@ -20457,6 +21311,17 @@ class GlbViewerWidget(QWidget):
                 self._sync_live_symmetric_preview_bindings(
                     drag.object_id,
                     group.current_transform,
+                )
+                if drag.handle.kind == TRANSFORM_GIZMO_ROTATE:
+                    self.placed_object_rotation_preview_changed.emit(
+                        drag.object_id,
+                        drag.start_rotation_degrees,
+                    )
+                self.placed_object_transform_preview_changed.emit(
+                    drag.object_id,
+                    tuple(float(value) for value in drag.start_world_position),
+                    drag.start_rotation_degrees,
+                    drag.start_axis_scales,
                 )
         self._sync_placed_object_selection_rendering()
 
@@ -20600,7 +21465,7 @@ class GlbViewerWidget(QWidget):
         if not hasattr(self, "view"):
             return
 
-        self._cancel_canvas_door_creation_press()
+        self._cancel_canvas_opening_creation_press()
         self._cancel_placed_object_instance_drag()
         self._symmetric_preview_timer.stop()
         self._canvas_stair_preview_timer.stop()
@@ -20626,7 +21491,7 @@ class GlbViewerWidget(QWidget):
         self._remove_transform_gizmo_items()
         self._remove_placed_object_instance_gizmo_items()
         self._canvas_opening_gizmo_items = []
-        self._canvas_door_creation_items = []
+        self._canvas_opening_creation_items = []
         self._canvas_surface_edit_gizmo_items = []
         self._canvas_surface_edit_gizmo_sizes = {}
         self._canvas_surface_drawing_items = []
@@ -20655,6 +21520,7 @@ class GlbViewerWidget(QWidget):
         self._atlas_stair_part_highlight_items = []
         self._canvas_stair_preview_groups = []
         self._window_preview_item = None
+        self._glass_area_preview_item = None
         self._door_placement_preview_root = None
         self._door_placement_preview_items = []
         self._level_transform_preview_outline_item = None
@@ -24331,23 +25197,34 @@ def _get_canvas_opening_handle_local_position(
     return dict(_get_canvas_opening_side_local_positions(target))[handle.side]
 
 
-def _get_canvas_door_creation_local_position(
+def _get_canvas_opening_creation_local_position(
     target: CanvasOpeningTarget,
 ) -> tuple[float, float] | None:
-    """Place the create-door plus just beyond a doorway's upper-right corner."""
+    """Place a fixture-creation plus beyond an opening's upper-right corner."""
 
-    if target.reference.kind != CANVAS_OPENING_DOORWAY:
+    if target.reference.kind not in {
+        CANVAS_OPENING_DOORWAY,
+        CANVAS_OPENING_WINDOW,
+    }:
         return None
     opening_width = target.bounds.horizontal_span * target.wall_width_meters
     opening_height = target.bounds.vertical_span * target.wall_height_meters
     offset_meters = max(
-        CANVAS_DOOR_CREATE_MINIMUM_OFFSET_METERS,
+        CANVAS_OPENING_CREATE_MINIMUM_OFFSET_METERS,
         min(opening_width, opening_height) * 0.08,
     )
     return (
         target.bounds.end_ratio + offset_meters / target.wall_width_meters,
         target.bounds.top_ratio + offset_meters / target.wall_height_meters,
     )
+
+
+def _get_canvas_door_creation_local_position(
+    target: CanvasOpeningTarget,
+) -> tuple[float, float] | None:
+    """Backward-compatible alias for the generalized opening plus position."""
+
+    return _get_canvas_opening_creation_local_position(target)
 
 
 def _get_canvas_opening_outline_local_positions(
@@ -25576,6 +26453,36 @@ def _offset_points_toward_camera(
 
 
 # ### Transform helpers ###
+def _snap_angle_degrees(angle_degrees: float, step_degrees: float) -> float:
+    """Round one signed rotation delta to the nearest positive step."""
+
+    angle = float(angle_degrees)
+    step = float(step_degrees)
+    if not math.isfinite(angle) or not math.isfinite(step) or step <= 0.0:
+        raise ValueError("Rotation snapping requires a finite angle and positive step.")
+    snapped_steps = math.floor(abs(angle) / step + 0.5)
+    return math.copysign(snapped_steps * step, angle)
+
+
+def _format_placed_object_rotation_status(
+    rotation_degrees: Sequence[float],
+    *,
+    snapped: bool,
+) -> str:
+    """Format live XYZ rotation feedback for an object-gizmo drag."""
+
+    rotation = np.asarray(rotation_degrees, dtype=float)
+    if rotation.shape != (3,) or not np.all(np.isfinite(rotation)):
+        raise ValueError("Placed-object rotations must contain finite XYZ angles.")
+    rotation = np.where(np.abs(rotation) < 5e-10, 0.0, rotation)
+    suffix = " Ctrl snap: 10 degrees." if snapped else ""
+    return (
+        f"Rotation: X {rotation[0]:.1f} degrees, "
+        f"Y {rotation[1]:.1f} degrees, Z {rotation[2]:.1f} degrees."
+        f"{suffix} Release to save; Escape cancels."
+    )
+
+
 def _build_symmetric_reflection_transform(
     orientation: str,
     plane_coordinate: float,
@@ -26057,6 +26964,32 @@ def _get_nearest_preview_placed_object_ray_hit(
             if nearest is None or hit_distance < nearest[2] - 1e-9:
                 nearest = (target, hit_point, hit_distance)
     return nearest
+
+
+def _get_preview_placed_object_local_bounds(
+    target: PreviewPlacedObject,
+) -> np.ndarray | None:
+    """Return local bounds for every authored and viewer-mirrored mesh."""
+
+    if not isinstance(target, PreviewPlacedObject):
+        return None
+    meshes = (
+        *target.meshes,
+        *_build_local_symmetric_preview_meshes(target),
+    )
+    vertices = tuple(
+        np.asarray(mesh.vertices, dtype=float)
+        for mesh in meshes
+        if isinstance(mesh, trimesh.Trimesh) and len(mesh.vertices)
+    )
+    if not vertices:
+        return None
+    combined = np.vstack(vertices)
+    if combined.ndim != 2 or combined.shape[1:] != (3,) or not np.isfinite(
+        combined
+    ).all():
+        return None
+    return np.asarray((np.min(combined, axis=0), np.max(combined, axis=0)))
 
 
 def _build_textured_wall_transform(
@@ -27487,6 +28420,18 @@ def _normalize_ambient_light_intensity(intensity: float) -> float:
     return min(
         max(normalized_intensity, MIN_AMBIENT_LIGHT_INTENSITY),
         MAX_AMBIENT_LIGHT_INTENSITY,
+    )
+
+
+def _normalize_point_light_intensity(intensity: float) -> float:
+    """Clamp one finite preview point-light intensity to its supported range."""
+
+    normalized_intensity = float(intensity)
+    if not np.isfinite(normalized_intensity):
+        raise ValueError("Point light intensity must be finite.")
+    return min(
+        max(normalized_intensity, MIN_POINT_LIGHT_INTENSITY),
+        MAX_POINT_LIGHT_INTENSITY,
     )
 
 

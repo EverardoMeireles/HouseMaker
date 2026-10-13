@@ -141,6 +141,60 @@ def build_doorway_cross_section_outline(
     return _close_profile_without_duplicate_vertices(points)
 
 
+def build_double_door_leaf_source_outline(
+    width_meters: float,
+    height_meters: float,
+    shape: str,
+    arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT,
+) -> tuple[tuple[float, float], ...]:
+    """Return one full-width source profile for a double door leaf.
+
+    Double-door body slots scale this source to half width.  The source is the
+    doorway's left half stretched across its full width, so the unmirrored left
+    leaf retains the left side of an arch and the mirrored right leaf completes
+    that same arch.  Rectangular profiles need no remapping and remain exact.
+    """
+
+    width = _normalize_positive_measurement(width_meters, "width")
+    height = _normalize_positive_measurement(height_meters, "height")
+    normalized_shape = normalize_doorway_shape(shape)
+    normalized_arch_amount = normalize_doorway_arch_amount(arch_amount)
+    outline = build_doorway_cross_section_outline(
+        width,
+        height,
+        normalized_shape,
+        normalized_arch_amount,
+    )
+    if (
+        normalized_shape == DOORWAY_SHAPE_RECTANGULAR
+        or normalized_arch_amount <= DOORWAY_PROFILE_EPSILON
+        or min(width / 2.0, height) * normalized_arch_amount
+        <= DOORWAY_PROFILE_EPSILON
+    ):
+        return outline
+
+    half_width = width / 2.0
+    points: list[tuple[float, float]] = [
+        (-half_width, 0.0),
+        (half_width, 0.0),
+    ]
+    upper_chain = outline[2:-1]
+    apex_index = max(
+        range(len(upper_chain)),
+        key=lambda point_index: upper_chain[point_index][1],
+    )
+    for width_coordinate, height_coordinate in upper_chain[apex_index:]:
+        source_width = 2.0 * width_coordinate + half_width
+        if math.isclose(
+            source_width,
+            half_width,
+            abs_tol=DOORWAY_PROFILE_EPSILON,
+        ):
+            source_width = half_width
+        points.append((source_width, height_coordinate))
+    return _close_profile_without_duplicate_vertices(points)
+
+
 # ### Profile construction helpers ###
 def _build_rectangular_outline(
     half_width_meters: float,

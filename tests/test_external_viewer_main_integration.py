@@ -38,7 +38,6 @@ from housemaker.texture_atlas_workspace import (
     build_atlas_wall_texture_source_id,
 )
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -771,18 +770,31 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             self._top_level_tab_labels(),
-            ["Canvas", "Doors", "Tour", "Settings"],
+            ["Canvas", "Doors and Windows", "Tour", "Settings"],
         )
 
         self.workspace._apply_generation_display_screen(None)
         self.assertEqual(
             self._top_level_tab_labels(),
-            ["Canvas", "Generation", "Doors", "Tour", "Settings"],
+            [
+                "Canvas",
+                "Generation",
+                "Doors and Windows",
+                "Tour",
+                "Settings",
+            ],
         )
         self.workspace._apply_atlas_display_screen(None)
         self.assertEqual(
             self._top_level_tab_labels(),
-            ["Canvas", "Atlas", "Generation", "Doors", "Tour", "Settings"],
+            [
+                "Canvas",
+                "Atlas",
+                "Generation",
+                "Doors and Windows",
+                "Tour",
+                "Settings",
+            ],
         )
         self.workspace._apply_scene_3d_display_screen(None)
         self.assertEqual(
@@ -792,7 +804,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
                 "3D scene",
                 "Atlas",
                 "Generation",
-                "Doors",
+                "Doors and Windows",
                 "Tour",
                 "Settings",
             ],

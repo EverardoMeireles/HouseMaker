@@ -13,19 +13,33 @@ from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_FRONT,
     DOOR_SLOT_BACK_BODY,
     DOOR_SLOT_BACK_KNOB,
+    DOOR_SLOT_BACK_LEFT_BODY,
+    DOOR_SLOT_BACK_LEFT_KNOB,
     DOOR_SLOT_BODY,
     DOOR_SLOT_KNOB,
+    DOOR_SLOT_LEFT_BODY,
+    DOOR_SLOT_LEFT_KNOB,
     DoorLibraryData,
     DoorPlacement,
     DoorSideDuplication,
     DoorSlotData,
+    GlassAreaData,
+    WindowPlacement,
     create_door_definition_for_doorway,
+    create_glass_area_data,
+    create_window_definition_for_frame,
     door_fits_doorway,
     door_slot_component,
+    door_slot_counterpart,
+    door_slot_display_name,
+    door_slot_leaf,
     door_slot_side,
     is_door_body_slot,
     is_door_knob_slot,
     next_door_name,
+    next_glass_area_name,
+    next_window_name,
+    set_door_double,
     set_door_double_sided,
 )
 from housemaker.models import DOORWAY_SHAPE_ARCH, DoorwayData, create_default_levels
@@ -48,6 +62,15 @@ def _doorway(*, doorway_id: str = "doorway-a") -> DoorwayData:
 
 # ### Door state tests ###
 class DoorStateTests(unittest.TestCase):
+    def test_legacy_handle_slot_id_uses_short_display_label(self) -> None:
+        slot = DoorSlotData(
+            slot_id=DOOR_SLOT_KNOB,
+            source_object_id="legacy-handle",
+        )
+
+        self.assertEqual(slot.slot_id, "door_knob")
+        self.assertEqual(slot.display_name, "Handle")
+
     def test_library_round_trip_preserves_slots_and_stable_placement_binding(
         self,
     ) -> None:
@@ -108,15 +131,32 @@ class DoorStateTests(unittest.TestCase):
             door_id="door-a",
             name="New door 1",
         )
-        displaced = replace(door, generate_displacement=True)
+        displaced = replace(door, generate_displacement=False)
 
         restored = type(door).from_dict(displaced.to_dict())
         legacy_payload = door.to_dict()
         legacy_payload.pop("generate_displacement")
         restored_legacy = type(door).from_dict(legacy_payload)
 
-        self.assertTrue(restored.generate_displacement)
+        self.assertTrue(door.generate_displacement)
+        self.assertFalse(restored.generate_displacement)
         self.assertFalse(restored_legacy.generate_displacement)
+
+    def test_profile_preservation_round_trip_and_legacy_default(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        preserving = replace(door, preserve_profile=True)
+
+        restored = type(door).from_dict(preserving.to_dict())
+        legacy_payload = door.to_dict()
+        legacy_payload.pop("preserve_profile")
+        restored_legacy = type(door).from_dict(legacy_payload)
+
+        self.assertTrue(restored.preserve_profile)
+        self.assertFalse(restored_legacy.preserve_profile)
 
     def test_displacement_generation_state_must_be_boolean(self) -> None:
         door = create_door_definition_for_doorway(
@@ -127,6 +167,9 @@ class DoorStateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "displacement-generation"):
             replace(door, generate_displacement=1)
+
+        with self.assertRaisesRegex(TypeError, "profile-preservation"):
+            replace(door, preserve_profile=1)
 
     def test_legacy_door_defaults_to_no_side_duplication(self) -> None:
         door = create_door_definition_for_doorway(
@@ -275,6 +318,144 @@ class DoorStateTests(unittest.TestCase):
         self.assertFalse(back_knob.joined)
         self.assertEqual(doubled.with_double_sided(False), original)
 
+    def test_double_toggle_builds_independent_mirrored_leaf_slots(self) -> None:
+        original = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+
+        doubled = set_door_double(original, True)
+
+        self.assertTrue(doubled.make_double)
+        self.assertEqual(
+            tuple(slot.slot_id for slot in doubled.slots),
+            (
+                DOOR_SLOT_BODY,
+                DOOR_SLOT_LEFT_BODY,
+                DOOR_SLOT_KNOB,
+                DOOR_SLOT_LEFT_KNOB,
+            ),
+        )
+        self.assertEqual(
+            len({slot.source_object_id for slot in doubled.slots}),
+            len(doubled.slots),
+        )
+        right_body = doubled.get_slot(DOOR_SLOT_BODY)
+        left_body = doubled.get_slot(DOOR_SLOT_LEFT_BODY)
+        right_handle = doubled.get_slot(DOOR_SLOT_KNOB)
+        left_handle = doubled.get_slot(DOOR_SLOT_LEFT_KNOB)
+        assert right_body is not None and left_body is not None
+        assert right_handle is not None and left_handle is not None
+        self.assertEqual(right_body.position_meters[0], 0.225)
+        self.assertEqual(left_body.position_meters[0], -0.225)
+        self.assertEqual(right_body.axis_scales[0], 0.5)
+        self.assertEqual(left_body.axis_scales[0], 0.5)
+        self.assertTrue(right_body.mirrored_horizontally)
+        self.assertFalse(left_body.mirrored_horizontally)
+        self.assertEqual(
+            left_handle.position_meters[0],
+            -right_handle.position_meters[0],
+        )
+        self.assertAlmostEqual(right_handle.position_meters[0], 0.04)
+        self.assertTrue(right_handle.mirrored_horizontally)
+        self.assertFalse(left_handle.mirrored_horizontally)
+        self.assertEqual(type(doubled).from_dict(doubled.to_dict()), doubled)
+        self.assertEqual(doubled.with_double(False), original)
+
+    def test_double_toggle_exactly_restores_custom_source_handedness(self) -> None:
+        original = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="custom-handed-door",
+            name="New door 1",
+        )
+        body = original.get_slot(DOOR_SLOT_BODY)
+        handle = original.get_slot(DOOR_SLOT_KNOB)
+        assert body is not None and handle is not None
+        original = original.replace_slot(
+            body.with_transform(mirrored_horizontally=True)
+        ).replace_slot(
+            handle.with_transform(
+                position_meters=(0.21, -0.03, 0.82),
+                mirrored_horizontally=True,
+            )
+        )
+
+        restored = original.with_double(True).with_double(False)
+
+        self.assertEqual(restored, original)
+
+    def test_double_and_double_sided_slots_combine_without_shared_ids(
+        self,
+    ) -> None:
+        original = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        doubled = original.with_double(True)
+
+        complete = doubled.with_double_sided(True)
+
+        expected_slot_ids = {
+            DOOR_SLOT_BODY,
+            DOOR_SLOT_KNOB,
+            DOOR_SLOT_LEFT_BODY,
+            DOOR_SLOT_LEFT_KNOB,
+            DOOR_SLOT_BACK_BODY,
+            DOOR_SLOT_BACK_KNOB,
+            DOOR_SLOT_BACK_LEFT_BODY,
+            DOOR_SLOT_BACK_LEFT_KNOB,
+        }
+        self.assertEqual(
+            {slot.slot_id for slot in complete.slots},
+            expected_slot_ids,
+        )
+        self.assertEqual(
+            len({slot.source_object_id for slot in complete.slots}),
+            len(expected_slot_ids),
+        )
+        self.assertEqual(
+            door_slot_counterpart(DOOR_SLOT_BACK_BODY),
+            DOOR_SLOT_BACK_LEFT_BODY,
+        )
+        self.assertEqual(door_slot_leaf(DOOR_SLOT_LEFT_KNOB), "left")
+        self.assertEqual(
+            door_slot_display_name(DOOR_SLOT_BODY, make_double=True),
+            "Body right",
+        )
+        self.assertEqual(
+            door_slot_display_name(DOOR_SLOT_LEFT_KNOB, make_double=True),
+            "Handle left",
+        )
+        self.assertEqual(type(complete).from_dict(complete.to_dict()), complete)
+        self.assertEqual(complete.with_double_sided(False), doubled)
+        self.assertEqual(
+            complete.with_double(False),
+            original.with_double_sided(True),
+        )
+
+    def test_legacy_door_and_slot_payloads_default_to_single_unmirrored(
+        self,
+    ) -> None:
+        original = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="legacy-door",
+            name="New door 1",
+        )
+        payload = original.to_dict()
+        payload.pop("make_double")
+        for raw_slot in payload["slots"]:
+            raw_slot.pop("mirrored_horizontally")
+
+        restored = type(original).from_dict(payload)
+
+        self.assertEqual(restored, original)
+        self.assertFalse(restored.make_double)
+        self.assertTrue(
+            all(not slot.mirrored_horizontally for slot in restored.slots)
+        )
+
     def test_double_sided_door_round_trip_and_slot_helpers(self) -> None:
         door = create_door_definition_for_doorway(
             _doorway(),
@@ -361,6 +542,374 @@ class DoorStateTests(unittest.TestCase):
             [item.placement_id for item in restored.placements],
             ["valid-placement"],
         )
+
+    def test_glass_areas_validate_bounds_and_use_monotonic_names(self) -> None:
+        first = create_glass_area_data(
+            "door-a",
+            (),
+            glass_area_id="glass-a",
+            minimum_x_ratio=0.1,
+            maximum_x_ratio=0.4,
+            minimum_z_ratio=0.2,
+            maximum_z_ratio=0.8,
+        )
+        third = replace(
+            first,
+            glass_area_id="glass-c",
+            source_object_id="opening:door-a:glass:glass-c",
+            name="Glass area 3",
+        )
+        second = create_glass_area_data(
+            "door-a",
+            (first, third),
+            glass_area_id="glass-d",
+            minimum_x_ratio=0.5,
+            maximum_x_ratio=0.9,
+            minimum_z_ratio=0.1,
+            maximum_z_ratio=0.7,
+        )
+
+        self.assertEqual(first.name, "Glass area 1")
+        self.assertEqual(second.name, "Glass area 4")
+        self.assertEqual(next_glass_area_name((first, third)), "Glass area 4")
+        self.assertEqual(
+            GlassAreaData.from_dict(first.to_dict()),
+            first,
+        )
+        for invalid_bounds in (
+            (-0.1, 0.4, 0.2, 0.8),
+            (0.1, 1.1, 0.2, 0.8),
+            (0.4, 0.4, 0.2, 0.8),
+            (0.1, 0.4, 0.8, 0.2),
+        ):
+            with self.subTest(bounds=invalid_bounds), self.assertRaises(
+                ValueError
+            ):
+                GlassAreaData(
+                    glass_area_id="invalid",
+                    source_object_id="invalid-source",
+                    name="Glass area 1",
+                    minimum_x_ratio=invalid_bounds[0],
+                    maximum_x_ratio=invalid_bounds[1],
+                    minimum_z_ratio=invalid_bounds[2],
+                    maximum_z_ratio=invalid_bounds[3],
+                )
+
+    def test_door_glass_areas_round_trip_and_legacy_payload_defaults_empty(
+        self,
+    ) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        glass_area = create_glass_area_data(
+            door.door_id,
+            (),
+            glass_area_id="glass-a",
+            minimum_x_ratio=0.2,
+            maximum_x_ratio=0.8,
+            minimum_z_ratio=0.25,
+            maximum_z_ratio=0.75,
+        )
+        with_glass = replace(door, glass_areas=(glass_area,))
+
+        restored = type(door).from_dict(with_glass.to_dict())
+        legacy_payload = door.to_dict()
+        legacy_payload.pop("glass_areas")
+        restored_legacy = type(door).from_dict(legacy_payload)
+        legacy_area_payload = glass_area.to_dict()
+        legacy_area_payload.pop("body_slot_id")
+
+        self.assertEqual(restored, with_glass)
+        self.assertEqual(
+            restored.get_glass_area(glass_area.glass_area_id),
+            glass_area,
+        )
+        self.assertEqual(restored_legacy.glass_areas, ())
+        self.assertEqual(
+            GlassAreaData.from_dict(legacy_area_payload),
+            glass_area,
+        )
+        with self.assertRaisesRegex(ValueError, "source object IDs"):
+            replace(
+                door,
+                glass_areas=(
+                    glass_area,
+                    replace(
+                        glass_area,
+                        glass_area_id="glass-b",
+                        name="Glass area 2",
+                    ),
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "cannot overlap"):
+            replace(
+                door,
+                glass_areas=(
+                    glass_area,
+                    replace(
+                        glass_area,
+                        glass_area_id="glass-overlap",
+                        source_object_id="glass-overlap-source",
+                        name="Glass area 2",
+                        minimum_x_ratio=0.7,
+                        maximum_x_ratio=0.9,
+                    ),
+                ),
+            )
+
+    def test_glass_areas_can_share_ratios_on_independent_door_leaves(
+        self,
+    ) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="double-door",
+            name="New door 1",
+        ).with_double(True)
+        right_area = create_glass_area_data(
+            door.door_id,
+            (),
+            glass_area_id="glass-right",
+            source_object_id="glass-source-right",
+            minimum_x_ratio=0.2,
+            maximum_x_ratio=0.8,
+            minimum_z_ratio=0.2,
+            maximum_z_ratio=0.8,
+            body_slot_id=DOOR_SLOT_BODY,
+        )
+        left_area = create_glass_area_data(
+            door.door_id,
+            (right_area,),
+            glass_area_id="glass-left",
+            source_object_id="glass-source-left",
+            minimum_x_ratio=0.2,
+            maximum_x_ratio=0.8,
+            minimum_z_ratio=0.2,
+            maximum_z_ratio=0.8,
+            body_slot_id=DOOR_SLOT_LEFT_BODY,
+        )
+
+        with_glass = replace(door, glass_areas=(right_area, left_area))
+
+        self.assertEqual(
+            tuple(area.body_slot_id for area in with_glass.glass_areas),
+            (DOOR_SLOT_BODY, DOOR_SLOT_LEFT_BODY),
+        )
+        self.assertEqual(
+            type(door).from_dict(with_glass.to_dict()),
+            with_glass,
+        )
+        self.assertEqual(
+            with_glass.with_double(False).glass_areas,
+            (right_area,),
+        )
+        with self.assertRaisesRegex(ValueError, "active body slot"):
+            replace(
+                with_glass.with_double(False),
+                glass_areas=(left_area,),
+            )
+
+    def test_door_placements_allow_only_one_door_per_doorway(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(),
+            door_id="door-a",
+            name="New door 1",
+        )
+        placement = DoorPlacement(
+            placement_id="first",
+            door_id=door.door_id,
+            level_index=2,
+            doorway_id="destination",
+        )
+        library = DoorLibraryData(
+            doors=[door],
+            placements=[placement],
+        )
+
+        self.assertEqual(
+            DoorLibraryData.from_dict(library.to_dict()),
+            library,
+        )
+        self.assertNotIn(
+            "fit_mode",
+            placement.to_dict(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "bindings must be unique"):
+            DoorLibraryData(
+                doors=[door],
+                placements=[
+                    placement,
+                    replace(placement, placement_id="duplicate"),
+                ],
+            )
+
+    def test_legacy_half_placement_mode_is_ignored_on_load(self) -> None:
+        payload = {
+            "placement_id": "legacy-left",
+            "door_id": "door-a",
+            "level_index": 2,
+            "doorway_id": "destination",
+            "mirrored_horizontally": True,
+            "fit_mode": "left",
+        }
+
+        placement = DoorPlacement.from_dict(payload)
+
+        self.assertEqual(placement.placement_id, "legacy-left")
+        self.assertTrue(placement.mirrored_horizontally)
+        self.assertNotIn("fit_mode", placement.to_dict())
+
+    def test_window_definition_and_placement_round_trip(self) -> None:
+        first = create_window_definition_for_frame(
+            "frame-a",
+            1.4,
+            1.1,
+            window_id="window-a",
+            name="New window 1",
+        )
+        third = replace(first, window_id="window-c", name="New window 3")
+        glass_area = create_glass_area_data(
+            first.window_id,
+            (),
+            glass_area_id="glass-window-a",
+            minimum_x_ratio=0.1,
+            maximum_x_ratio=0.9,
+            minimum_z_ratio=0.1,
+            maximum_z_ratio=0.9,
+        )
+        first = replace(first, glass_areas=(glass_area,))
+        placement = WindowPlacement(
+            placement_id="window-placement-a",
+            window_id=first.window_id,
+            level_index=2,
+            window_frame_id="frame-destination",
+            mirrored_horizontally=True,
+        )
+        library = DoorLibraryData(
+            windows=[first],
+            window_placements=[placement],
+        )
+
+        restored = DoorLibraryData.from_dict(library.to_dict())
+
+        self.assertEqual(restored, library)
+        self.assertTrue(first.generate_displacement)
+        self.assertFalse(first.preserve_profile)
+        self.assertEqual(
+            tuple(slot.display_name for slot in first.slots),
+            ("Body", "Handle"),
+        )
+        self.assertTrue(first.get_slot(DOOR_SLOT_BODY).joined)  # type: ignore[union-attr]
+        self.assertEqual(first.get_glass_area("glass-window-a"), glass_area)
+        self.assertEqual(next_window_name((first, third)), "New window 4")
+        self.assertEqual(
+            library.to_dict()["schema_version"],
+            DOOR_LIBRARY_SCHEMA_VERSION,
+        )
+
+        legacy_payload = first.to_dict()
+        legacy_payload.pop("generate_displacement")
+        legacy_payload.pop("preserve_profile")
+        restored_legacy = type(first).from_dict(legacy_payload)
+        self.assertFalse(restored_legacy.generate_displacement)
+        self.assertFalse(restored_legacy.preserve_profile)
+
+    def test_window_double_structure_round_trips_with_window_source_ids(
+        self,
+    ) -> None:
+        original = create_window_definition_for_frame(
+            "frame-a",
+            1.2,
+            1.0,
+            window_id="window-a",
+            name="New window 1",
+        )
+
+        complete = original.with_double(True).with_double_sided(True)
+
+        expected_slot_ids = {
+            DOOR_SLOT_BODY,
+            DOOR_SLOT_KNOB,
+            DOOR_SLOT_LEFT_BODY,
+            DOOR_SLOT_LEFT_KNOB,
+            DOOR_SLOT_BACK_BODY,
+            DOOR_SLOT_BACK_KNOB,
+            DOOR_SLOT_BACK_LEFT_BODY,
+            DOOR_SLOT_BACK_LEFT_KNOB,
+        }
+        self.assertTrue(complete.make_double)
+        self.assertTrue(complete.make_double_sided)
+        self.assertEqual(
+            {slot.slot_id for slot in complete.slots},
+            expected_slot_ids,
+        )
+        self.assertTrue(
+            all(
+                slot.source_object_id.startswith("window:window-a:slot:")
+                for slot in complete.slots
+            )
+        )
+        self.assertEqual(
+            type(complete).from_dict(complete.to_dict()),
+            complete,
+        )
+        self.assertEqual(
+            complete.with_double_sided(False).with_double(False),
+            original,
+        )
+        self.assertEqual(
+            complete.with_double(False).with_double_sided(False),
+            original,
+        )
+
+    def test_window_rejects_slots_for_inactive_structure(self) -> None:
+        window = create_window_definition_for_frame(
+            "frame-a",
+            1.2,
+            1.0,
+            window_id="window-a",
+            name="New window 1",
+        ).with_double(True)
+
+        with self.assertRaisesRegex(ValueError, "inactive component slots"):
+            replace(window, make_double=False)
+
+    def test_library_load_skips_conflicting_and_dangling_window_entries(
+        self,
+    ) -> None:
+        window = create_window_definition_for_frame(
+            "frame-a",
+            1.0,
+            1.0,
+            window_id="window-a",
+            name="New window 1",
+        )
+        valid = WindowPlacement(
+            placement_id="valid",
+            window_id=window.window_id,
+            level_index=2,
+            window_frame_id="frame-target",
+        )
+        payload = {
+            "windows": [window.to_dict(), {"broken": True}],
+            "window_placements": [
+                valid.to_dict(),
+                replace(valid, placement_id="duplicate").to_dict(),
+                {
+                    "placement_id": "dangling",
+                    "window_id": "missing",
+                    "level_index": 2,
+                    "window_frame_id": "other-frame",
+                },
+            ],
+        }
+
+        restored = DoorLibraryData.from_dict(payload)
+
+        self.assertEqual(restored.windows, [window])
+        self.assertEqual(restored.window_placements, [valid])
 
 
 # ### Doorway identity persistence tests ###

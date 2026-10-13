@@ -358,9 +358,6 @@ class CanvasOpeningMainTests(unittest.TestCase):
             len(self.workspace.viewer._canvas_opening_gizmo_items),
             5,
         )
-        status_label = self.workspace.viewer.window_tools_status_label
-        assert status_label is not None
-        self.assertIn("blue arch shoulder", status_label.text())
 
         self.workspace.selected_doorway_arch_checkbox.click()
 
@@ -371,7 +368,6 @@ class CanvasOpeningMainTests(unittest.TestCase):
             len(self.workspace.viewer._canvas_opening_gizmo_items),
             3,
         )
-        self.assertNotIn("blue arch shoulder", status_label.text())
 
     def test_arch_gizmo_uses_delayed_mesh_commit_and_updates_amount_field(
         self,

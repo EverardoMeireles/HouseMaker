@@ -13,19 +13,33 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.door_state import (
+    DOOR_LEAF_LEFT,
     DOOR_SIDE_DUPLICATION_FRONT,
+    DOOR_SLOT_BACK_BODY,
+    DOOR_SLOT_BACK_KNOB,
+    DOOR_SLOT_BACK_LEFT_BODY,
+    DOOR_SLOT_BACK_LEFT_KNOB,
     DOOR_SLOT_BODY,
     DOOR_SLOT_KNOB,
+    DOOR_SLOT_LEFT_BODY,
+    DOOR_SLOT_LEFT_KNOB,
     DoorDefinition,
     DoorSlotData,
+    WindowDefinition,
+    door_slot_display_name,
+    door_slot_leaf,
     door_slot_side,
     is_door_body_slot,
     is_door_knob_slot,
 )
-from housemaker.doorway_geometry import build_doorway_cross_section_outline
+from housemaker.doorway_geometry import (
+    build_doorway_cross_section_outline,
+    build_double_door_leaf_source_outline,
+)
 from housemaker.glb import (
     DOOR_BODY_MARKER_METADATA_KEY,
     DOOR_COMPONENT_MARKER_METADATA_KEY,
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     GeneratedModel,
@@ -34,6 +48,7 @@ from housemaker.glb import (
     compose_placed_generated_models,
     compose_placed_generated_models_preview,
 )
+from housemaker.opening_glass import apply_opening_glass_areas
 
 # ### Constants ###
 DOOR_BODY_COLOR = (164, 109, 68, 255)
@@ -41,6 +56,14 @@ DOOR_BODY_GEOMETRY_NAME = "door_body"
 DOOR_GEOMETRY_EPSILON = 1e-9
 DOOR_UV_ATLAS_RESOLUTION = 1024
 DOOR_UV_PADDING_PIXELS = 2
+DOOR_BODY_SOURCE_HALF_LEFT = "left"
+DOOR_BODY_SOURCE_HALF_RIGHT = "right"
+DOOR_BODY_HANDLE_SLOT_IDS = {
+    DOOR_SLOT_BODY: DOOR_SLOT_KNOB,
+    DOOR_SLOT_LEFT_BODY: DOOR_SLOT_LEFT_KNOB,
+    DOOR_SLOT_BACK_BODY: DOOR_SLOT_BACK_KNOB,
+    DOOR_SLOT_BACK_LEFT_BODY: DOOR_SLOT_BACK_LEFT_KNOB,
+}
 
 
 # ### Door processing models ###
@@ -99,19 +122,17 @@ def build_door_body_model(
     Its glTF scene is stored Y-up to match every other ``GeneratedModel``.
     """
 
-    thickness = _normalize_positive_measurement(
-        thickness_meters,
-        "Door thickness",
-    )
     outline = build_doorway_cross_section_outline(
         width_meters,
         height_meters,
         shape,
         arch_amount,
     )
-    mesh = _extrude_profile(outline, thickness)
-    mesh = _unwrap_mesh(mesh, DOOR_BODY_COLOR, geometry_name)
-    return _build_generated_model(mesh, geometry_name)
+    return _build_door_body_model_from_profile(
+        outline,
+        thickness_meters,
+        geometry_name,
+    )
 
 
 def build_default_door_slot_models(
@@ -121,13 +142,10 @@ def build_default_door_slot_models(
 
     _require_door_definition(door)
     return {
-        slot.slot_id: build_door_body_model(
-            door.width_meters,
-            door.height_meters,
+        slot.slot_id: _build_door_body_model_from_profile(
+            build_door_body_source_outline(door, slot),
             door.thickness_meters,
-            shape=door.shape,
-            arch_amount=door.arch_amount,
-            geometry_name=(
+            (
                 DOOR_BODY_GEOMETRY_NAME
                 if slot.slot_id == DOOR_SLOT_BODY
                 else f"{DOOR_BODY_GEOMETRY_NAME}_{slot.slot_id}"
@@ -136,6 +154,108 @@ def build_default_door_slot_models(
         for slot in door.slots
         if is_door_body_slot(slot.slot_id)
     }
+
+
+def build_door_body_source_outline(
+    door: DoorDefinition,
+    slot: DoorSlotData,
+) -> tuple[tuple[float, float], ...]:
+    """Resolve the profile authored into one door body's source model."""
+
+    _require_door_definition(door)
+    if not isinstance(slot, DoorSlotData) or not is_door_body_slot(slot.slot_id):
+        raise TypeError("Door body profiles require a body slot.")
+    if not door.make_double:
+        return build_doorway_cross_section_outline(
+            door.width_meters,
+            door.height_meters,
+            door.shape,
+            door.arch_amount,
+        )
+
+    outline = build_double_door_leaf_source_outline(
+        door.width_meters,
+        door.height_meters,
+        door.shape,
+        door.arch_amount,
+    )
+    if door_body_slot_source_half(slot) == DOOR_BODY_SOURCE_HALF_LEFT:
+        return outline
+    return _mirror_closed_profile_horizontally(outline)
+
+
+def door_body_slot_source_half(slot: DoorSlotData) -> str:
+    """Return the global profile half expected before slot-level mirroring."""
+
+    if not isinstance(slot, DoorSlotData) or not is_door_body_slot(slot.slot_id):
+        raise TypeError("Door leaf source orientation requires a body slot.")
+    is_left_leaf = door_slot_leaf(slot.slot_id) == DOOR_LEAF_LEFT
+    uses_left_source = is_left_leaf != slot.mirrored_horizontally
+    return (
+        DOOR_BODY_SOURCE_HALF_LEFT
+        if uses_left_source
+        else DOOR_BODY_SOURCE_HALF_RIGHT
+    )
+
+
+def _build_door_body_model_from_profile(
+    profile_outline: Sequence[tuple[float, float]],
+    thickness_meters: float,
+    geometry_name: str,
+) -> GeneratedModel:
+    """Extrude one already-resolved canonical door body profile."""
+
+    thickness = _normalize_positive_measurement(
+        thickness_meters,
+        "Door thickness",
+    )
+    mesh = _extrude_profile(profile_outline, thickness)
+    mesh = _unwrap_mesh(mesh, DOOR_BODY_COLOR, geometry_name)
+    return _build_generated_model(mesh, geometry_name)
+
+
+def build_default_window_slot_models(
+    window: WindowDefinition,
+) -> dict[str, GeneratedModel]:
+    """Build a rectangular fallback for every active window body slot."""
+
+    _require_window_definition(window)
+    return {
+        slot.slot_id: build_door_body_model(
+            window.width_meters,
+            window.height_meters,
+            window.thickness_meters,
+            shape="rectangular",
+            arch_amount=0.0,
+            geometry_name=(
+                "window_body"
+                if slot.slot_id == DOOR_SLOT_BODY
+                else f"window_body_{slot.slot_id}"
+            ),
+        )
+        for slot in window.slots
+        if is_door_body_slot(slot.slot_id)
+    }
+
+
+# ### Body profile helpers ###
+def _mirror_closed_profile_horizontally(
+    outline: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    """Reflect a canonical closed X/Z profile and retain its point order."""
+
+    unique_points = [(-float(x), float(z)) for x, z in outline[:-1]]
+    reversed_points = list(reversed(unique_points))
+    start_index = min(
+        range(len(reversed_points)),
+        key=lambda point_index: (
+            reversed_points[point_index][1],
+            reversed_points[point_index][0],
+        ),
+    )
+    ordered = reversed_points[start_index:] + reversed_points[:start_index]
+    ordered.append(ordered[0])
+    return tuple(ordered)
 
 
 # ### Door assembly ###
@@ -177,6 +297,7 @@ def assemble_door_model(
         else dict(slot_models)
     )
     placements: list[PlacedGeneratedModel] = []
+    effective_body_mirrors: dict[str, DoorBodyMirrorConfiguration] = {}
     for slot in door.slots:
         if (
             not is_door_body_slot(slot.slot_id)
@@ -189,30 +310,108 @@ def assemble_door_model(
             if is_door_body_slot(slot.slot_id):
                 raise ValueError("The door body has no generated source model.")
             continue
+        slot_side = door_slot_side(slot.slot_id)
+        depth_mirrored = slot_side != DOOR_SIDE_DUPLICATION_FRONT
+        if depth_mirrored:
+            component_model = mirror_door_model_depthwise(component_model)
+        slot_body_mirror = _transform_body_mirror_configuration(
+            normalized_body_mirrors.get(slot.slot_id),
+            horizontal_mirror=slot.mirrored_horizontally,
+            depth_mirror=depth_mirrored,
+        )
+        if slot_body_mirror is not None:
+            effective_body_mirrors[slot.slot_id] = slot_body_mirror
         if is_door_body_slot(slot.slot_id):
+            if slot.mirrored_horizontally:
+                component_model = mirror_door_model_horizontally(
+                    component_model
+                )
+            omitted_glass_depth_cap = None
+            if door.make_double_sided:
+                omitted_glass_depth_cap = (
+                    "maximum"
+                    if door_slot_side(slot.slot_id)
+                    == DOOR_SIDE_DUPLICATION_FRONT
+                    else "minimum"
+                )
+            component_model = _with_opening_glass_areas(
+                component_model,
+                tuple(
+                    area
+                    for area in door.glass_areas
+                    if _glass_area_applies_to_body_slot(
+                        door,
+                        area.body_slot_id,
+                        slot.slot_id,
+                    )
+                ),
+                width_meters=door.width_meters,
+                height_meters=door.height_meters,
+                omitted_glass_depth_cap=omitted_glass_depth_cap,
+            )
+            # Glass cutting serializes authoritative source models.  Apply it
+            # before the placement-dependent body marker exists, then tag the
+            # opaque body and its glass panes as one reconstruction group.
             component_model = _with_door_body_marker(
                 component_model,
                 slot.source_object_id,
             )
         elif is_door_knob_slot(slot.slot_id):
+            if slot.mirrored_horizontally:
+                component_model = mirror_door_model_horizontally(
+                    component_model
+                )
             component_model = _with_door_component_marker(
                 component_model,
                 slot.source_object_id,
                 DOOR_SLOT_KNOB,
             )
-        slot_body_mirror = normalized_body_mirrors.get(slot.slot_id)
+        component_display_name = door_slot_display_name(
+            slot.slot_id,
+            make_double=door.make_double,
+        )
         world_position = slot.position_meters
         axis_scales = slot.axis_scales
         if is_door_body_slot(slot.slot_id):
-            bottom_center = _mesh_bottom_center(component_model.mesh)
-            world_position = tuple(
-                float(slot.position_meters[index] + bottom_center[index])
-                for index in range(3)
+            reconstructed_extents = _body_fitting_extents(
+                component_model,
+                slot_body_mirror,
+                target_extents=np.asarray(
+                    (
+                        door.width_meters,
+                        door.thickness_meters,
+                        door.height_meters,
+                    ),
+                    dtype=float,
+                ),
+            )
+            axis_scales = (
+                axis_scales[0]
+                * door.width_meters
+                / reconstructed_extents[0],
+                axis_scales[1]
+                * door.thickness_meters
+                / reconstructed_extents[1],
+                axis_scales[2]
+                * door.height_meters
+                / reconstructed_extents[2],
+            )
+            world_position = _reconstructed_body_world_position(
+                component_model,
+                slot_body_mirror,
+                target_position=slot.position_meters,
+                rotation_degrees=slot.rotation_degrees,
+                axis_scales=axis_scales,
+                target_extents=(
+                    door.width_meters,
+                    door.thickness_meters,
+                    door.height_meters,
+                ),
             )
             if door.make_double_sided:
                 body_depth = _mesh_axis_extent(component_model.mesh, 1)
                 side_depth = (
-                    door.thickness_meters * axis_scales[1] * 0.5
+                    door.thickness_meters * slot.axis_scales[1] * 0.5
                 )
                 side_sign = (
                     -1.0
@@ -231,11 +430,23 @@ def assemble_door_model(
                     side_depth / body_depth,
                     axis_scales[2],
                 )
+        elif is_door_knob_slot(slot.slot_id) and door.make_double_sided:
+            side_sign = (
+                -1.0
+                if slot_side == DOOR_SIDE_DUPLICATION_FRONT
+                else 1.0
+            )
+            world_position = (
+                world_position[0],
+                world_position[1]
+                + side_sign * door.thickness_meters * 0.5,
+                world_position[2],
+            )
         placements.append(
             PlacedGeneratedModel(
                 object_id=slot.source_object_id,
                 source_object_id=slot.source_object_id,
-                object_name=f"{door.name} {slot.display_name}",
+                object_name=f"{door.name} {component_display_name}",
                 model=component_model,
                 world_position=world_position,
                 symmetric_preview_orientation=(
@@ -269,20 +480,95 @@ def assemble_door_model(
         replace(preview, fade_enabled=False)
         for preview in assembled.preview_symmetric_objects
     ]
-    if (
-        normalized_body_mirrors.get(DOOR_SLOT_BODY) is not None
-        and normalized_body_mirrors[
-            DOOR_SLOT_BODY
-        ].side_duplication_plane_coordinate
-        is not None
-    ):
+    for body_slot_id, body_mirror_configuration in effective_body_mirrors.items():
+        if body_mirror_configuration.side_duplication_plane_coordinate is None:
+            continue
         _append_side_duplication_previews(
             assembled,
-            door.get_slot(DOOR_SLOT_BODY),
-            door.get_slot(DOOR_SLOT_KNOB),
-            normalized_body_mirrors[DOOR_SLOT_BODY],
+            door.get_slot(body_slot_id),
+            door.get_slot(DOOR_BODY_HANDLE_SLOT_IDS[body_slot_id]),
+            body_mirror_configuration,
         )
     return assembled
+
+
+def _glass_area_applies_to_body_slot(
+    door: DoorDefinition,
+    owner_slot_id: str,
+    candidate_slot_id: str,
+) -> bool:
+    """Match one opening to its leaf on each authored door side."""
+
+    if owner_slot_id == candidate_slot_id:
+        return True
+    if not door.make_double_sided:
+        return False
+    return door_slot_leaf(owner_slot_id) == door_slot_leaf(candidate_slot_id)
+
+
+def assemble_window_model(
+    window: WindowDefinition,
+    slot_models: Mapping[str, GeneratedModel] | None = None,
+    *,
+    include_unjoined: bool = False,
+    body_mirror: DoorBodyMirrorConfiguration | None = None,
+    body_mirrors: Mapping[str, DoorBodyMirrorConfiguration] | None = None,
+) -> GeneratedModel:
+    """Assemble a reusable window through the proven door component path."""
+
+    _require_window_definition(window)
+    surrogate = DoorDefinition(
+        door_id=window.window_id,
+        name=window.name,
+        source_doorway_id=window.source_window_frame_id,
+        width_meters=window.width_meters,
+        height_meters=window.height_meters,
+        thickness_meters=window.thickness_meters,
+        make_double=window.make_double,
+        make_double_sided=window.make_double_sided,
+        slots=window.slots,
+        glass_areas=window.glass_areas,
+    )
+    models = (
+        build_default_window_slot_models(window)
+        if slot_models is None
+        else slot_models
+    )
+    return assemble_door_model(
+        surrogate,
+        models,
+        include_unjoined=include_unjoined,
+        body_mirror=body_mirror,
+        body_mirrors=body_mirrors,
+    )
+
+
+def _with_opening_glass_areas(
+    body_model: GeneratedModel,
+    areas: Sequence[object],
+    *,
+    width_meters: float,
+    height_meters: float,
+    omitted_glass_depth_cap: str | None = None,
+) -> GeneratedModel:
+    """Rebuild one body with all persistent through-cuts and glass cuboids."""
+
+    if not areas:
+        return body_model
+    half_width = _normalize_positive_measurement(
+        width_meters,
+        "Opening width",
+    ) * 0.5
+    height = _normalize_positive_measurement(
+        height_meters,
+        "Opening height",
+    )
+    return apply_opening_glass_areas(
+        body_model,
+        tuple(areas),
+        profile_bounds_meters=(-half_width, half_width, 0.0, height),
+        omitted_glass_depth_cap=omitted_glass_depth_cap,
+    ).model
 
 
 def _with_door_body_marker(
@@ -500,18 +786,6 @@ def _reflect_preview_meshes(
     return tuple(reflected)
 
 
-def _mesh_bottom_center(mesh: trimesh.Trimesh) -> np.ndarray:
-    minimum, maximum = np.asarray(mesh.bounds, dtype=float)
-    return np.asarray(
-        (
-            (minimum[0] + maximum[0]) * 0.5,
-            (minimum[1] + maximum[1]) * 0.5,
-            minimum[2],
-        ),
-        dtype=float,
-    )
-
-
 def _mesh_axis_extent(mesh: trimesh.Trimesh, axis: int) -> float:
     """Return one finite positive local mesh extent."""
 
@@ -522,28 +796,226 @@ def _mesh_axis_extent(mesh: trimesh.Trimesh, axis: int) -> float:
     return extent
 
 
+def _body_fitting_extents(
+    model: GeneratedModel,
+    mirror: DoorBodyMirrorConfiguration | None,
+    *,
+    target_extents: np.ndarray,
+) -> np.ndarray:
+    """Return body extents used to fit one slot to its canonical profile.
+
+    Generated body assets from older projects are not guaranteed to have the
+    canonical door dimensions.  Slot offsets are expressed in that canonical
+    coordinate system, so fitting by these reconstructed extents keeps paired
+    leaves flush without changing their meshes, UVs, or materials.
+    """
+
+    bounds = _body_fitting_bounds(
+        model,
+        mirror,
+        target_extents=target_extents,
+    )
+    extents = bounds[1] - bounds[0]
+    if np.any(~np.isfinite(extents)) or np.any(
+        extents <= DOOR_GEOMETRY_EPSILON
+    ):
+        raise ValueError("A door body has no measurable size on every axis.")
+    return extents
+
+
+def _body_fitting_bounds(
+    model: GeneratedModel,
+    mirror: DoorBodyMirrorConfiguration | None,
+    *,
+    target_extents: Sequence[float],
+) -> np.ndarray:
+    """Return the effective full-body bounds used by fitting and anchoring."""
+
+    authored_bounds = np.asarray(model.mesh.bounds, dtype=float)
+    if authored_bounds.shape != (2, 3) or not np.all(
+        np.isfinite(authored_bounds)
+    ):
+        raise ValueError("A door body has invalid bounds.")
+    normalized_targets = np.asarray(target_extents, dtype=float)
+    if normalized_targets.shape != (3,) or np.any(
+        ~np.isfinite(normalized_targets)
+    ) or np.any(normalized_targets <= DOOR_GEOMETRY_EPSILON):
+        raise ValueError("Door body target dimensions are invalid.")
+    reconstructed_bounds = _reconstructed_body_bounds(model, mirror)
+    authored_extents = authored_bounds[1] - authored_bounds[0]
+    use_authored_bounds = np.isclose(
+        authored_extents,
+        normalized_targets,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    effective_bounds = reconstructed_bounds.copy()
+    effective_bounds[:, use_authored_bounds] = authored_bounds[
+        :, use_authored_bounds
+    ]
+    return effective_bounds
+
+
+def _reconstructed_body_bounds(
+    model: GeneratedModel,
+    mirror: DoorBodyMirrorConfiguration | None,
+) -> np.ndarray:
+    """Return authored bounds expanded by every runtime body reflection."""
+
+    bounds = np.asarray(model.mesh.bounds, dtype=float)
+    if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+        raise ValueError("A door body has invalid bounds.")
+    minimum = bounds[0].copy()
+    maximum = bounds[1].copy()
+    if mirror is None:
+        return np.stack((minimum, maximum))
+
+    mirror_planes: list[tuple[int, float]] = []
+    if mirror.symmetric_orientation is not None:
+        assert mirror.symmetric_plane_coordinate is not None
+        mirror_planes.append(
+            (
+                SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[
+                    mirror.symmetric_orientation
+                ],
+                mirror.symmetric_plane_coordinate,
+            )
+        )
+    if mirror.side_duplication_plane_coordinate is not None:
+        mirror_planes.append((1, mirror.side_duplication_plane_coordinate))
+    for axis, plane_coordinate in mirror_planes:
+        reflected_minimum = 2.0 * plane_coordinate - maximum[axis]
+        reflected_maximum = 2.0 * plane_coordinate - minimum[axis]
+        minimum[axis] = min(minimum[axis], reflected_minimum)
+        maximum[axis] = max(maximum[axis], reflected_maximum)
+    return np.stack((minimum, maximum))
+
+
+def _reconstructed_body_world_position(
+    model: GeneratedModel,
+    mirror: DoorBodyMirrorConfiguration | None,
+    *,
+    target_position: Sequence[float],
+    rotation_degrees: Sequence[float],
+    axis_scales: Sequence[float],
+    target_extents: Sequence[float],
+) -> tuple[float, float, float]:
+    """Anchor a reconstructed body's bottom center on its canonical slot.
+
+    Placed generated models normally pivot around the retained mesh's bottom
+    center.  A symmetric body contains only one authored half, so that pivot
+    is not the center of the body reconstructed by the viewer.  Compensating
+    the placement here keeps paired generated leaves flush at the centerline.
+    """
+
+    authored_bounds = np.asarray(model.mesh.bounds, dtype=float)
+    reconstructed_bounds = _body_fitting_bounds(
+        model,
+        mirror,
+        target_extents=target_extents,
+    )
+    authored_anchor = _bounds_bottom_center(authored_bounds)
+    reconstructed_anchor = _bounds_bottom_center(reconstructed_bounds)
+    local_offset = np.asarray(axis_scales, dtype=float) * (
+        authored_anchor - reconstructed_anchor
+    )
+    rotation = trimesh.transformations.euler_matrix(
+        *np.radians(np.asarray(rotation_degrees, dtype=float)),
+        axes="sxyz",
+    )[:3, :3]
+    world_position = np.asarray(target_position, dtype=float) + rotation @ local_offset
+    return tuple(float(value) for value in world_position)
+
+
+def _bounds_bottom_center(bounds: np.ndarray) -> np.ndarray:
+    """Return the Z-up bottom-center anchor of finite XYZ bounds."""
+
+    normalized = np.asarray(bounds, dtype=float)
+    if normalized.shape != (2, 3) or not np.all(np.isfinite(normalized)):
+        raise ValueError("Door body bounds are invalid.")
+    return np.asarray(
+        (
+            (normalized[0, 0] + normalized[1, 0]) * 0.5,
+            (normalized[0, 1] + normalized[1, 1]) * 0.5,
+            normalized[0, 2],
+        ),
+        dtype=float,
+    )
+
+
+def _transform_body_mirror_configuration(
+    mirror: DoorBodyMirrorConfiguration | None,
+    *,
+    horizontal_mirror: bool,
+    depth_mirror: bool,
+) -> DoorBodyMirrorConfiguration | None:
+    """Follow slot-level reflections with the body's local mirror planes."""
+
+    if mirror is None:
+        return None
+    symmetric_plane = mirror.symmetric_plane_coordinate
+    if mirror.symmetric_orientation is not None:
+        symmetric_axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[
+            mirror.symmetric_orientation
+        ]
+        if (symmetric_axis == 0 and horizontal_mirror) or (
+            symmetric_axis == 1 and depth_mirror
+        ):
+            assert symmetric_plane is not None
+            symmetric_plane = -symmetric_plane
+    side_plane = mirror.side_duplication_plane_coordinate
+    if side_plane is not None and depth_mirror:
+        side_plane = -side_plane
+    return DoorBodyMirrorConfiguration(
+        symmetric_orientation=mirror.symmetric_orientation,
+        symmetric_plane_coordinate=symmetric_plane,
+        side_duplication_plane_coordinate=side_plane,
+    )
+
+
 def mirror_door_model_horizontally(model: GeneratedModel) -> GeneratedModel:
     """Return a material-preserving copy reflected across local X=0."""
 
+    return _mirror_door_model_across_axis(model, 0)
+
+
+def mirror_door_model_depthwise(model: GeneratedModel) -> GeneratedModel:
+    """Return a material-preserving copy reflected across local Y=0."""
+
+    return _mirror_door_model_across_axis(model, 1)
+
+
+def _mirror_door_model_across_axis(
+    model: GeneratedModel,
+    axis: int,
+) -> GeneratedModel:
+    """Reflect one door component while preserving every preview payload."""
+
     if not isinstance(model, GeneratedModel):
         raise TypeError("Only GeneratedModel doors can be mirrored.")
+    if axis not in {0, 1}:
+        raise ValueError("Door models can only be mirrored across X or Y.")
     reflection = np.eye(4, dtype=float)
-    reflection[0, 0] = -1.0
+    reflection[axis, axis] = -1.0
 
     preview_mesh = copy.deepcopy(model.mesh)
-    _reflect_mesh_x(preview_mesh)
+    _reflect_mesh_axis(preview_mesh, axis)
     scene = copy.deepcopy(model.scene)
-    scene.apply_transform(reflection)
+    scene.apply_transform(
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM
+        @ reflection
+        @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+    )
     glb_bytes = scene.export(file_type="glb") if scene.geometry else b""
 
     preview_untextured_mesh = None
     if model.preview_untextured_mesh is not None:
         preview_untextured_mesh = copy.deepcopy(model.preview_untextured_mesh)
-        _reflect_mesh_x(preview_untextured_mesh)
+        _reflect_mesh_axis(preview_untextured_mesh, axis)
     preview_base_mesh = None
     if model.preview_base_mesh is not None:
         preview_base_mesh = copy.deepcopy(model.preview_base_mesh)
-        _reflect_mesh_x(preview_base_mesh)
+        _reflect_mesh_axis(preview_base_mesh, axis)
     return GeneratedModel(
         mesh=preview_mesh,
         scene=scene,
@@ -552,8 +1024,9 @@ def mirror_door_model_horizontally(model: GeneratedModel) -> GeneratedModel:
         preview_textured_surfaces=list(model.preview_textured_surfaces),
         preview_untextured_mesh=preview_untextured_mesh,
         object_texture_variants=model.object_texture_variants,
-        preview_symmetric_objects=_reflect_symmetric_previews_x(
-            model.preview_symmetric_objects
+        preview_symmetric_objects=_reflect_symmetric_previews(
+            model.preview_symmetric_objects,
+            axis,
         ),
         preview_placed_objects=list(model.preview_placed_objects),
         preview_stair_parts=list(model.preview_stair_parts),
@@ -564,21 +1037,22 @@ def mirror_door_model_horizontally(model: GeneratedModel) -> GeneratedModel:
     )
 
 
-def _reflect_symmetric_previews_x(
+def _reflect_symmetric_previews(
     previews: Sequence[PreviewSymmetricObject],
+    axis: int,
 ) -> list[PreviewSymmetricObject]:
-    """Keep embedded body-only mirrors aligned with a mirrored door."""
+    """Keep embedded reconstruction previews aligned with a mirrored door."""
 
     reflected_previews: list[PreviewSymmetricObject] = []
     for preview in previews:
         retained_meshes = tuple(
-            _reflected_mesh_x(mesh) for mesh in preview.meshes
+            _reflected_mesh(mesh, axis) for mesh in preview.meshes
         )
         mirrored_meshes = tuple(
-            _reflected_mesh_x(mesh) for mesh in preview.mirrored_meshes
+            _reflected_mesh(mesh, axis) for mesh in preview.mirrored_meshes
         )
         plane_coordinate = preview.plane_coordinate
-        if SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[preview.orientation] == 0:
+        if SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[preview.orientation] == axis:
             plane_coordinate *= -1.0
         reflected_previews.append(
             PreviewSymmetricObject(
@@ -593,9 +1067,12 @@ def _reflect_symmetric_previews_x(
     return reflected_previews
 
 
-def _reflected_mesh_x(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def _reflected_mesh(
+    mesh: trimesh.Trimesh,
+    axis: int,
+) -> trimesh.Trimesh:
     reflected = copy.deepcopy(mesh)
-    _reflect_mesh_x(reflected)
+    _reflect_mesh_axis(reflected, axis)
     return reflected
 
 
@@ -766,9 +1243,9 @@ def _unwrap_mesh(
     )
 
 
-def _reflect_mesh_x(mesh: trimesh.Trimesh) -> None:
+def _reflect_mesh_axis(mesh: trimesh.Trimesh, axis: int) -> None:
     vertices = np.asarray(mesh.vertices, dtype=float).copy()
-    vertices[:, 0] *= -1.0
+    vertices[:, axis] *= -1.0
     mesh.vertices = vertices
     mesh.faces = np.ascontiguousarray(
         np.asarray(mesh.faces, dtype=np.int64)[:, (0, 2, 1)]
@@ -780,6 +1257,12 @@ def _require_door_definition(door: object) -> DoorDefinition:
     if not isinstance(door, DoorDefinition):
         raise TypeError("Door geometry requires a DoorDefinition.")
     return door
+
+
+def _require_window_definition(window: object) -> WindowDefinition:
+    if not isinstance(window, WindowDefinition):
+        raise TypeError("Window geometry requires a WindowDefinition.")
+    return window
 
 
 def _normalize_positive_measurement(value: object, label: str) -> float:

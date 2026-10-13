@@ -82,41 +82,8 @@ class ObjectMaskTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(self.view.get_mask()), 0)
 
 
-# ### Reference-edit input tests ###
-class ReferenceEditInputTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.view = VideoInpaintView()
-        frame = np.zeros((80, 120, 3), dtype=np.uint8)
-        frame[:, :] = (15, 45, 90)
-        self.view.set_frame(frame, [_stroke(0.5, 0.5, 0.2)])
-
-    def tearDown(self) -> None:
-        self.view.close()
-
-    def test_build_source_encodes_object_selection_in_its_alpha(self) -> None:
-        source_bgra = self.view.build_reference_edit_source(
-            padding_ratio=0.1
-        )
-
-        self.assertEqual(source_bgra.shape[2], 4)
-        self.assertGreater(np.count_nonzero(source_bgra[:, :, 3]), 0)
-        self.assertGreater(np.count_nonzero(source_bgra[:, :, 3] == 0), 0)
-
-    def test_build_source_rejects_multiple_object_blobs(self) -> None:
-        self.view.set_strokes([_stroke(0.2, 0.5), _stroke(0.8, 0.5)])
-
-        with self.assertRaisesRegex(ValueError, "exactly one connected object"):
-            self.view.build_reference_edit_source()
-
-    def test_build_source_requires_an_object_selection(self) -> None:
-        self.view.set_strokes([])
-
-        with self.assertRaisesRegex(ValueError, "one selected object"):
-            self.view.build_reference_edit_source()
-
-
-# ### Reference preview tests ###
-class ReferencePreviewTests(unittest.TestCase):
+# ### Temporary image preview tests ###
+class TemporaryReferencePreviewTests(unittest.TestCase):
     def setUp(self) -> None:
         self.view = VideoInpaintView()
         self.view.resize(400, 300)

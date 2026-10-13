@@ -26,7 +26,6 @@ from housemaker.surface_geometry import (
     build_wall_window_placement,
 )
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -180,13 +179,11 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
                 if surface.surface_type == "wall"
             },
         )
-        assert self.workspace.viewer.window_tools_status_label is not None
         self.assertEqual(
-            self.workspace.viewer.window_tools_status_label.text(),
-            "Window added.",
+            self.workspace._canvas_window_undo_ids,
+            [level.windows[0].window_id],
         )
-        assert self.workspace.viewer.undo_window_button is not None
-        self.assertTrue(self.workspace.viewer.undo_window_button.isEnabled())
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
         self.assertIsNone(self.workspace.surface_texture_generation.surface_view)
         surface_wall = self.workspace.viewer._canvas_surface_targets.get(
             wall.surface_id
@@ -199,7 +196,7 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             self.workspace.canvas_viewer_workspace
         )
         _qt_application.processEvents()
-        self.workspace.viewer.undo_window_button.click()
+        self.workspace.viewer.undo_requested.emit()
 
         self.assertEqual(level.windows, [])
         restored_wall = _get_target_wall(level)
@@ -210,11 +207,8 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertIsNotNone(restored_surface_wall)
         assert restored_surface_wall is not None
         self.assertAlmostEqual(restored_surface_wall.area_square_meters, 6.0)
-        self.assertFalse(self.workspace.viewer.undo_window_button.isEnabled())
-        self.assertEqual(
-            self.workspace.viewer.window_tools_status_label.text(),
-            "Window undone.",
-        )
+        self.assertEqual(self.workspace._canvas_window_undo_ids, [])
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_window_undo_is_lifo_across_successful_commits(self) -> None:
         level = _build_square_level()
@@ -235,18 +229,21 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         )
         self.workspace._handle_canvas_window_placement_requested(second_placement)
         second_window = level.windows[1]
-        assert self.workspace.viewer.undo_window_button is not None
 
-        self.workspace.viewer.undo_window_button.click()
+        self.workspace.viewer.undo_requested.emit()
 
         self.assertEqual(level.windows, [first_window])
         self.assertNotIn(second_window, level.windows)
-        self.assertTrue(self.workspace.viewer.undo_window_button.isEnabled())
+        self.assertEqual(
+            self.workspace._canvas_window_undo_ids,
+            [first_window.window_id],
+        )
 
-        self.workspace.viewer.undo_window_button.click()
+        self.workspace.viewer.undo_requested.emit()
 
         self.assertEqual(level.windows, [])
-        self.assertFalse(self.workspace.viewer.undo_window_button.isEnabled())
+        self.assertEqual(self.workspace._canvas_window_undo_ids, [])
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_window_undo_restores_both_wall_faces_and_removes_reveal(
         self,
@@ -293,8 +290,7 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             )
         )
 
-        assert self.workspace.viewer.undo_window_button is not None
-        self.workspace.viewer.undo_window_button.click()
+        self.workspace.viewer.undo_requested.emit()
 
         restored_surfaces = {
             surface.surface_id: surface
@@ -395,19 +391,10 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
                     self.workspace._canvas_window_undo_ids,
                     history_before,
                 )
-                assert self.workspace.viewer.undo_window_button is not None
-                self.assertTrue(
-                    self.workspace.viewer.undo_window_button.isEnabled()
-                )
                 set_model.assert_not_called()
                 set_wall_targets.assert_not_called()
                 set_surface_levels.assert_not_called()
                 set_preview_model.assert_not_called()
-                assert self.workspace.viewer.window_tools_status_label is not None
-                self.assertTrue(
-                    self.workspace.viewer.window_tools_status_label.text()
-                    .startswith("Window could not be undone")
-                )
 
     def test_failed_model_refresh_rolls_back_only_the_new_window(self) -> None:
         for failure_kind in ("none", "exception"):
@@ -465,11 +452,6 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
                 set_model.assert_not_called()
                 set_wall_targets.assert_not_called()
                 set_preview_model.assert_not_called()
-                assert self.workspace.viewer.window_tools_status_label is not None
-                self.assertTrue(
-                    self.workspace.viewer.window_tools_status_label.text()
-                    .startswith("Window not added")
-                )
 
     def test_project_replacement_keeps_loaded_windows_but_clears_undo_history(
         self,
@@ -504,10 +486,9 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
 
         self.assertEqual(loaded_level.windows, [loaded_window])
         self.assertEqual(self.workspace._canvas_window_undo_ids, [])
-        assert self.workspace.viewer.undo_window_button is not None
-        self.assertFalse(self.workspace.viewer.undo_window_button.isEnabled())
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
-    def test_detached_canvas_keeps_undo_tools_and_uses_canvas_add_button(
+    def test_detached_scene_has_no_window_widgets_and_keeps_canvas_add_button(
         self,
     ) -> None:
         level = _build_square_level()
@@ -527,16 +508,15 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         panel = viewer.window_tools_panel
         button = self.workspace.add_window_button
         undo_button = viewer.undo_window_button
-        self.assertIsNotNone(panel)
-        self.assertIsNotNone(undo_button)
+        self.assertIs(panel, viewer.canvas_tools_panel)
         assert panel is not None
-        assert undo_button is not None
+        self.assertIsNone(undo_button)
+        self.assertIsNone(viewer.window_tools_status_label)
         self.assertFalse(hasattr(viewer, "add_window_button"))
         self.assertIsNone(
             panel.findChild(type(button), "canvas-add-window-button")
         )
         self.assertFalse(viewer.isAncestorOf(button))
-        viewer.set_window_undo_available(True)
 
         screen = _primary_screen()
         with patch(
@@ -554,18 +534,13 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             host.window,
         )
         self.assertIs(viewer.parentWidget(), self.workspace.scene_3d_workspace)
+        self.assertIs(viewer.window_tools_panel, panel)
         self.assertTrue(viewer.isAncestorOf(panel))
         self.assertTrue(panel.isVisibleTo(host.window))
         self.assertGreaterEqual(panel.geometry().left(), viewer.view.width())
-        self.assertEqual(button.text(), "Add window")
+        self.assertIsNone(viewer.undo_window_button)
+        self.assertEqual(button.text(), "Add window frame")
         self.assertTrue(button.isEnabled())
-        self.assertEqual(undo_button.text(), "Undo window")
-        self.assertTrue(undo_button.isEnabled())
-        button.click()
-        self.assertTrue(viewer.is_window_placement_active())
-        self.assertFalse(undo_button.isEnabled())
-        viewer.cancel_window_placement(status_message=None)
-        self.assertTrue(undo_button.isEnabled())
 
         self.workspace._apply_scene_3d_display_screen(None)
         _qt_application.processEvents()
@@ -578,8 +553,8 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             self.workspace.scene_3d_workspace,
         )
         self.assertIs(viewer.window_tools_panel, panel)
-        self.assertIs(viewer.undo_window_button, undo_button)
-        self.assertTrue(undo_button.isEnabled())
+        self.assertIsNone(viewer.undo_window_button)
+        self.assertFalse(viewer.isAncestorOf(button))
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
 
 

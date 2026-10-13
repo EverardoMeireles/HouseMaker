@@ -158,6 +158,7 @@ _REPEAT_CLIP_EPSILON = 1e-12
 _REPAIRED_POINT_CHART_EXTENT = 2.0
 _REPAIRED_LINE_CHART_HEIGHT = 2.0
 _REPAIRED_CHART_MARGIN = 1.0
+_MAX_AXIS_SPLIT_PLANES = 64
 
 
 # ### Public data models ###
@@ -831,6 +832,75 @@ def clip_glb_to_axis_half(
         kept_side=kept_side,
         plane_coordinate=resolved_plane,
     )
+
+
+def split_scene_at_z_up_axis_planes(
+    scene: trimesh.Scene,
+    *,
+    axis: int,
+    plane_coordinates: Sequence[float],
+) -> int:
+    """Split scene triangles at Z-up planes while interpolating attributes.
+
+    The scene graph, node names, materials, and texture pixels stay in place.
+    Only geometry crossed by a requested plane is retessellated, with UVs,
+    normals, colors, and face-material ownership interpolated or copied.
+    The returned count is the number of geometry primitives that changed.
+    """
+
+    if not isinstance(scene, trimesh.Scene):
+        raise TypeError("Axis-plane splitting requires a mesh scene.")
+    _validate_axis_half_request(axis, AXIS_HALF_SIDE_NEGATIVE)
+    if isinstance(plane_coordinates, str | bytes | bytearray):
+        raise TypeError("Axis split planes must be a numeric sequence.")
+    try:
+        raw_planes = tuple(plane_coordinates)
+    except TypeError as error:
+        raise TypeError("Axis split planes must be a numeric sequence.") from error
+    if len(raw_planes) > _MAX_AXIS_SPLIT_PLANES:
+        raise ValueError("Axis-plane splitting received too many planes.")
+    planes: list[float] = []
+    for raw_plane in raw_planes:
+        if isinstance(raw_plane, bool):
+            raise TypeError("Axis split planes must be finite numbers.")
+        try:
+            plane = float(raw_plane)
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "Axis split planes must be finite numbers."
+            ) from error
+        if not math.isfinite(plane):
+            raise ValueError("Axis split planes must be finite numbers.")
+        if not any(math.isclose(plane, known, abs_tol=1e-12) for known in planes):
+            planes.append(plane)
+    if not planes:
+        return 0
+    planes.sort()
+
+    instances = _collect_mesh_instances(scene)
+    changed_count = 0
+    for instance in instances:
+        minimum = float(np.min(instance.world_vertices[:, axis]))
+        maximum = float(np.max(instance.world_vertices[:, axis]))
+        epsilon = max(1.0, maximum - minimum) * _CLIP_RELATIVE_EPSILON
+        crossing_planes = tuple(
+            plane
+            for plane in planes
+            if minimum + epsilon < plane < maximum - epsilon
+        )
+        if not crossing_planes:
+            continue
+        split_mesh = _split_instance_mesh_at_axis_planes(
+            instance,
+            axis=axis,
+            plane_coordinates=crossing_planes,
+            epsilon=epsilon,
+        )
+        if split_mesh is None:
+            continue
+        scene.geometry[instance.geometry_name] = split_mesh
+        changed_count += 1
+    return changed_count
 
 
 def build_axis_mirror_retexture_proxy_glb(
@@ -1538,6 +1608,195 @@ def _clip_instance_mesh(
     )
 
 
+def _split_instance_mesh_at_axis_planes(
+    instance: _MeshInstance,
+    *,
+    axis: int,
+    plane_coordinates: Sequence[float],
+    epsilon: float,
+) -> trimesh.Trimesh | None:
+    """Retessellate one primitive wherever its faces cross axis planes."""
+
+    source_mesh = instance.mesh
+    source_vertices = np.asarray(source_mesh.vertices, dtype=float)
+    source_faces = np.asarray(source_mesh.faces, dtype=np.int64)
+    source_normals = _get_vertex_normals(source_mesh)
+    source_uvs = _get_vertex_uvs(source_mesh, allow_repeat=True)
+    source_vertex_colors = _get_vertex_colors(source_mesh)
+    source_face_colors = _get_face_colors(source_mesh)
+    source_face_materials = _get_face_materials(source_mesh)
+
+    output_vertices: list[np.ndarray] = []
+    output_normals: list[np.ndarray] = []
+    output_uvs: list[np.ndarray] = []
+    output_vertex_colors: list[np.ndarray] = []
+    output_faces: list[tuple[int, int, int]] = []
+    output_face_materials: list[int] = []
+    output_face_colors: list[np.ndarray] = []
+    output_index_by_key: dict[tuple[object, ...], int] = {}
+    changed = False
+
+    for face_index, face in enumerate(source_faces):
+        first_plane = float(plane_coordinates[0])
+        polygons = [
+            [
+                _build_clip_vertex(
+                    vertex_index=int(vertex_index),
+                    instance=instance,
+                    source_vertices=source_vertices,
+                    source_normals=source_normals,
+                    source_uvs=source_uvs,
+                    source_vertex_colors=source_vertex_colors,
+                    axis=axis,
+                    plane_coordinate=first_plane,
+                    direction=1.0,
+                )
+                for vertex_index in face
+            ]
+        ]
+        for plane_coordinate in plane_coordinates:
+            next_polygons: list[list[_ClipVertex]] = []
+            for polygon in polygons:
+                coordinates = np.asarray(
+                    [vertex.world_position[axis] for vertex in polygon],
+                    dtype=float,
+                )
+                if (
+                    float(np.min(coordinates)) >= plane_coordinate - epsilon
+                    or float(np.max(coordinates)) <= plane_coordinate + epsilon
+                ):
+                    next_polygons.append(polygon)
+                    continue
+                changed = True
+                for direction in (-1.0, 1.0):
+                    directed_polygon = [
+                        replace(
+                            vertex,
+                            distance=(
+                                float(vertex.world_position[axis])
+                                - plane_coordinate
+                            )
+                            * direction,
+                        )
+                        for vertex in polygon
+                    ]
+                    clipped = _clip_polygon_to_half_space(
+                        directed_polygon,
+                        epsilon,
+                    )
+                    if len(clipped) >= 3:
+                        next_polygons.append(clipped)
+            polygons = next_polygons
+
+        for polygon in polygons:
+            for corner_index in range(1, len(polygon) - 1):
+                triangle = (
+                    polygon[0],
+                    polygon[corner_index],
+                    polygon[corner_index + 1],
+                )
+                if _is_degenerate_triangle(triangle, epsilon):
+                    continue
+                triangle_indices = tuple(
+                    _append_axis_split_output_vertex(
+                        vertex,
+                        output_vertices=output_vertices,
+                        output_normals=output_normals,
+                        output_uvs=output_uvs,
+                        output_vertex_colors=output_vertex_colors,
+                        output_index_by_key=output_index_by_key,
+                    )
+                    for vertex in triangle
+                )
+                if len(set(triangle_indices)) < 3:
+                    continue
+                output_faces.append(triangle_indices)
+                if source_face_materials is not None:
+                    output_face_materials.append(
+                        int(source_face_materials[face_index])
+                    )
+                if source_face_colors is not None:
+                    output_face_colors.append(
+                        source_face_colors[face_index].copy()
+                    )
+
+    if not changed:
+        return None
+    if not output_faces:
+        raise ValueError("Axis-plane splitting removed every source face.")
+    return _build_output_mesh(
+        source_mesh,
+        vertices=np.asarray(output_vertices, dtype=float),
+        faces=np.asarray(output_faces, dtype=np.int64),
+        normals=np.asarray(output_normals, dtype=float),
+        uvs=(
+            np.asarray(output_uvs, dtype=float)
+            if source_uvs is not None
+            else None
+        ),
+        vertex_colors=(
+            np.asarray(output_vertex_colors)
+            if source_vertex_colors is not None
+            else None
+        ),
+        face_colors=(
+            np.asarray(output_face_colors)
+            if source_face_colors is not None
+            else None
+        ),
+        face_materials=(
+            np.asarray(output_face_materials, dtype=np.int64)
+            if source_face_materials is not None
+            else None
+        ),
+    )
+
+
+def _append_axis_split_output_vertex(
+    vertex: _ClipVertex,
+    *,
+    output_vertices: list[np.ndarray],
+    output_normals: list[np.ndarray],
+    output_uvs: list[np.ndarray],
+    output_vertex_colors: list[np.ndarray],
+    output_index_by_key: dict[tuple[object, ...], int],
+) -> int:
+    """Append one split vertex with identical source lineage and attributes."""
+
+    key = (
+        vertex.source_indices,
+        *tuple(np.round(vertex.local_position, decimals=12)),
+        *tuple(np.round(vertex.normal, decimals=12)),
+        *(
+            ()
+            if vertex.uv is None
+            else tuple(np.round(vertex.uv, decimals=12))
+        ),
+        *(
+            ()
+            if vertex.vertex_color is None
+            else tuple(np.round(vertex.vertex_color, decimals=8))
+        ),
+    )
+    output_index = output_index_by_key.get(key)
+    if output_index is not None:
+        return output_index
+    output_index = len(output_vertices)
+    output_index_by_key[key] = output_index
+    output_vertices.append(vertex.local_position.copy())
+    output_normals.append(
+        _normalize_vector(
+            vertex.normal,
+            fallback=np.asarray((0.0, 0.0, 1.0), dtype=float),
+        )
+    )
+    if vertex.uv is not None:
+        output_uvs.append(vertex.uv.copy())
+    if vertex.vertex_color is not None:
+        output_vertex_colors.append(vertex.vertex_color.copy())
+    return output_index
+
+
 def _build_clip_vertex(
     *,
     vertex_index: int,
@@ -1674,6 +1933,22 @@ def _build_output_mesh(
     face_colors: np.ndarray | None,
     face_materials: np.ndarray | None,
 ) -> trimesh.Trimesh:
+    normalized_vertex_colors = vertex_colors
+    source_vertex_colors = _get_vertex_colors(source_mesh)
+    if vertex_colors is not None and source_vertex_colors is not None:
+        source_color_dtype = source_vertex_colors.dtype
+        color_values = np.asarray(vertex_colors, dtype=float)
+        if np.issubdtype(source_color_dtype, np.integer):
+            color_bounds = np.iinfo(source_color_dtype)
+            color_values = np.clip(
+                np.rint(color_values),
+                color_bounds.min,
+                color_bounds.max,
+            )
+        normalized_vertex_colors = color_values.astype(
+            source_color_dtype,
+            copy=False,
+        )
     output = trimesh.Trimesh(
         vertices=vertices,
         faces=faces,
@@ -1688,10 +1963,15 @@ def _build_output_mesh(
             material=copy.deepcopy(source_mesh.visual.material),
             face_materials=face_materials,
         )
-    elif vertex_colors is not None or face_colors is not None:
+    elif isinstance(source_mesh.visual, TextureVisuals):
+        output.visual = TextureVisuals(
+            material=copy.deepcopy(source_mesh.visual.material),
+            face_materials=face_materials,
+        )
+    elif normalized_vertex_colors is not None or face_colors is not None:
         output.visual = ColorVisuals(
             mesh=output,
-            vertex_colors=vertex_colors,
+            vertex_colors=normalized_vertex_colors,
             face_colors=face_colors,
         )
     return output
@@ -5051,7 +5331,9 @@ def _interpolate(
     second: np.ndarray,
     fraction: float,
 ) -> np.ndarray:
-    return np.asarray(first + (second - first) * fraction)
+    first_values = np.asarray(first, dtype=float)
+    second_values = np.asarray(second, dtype=float)
+    return first_values + (second_values - first_values) * fraction
 
 
 def _interpolate_optional(

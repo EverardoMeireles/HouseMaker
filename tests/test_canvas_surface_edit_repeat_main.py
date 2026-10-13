@@ -32,7 +32,6 @@ from housemaker.surface_geometry import (
     build_fixed_surfaces,
 )
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -457,11 +456,6 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
             restored_x_target.chain_vertex_image_positions[-1],
             (100.0, 0.0),
         )
-        assert self.workspace.viewer.window_tools_status_label is not None
-        self.assertIn(
-            "invalid repeated wall edit",
-            self.workspace.viewer.window_tools_status_label.text(),
-        )
 
     def test_multi_wall_mixed_burst_failure_restores_complete_graph(
         self,
@@ -525,11 +519,6 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         )
         self._assert_twelve_selected_wall_handles(
             (first_wall.surface_id, second_wall.surface_id)
-        )
-        assert self.workspace.viewer.window_tools_status_label is not None
-        self.assertIn(
-            "invalid multi-wall burst",
-            self.workspace.viewer.window_tools_status_label.text(),
         )
 
     def test_selecting_another_surface_flushes_the_pending_wall_edit(

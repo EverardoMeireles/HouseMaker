@@ -26,12 +26,20 @@ from housemaker.door_state import (
     DOOR_SLOT_BACK_KNOB,
     DOOR_SLOT_BODY,
     DOOR_SLOT_KNOB,
+    DOOR_SLOT_LEFT_BODY,
+    DOOR_SLOT_LEFT_KNOB,
     DoorDefinition,
     DoorLibraryData,
     DoorPlacement,
     DoorSlotData,
+    GlassAreaData,
+    WindowDefinition,
+    WindowPlacement,
 )
-from housemaker.doors_workspace import DoorsWorkspace
+from housemaker.doors_workspace import (
+    ASSET_KIND_WINDOW,
+    DoorsWorkspace,
+)
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -66,6 +74,34 @@ def _door(
                 source_object_id=f"{door_id}-knob",
             ),
         ),
+    )
+
+
+def _window(
+    window_id: str = "window-1",
+    *,
+    name: str = "New window 1",
+    glass_areas: tuple[GlassAreaData, ...] = (),
+) -> WindowDefinition:
+    return WindowDefinition(
+        window_id=window_id,
+        name=name,
+        source_window_frame_id=f"window-frame-{window_id}",
+        width_meters=1.2,
+        height_meters=1.0,
+        thickness_meters=0.04,
+        slots=(
+            DoorSlotData(
+                slot_id=DOOR_SLOT_BODY,
+                source_object_id=f"{window_id}-body",
+                joined=True,
+            ),
+            DoorSlotData(
+                slot_id=DOOR_SLOT_KNOB,
+                source_object_id=f"{window_id}-handle",
+            ),
+        ),
+        glass_areas=glass_areas,
     )
 
 
@@ -110,7 +146,7 @@ class DoorsWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.workspace.door_tree.columnCount(), 1)
         self.assertEqual(
             self.workspace.door_tree.headerItem().text(0),
-            "Door / slot",
+            "Door, window / part",
         )
         self.assertEqual(self.workspace.door_tree.topLevelItemCount(), 1)
         door_item = self.workspace.door_tree.topLevelItem(0)
@@ -118,10 +154,286 @@ class DoorsWorkspaceTests(unittest.TestCase):
         self.assertEqual(door_item.childCount(), 2)
         self.assertEqual(
             [door_item.child(index).text(0) for index in range(2)],
-            ["Body", "Door knob/handle"],
+            ["Body", "Handle"],
         )
-        self.assertEqual(self.workspace.profile_shape_label.text(), "Arched (35%)")
-        self.assertIn("2.100 m H", self.workspace.profile_dimensions_label.text())
+
+    def test_profile_section_and_its_legacy_text_labels_are_removed(self) -> None:
+        self.assertFalse(hasattr(self.workspace, "profile_group"))
+        self.assertFalse(hasattr(self.workspace, "profile_name_label"))
+        self.assertFalse(hasattr(self.workspace, "profile_shape_label"))
+        self.assertFalse(hasattr(self.workspace, "profile_dimensions_label"))
+        self.assertFalse(hasattr(self.workspace, "profile_source_label"))
+
+    def test_tree_shows_windows_with_body_and_handle_slots(self) -> None:
+        door = _door()
+        window = _window()
+
+        self.workspace.set_data(
+            DoorLibraryData(doors=[door], windows=[window])
+        )
+
+        self.assertEqual(self.workspace.door_tree.topLevelItemCount(), 2)
+        window_item = self.workspace.door_tree.topLevelItem(1)
+        self.assertEqual(window_item.text(0), window.name)
+        self.assertEqual(
+            [window_item.child(index).text(0) for index in range(2)],
+            ["Body", "Handle"],
+        )
+        self.assertTrue(
+            self.workspace.select_window_slot(
+                window.window_id,
+                DOOR_SLOT_KNOB,
+            )
+        )
+        self.assertEqual(self.workspace.selected_asset_kind(), ASSET_KIND_WINDOW)
+        self.assertEqual(self.workspace.selected_window_id(), window.window_id)
+        self.assertEqual(self.workspace.selected_door_id(), None)
+        self.assertEqual(
+            self.workspace.selected_window_slot(),
+            window.get_slot(DOOR_SLOT_KNOB),
+        )
+        self.assertTrue(self.workspace.make_double_checkbox.isEnabled())
+        self.assertTrue(self.workspace.make_double_sided_checkbox.isEnabled())
+
+    def test_window_selection_and_slot_requests_are_asset_aware(self) -> None:
+        window = _window()
+        selections: list[tuple[object, ...]] = []
+        edit_requests: list[tuple[object, ...]] = []
+        legacy_requests: list[tuple[object, ...]] = []
+        self.workspace.asset_selection_changed.connect(
+            lambda *values: selections.append(values)
+        )
+        self.workspace.asset_slot_edit_requested.connect(
+            lambda *values: edit_requests.append(values)
+        )
+        self.workspace.slot_edit_requested.connect(
+            lambda *values: legacy_requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+        window_item = self.workspace.door_tree.topLevelItem(0)
+        handle_item = window_item.child(1)
+
+        self.workspace.door_tree.itemDoubleClicked.emit(handle_item, 0)
+
+        self.assertEqual(
+            edit_requests,
+            [(ASSET_KIND_WINDOW, window.window_id, DOOR_SLOT_KNOB)],
+        )
+        self.assertEqual(legacy_requests, [])
+        self.assertIn(
+            (
+                ASSET_KIND_WINDOW,
+                window.window_id,
+                DOOR_SLOT_BODY,
+                None,
+            ),
+            selections,
+        )
+
+    def test_delete_button_requests_the_selected_asset_owner(self) -> None:
+        door = _door()
+        window = _window()
+        original_data = DoorLibraryData(doors=[door], windows=[window])
+        requests: list[tuple[str, str]] = []
+        self.workspace.asset_delete_requested.connect(
+            lambda *values: requests.append(values)
+        )
+
+        self.assertEqual(self.workspace.delete_asset_button.text(), "Delete")
+        self.assertEqual(
+            self.workspace.delete_asset_button.objectName(),
+            "delete_opening_asset_button",
+        )
+        self.assertFalse(self.workspace.delete_asset_button.isEnabled())
+        self.workspace.set_data(original_data)
+        self.assertTrue(
+            self.workspace.select_window_slot(
+                window.window_id,
+                DOOR_SLOT_KNOB,
+            )
+        )
+
+        self.workspace.delete_asset_button.click()
+
+        self.assertEqual(
+            requests,
+            [(ASSET_KIND_WINDOW, window.window_id)],
+        )
+        self.assertEqual(self.workspace.data(), original_data)
+        self.workspace.set_data(DoorLibraryData())
+        self.assertFalse(self.workspace.delete_asset_button.isEnabled())
+
+    def test_window_double_controls_emit_only_asset_aware_requests(self) -> None:
+        window = _window()
+        double_requests: list[tuple[object, ...]] = []
+        sided_requests: list[tuple[object, ...]] = []
+        legacy_double_requests: list[tuple[object, ...]] = []
+        legacy_sided_requests: list[tuple[object, ...]] = []
+        self.workspace.asset_make_double_changed.connect(
+            lambda *values: double_requests.append(values)
+        )
+        self.workspace.asset_make_double_sided_changed.connect(
+            lambda *values: sided_requests.append(values)
+        )
+        self.workspace.make_double_changed.connect(
+            lambda *values: legacy_double_requests.append(values)
+        )
+        self.workspace.make_double_sided_changed.connect(
+            lambda *values: legacy_sided_requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+
+        self.workspace.make_double_checkbox.click()
+        self.assertEqual(
+            double_requests,
+            [(ASSET_KIND_WINDOW, window.window_id, True)],
+        )
+
+        doubled = window.with_double(True)
+        self.workspace.upsert_window(doubled, select_body=True)
+        self.workspace.make_double_sided_checkbox.click()
+        self.assertEqual(
+            sided_requests,
+            [(ASSET_KIND_WINDOW, window.window_id, True)],
+        )
+        self.assertEqual(legacy_double_requests, [])
+        self.assertEqual(legacy_sided_requests, [])
+
+    def test_double_sided_double_window_groups_all_slots_by_face(self) -> None:
+        window = _window().with_double(True).with_double_sided(True)
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+
+        window_item = self.workspace.door_tree.topLevelItem(0)
+        self.assertEqual(window_item.childCount(), 2)
+        front_item = window_item.child(0)
+        back_item = window_item.child(1)
+        self.assertEqual(front_item.text(0), "Front")
+        self.assertEqual(back_item.text(0), "Back")
+        self.assertEqual(
+            [front_item.child(index).text(0) for index in range(4)],
+            ["Body right", "Body left", "Handle right", "Handle left"],
+        )
+        self.assertEqual(
+            [back_item.child(index).text(0) for index in range(4)],
+            ["Body right", "Body left", "Handle right", "Handle left"],
+        )
+        self.assertTrue(self.workspace.make_double_checkbox.isChecked())
+        self.assertTrue(self.workspace.make_double_sided_checkbox.isChecked())
+
+    def test_window_ctrl_copy_and_paste_emits_asset_counterpart_request(
+        self,
+    ) -> None:
+        window = _window().with_double(True)
+        asset_requests: list[tuple[object, ...]] = []
+        legacy_requests: list[tuple[object, ...]] = []
+        self.workspace.asset_slot_mesh_paste_requested.connect(
+            lambda *values: asset_requests.append(values)
+        )
+        self.workspace.slot_mesh_paste_requested.connect(
+            lambda *values: legacy_requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+
+        self.workspace.select_window_slot(window.window_id, DOOR_SLOT_BODY)
+        self.workspace.copy_slot_shortcut.activated.emit()
+        self.workspace.select_window_slot(window.window_id, DOOR_SLOT_LEFT_BODY)
+        self.workspace.paste_slot_shortcut.activated.emit()
+
+        self.assertEqual(
+            asset_requests,
+            [
+                (
+                    ASSET_KIND_WINDOW,
+                    window.window_id,
+                    DOOR_SLOT_BODY,
+                    DOOR_SLOT_LEFT_BODY,
+                )
+            ],
+        )
+        self.assertEqual(legacy_requests, [])
+
+    def test_window_upsert_and_remove_preserve_door_library_data(self) -> None:
+        door = _door()
+        window = _window()
+        door_placement = DoorPlacement(
+            placement_id="door-placement",
+            door_id=door.door_id,
+            level_index=0,
+            doorway_id="doorway-1",
+        )
+        window_placement = WindowPlacement(
+            placement_id="window-placement",
+            window_id=window.window_id,
+            level_index=0,
+            window_frame_id="window-frame-1",
+        )
+        self.workspace.set_data(
+            DoorLibraryData(
+                doors=[door],
+                placements=[door_placement],
+                windows=[window],
+                window_placements=[window_placement],
+            )
+        )
+
+        self.workspace.upsert_window(
+            replace(window, name="Kitchen window"),
+            select_body=True,
+        )
+
+        self.assertEqual(self.workspace.selected_window_id(), window.window_id)
+        self.assertEqual(self.workspace.selected_slot_id(), DOOR_SLOT_BODY)
+        self.assertEqual(self.workspace.data().doors, [door])
+        self.assertEqual(self.workspace.data().placements, [door_placement])
+        self.assertTrue(self.workspace.remove_window(window.window_id))
+        self.assertEqual(self.workspace.data().doors, [door])
+        self.assertEqual(self.workspace.data().placements, [door_placement])
+        self.assertEqual(self.workspace.data().windows, [])
+        self.assertEqual(self.workspace.data().window_placements, [])
+
+    def test_glass_area_leaf_selects_without_opening_generation(self) -> None:
+        glass_area = GlassAreaData(
+            glass_area_id="glass-1",
+            source_object_id="window-1-glass-1",
+            name="Glass area 1",
+            minimum_x_ratio=0.2,
+            maximum_x_ratio=0.8,
+            minimum_z_ratio=0.1,
+            maximum_z_ratio=0.9,
+        )
+        window = _window(glass_areas=(glass_area,))
+        edit_requests: list[tuple[object, ...]] = []
+        glass_requests: list[tuple[object, ...]] = []
+        self.workspace.asset_slot_edit_requested.connect(
+            lambda *values: edit_requests.append(values)
+        )
+        self.workspace.glass_area_creation_requested.connect(
+            lambda *values: glass_requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+        window_item = self.workspace.door_tree.topLevelItem(0)
+        glass_item = window_item.child(2)
+
+        self.workspace.door_tree.setCurrentItem(glass_item)
+        self.workspace.door_tree.itemDoubleClicked.emit(glass_item, 0)
+
+        self.assertEqual(self.workspace.selected_glass_area(), glass_area)
+        self.assertEqual(self.workspace.selected_asset_slot(), None)
+        self.assertEqual(edit_requests, [])
+        self.assertFalse(
+            self.workspace.confirm_slot_position_button.isEnabled()
+        )
+        self.workspace.add_glass_area_button.click()
+        self.assertEqual(
+            glass_requests,
+            [
+                (
+                    ASSET_KIND_WINDOW,
+                    window.window_id,
+                    window.get_slot(DOOR_SLOT_BODY).source_object_id,
+                )
+            ],
+        )
 
     def test_double_sided_door_groups_front_and_back_slots(self) -> None:
         door = _door().with_double_sided(True)
@@ -142,11 +454,11 @@ class DoorsWorkspaceTests(unittest.TestCase):
         self.assertTrue(back_item.isExpanded())
         self.assertEqual(
             [front_item.child(index).text(0) for index in range(2)],
-            ["Body", "Door knob/handle"],
+            ["Body", "Handle"],
         )
         self.assertEqual(
             [back_item.child(index).text(0) for index in range(2)],
-            ["Body", "Door knob/handle"],
+            ["Body", "Handle"],
         )
         self.assertTrue(self.workspace.make_double_sided_checkbox.isChecked())
         self.assertTrue(
@@ -183,47 +495,170 @@ class DoorsWorkspaceTests(unittest.TestCase):
             [(door.door_id, True), (door.door_id, False)],
         )
 
-    def test_generate_displacement_checkbox_tracks_door_and_requests_change(
+    def test_make_double_shows_contextual_left_and_right_slots(self) -> None:
+        door = _door().with_double(True)
+
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+
+        door_item = self.workspace.door_tree.topLevelItem(0)
+        self.assertEqual(door_item.childCount(), 4)
+        self.assertEqual(
+            [door_item.child(index).text(0) for index in range(4)],
+            ["Body right", "Body left", "Handle right", "Handle left"],
+        )
+        self.assertTrue(self.workspace.make_double_checkbox.isChecked())
+
+    def test_preview_editing_controls_follow_double_asset_state(self) -> None:
+        """Cursor lighting is optional and proportional editing is contextual."""
+
+        self.assertTrue(self.workspace.cursor_light_checkbox.isChecked())
+        self.assertTrue(
+            self.workspace.preview_viewer.is_hover_point_light_enabled()
+        )
+        self.assertTrue(self.workspace.proportional_editing_checkbox.isChecked())
+        self.assertTrue(self.workspace.proportional_editing_checkbox.isHidden())
+
+        door = _door().with_double(True)
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+
+        self.assertFalse(self.workspace.proportional_editing_checkbox.isHidden())
+        self.assertTrue(self.workspace.is_proportional_editing_enabled())
+        self.workspace.cursor_light_checkbox.click()
+        self.assertFalse(
+            self.workspace.preview_viewer.is_hover_point_light_enabled()
+        )
+
+        self.workspace.set_data(DoorLibraryData(doors=[_door()]))
+        self.assertTrue(self.workspace.proportional_editing_checkbox.isHidden())
+        self.assertFalse(self.workspace.is_proportional_editing_enabled())
+
+    def test_proportional_counterpart_follows_every_live_transform_preview(
         self,
     ) -> None:
+        """Mirror the other leaf before the source gizmo is released."""
+
+        door = _door().with_double(True)
+        slot_models = build_default_door_slot_models(door)
+        handle_model = build_door_body_model(
+            0.08,
+            0.12,
+            0.04,
+            shape="rectangular",
+            arch_amount=0.0,
+            geometry_name="generated_handle_fixture",
+        )
+        for slot_id in (DOOR_SLOT_KNOB, DOOR_SLOT_LEFT_KNOB):
+            slot = door.get_slot(slot_id)
+            assert slot is not None
+            slot_models[slot.source_object_id] = handle_model
+        complete_model = assemble_door_model(
+            door,
+            slot_models,
+            include_unjoined=True,
+        )
+        right = door.get_slot(DOOR_SLOT_KNOB)
+        left = door.get_slot(DOOR_SLOT_LEFT_KNOB)
+        assert right is not None and left is not None
+
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+        self.workspace.select_door_slot(door.door_id, right.slot_id)
+        self.workspace.set_preview_model(complete_model)
+
+        self.workspace.preview_viewer.placed_object_transform_preview_changed.emit(
+            right.source_object_id,
+            (0.24, -0.03, 0.91),
+            (12.0, 24.0, -36.0),
+            (1.2, 0.8, 1.4),
+        )
+
+        left_preview = self.workspace.preview_viewer._placed_object_render_groups[
+            left.source_object_id
+        ].preview
+        self.assertEqual(left_preview.world_position, (-0.24, -0.03, 0.91))
+        self.assertEqual(left_preview.rotation_degrees, (12.0, -24.0, 36.0))
+        self.assertEqual(left_preview.axis_scales, (1.2, 0.8, 1.4))
+        persisted_left = self.workspace.data().get_door(door.door_id)
+        assert persisted_left is not None
+        self.assertEqual(persisted_left.get_slot(left.slot_id), left)
+
+    def test_make_double_checkbox_requests_a_model_transition(self) -> None:
         door = _door()
         requests: list[tuple[str, bool]] = []
-        self.workspace.generate_displacement_changed.connect(
+        self.workspace.make_double_changed.connect(
             lambda door_id, checked: requests.append((door_id, checked))
         )
         self.workspace.set_data(DoorLibraryData(doors=[door]))
 
-        self.assertFalse(
-            self.workspace.generate_displacement_checkbox.isChecked()
-        )
-        self.workspace.generate_displacement_checkbox.click()
+        self.workspace.make_double_checkbox.click()
 
         self.assertEqual(requests, [(door.door_id, True)])
 
-        displaced = replace(door, generate_displacement=True)
-        self.workspace.upsert_door(displaced)
+        updated = door.with_double(True)
+        self.workspace.upsert_door(updated)
+        self.workspace.make_double_checkbox.click()
 
-        self.assertTrue(
-            self.workspace.generate_displacement_checkbox.isChecked()
-        )
-        self.workspace.generate_displacement_checkbox.click()
         self.assertEqual(
             requests,
             [(door.door_id, True), (door.door_id, False)],
         )
 
-    def test_door_option_checkboxes_are_adjacent(self) -> None:
+    def test_ctrl_copy_and_paste_requests_the_selected_counterpart_slot(
+        self,
+    ) -> None:
+        door = _door().with_double(True)
+        requests: list[tuple[str, str, str]] = []
+        self.workspace.slot_mesh_paste_requested.connect(
+            lambda *values: requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+
+        self.assertTrue(
+            self.workspace.select_door_slot(door.door_id, DOOR_SLOT_BODY)
+        )
+        self.workspace.copy_slot_shortcut.activated.emit()
+        self.assertTrue(
+            self.workspace.select_door_slot(
+                door.door_id,
+                DOOR_SLOT_LEFT_BODY,
+            )
+        )
+        self.workspace.paste_slot_shortcut.activated.emit()
+
+        self.assertEqual(
+            requests,
+            [(door.door_id, DOOR_SLOT_BODY, DOOR_SLOT_LEFT_BODY)],
+        )
+
+        self.assertTrue(
+            self.workspace.select_door_slot(
+                door.door_id,
+                DOOR_SLOT_LEFT_KNOB,
+            )
+        )
+        self.workspace.paste_slot_shortcut.activated.emit()
+        self.assertEqual(
+            requests,
+            [(door.door_id, DOOR_SLOT_BODY, DOOR_SLOT_LEFT_BODY)],
+        )
+
+    def test_door_option_checkboxes_are_below_the_list_and_adjacent(self) -> None:
+        make_double = self.workspace.make_double_checkbox
         make_double_sided = self.workspace.make_double_sided_checkbox
-        generate_displacement = self.workspace.generate_displacement_checkbox
         option_layout = make_double_sided.parentWidget().layout()
+        controls_layout = self.workspace.door_tree.parentWidget().layout()
 
         self.assertIs(
+            make_double.parentWidget(),
             make_double_sided.parentWidget(),
-            generate_displacement.parentWidget(),
         )
         assert option_layout is not None
-        self.assertEqual(option_layout.indexOf(make_double_sided), 0)
-        self.assertEqual(option_layout.indexOf(generate_displacement), 1)
+        assert controls_layout is not None
+        self.assertEqual(option_layout.indexOf(make_double), 0)
+        self.assertEqual(option_layout.indexOf(make_double_sided), 1)
+        self.assertGreater(
+            controls_layout.indexOf(make_double.parentWidget()),
+            controls_layout.indexOf(self.workspace.door_tree),
+        )
 
     # ### Selection synchronization ###
     def test_slot_selection_emits_ids_and_survives_door_update(self) -> None:
@@ -243,7 +678,10 @@ class DoorsWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(self.workspace.selected_door_id(), door.door_id)
         self.assertEqual(self.workspace.selected_slot_id(), DOOR_SLOT_KNOB)
-        self.assertEqual(self.workspace.profile_name_label.text(), "Front door")
+        self.assertEqual(
+            self.workspace.door_tree.topLevelItem(0).text(0),
+            "Front door",
+        )
 
     def test_select_body_can_be_requested_when_inserting_a_door(self) -> None:
         door = _door()
@@ -308,10 +746,9 @@ class DoorsWorkspaceTests(unittest.TestCase):
         self.assertEqual(requests, [(door.door_id, DOOR_SLOT_KNOB)])
         selected_item = self.workspace.door_tree.currentItem()
         assert selected_item is not None
-        self.assertIn(
-            "transform pending",
-            self.workspace.selected_slot_label.text(),
-        )
+        self.assertEqual(self.workspace.selected_slot_id(), DOOR_SLOT_KNOB)
+        self.assertEqual(selected_item.text(0), "Handle")
+        self.assertTrue(self.workspace.confirm_slot_position_button.isEnabled())
         self.assertEqual(
             self.workspace.confirm_slot_position_button.text(),
             "Confirm slot transform",
@@ -469,6 +906,112 @@ class DoorsWorkspaceTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_selected_slot_rotation_text_tracks_live_preview_rotation(self) -> None:
+        door = _door()
+        handle = door.get_slot(DOOR_SLOT_KNOB)
+        assert handle is not None
+        door = door.replace_slot(
+            replace(handle, rotation_degrees=(12.5, -20.0, 30.0))
+        )
+        handle = door.get_slot(DOOR_SLOT_KNOB)
+        assert handle is not None
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+        self.workspace.select_door_slot(door.door_id, DOOR_SLOT_KNOB)
+
+        controls_layout = self.workspace.door_tree.parentWidget().layout()
+        assert controls_layout is not None
+        self.assertEqual(
+            controls_layout.indexOf(self.workspace.rotation_status_label),
+            controls_layout.indexOf(self.workspace.door_tree) + 1,
+        )
+
+        self.assertEqual(
+            self.workspace.rotation_status_label.text(),
+            "Rotation: X 12.5 degrees, Y -20.0 degrees, Z 30.0 degrees",
+        )
+
+        self.workspace.preview_viewer.placed_object_rotation_preview_changed.emit(
+            handle.source_object_id,
+            (10.0, 20.0, 40.0),
+        )
+
+        self.assertEqual(
+            self.workspace.rotation_status_label.text(),
+            "Rotation: X 10.0 degrees, Y 20.0 degrees, Z 40.0 degrees",
+        )
+
+        self.workspace.preview_viewer.placed_object_rotation_preview_changed.emit(
+            "another-object",
+            (0.0, 0.0, 0.0),
+        )
+        self.assertEqual(
+            self.workspace.rotation_status_label.text(),
+            "Rotation: X 10.0 degrees, Y 20.0 degrees, Z 40.0 degrees",
+        )
+
+    def test_window_preview_emits_asset_aware_transform_and_scale(self) -> None:
+        fixture_door = _door(door_id="window-preview")
+        window = WindowDefinition(
+            window_id="window-preview",
+            name="New window 1",
+            source_window_frame_id="window-frame-1",
+            width_meters=fixture_door.width_meters,
+            height_meters=fixture_door.height_meters,
+            slots=fixture_door.slots,
+        )
+        handle = window.get_slot(DOOR_SLOT_KNOB)
+        assert handle is not None
+        transform_requests: list[tuple[object, ...]] = []
+        scale_requests: list[tuple[object, ...]] = []
+        legacy_transforms: list[tuple[object, ...]] = []
+        self.workspace.asset_slot_transform_changed.connect(
+            lambda *values: transform_requests.append(values)
+        )
+        self.workspace.asset_slot_axis_scales_changed.connect(
+            lambda *values: scale_requests.append(values)
+        )
+        self.workspace.slot_transform_changed.connect(
+            lambda *values: legacy_transforms.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+        self.workspace.select_window_slot(window.window_id, DOOR_SLOT_KNOB)
+        self.workspace.set_preview_model(_complete_door_model(fixture_door))
+
+        self.workspace.preview_viewer.placed_object_transform_changed.emit(
+            handle.source_object_id,
+            (0.1, 0.2, 0.3),
+            (1.0, 2.0, 3.0),
+        )
+        self.workspace.preview_viewer.placed_object_axis_scales_changed.emit(
+            handle.source_object_id,
+            (1.1, 1.2, 1.3),
+        )
+
+        self.assertEqual(
+            transform_requests,
+            [
+                (
+                    ASSET_KIND_WINDOW,
+                    window.window_id,
+                    DOOR_SLOT_KNOB,
+                    (0.1, 0.2, 0.3),
+                    (1.0, 2.0, 3.0),
+                )
+            ],
+        )
+        self.assertEqual(
+            scale_requests,
+            [
+                (
+                    ASSET_KIND_WINDOW,
+                    window.window_id,
+                    DOOR_SLOT_KNOB,
+                    (1.1, 1.2, 1.3),
+                )
+            ],
+        )
+        self.assertEqual(legacy_transforms, [])
 
     def test_preview_mesh_selection_selects_its_slot_before_gizmo_edits(
         self,

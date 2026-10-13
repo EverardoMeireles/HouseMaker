@@ -33,6 +33,10 @@ from housemaker.door_state import (
     DoorSideDuplication,
     DoorSideDuplicationMetadata,
 )
+from housemaker.doorway_geometry import (
+    build_doorway_cross_section_outline,
+    build_double_door_leaf_source_outline,
+)
 from housemaker.generation_state import (
     MASK_MODE_PAINT,
     GeneratedObjectRecord,
@@ -49,6 +53,7 @@ from housemaker.generation_workspace import (
     SCAN_PROJECTION_PIPELINE_KEY,
     TEXTURE_INPAINT_STROKES_PIPELINE_KEY,
     VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
+    GenerationRequest,
     GenerationWorkspace,
     MeshyModelExecutor,
     MeshyTextureRegenerator,
@@ -302,6 +307,79 @@ def _textured_relief_door_glb() -> bytes:
                 "RGBA",
                 (8, 8),
                 (85, 115, 145, 255),
+            )
+        ),
+    )
+    return bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+
+def _textured_profile_ready_door_glb() -> bytes:
+    """Build a subdivided textured body that can represent an arch apex."""
+
+    source = trimesh.creation.box(extents=(2.0, 3.0, 0.4))
+    vertices, faces = trimesh.remesh.subdivide(
+        np.asarray(source.vertices, dtype=float),
+        np.asarray(source.faces, dtype=np.int64),
+    )
+    front_indices = np.flatnonzero(
+        np.isclose(vertices[:, 2], np.max(vertices[:, 2]))
+    )
+    relief_index = min(
+        front_indices,
+        key=lambda index: abs(vertices[index, 0]) + abs(vertices[index, 1]),
+    )
+    vertices[relief_index, 2] += 0.2
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    uv = np.column_stack(
+        (
+            (vertices[:, 0] - np.min(vertices[:, 0]))
+            / np.ptp(vertices[:, 0]),
+            (vertices[:, 1] - np.min(vertices[:, 1]))
+            / np.ptp(vertices[:, 1]),
+        )
+    )
+    mesh.visual = TextureVisuals(
+        uv=uv,
+        material=PBRMaterial(
+            baseColorTexture=Image.new(
+                "RGBA",
+                (8, 8),
+                (120, 90, 60, 255),
+            )
+        ),
+    )
+    return bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+
+def _textured_tapered_door_glb() -> bytes:
+    """Build a slab whose generated side contour retreats at lower heights."""
+
+    source = trimesh.creation.box(extents=(2.0, 3.0, 0.4))
+    vertices, faces = trimesh.remesh.subdivide(
+        np.asarray(source.vertices, dtype=float),
+        np.asarray(source.faces, dtype=np.int64),
+    )
+    normalized_height = (
+        (vertices[:, 1] - np.min(vertices[:, 1]))
+        / np.ptp(vertices[:, 1])
+    )
+    lateral_scale = 0.78 + 0.22 * normalized_height
+    vertices[:, 0] *= lateral_scale
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    uv = np.column_stack(
+        (
+            (vertices[:, 0] - np.min(vertices[:, 0]))
+            / np.ptp(vertices[:, 0]),
+            normalized_height,
+        )
+    )
+    mesh.visual = TextureVisuals(
+        uv=uv,
+        material=PBRMaterial(
+            baseColorTexture=Image.new(
+                "RGBA",
+                (8, 8),
+                (145, 105, 65, 255),
             )
         ),
     )
@@ -645,6 +723,271 @@ class DoorDisplacementGeometryTests(unittest.TestCase):
                 )
             )
             self.assertGreaterEqual(len(distinct_depths), 3)
+
+    def test_profile_warp_preserves_uvs_textures_and_depth_relief(self) -> None:
+        source = _relief_door_texture_variants()
+        profile_ready_glb = _textured_profile_ready_door_glb()
+        source = replace(
+            source,
+            glb_by_resolution={
+                resolution: profile_ready_glb
+                for resolution in TEXTURE_RESOLUTIONS
+            },
+        )
+        target_dimensions = (0.9, 0.06, 2.1)
+        profile_outline = build_doorway_cross_section_outline(
+            target_dimensions[0],
+            target_dimensions[2],
+            "arch",
+            0.8,
+        )
+
+        fitted = _fit_generated_door_body_texture_variants(
+            source,
+            target_dimensions,
+            profile_outline=profile_outline,
+        )
+
+        self.assertEqual(
+            fitted.texture_png_by_resolution,
+            source.texture_png_by_resolution,
+        )
+        upper_chain = np.asarray(profile_outline[2:-1], dtype=float)[::-1]
+        for resolution in TEXTURE_RESOLUTIONS:
+            source_glb = source.glb_by_resolution[resolution]
+            fitted_glb = fitted.glb_by_resolution[resolution]
+            source_model = import_generated_glb(source_glb)
+            fitted_model = import_generated_glb(fitted_glb)
+            source_uvs = np.asarray(source_model.mesh.visual.uv, dtype=float)
+            fitted_uvs = np.asarray(fitted_model.mesh.visual.uv, dtype=float)
+            for source_uv in source_uvs:
+                self.assertTrue(
+                    np.any(
+                        np.all(
+                            np.isclose(
+                                fitted_uvs,
+                                source_uv,
+                                rtol=0.0,
+                                atol=1e-7,
+                            ),
+                            axis=1,
+                        )
+                    )
+                )
+            np.testing.assert_array_equal(
+                np.asarray(
+                    fitted_model.mesh.visual.material.baseColorTexture.convert(
+                        "RGBA"
+                    )
+                ),
+                np.asarray(
+                    source_model.mesh.visual.material.baseColorTexture.convert(
+                        "RGBA"
+                    )
+                ),
+            )
+            vertices = np.asarray(fitted_model.mesh.vertices, dtype=float)
+            upper_heights = np.interp(
+                vertices[:, 0],
+                upper_chain[:, 0],
+                upper_chain[:, 1],
+            )
+            self.assertTrue(
+                np.all(vertices[:, 2] <= upper_heights + 1e-6)
+            )
+            fitted_bounds = np.asarray(fitted_model.mesh.bounds, dtype=float)
+            np.testing.assert_allclose(
+                fitted_bounds[1] - fitted_bounds[0],
+                target_dimensions,
+                rtol=1e-5,
+                atol=1e-7,
+            )
+            self.assertGreaterEqual(
+                len(np.unique(np.round(vertices[:, 1], decimals=7))),
+                3,
+            )
+            for profile_x, profile_z in upper_chain:
+                self.assertTrue(
+                    np.any(
+                        (np.abs(vertices[:, 0] - profile_x) <= 1e-6)
+                        & (np.abs(vertices[:, 2] - profile_z) <= 1e-6)
+                    ),
+                    msg=(
+                        "The fitted upper boundary omitted profile sample "
+                        f"({profile_x}, {profile_z})."
+                    ),
+                )
+
+    def test_profile_warp_inserts_all_breakpoints_without_changing_pixels(
+        self,
+    ) -> None:
+        source = _relief_door_texture_variants()
+        target_dimensions = np.asarray((0.9, 0.06, 2.1), dtype=float)
+        profile_outline = build_doorway_cross_section_outline(
+            target_dimensions[0],
+            target_dimensions[2],
+            "arch",
+            0.8,
+        )
+
+        fitted = _fit_generated_door_body_texture_variants(
+            source,
+            target_dimensions,
+            profile_outline=profile_outline,
+        )
+
+        self.assertEqual(
+            fitted.texture_png_by_resolution,
+            source.texture_png_by_resolution,
+        )
+        upper_chain = np.asarray(profile_outline[2:-1], dtype=float)[::-1]
+        for resolution in TEXTURE_RESOLUTIONS:
+            source_glb = source.glb_by_resolution[resolution]
+            fitted_glb = fitted.glb_by_resolution[resolution]
+            source_model = import_generated_glb(source_glb)
+            fitted_model = import_generated_glb(fitted_glb)
+            source_fingerprint = build_uv_fingerprint(source_glb)
+            fitted_fingerprint = build_uv_fingerprint(fitted_glb)
+            self.assertGreater(
+                fitted_fingerprint.face_count,
+                source_fingerprint.face_count,
+            )
+            source_texture = np.asarray(
+                source_model.mesh.visual.material.baseColorTexture.convert(
+                    "RGBA"
+                )
+            )
+            fitted_texture = np.asarray(
+                fitted_model.mesh.visual.material.baseColorTexture.convert(
+                    "RGBA"
+                )
+            )
+            np.testing.assert_array_equal(fitted_texture, source_texture)
+            vertices = np.asarray(fitted_model.mesh.vertices, dtype=float)
+            upper_heights = np.interp(
+                vertices[:, 0],
+                upper_chain[:, 0],
+                upper_chain[:, 1],
+            )
+            self.assertTrue(
+                np.all(vertices[:, 2] <= upper_heights + 1e-6)
+            )
+            fitted_bounds = np.asarray(fitted_model.mesh.bounds, dtype=float)
+            fitted_extents = fitted_bounds[1] - fitted_bounds[0]
+            np.testing.assert_allclose(
+                fitted_extents,
+                target_dimensions,
+                rtol=1e-5,
+                atol=1e-7,
+            )
+            for profile_x, profile_z in upper_chain:
+                self.assertTrue(
+                    np.any(
+                        (np.abs(vertices[:, 0] - profile_x) <= 1e-6)
+                        & (np.abs(vertices[:, 2] - profile_z) <= 1e-6)
+                    ),
+                    msg=(
+                        "The fitted upper boundary omitted profile sample "
+                        f"({profile_x}, {profile_z})."
+                    ),
+                )
+            np.testing.assert_allclose(
+                (
+                    (fitted_bounds[0, 0] + fitted_bounds[1, 0]) * 0.5,
+                    (fitted_bounds[0, 1] + fitted_bounds[1, 1]) * 0.5,
+                    fitted_bounds[0, 2],
+                ),
+                (0.0, 0.0, 0.0),
+                atol=1e-7,
+            )
+
+    def test_profile_warp_restores_exact_double_leaf_side_planes(self) -> None:
+        source = _relief_door_texture_variants()
+        tapered_glb = _textured_tapered_door_glb()
+        source = replace(
+            source,
+            glb_by_resolution={
+                resolution: tapered_glb
+                for resolution in TEXTURE_RESOLUTIONS
+            },
+        )
+        target_dimensions = np.asarray((0.9, 0.06, 2.1), dtype=float)
+        profile_outline = build_double_door_leaf_source_outline(
+            target_dimensions[0],
+            target_dimensions[2],
+            "arch",
+            0.8,
+        )
+
+        fitted = _fit_generated_door_body_texture_variants(
+            source,
+            target_dimensions,
+            profile_outline=profile_outline,
+        )
+
+        self.assertEqual(
+            fitted.texture_png_by_resolution,
+            source.texture_png_by_resolution,
+        )
+        expected_seam_x = target_dimensions[0] * 0.5
+        expected_levels = (0.0, target_dimensions[2] * 0.5, target_dimensions[2])
+        for resolution in TEXTURE_RESOLUTIONS:
+            fitted_model = import_generated_glb(
+                fitted.glb_by_resolution[resolution]
+            )
+            vertices = np.asarray(fitted_model.mesh.vertices, dtype=float)
+            for expected_height in expected_levels:
+                level_vertices = vertices[
+                    np.isclose(
+                        vertices[:, 2],
+                        expected_height,
+                        rtol=0.0,
+                        atol=1e-6,
+                    )
+                ]
+                self.assertGreater(len(level_vertices), 0)
+                self.assertTrue(
+                    np.any(
+                        np.isclose(
+                            level_vertices[:, 0],
+                            expected_seam_x,
+                            rtol=0.0,
+                            atol=1e-6,
+                        )
+                    ),
+                    msg=(
+                        "The preserved double-door center seam retreated at "
+                        f"height {expected_height}."
+                    ),
+                )
+
+    def test_profile_request_requires_matching_fit_dimensions(self) -> None:
+        profile_outline = build_doorway_cross_section_outline(
+            0.9,
+            2.1,
+            "arch",
+            0.8,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires target fit dimensions",
+        ):
+            GenerationRequest(
+                frame_index=0,
+                selected_object_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+                settings=GenerationServiceSettings(),
+                door_body_profile_outline=profile_outline,
+            )
+
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(),
+            door_body_fit_dimensions=(0.9, 0.06, 2.1),
+            door_body_profile_outline=profile_outline,
+        )
+        self.assertEqual(request.door_body_profile_outline, profile_outline)
 
 
 # ### Provider fixtures ###
@@ -2936,6 +3279,45 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertEqual(target.object_id, "door-knob")
         self.assertEqual(target.slot_display_name, "Door knob/handle")
 
+    def test_loaded_reference_exits_handle_mode_and_restores_division(self) -> None:
+        """Paste/Load-image input starts an ordinary object-generation session."""
+
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                object_name="New door 1 - Handle",
+                slot_display_name="Handle",
+            )
+        )
+        self.assertFalse(self.workspace.symmetric_division_checkbox.isEnabled())
+
+        self.workspace.set_temporary_object_reference(
+            np.full((8, 8, 4), 255, dtype=np.uint8)
+        )
+
+        self.assertIsNone(self.workspace._door_slot_editing_target)
+        self.assertTrue(self.workspace.symmetric_division_checkbox.isEnabled())
+
+    def test_video_seek_exits_handle_mode_and_restores_division(self) -> None:
+        self._load_reference()
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-knob",
+                object_name="New door 1 - Handle",
+                slot_display_name="Handle",
+            )
+        )
+        self.assertFalse(self.workspace.symmetric_division_checkbox.isEnabled())
+
+        self.workspace.show_frame(1)
+
+        self.assertIsNone(self.workspace._door_slot_editing_target)
+        self.assertTrue(self.workspace.symmetric_division_checkbox.isEnabled())
+
     def test_generate_replaces_existing_knob_with_model_generation(
         self,
     ) -> None:
@@ -3076,6 +3458,165 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         start_texture_regeneration.assert_called_once()
         request = start_texture_regeneration.call_args.args[0]
         self.assertEqual(request.object_id, "door-body")
+
+    def test_preserved_profile_rebuilds_body_without_displacement(self) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        dimensions = (1.0, 0.04, 2.0)
+        profile_outline = build_doorway_cross_section_outline(
+            dimensions[0],
+            dimensions[2],
+            "arch",
+            0.75,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                generate_displacement=False,
+                preserve_profile=True,
+                door_body_fit_dimensions=dimensions,
+                door_body_profile_outline=profile_outline,
+            )
+        )
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="door-profile-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.workspace.generate()
+
+        start_texture_regeneration.assert_not_called()
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        self.assertTrue(request.symmetric_division_enabled)
+        self.assertEqual(request.door_body_fit_dimensions, dimensions)
+        self.assertEqual(request.door_body_profile_outline, profile_outline)
+        self.assertEqual(
+            start_generation.call_args.kwargs["replaced_object_record"],
+            original,
+        )
+
+        with patch.object(
+            self.workspace.video_view,
+            "build_selected_object_crops",
+            return_value=(
+                np.full((3, 3, 4), 127, dtype=np.uint8),
+                np.full((4, 4, 4), 255, dtype=np.uint8),
+            ),
+        ):
+            batch_requests = self.workspace._build_generation_requests()
+        self.assertEqual(len(batch_requests), 2)
+        self.assertTrue(
+            all(
+                batch_request.door_body_profile_outline == profile_outline
+                for batch_request in batch_requests
+            )
+        )
+
+    def test_asymmetric_preserved_profile_rejects_symmetric_division(
+        self,
+    ) -> None:
+        dimensions = (1.0, 0.04, 2.0)
+        profile_outline = build_double_door_leaf_source_outline(
+            dimensions[0],
+            dimensions[2],
+            "arch",
+            0.75,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body right",
+                slot_display_name="Body right",
+                preserve_profile=True,
+                door_body_fit_dimensions=dimensions,
+                door_body_profile_outline=profile_outline,
+            )
+        )
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+        self._load_reference()
+
+        self.assertIsNone(self.workspace._build_generation_request())
+        self.assertEqual(
+            self.workspace.status_label.text(),
+            "Symmetric division cannot preserve this asymmetric door profile. "
+            "Disable Symmetric division or Preserve door profile.",
+        )
+
+    def test_profile_setting_does_not_change_texture_only_generation(self) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        dimensions = (1.0, 0.04, 2.0)
+        profile_outline = build_doorway_cross_section_outline(
+            dimensions[0],
+            dimensions[2],
+            "arch",
+            0.75,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                preserve_profile=True,
+                door_body_fit_dimensions=dimensions,
+                door_body_profile_outline=profile_outline,
+            )
+        )
+        self._load_reference()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_generation",
+                return_value="unexpected-model-operation",
+            ) as start_generation,
+            patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_texture_regeneration,
+        ):
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+
+        start_generation.assert_not_called()
+        start_texture_regeneration.assert_called_once()
+        texture_request = start_texture_regeneration.call_args.args[0]
+        self.assertFalse(
+            hasattr(texture_request, "door_body_profile_outline")
+        )
 
     def test_clearing_applied_side_duplication_rebuilds_full_body(self) -> None:
         component_model = import_generated_glb(_uv_glb(texture_resolution=8))
@@ -3528,45 +4069,6 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertEqual(
             preflight.projection_camera_percentages,
             expected,
-        )
-
-    def test_accepted_reference_edit_is_the_retexture_image(self) -> None:
-        self._seed_object(0, name="Edited table", task_id="geometry-task")
-        original_crop = self._load_reference()
-        _source, signature = self.workspace.build_object_reference_edit_inputs()
-        edited_reference = np.empty((1024, 1024, 4), dtype=np.uint8)
-        edited_reference[:] = (17, 83, 229, 255)
-        self.assertTrue(
-            self.workspace.accept_object_reference_edit(
-                signature,
-                edited_reference,
-            )
-        )
-
-        self.workspace.video_view.clear_mask()
-        _qt_application.processEvents()
-
-        self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
-        preflight = self.workspace._build_texture_regeneration_request()
-        self.assertIsNotNone(preflight)
-        assert preflight is not None
-        self.assertEqual(preflight.reference_image_bgra.shape, (1024, 1024, 4))
-        np.testing.assert_array_equal(
-            preflight.reference_image_bgra,
-            edited_reference,
-        )
-        self.assertNotEqual(
-            preflight.reference_image_bgra.shape,
-            original_crop.shape,
-        )
-
-        materialized = _materialize_texture_regeneration_preflight(
-            preflight,
-            self.asset_directory,
-        ).request
-        np.testing.assert_array_equal(
-            materialized.reference_image_bgra,
-            edited_reference,
         )
 
     def test_existing_glass_retexture_defers_to_authored_sidedness(self) -> None:

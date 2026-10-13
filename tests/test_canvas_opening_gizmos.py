@@ -31,8 +31,8 @@ from housemaker.door_state import (
 from housemaker.glb import GeneratedModel
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
-    CANVAS_DOOR_CREATE_SIZE_PIXELS,
     CANVAS_OPENING_ARCH_SIZE_PIXELS,
+    CANVAS_OPENING_CREATE_SIZE_PIXELS,
     CANVAS_OPENING_GIZMO_ANCHOR,
     CANVAS_OPENING_GIZMO_ARCH,
     CANVAS_OPENING_GIZMO_SIDE,
@@ -49,7 +49,7 @@ from housemaker.viewer import (
     DoorPlacementPreviewPart,
     GlbViewerWidget,
     _CanvasOpeningGizmoHandle,
-    _get_canvas_door_creation_local_position,
+    _get_canvas_opening_creation_local_position,
 )
 
 # ### Module state ###
@@ -297,12 +297,12 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             first_items[0] not in viewer._canvas_opening_gizmo_items
         )
 
-    def test_create_door_plus_is_only_rendered_for_selected_doorways(self) -> None:
+    def test_create_fixture_plus_is_rendered_for_both_opening_types(self) -> None:
         window_target = _build_target(CANVAS_OPENING_WINDOW)
         viewer = self._build_viewer(window_target)
         viewer.select_canvas_opening(window_target.reference)
 
-        self.assertEqual(viewer._canvas_door_creation_items, [])
+        self.assertEqual(len(viewer._canvas_opening_creation_items), 2)
 
         doorway_target = _build_target(
             CANVAS_OPENING_DOORWAY,
@@ -311,9 +311,9 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         viewer.set_canvas_opening_targets((window_target, doorway_target))
         viewer.select_canvas_opening(doorway_target.reference)
 
-        self.assertEqual(len(viewer._canvas_door_creation_items), 2)
-        background_item, icon_item = viewer._canvas_door_creation_items
-        self.assertEqual(background_item.size, CANVAS_DOOR_CREATE_SIZE_PIXELS)
+        self.assertEqual(len(viewer._canvas_opening_creation_items), 2)
+        background_item, icon_item = viewer._canvas_opening_creation_items
+        self.assertEqual(background_item.size, CANVAS_OPENING_CREATE_SIZE_PIXELS)
         for item in (background_item, icon_item):
             self.assertEqual(item.depthValue(), CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
             gl_options = getattr(item, "_GLGraphicsItem__glOpts")
@@ -326,7 +326,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         viewer.select_canvas_opening(target.reference)
         requested: list[object] = []
         viewer.door_creation_requested.connect(requested.append)
-        local_position = _get_canvas_door_creation_local_position(target)
+        local_position = _get_canvas_opening_creation_local_position(target)
         assert local_position is not None
         world_position = target.local_to_world(*local_position)
 
@@ -345,7 +345,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         ):
             viewer._handle_placed_object_pointer_pressed(QPointF())
             self.assertEqual(
-                viewer._canvas_door_creation_pressed_reference,
+                viewer._canvas_opening_creation_pressed_reference,
                 target.reference,
             )
             self.assertIsNone(viewer._canvas_opening_edit_drag)
@@ -354,7 +354,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
 
         self.assertEqual(requested, [target.reference])
         self.assertEqual(viewer._canvas_opening_targets[target.key], target)
-        self.assertIsNone(viewer._canvas_door_creation_pressed_reference)
+        self.assertIsNone(viewer._canvas_opening_creation_pressed_reference)
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
 
     def test_create_door_plus_cancels_when_release_leaves_control(self) -> None:
@@ -363,7 +363,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         viewer.select_canvas_opening(target.reference)
         requested: list[object] = []
         viewer.door_creation_requested.connect(requested.append)
-        local_position = _get_canvas_door_creation_local_position(target)
+        local_position = _get_canvas_opening_creation_local_position(target)
         assert local_position is not None
         world_position = target.local_to_world(*local_position)
 
@@ -384,7 +384,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             viewer._handle_canvas_gizmo_pointer_released(QPointF())
 
         self.assertEqual(requested, [])
-        self.assertIsNone(viewer._canvas_door_creation_pressed_reference)
+        self.assertIsNone(viewer._canvas_opening_creation_pressed_reference)
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
 
     def test_create_door_plus_press_is_cleared_when_selection_changes(self) -> None:
@@ -397,7 +397,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         viewer = self._build_viewer(doorway_target)
         viewer.set_canvas_opening_targets((doorway_target, window_target))
         viewer.select_canvas_opening(doorway_target.reference)
-        local_position = _get_canvas_door_creation_local_position(doorway_target)
+        local_position = _get_canvas_opening_creation_local_position(doorway_target)
         assert local_position is not None
         world_position = doorway_target.local_to_world(*local_position)
 
@@ -412,9 +412,35 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             viewer._handle_placed_object_pointer_pressed(QPointF())
         viewer.select_canvas_opening(window_target.reference)
 
-        self.assertIsNone(viewer._canvas_door_creation_pressed_reference)
+        self.assertIsNone(viewer._canvas_opening_creation_pressed_reference)
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
-        self.assertEqual(viewer._canvas_door_creation_items, [])
+        self.assertEqual(len(viewer._canvas_opening_creation_items), 2)
+
+    def test_create_window_plus_emits_a_separate_fixture_request(self) -> None:
+        target = _build_target(CANVAS_OPENING_WINDOW)
+        viewer = self._build_viewer(target)
+        viewer.select_canvas_opening(target.reference)
+        requested: list[object] = []
+        door_requests: list[object] = []
+        viewer.window_fixture_creation_requested.connect(requested.append)
+        viewer.door_creation_requested.connect(door_requests.append)
+        local_position = _get_canvas_opening_creation_local_position(target)
+        assert local_position is not None
+        world_position = target.local_to_world(*local_position)
+
+        with (
+            patch.object(viewer.view, "pixelSize", return_value=0.01),
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(world_position[0], world_position[2]),
+            ),
+        ):
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+            viewer._handle_canvas_gizmo_pointer_released(QPointF())
+
+        self.assertEqual(requested, [target.reference])
+        self.assertEqual(door_requests, [])
 
     def test_door_placement_click_emits_without_cancellation(self) -> None:
         target = _build_target(CANVAS_OPENING_DOORWAY)
@@ -445,6 +471,104 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         self.assertFalse(viewer.is_door_placement_active)
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
         self.assertFalse(viewer.view._primary_pointer_tool_active)
+
+    def test_ctrl_door_placement_still_places_the_complete_door(self) -> None:
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        candidate = _build_door_preview_candidate(target)
+        placements: list[tuple[str, object, bool]] = []
+        viewer.door_placement_requested.connect(
+            lambda door_id, reference, mirrored: placements.append(
+                (door_id, reference, mirrored)
+            )
+        )
+
+        self.assertTrue(
+            viewer.begin_door_placement(
+                "door-a",
+                (target.key,),
+                preview_candidates=(candidate,),
+            )
+        )
+        viewer.view.control_modifier_changed.emit(True)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(1.5, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            self.assertIsNotNone(viewer._door_placement_preview_root)
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+            viewer._handle_canvas_gizmo_pointer_released(QPointF())
+
+        self.assertEqual(placements, [("door-a", target.reference, False)])
+        self.assertFalse(viewer.is_door_placement_active)
+
+    def test_ctrl_door_placement_does_not_block_an_arched_doorway(self) -> None:
+        target = _build_target(
+            CANVAS_OPENING_DOORWAY,
+            arch_amount=0.6,
+        )
+        viewer = self._build_viewer(target)
+        placements: list[tuple[str, object, bool]] = []
+        viewer.door_placement_requested.connect(
+            lambda door_id, reference, mirrored: placements.append(
+                (door_id, reference, mirrored)
+            )
+        )
+
+        self.assertTrue(viewer.begin_door_placement("door-a", (target.key,)))
+        viewer.view.control_modifier_changed.emit(True)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(1.5, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+            viewer._handle_canvas_gizmo_pointer_released(QPointF())
+
+        self.assertEqual(placements, [("door-a", target.reference, False)])
+        self.assertFalse(viewer.is_door_placement_active)
+
+    def test_window_fixture_placement_reuses_preview_and_mirror_pipeline(
+        self,
+    ) -> None:
+        target = _build_target(CANVAS_OPENING_WINDOW)
+        viewer = self._build_viewer(target)
+        candidate = _build_door_preview_candidate(target)
+        placements: list[tuple[str, object, bool]] = []
+        viewer.window_fixture_placement_requested.connect(
+            lambda window_id, reference, mirrored: placements.append(
+                (window_id, reference, mirrored)
+            )
+        )
+
+        self.assertTrue(
+            viewer.begin_window_fixture_placement(
+                "window-a",
+                (target.key,),
+                preview_candidates=(candidate,),
+            )
+        )
+        self.assertTrue(viewer.is_window_fixture_placement_active)
+        self.assertFalse(viewer.is_door_placement_active)
+        viewer._handle_projection_camera_wheel_steps_requested(1)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            self.assertIsNotNone(viewer._door_placement_preview_root)
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+            viewer._handle_canvas_gizmo_pointer_released(QPointF())
+
+        self.assertEqual(
+            placements,
+            [("window-a", target.reference, True)],
+        )
+        self.assertFalse(viewer.is_opening_fixture_placement_active)
 
     def test_door_placement_hover_shows_colored_component_profile(self) -> None:
         target = _build_target(CANVAS_OPENING_DOORWAY)
@@ -682,11 +806,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
 
         self.assertEqual(placements, [])
         self.assertTrue(viewer.is_door_placement_active)
-        assert viewer.window_tools_status_label is not None
-        self.assertIn(
-            "not compatible",
-            viewer.window_tools_status_label.text().lower(),
-        )
+        self.assertIsNone(viewer.window_tools_status_label)
 
     def test_door_placement_wheel_toggles_mirror_without_editing_camera(
         self,

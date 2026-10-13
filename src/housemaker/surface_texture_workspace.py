@@ -682,6 +682,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     generation_completed = Signal(object)
     assignments_removed = Signal(object)
     surface_content_changed = Signal()
+    controls_synced = Signal()
 
     def __init__(
         self,
@@ -4433,6 +4434,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             and has_surface
             and has_key
         )
+        self.controls_synced.emit()
 
     def _emit_data_changed(self) -> None:
         self.data_changed.emit(self._data.clone())

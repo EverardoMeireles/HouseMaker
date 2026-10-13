@@ -836,6 +836,63 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         np.testing.assert_allclose(position, (0.0, 0.0, 0.0), atol=1e-7)
         np.testing.assert_allclose(rotation, (0.0, 0.0, 90.0), atol=1e-7)
 
+    def test_ctrl_rotation_drag_snaps_live_and_committed_rotation_to_ten_degrees(
+        self,
+    ) -> None:
+        viewer = self._build_viewer(_build_placed_object("chair"))
+        viewer.select_placed_object("chair")
+        previews: list[tuple[str, object]] = []
+        committed: list[tuple[str, object, object]] = []
+        viewer.placed_object_rotation_preview_changed.connect(
+            lambda object_id, rotation: previews.append((object_id, rotation))
+        )
+        viewer.placed_object_transform_changed.connect(
+            lambda object_id, position, rotation: committed.append(
+                (object_id, position, rotation)
+            )
+        )
+        handle = _TransformGizmoHandle(kind="rotate", axis_index=2)
+        angle_radians = np.radians(14.0)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(1.0, 0.0),
+        ):
+            self.assertTrue(
+                viewer._begin_placed_object_gizmo_drag(handle, QPointF())
+            )
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_downward_ray(
+                    float(np.cos(angle_radians)),
+                    float(np.sin(angle_radians)),
+                ),
+            ),
+            patch(
+                "housemaker.viewer.QApplication.keyboardModifiers",
+                return_value=Qt.KeyboardModifier.ControlModifier,
+            ),
+        ):
+            self.assertTrue(
+                viewer._update_placed_object_gizmo_drag(QPointF(20.0, 20.0))
+            )
+            self.assertIn(
+                "Ctrl snap: 10 degrees",
+                viewer.object_transform_status_label.text(),
+            )
+            self.assertTrue(
+                viewer._finish_placed_object_gizmo_drag(QPointF(20.0, 20.0))
+            )
+
+        self.assertEqual(len(previews), 1)
+        self.assertEqual(previews[0][0], "chair")
+        np.testing.assert_allclose(previews[0][1], (0.0, 0.0, 10.0), atol=1e-7)
+        self.assertEqual(len(committed), 1)
+        np.testing.assert_allclose(committed[0][2], (0.0, 0.0, 10.0), atol=1e-7)
+
     def test_rotation_drag_preserves_an_existing_uniform_scale(self) -> None:
         viewer = self._build_viewer(
             _build_placed_object("chair", scale=2.0)

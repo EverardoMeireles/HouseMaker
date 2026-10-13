@@ -3,15 +3,16 @@ from __future__ import annotations
 
 import unittest
 from io import BytesIO
+from itertools import pairwise
 
 import numpy as np
-import trimesh
 from PIL import Image
 from shapely import Point, Polygon
 
 from housemaker.doorway_geometry import (
     DOORWAY_ARCH_SEGMENT_COUNT,
     build_doorway_cross_section_outline,
+    build_double_door_leaf_source_outline,
 )
 from housemaker.glb import (
     _build_level_doorway_reveal_mesh,
@@ -129,7 +130,7 @@ def _profile_reveal_length(
 ) -> float:
     return sum(
         float(np.linalg.norm(np.subtract(second, first)))
-        for first, second in zip(outline[1:], outline[2:])
+        for first, second in pairwise(outline[1:])
     )
 
 
@@ -189,7 +190,7 @@ class DoorwayArchProfileTests(unittest.TestCase):
             all(
                 not math_is_close(first[0], second[0])
                 and not math_is_close(first[1], second[1])
-                for first, second in zip(arc_points, arc_points[1:])
+                for first, second in pairwise(arc_points)
             )
         )
 
@@ -215,9 +216,76 @@ class DoorwayArchProfileTests(unittest.TestCase):
 
         self.assertEqual(outline[0], outline[-1])
         self.assertTrue(
-            all(first != second for first, second in zip(outline, outline[1:]))
+            all(first != second for first, second in pairwise(outline))
         )
         self.assertAlmostEqual(max(height for _width, height in outline), 0.4)
+
+    def test_double_leaf_source_keeps_rectangular_profile_exact(self) -> None:
+        expected = build_doorway_cross_section_outline(
+            0.9,
+            2.1,
+            DOORWAY_SHAPE_RECTANGULAR,
+            1.0,
+        )
+
+        self.assertEqual(
+            build_double_door_leaf_source_outline(
+                0.9,
+                2.1,
+                DOORWAY_SHAPE_RECTANGULAR,
+                1.0,
+            ),
+            expected,
+        )
+        self.assertEqual(
+            build_double_door_leaf_source_outline(
+                0.9,
+                2.1,
+                DOORWAY_SHAPE_ARCH,
+                0.0,
+            ),
+            expected,
+        )
+
+    def test_double_leaf_source_stretches_left_arch_half_to_full_width(
+        self,
+    ) -> None:
+        width = 0.9
+        height = 2.1
+        arch_amount = 0.75
+        full_outline = build_doorway_cross_section_outline(
+            width,
+            height,
+            DOORWAY_SHAPE_ARCH,
+            arch_amount,
+        )
+        leaf_outline = build_double_door_leaf_source_outline(
+            width,
+            height,
+            DOORWAY_SHAPE_ARCH,
+            arch_amount,
+        )
+        half_width = width / 2.0
+        restored_left_arch = tuple(
+            ((source_width - half_width) / 2.0, source_height)
+            for source_width, source_height in leaf_outline[2:-1]
+        )
+        expected_left_arch = tuple(
+            point
+            for point in full_outline[2:-1]
+            if point[0] <= 1e-9
+        )
+
+        np.testing.assert_allclose(
+            restored_left_arch,
+            expected_left_arch,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            leaf_outline[:3],
+            ((-half_width, 0.0), (half_width, 0.0), (half_width, height)),
+            atol=1e-12,
+        )
 
 
 # ### Wall and reveal tests ###

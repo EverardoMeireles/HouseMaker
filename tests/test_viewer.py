@@ -877,6 +877,110 @@ class GlbViewerRenderingTests(unittest.TestCase):
         for item in viewer._iter_textured_mesh_items():
             self.assertIsNone(item.get_point_light_world_position())
 
+    def test_hover_point_light_tracks_model_and_clears_on_miss(self) -> None:
+        viewer = self._build_viewer(hover_point_light_enabled=True)
+        viewer.set_model(_build_generated_model(textured=True))
+        viewer.set_point_light_intensity(2.5)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(
+                np.asarray((0.25, 0.25, 1.0), dtype=float),
+                np.asarray((0.0, 0.0, -1.0), dtype=float),
+            ),
+        ):
+            viewer._handle_hover_point_light_pointer_hovered(QPointF(20.0, 20.0))
+
+        hover_position = viewer.get_hover_point_light_position()
+        self.assertTrue(viewer.is_hover_point_light_active())
+        self.assertIsNotNone(hover_position)
+        assert hover_position is not None
+        self.assertAlmostEqual(hover_position[0], 0.25)
+        self.assertAlmostEqual(hover_position[1], 0.25)
+        self.assertGreater(hover_position[2], 0.0)
+        self.assertFalse(viewer.is_orbiting_point_light_enabled())
+        self.assertIsNone(viewer._orbiting_point_light_marker_item)
+        for item in viewer._iter_textured_mesh_items():
+            self.assertEqual(item.get_point_light_world_position(), hover_position)
+            self.assertEqual(item.get_point_light_intensity(), 2.5)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(
+                np.asarray((2.0, 2.0, 1.0), dtype=float),
+                np.asarray((0.0, 0.0, -1.0), dtype=float),
+            ),
+        ):
+            viewer._handle_hover_point_light_pointer_hovered(QPointF(40.0, 40.0))
+
+        self.assertFalse(viewer.is_hover_point_light_active())
+        self.assertIsNone(viewer.get_hover_point_light_position())
+        self.assertIsNone(viewer._orbiting_point_light_marker_item)
+        for item in viewer._iter_textured_mesh_items():
+            self.assertIsNone(item.get_point_light_world_position())
+
+    def test_hover_point_light_can_be_disabled_and_reenabled(self) -> None:
+        viewer = self._build_viewer(hover_point_light_enabled=True)
+        viewer._hover_point_light_position = (1.0, 2.0, 3.0)
+
+        viewer.set_hover_point_light_enabled(False)
+
+        self.assertFalse(viewer.is_hover_point_light_enabled())
+        self.assertFalse(viewer.is_hover_point_light_active())
+        self.assertIsNone(viewer.get_hover_point_light_position())
+
+        viewer.set_hover_point_light_enabled(True)
+        self.assertTrue(viewer.is_hover_point_light_enabled())
+        self.assertTrue(viewer._hover_point_light_input_connected)
+
+    def test_hover_point_light_temporarily_overrides_pbr_orbit(self) -> None:
+        viewer = self._build_viewer(
+            hover_point_light_enabled=True,
+            orbiting_point_light_with_pbr=True,
+        )
+        viewer.set_pbr_maps_enabled((PBR_MAP_NORMAL,))
+        viewer.set_model(_build_generated_model(textured=True))
+        orbit_position = viewer.get_orbiting_point_light_position()
+        self.assertIsNotNone(orbit_position)
+        self.assertIsNotNone(viewer._orbiting_point_light_marker_item)
+
+        with patch.object(
+            viewer,
+            "_get_hover_point_light_hit",
+            return_value=np.asarray((0.25, 0.25, 0.0), dtype=float),
+        ), patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(
+                np.asarray((0.25, 0.25, 1.0), dtype=float),
+                np.asarray((0.0, 0.0, -1.0), dtype=float),
+            ),
+        ):
+            viewer._handle_hover_point_light_pointer_hovered(QPointF())
+
+        self.assertTrue(viewer.is_hover_point_light_active())
+        self.assertFalse(viewer._orbiting_point_light_timer.isActive())
+        self.assertIsNone(viewer._orbiting_point_light_marker_item)
+        self.assertNotEqual(
+            viewer.get_orbiting_point_light_position(),
+            orbit_position,
+        )
+        hover_position = viewer.get_orbiting_point_light_position()
+        viewer._advance_orbiting_point_light()
+        self.assertEqual(
+            viewer.get_orbiting_point_light_position(),
+            hover_position,
+        )
+
+        viewer._handle_hover_point_light_pointer_left()
+
+        self.assertFalse(viewer.is_hover_point_light_active())
+        self.assertTrue(viewer.is_orbiting_point_light_enabled())
+        self.assertIsNotNone(viewer.get_orbiting_point_light_position())
+        self.assertIsNotNone(viewer._orbiting_point_light_marker_item)
+
     def test_orbiting_point_light_marker_is_rebuilt_with_the_model(self) -> None:
         viewer = self._build_viewer(orbiting_point_light_with_pbr=True)
         viewer.set_pbr_maps_enabled((PBR_MAP_NORMAL,))

@@ -290,15 +290,41 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         self.assertFalse(self.workspace.seekbar.isEnabled())
         self.assertFalse(self.workspace.paint_mask_button.isEnabled())
         self.assertFalse(self.workspace.erase_mask_button.isEnabled())
-        self.workspace.reference_edit_model_combo.setCurrentIndex(
-            self.workspace.reference_edit_model_combo.findData(
-                "Qwen-Image-2.1"
-            )
+        self.assertFalse(hasattr(self.workspace, "reference_edit_prompt"))
+        self.assertFalse(hasattr(self.workspace, "edit_reference_button"))
+
+    def test_paste_and_load_image_exit_handle_generation_mode(self) -> None:
+        reference = _reference_bgra()
+        self._set_clipboard_reference(reference)
+        target_arguments = {
+            "door_id": "door-1",
+            "slot_id": "door_knob",
+            "object_id": "door-handle",
+            "object_name": "Handle",
+            "slot_display_name": "Handle",
+        }
+
+        self.assertTrue(
+            self.objects.set_door_slot_editing_target(**target_arguments)
         )
-        self.workspace.reference_edit_prompt.setText("Remove the cover.")
-        self.workspace.sync_shared_controls()
-        self.assertTrue(self.workspace.reference_edit_prompt.isEnabled())
-        self.assertTrue(self.workspace.edit_reference_button.isEnabled())
+        self.workspace.paste_inpaint_button.click()
+
+        self.assertIsNone(self.objects._door_slot_editing_target)
+        self.assertTrue(self.objects.symmetric_division_checkbox.isEnabled())
+
+        self.assertTrue(
+            self.objects.set_door_slot_editing_target(**target_arguments)
+        )
+        image_path = Path(self.temporary_directory.name) / "loaded-reference.png"
+        self.assertTrue(cv2.imwrite(str(image_path), reference))
+        with patch(
+            "housemaker.merged_generation_workspace.QFileDialog.getOpenFileName",
+            return_value=(str(image_path), "Image files"),
+        ):
+            self.workspace.load_reference_image_button.click()
+
+        self.assertIsNone(self.objects._door_slot_editing_target)
+        self.assertTrue(self.objects.symmetric_division_checkbox.isEnabled())
 
     def test_pasted_reference_is_used_for_surface_generation(self) -> None:
         surface = self._enable_surface_generation()

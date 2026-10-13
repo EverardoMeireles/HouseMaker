@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import trimesh
 from PIL import Image
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton
 
 from housemaker.glb import (
     GeneratedModel,
@@ -182,6 +182,44 @@ class CanvasSceneVisibilityTests(unittest.TestCase):
         self.viewer.close()
         self.viewer.deleteLater()
         _qt_application.processEvents()
+
+    def test_side_panel_wireframe_checkbox_controls_scene_meshes(self) -> None:
+        checkbox = self.viewer.scene_wireframe_checkbox
+
+        self.assertIsNotNone(checkbox)
+        assert checkbox is not None
+        self.assertIs(
+            self.viewer.findChild(
+                QCheckBox,
+                "canvas-scene-wireframe-checkbox",
+            ),
+            checkbox,
+        )
+        self.assertEqual(checkbox.text(), "Wireframe")
+        self.assertTrue(checkbox.isChecked())
+        self.assertTrue(self.viewer.get_wireframe_enabled())
+
+        checkbox.click()
+
+        self.assertFalse(checkbox.isChecked())
+        self.assertFalse(self.viewer.get_wireframe_enabled())
+
+        checkbox.click()
+
+        self.assertTrue(checkbox.isChecked())
+        self.assertTrue(self.viewer.get_wireframe_enabled())
+
+    def test_programmatic_wireframe_change_syncs_side_panel_checkbox(self) -> None:
+        checkbox = self.viewer.scene_wireframe_checkbox
+        assert checkbox is not None
+
+        self.viewer.set_wireframe_enabled(False)
+
+        self.assertFalse(checkbox.isChecked())
+
+        self.viewer.set_wireframe_enabled(True)
+
+        self.assertTrue(checkbox.isChecked())
 
     def test_side_panel_controls_surface_focus_and_ceiling_visibility(self) -> None:
         floor_id = "level:0/floor"

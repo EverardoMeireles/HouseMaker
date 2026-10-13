@@ -195,6 +195,10 @@ class DoorLiveMirrorTests(unittest.TestCase):
                 (object_id, position, rotation)
             )
         )
+        preview_emitted: list[tuple[object, ...]] = []
+        self.viewer.placed_object_transform_preview_changed.connect(
+            lambda *values: preview_emitted.append(values)
+        )
         initial_transform = knob_group.current_transform.copy()
         handle = _TransformGizmoHandle(TRANSFORM_GIZMO_TRANSLATE, 1)
 
@@ -223,6 +227,12 @@ class DoorLiveMirrorTests(unittest.TestCase):
             self.assertAlmostEqual(knob_group.current_transform[1, 3], 0.38)
             self.assertAlmostEqual(_item_transform(mirror_root)[1, 3], -0.5)
             self.assertEqual(emitted, [])
+            self.assertEqual(preview_emitted[-1][0], "door-1:door_knob")
+            np.testing.assert_allclose(
+                preview_emitted[-1][1],
+                (0.35, 0.38, 1.0),
+                atol=1e-7,
+            )
 
         self.viewer._cancel_placed_object_gizmo_drag()
 
@@ -237,6 +247,11 @@ class DoorLiveMirrorTests(unittest.TestCase):
             atol=1e-7,
         )
         self.assertEqual(emitted, [])
+        np.testing.assert_allclose(
+            preview_emitted[-1][1],
+            (0.35, -0.12, 1.0),
+            atol=1e-7,
+        )
 
         with patch.object(
             self.viewer.view,
@@ -280,6 +295,10 @@ class DoorLiveMirrorTests(unittest.TestCase):
         self.viewer.placed_object_axis_scales_changed.connect(
             lambda object_id, scales: emitted.append((object_id, scales))
         )
+        preview_emitted: list[tuple[object, ...]] = []
+        self.viewer.placed_object_transform_preview_changed.connect(
+            lambda *values: preview_emitted.append(values)
+        )
         initial_transform = knob_group.current_transform.copy()
         handle = _TransformGizmoHandle(TRANSFORM_GIZMO_SCALE, 0)
 
@@ -306,6 +325,12 @@ class DoorLiveMirrorTests(unittest.TestCase):
                 initial_transform,
             )
             self.assertEqual(emitted, [])
+            self.assertGreater(float(preview_emitted[-1][3][0]), 1.0)
+            np.testing.assert_allclose(
+                preview_emitted[-1][3][1:],
+                (1.0, 1.0),
+                atol=1e-7,
+            )
 
             self.assertTrue(
                 self.viewer._finish_placed_object_gizmo_drag(QPointF(20.0, 0.0))

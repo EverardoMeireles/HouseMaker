@@ -34,7 +34,6 @@ from housemaker.surface_geometry import (
     build_fixed_surfaces,
 )
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -733,11 +732,6 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertTrue(
             self.workspace.viewer._get_active_canvas_surface_edit_targets()
         )
-        assert self.workspace.viewer.window_tools_status_label is not None
-        self.assertIn(
-            "invalid delayed wall",
-            self.workspace.viewer.window_tools_status_label.text(),
-        )
         reconcile_assignments.assert_not_called()
 
     def test_pending_wall_edit_blocks_unrelated_preview_rebuilds(self) -> None:
@@ -919,7 +913,9 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             _edit(target, 0.0)
         )
 
-    def test_singular_wall_restoration_rearms_window_placement(self) -> None:
+    def test_singular_wall_restoration_keeps_window_frame_tool_available(
+        self,
+    ) -> None:
         level = _build_plain_connected_level()
         surfaces = self._install_level(level)
         wall = _surface(
@@ -950,8 +946,12 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             viewer.get_selected_wall_surface_id(),
             wall.surface_id,
         )
-        self.workspace.add_window_button.click()
-        self.assertTrue(viewer.is_window_placement_active())
+        self.assertEqual(
+            self.workspace.add_window_button.text(),
+            "Add window frame",
+        )
+        self.assertTrue(self.workspace.add_window_button.isEnabled())
+        self.assertFalse(viewer.is_window_placement_active())
 
 
 # ### Direct execution ###

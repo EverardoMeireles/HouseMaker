@@ -1,10 +1,10 @@
 # ### Environment setup ###
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 import os
-from types import SimpleNamespace
 import unittest
+from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -12,21 +12,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import numpy as np
+import trimesh
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication
-import trimesh
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from housemaker.glb import GeneratedModel
 from housemaker.surface_geometry import (
-    FixedSurface,
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
+    FixedSurface,
     WallWindowPlacement,
 )
 from housemaker.viewer import ATLAS_SURFACE_HIGHLIGHT_COLOR, GlbViewerWidget
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -160,21 +159,26 @@ class CanvasWindowEditorTests(unittest.TestCase):
         ordinary_viewer = self._build_viewer(enabled=False)
         canvas_viewer = self._build_viewer()
 
+        self.assertIsNone(ordinary_viewer.canvas_tools_panel)
         self.assertIsNone(ordinary_viewer.window_tools_panel)
         self.assertIsNone(ordinary_viewer.undo_window_button)
+        self.assertIsNotNone(canvas_viewer.canvas_tools_panel)
         self.assertIsNotNone(canvas_viewer.window_tools_panel)
-        self.assertIsNotNone(canvas_viewer.undo_window_button)
-        assert canvas_viewer.undo_window_button is not None
+        self.assertIsNone(canvas_viewer.undo_window_button)
+        self.assertIsNone(canvas_viewer.window_tools_status_label)
         self.assertFalse(hasattr(ordinary_viewer, "add_window_button"))
         self.assertFalse(hasattr(canvas_viewer, "add_window_button"))
-        self.assertEqual(canvas_viewer.undo_window_button.text(), "Undo window")
-        self.assertFalse(canvas_viewer.undo_window_button.isEnabled())
-
-        panel_layout = canvas_viewer.window_tools_panel.layout()
-        self.assertIs(
-            panel_layout.itemAt(1).widget(),
-            canvas_viewer.undo_window_button,
+        assert canvas_viewer.canvas_tools_panel is not None
+        labels = tuple(
+            label.text()
+            for label in canvas_viewer.canvas_tools_panel.findChildren(QLabel)
         )
+        buttons = tuple(
+            button.text()
+            for button in canvas_viewer.canvas_tools_panel.findChildren(QPushButton)
+        )
+        self.assertNotIn("Window tools", labels)
+        self.assertNotIn("Undo window", buttons)
 
         wall = _build_wall()
         canvas_viewer.set_wall_targets((_build_floor(), wall))
@@ -184,29 +188,17 @@ class CanvasWindowEditorTests(unittest.TestCase):
         self.assertTrue(canvas_viewer.begin_window_placement())
         self.assertTrue(canvas_viewer.is_window_placement_active())
 
-    def test_undo_availability_is_independent_of_selection_and_pauses_drawing(
+    def test_removed_window_undo_api_remains_an_inert_compatibility_shim(
         self,
     ) -> None:
         viewer = self._build_viewer()
-        assert viewer.undo_window_button is not None
-        emitted: list[bool] = []
-        viewer.window_undo_requested.connect(lambda: emitted.append(True))
 
         viewer.set_window_undo_available(True)
 
-        self.assertTrue(viewer.undo_window_button.isEnabled())
+        self.assertIsNone(viewer.undo_window_button)
         wall = self._arm_selected_wall(viewer)
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
-        self.assertFalse(viewer.undo_window_button.isEnabled())
-
-        viewer.cancel_window_placement(status_message=None)
-        self.assertTrue(viewer.undo_window_button.isEnabled())
-        viewer.select_wall_target(None)
-        self.assertTrue(viewer.undo_window_button.isEnabled())
-        viewer.undo_window_button.click()
-
-        self.assertEqual(emitted, [True])
-        self.assertFalse(viewer.is_window_placement_active())
+        self.assertTrue(viewer.is_window_placement_active())
 
     def test_hidden_semantic_wall_pick_selects_the_nearest_wall(self) -> None:
         viewer = self._build_viewer()
@@ -500,11 +492,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
         self.assertFalse(viewer._window_preview_is_valid)
         self.assertIsNone(viewer._window_preview_placement)
         self.assertIsNotNone(viewer._window_preview_item)
-        assert viewer.window_tools_status_label is not None
-        self.assertNotEqual(
-            viewer.window_tools_status_label.text(),
-            "Release to add this window.",
-        )
+        self.assertIsNone(viewer.window_tools_status_label)
 
         with patch.object(
             viewer.view,

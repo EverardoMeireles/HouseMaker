@@ -216,6 +216,31 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             )
         )
 
+    def _get_rendered_placed_object_bounds(self, object_id: str) -> np.ndarray:
+        """Return world bounds from the model installed in the real viewer."""
+
+        model = self.workspace.viewer.model
+        self.assertIsNotNone(model)
+        assert model is not None
+        preview = next(
+            (
+                candidate
+                for candidate in model.preview_placed_objects
+                if candidate.object_id == object_id
+            ),
+            None,
+        )
+        self.assertIsNotNone(preview)
+        assert preview is not None
+
+        world_vertices: list[np.ndarray] = []
+        for mesh in preview.meshes:
+            world_mesh = mesh.copy()
+            world_mesh.apply_transform(preview.placement_transform)
+            world_vertices.append(np.asarray(world_mesh.vertices, dtype=float))
+        vertices = np.vstack(world_vertices)
+        return np.vstack((np.min(vertices, axis=0), np.max(vertices, axis=0)))
+
     def _place_edging(
         self,
         trim_id: str,
@@ -1006,6 +1031,99 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             expected_frame.target_extents,
             rtol=1e-5,
             atol=1e-7,
+        )
+
+    def test_textured_cornice_follows_changed_ceiling_height(self) -> None:
+        """Keep authored cornices attached to their current host-wall top."""
+
+        trim_id = "9" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_cornice(trim_id, _wall_surface_id(1, 2))
+        target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+        self._publish_authored_trim_texture(
+            target.object_id,
+            task_id="height-following-cornice-texture",
+        )
+
+        original_placements, _original_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+        self.assertEqual(len(original_placements), 1)
+        original_world_mesh = original_placements[0].model.mesh.copy()
+        original_world_mesh.apply_transform(
+            build_placed_generated_model_transform(original_placements[0])
+        )
+
+        height_delta = 0.75
+        self.level.rooms[0].height_meters += height_delta
+        self.workspace._reconcile_canvas_surface_edit_and_refresh()
+        moved_placements, _moved_keys = (
+            self.workspace._build_active_architectural_trim_component_models(
+                include_excluded_levels=True,
+            )
+        )
+        self.assertEqual(len(moved_placements), 1)
+        moved_world_mesh = moved_placements[0].model.mesh.copy()
+        moved_world_mesh.apply_transform(
+            build_placed_generated_model_transform(moved_placements[0])
+        )
+
+        self.assertAlmostEqual(
+            float(moved_world_mesh.bounds[1, 2]),
+            float(original_world_mesh.bounds[1, 2]) + height_delta,
+        )
+
+    def test_height_level_ui_refreshes_textured_cornice_before_window_edit(
+        self,
+    ) -> None:
+        """Move the rendered cornice through the real Height level UI path."""
+
+        self.level.rooms.clear()
+        self.workspace._set_canvas_viewer_targets(
+            build_fixed_surfaces([self.level])
+        )
+        trim_id = "0" * 32
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._place_cornice(trim_id, "level:2/wall:1:2")
+        target = self.workspace.generation._architectural_trim_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+        self._publish_authored_trim_texture(
+            target.object_id,
+            task_id="height-level-ui-cornice-texture",
+        )
+
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        self.workspace._run_scheduled_viewer_preview_refresh()
+        original_bounds = self._get_rendered_placed_object_bounds(
+            target.object_id
+        )
+
+        height_delta = 0.75
+        original_height = self.level.height_meters
+        self.assertIsNone(self.workspace._pending_window_mesh_level_index)
+        self.workspace.height_level_spinbox.setValue(
+            original_height + height_delta
+        )
+
+        self.assertAlmostEqual(
+            self.level.height_meters,
+            original_height + height_delta,
+        )
+        self.assertTrue(self.workspace._is_viewer_refresh_scheduled)
+        self.workspace._run_scheduled_viewer_preview_refresh()
+        moved_bounds = self._get_rendered_placed_object_bounds(target.object_id)
+
+        self.assertIsNone(self.workspace._pending_window_mesh_level_index)
+        self.assertAlmostEqual(
+            float(moved_bounds[1, 2]),
+            float(original_bounds[1, 2]) + height_delta,
         )
 
     def test_generated_cornice_surface_texture_is_listed_and_assignable(
@@ -2177,6 +2295,7 @@ class ArchitecturalTrimMainTests(unittest.TestCase):
             self._place_skirting("4" * 32, _wall_surface_id(1, 2))
             self.workspace.canvas.set_selected_vertex_ids((1,))
             self.workspace.canvas._delete_selected_vertices()
+            self.workspace._commit_pending_wall_vertex_update()
 
         self.assertEqual(self.level.architectural_trims, [])
 

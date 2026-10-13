@@ -92,6 +92,9 @@ USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
 MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY = (
     "generation/minimum_face_visibility_percentage"
 )
+DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY = (
+    "preview/doors_and_windows_point_light_intensity"
+)
 MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY = (
     # Keep the original persisted key so existing preferences remain valid.
     "canvas/doorway_mesh_update_delay_seconds"
@@ -116,6 +119,10 @@ CLEAR_MASK_HOTKEY_VALUES = frozenset(
 DEFAULT_UNUSED_FACE_REMOVAL = False
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
+DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY = 1.0
+MIN_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY = 0.0
+MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY = 10.0
+DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_STEP = 0.1
 AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS = (512, 1024)
 DEFAULT_AUTOMATIC_ATLAS_CREATION = False
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR = False
@@ -229,6 +236,9 @@ class GenerationServiceSettings:
     clear_mask_hotkey: str = DEFAULT_CLEAR_MASK_HOTKEY
     plan_correction_model: str = DEFAULT_PLAN_CORRECTION_MODEL
     make_walls_continuous: bool = DEFAULT_MAKE_WALLS_CONTINUOUS
+    doors_and_windows_point_light_intensity: float = (
+        DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY
+    )
 
     def __post_init__(self) -> None:
         try:
@@ -332,6 +342,22 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Make walls continuous must be enabled or disabled."
             )
+        normalized_point_light_intensity = (
+            _normalize_doors_and_windows_point_light_intensity(
+                self.doors_and_windows_point_light_intensity
+            )
+        )
+        if normalized_point_light_intensity is None:
+            raise ValueError(
+                "Doors and Windows point light intensity must be between "
+                f"{MIN_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY} and "
+                f"{MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY}."
+            )
+        object.__setattr__(
+            self,
+            "doors_and_windows_point_light_intensity",
+            normalized_point_light_intensity,
+        )
         if (
             self.scene_3d_display_screen_id is not None
             and not isinstance(self.scene_3d_display_screen_id, str)
@@ -544,6 +570,9 @@ class SettingsWidget(QWidget):
             ),
             make_walls_continuous=(
                 self.make_walls_continuous_checkbox.isChecked()
+            ),
+            doors_and_windows_point_light_intensity=(
+                self.doors_and_windows_point_light_intensity_spinbox.value()
             ),
         )
 
@@ -1077,6 +1106,33 @@ class SettingsWidget(QWidget):
             self.minimum_face_visibility_percentage_spinbox,
         )
 
+        self.doors_and_windows_point_light_intensity_spinbox = QDoubleSpinBox()
+        self.doors_and_windows_point_light_intensity_spinbox.setObjectName(
+            "doors_and_windows_point_light_intensity_spinbox"
+        )
+        self.doors_and_windows_point_light_intensity_spinbox.setRange(
+            MIN_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
+            MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
+        )
+        self.doors_and_windows_point_light_intensity_spinbox.setDecimals(1)
+        self.doors_and_windows_point_light_intensity_spinbox.setSingleStep(
+            DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_STEP
+        )
+        self.doors_and_windows_point_light_intensity_spinbox.setKeyboardTracking(
+            False
+        )
+        self.doors_and_windows_point_light_intensity_spinbox.setToolTip(
+            "Control the point light that follows the pointer over door and "
+            "window meshes in their dedicated 3D preview."
+        )
+        self.doors_and_windows_point_light_intensity_spinbox.valueChanged.connect(
+            self._handle_doors_and_windows_point_light_intensity_changed
+        )
+        object_generation_form.addRow(
+            "Doors and Windows point light intensity",
+            self.doors_and_windows_point_light_intensity_spinbox,
+        )
+
         security_note = QLabel(
             "Testing mode: API keys are stored as plaintext in the local "
             "HouseMaker settings.json file, but never in project JSON files. "
@@ -1237,6 +1293,11 @@ class SettingsWidget(QWidget):
         )
         self.minimum_face_visibility_percentage_spinbox.setValue(
             read_minimum_face_visibility_percentage(
+                self._application_settings
+            )
+        )
+        self.doors_and_windows_point_light_intensity_spinbox.setValue(
+            read_doors_and_windows_point_light_intensity(
                 self._application_settings
             )
         )
@@ -1817,6 +1878,20 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_doors_and_windows_point_light_intensity_changed(
+        self,
+        value: float,
+    ) -> None:
+        """Persist the hover-light strength used by the opening preview."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
+            float(value),
+        )
+        self.settings_changed.emit()
+
     def _handle_mesh_edit_update_delay_changed(self, value: float) -> None:
         if self._is_loading_settings:
             return
@@ -2061,6 +2136,38 @@ def read_minimum_face_visibility_percentage(
     ):
         return DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE
     return int(value)
+
+
+# ### Preview lighting setting helpers ###
+def read_doors_and_windows_point_light_intensity(
+    application_settings: ApplicationSettingsStore,
+) -> float:
+    """Read the Doors and Windows hover-light strength safely."""
+
+    normalized = _normalize_doors_and_windows_point_light_intensity(
+        application_settings.get(
+            DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
+            DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
+        )
+    )
+    if normalized is None:
+        return DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY
+    return normalized
+
+
+def _normalize_doors_and_windows_point_light_intensity(
+    value: object,
+) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    normalized = float(value)
+    if not math.isfinite(normalized) or not (
+        MIN_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY
+        <= normalized
+        <= MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY
+    ):
+        return None
+    return normalized
 
 
 # ### Canvas snapping setting helpers ###

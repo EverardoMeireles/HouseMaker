@@ -113,7 +113,7 @@ class TourMainIntegrationTests(unittest.TestCase):
                 "3D scene",
                 "Atlas",
                 "Generation",
-                "Doors",
+                "Doors and Windows",
                 "Tour",
                 "Settings",
             ],
