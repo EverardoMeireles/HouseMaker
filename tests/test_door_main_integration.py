@@ -497,6 +497,31 @@ class DoorMainIntegrationTests(unittest.TestCase):
         self.assertEqual(library.get_door(door.door_id), door)
         self.assertEqual(len(self.level.doorways), 1)
 
+    def test_scene_door_selection_redirects_to_its_owning_doorway(self) -> None:
+        """Canvas must expose an installed door through its structural opening."""
+
+        door = self._create_door()
+        reference = self._doorway_reference()
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            reference,
+            False,
+        )
+        placement = self.workspace.doors_workspace.data().placements[0]
+        scene_object_id = f"door-placement:{placement.placement_id}"
+
+        self.workspace.viewer.select_placed_object(scene_object_id)
+
+        self.assertEqual(
+            self.workspace.viewer.get_selected_canvas_opening_reference(),
+            reference,
+        )
+        self.assertEqual(
+            self.workspace.viewer.get_selected_placed_object_ids(),
+            (),
+        )
+        self.assertEqual(self.workspace.canvas.selected_doorway_index, 0)
+
     def test_scene_delete_detaches_window_without_deleting_reusable_asset(
         self,
     ) -> None:

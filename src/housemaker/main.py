@@ -5039,6 +5039,7 @@ class BlueprintWorkspace(QWidget):
             target.key: target for target in opening_targets
         }
         self.viewer.set_canvas_opening_targets(opening_targets)
+        self._sync_canvas_opening_fixture_keys()
         stair_part_targets = self._sync_canvas_stair_semantic_targets(
             semantic_levels
         )
@@ -16815,7 +16816,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_canvas_opening_fixture_keys()
 
     def _sync_canvas_opening_fixture_keys(self) -> None:
-        """Tell the 2D canvas which openings own removable fixtures."""
+        """Publish installed-fixture ownership to both Canvas views."""
 
         library = self.doors_workspace.data()
         doorway_bindings = {
@@ -16834,6 +16835,28 @@ class BlueprintWorkspace(QWidget):
             for placement in library.window_placements
         )
         self.canvas.set_fixture_opening_keys(opening_keys)
+
+        doorway_references = {
+            (target.reference.level_index, target.reference.stable_id): (
+                target.reference
+            )
+            for target in self._canvas_opening_targets_by_key.values()
+            if (
+                target.reference.kind == CANVAS_OPENING_DOORWAY
+                and target.reference.stable_id is not None
+            )
+        }
+        placed_door_bindings = {
+            f"door-placement:{placement.placement_id}": reference
+            for placement in library.placements
+            if (
+                reference := doorway_references.get(
+                    (placement.level_index, placement.doorway_id)
+                )
+            )
+            is not None
+        }
+        self.viewer.set_placed_door_opening_bindings(placed_door_bindings)
 
     def _set_mesh_edit_update_delay_seconds(
         self,

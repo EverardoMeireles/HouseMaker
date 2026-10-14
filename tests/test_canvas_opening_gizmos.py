@@ -28,7 +28,7 @@ from housemaker.door_state import (
     DOOR_SLOT_BODY,
     DOOR_SLOT_KNOB,
 )
-from housemaker.glb import GeneratedModel
+from housemaker.glb import GeneratedModel, PreviewPlacedObject
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
     CANVAS_OPENING_ARCH_SIZE_PIXELS,
@@ -125,6 +125,40 @@ def _build_model() -> GeneratedModel:
     mesh = trimesh.creation.box(extents=(4.0, 0.2, 3.0))
     mesh.apply_translation((2.0, 0.0, 1.5))
     return GeneratedModel(mesh=mesh, scene=trimesh.Scene(mesh), glb_bytes=b"")
+
+
+def _build_opening_fixture_selection_model() -> GeneratedModel:
+    """Build one installed door and one ordinary selectable scene object."""
+
+    base_mesh = trimesh.creation.box(extents=(0.01, 0.01, 0.01))
+    base_mesh.apply_translation((100.0, 100.0, 100.0))
+    door_mesh = trimesh.creation.box(extents=(0.8, 0.2, 1.8))
+    door_mesh.apply_translation((2.0, 0.0, 1.5))
+    ordinary_mesh = trimesh.creation.box(extents=(0.8, 0.2, 1.0))
+    ordinary_mesh.apply_translation((3.5, 0.0, 1.0))
+    identity = np.eye(4, dtype=float)
+    return GeneratedModel(
+        mesh=base_mesh,
+        scene=trimesh.Scene(base_mesh),
+        glb_bytes=b"",
+        preview_base_mesh=base_mesh.copy(),
+        preview_placed_objects=[
+            PreviewPlacedObject(
+                object_id="door-placement:placement-a",
+                meshes=(door_mesh,),
+                placement_transform=identity.copy(),
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+            ),
+            PreviewPlacedObject(
+                object_id="ordinary-object",
+                meshes=(ordinary_mesh,),
+                placement_transform=identity.copy(),
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+            ),
+        ],
+    )
 
 
 def _ray_at(x: float, z: float) -> tuple[np.ndarray, np.ndarray]:
@@ -235,6 +269,68 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         )
         self.assertIsNone(viewer.get_selected_wall_surface_id())
         self.assertEqual(selected, [target.reference])
+
+    def test_installed_door_pick_selects_its_doorway_instead_of_the_mesh(
+        self,
+    ) -> None:
+        """Installed doors redirect Canvas selection to their owning opening."""
+
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        viewer.set_model(_build_opening_fixture_selection_model())
+        viewer.set_placed_door_opening_bindings(
+            {"door-placement:placement-a": target.reference}
+        )
+        selected_openings: list[object] = []
+        selected_objects: list[object] = []
+        viewer.canvas_opening_selection_changed.connect(selected_openings.append)
+        viewer.placed_object_selection_changed.connect(selected_objects.append)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(
+                np.asarray((2.0, -5.0, 1.5), dtype=float),
+                np.asarray((0.0, 1.0, 0.0), dtype=float),
+            ),
+        ):
+            viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertEqual(
+            viewer.get_selected_canvas_opening_reference(),
+            target.reference,
+        )
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ())
+        self.assertEqual(selected_openings, [target.reference])
+        self.assertNotIn("door-placement:placement-a", selected_objects)
+
+    def test_ordinary_placed_object_remains_selectable_beside_installed_door(
+        self,
+    ) -> None:
+        """Door redirection must not change ordinary Canvas object selection."""
+
+        target = _build_target(CANVAS_OPENING_DOORWAY)
+        viewer = self._build_viewer(target)
+        viewer.set_model(_build_opening_fixture_selection_model())
+        viewer.set_placed_door_opening_bindings(
+            {"door-placement:placement-a": target.reference}
+        )
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(
+                np.asarray((3.5, -5.0, 1.0), dtype=float),
+                np.asarray((0.0, 1.0, 0.0), dtype=float),
+            ),
+        ):
+            viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertIsNone(viewer.get_selected_canvas_opening_reference())
+        self.assertEqual(
+            viewer.get_selected_placed_object_ids(),
+            ("ordinary-object",),
+        )
 
     def test_opening_and_handles_remain_selectable_through_a_nearer_wall(
         self,

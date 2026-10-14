@@ -4881,6 +4881,10 @@ class GlbViewerWidget(QWidget):
         self._tour_gizmo_items: list[GLGraphicsItem] = []
         self._tour_gizmo_size = TOUR_GIZMO_MIN_SIZE_METERS
         self._canvas_opening_targets: dict[str, CanvasOpeningTarget] = {}
+        self._placed_door_opening_references: dict[
+            str,
+            CanvasOpeningReference,
+        ] = {}
         self._selected_canvas_opening_key: str | None = None
         self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
         self._canvas_opening_gizmo_items: list[GLGraphicsItem] = []
@@ -8259,6 +8263,46 @@ class GlbViewerWidget(QWidget):
         return True
 
     # ### Canvas opening edit API ###
+    def set_placed_door_opening_bindings(
+        self,
+        bindings: Mapping[str, CanvasOpeningReference],
+    ) -> bool:
+        """Redirect installed-door selection to each door's doorway."""
+
+        if not isinstance(bindings, Mapping):
+            raise TypeError("Placed-door opening bindings must be a mapping.")
+
+        normalized_bindings: dict[str, CanvasOpeningReference] = {}
+        for raw_object_id, reference in bindings.items():
+            object_id = str(raw_object_id).strip()
+            if not object_id:
+                raise ValueError("Placed-door object IDs cannot be empty.")
+            if not isinstance(reference, CanvasOpeningReference):
+                raise TypeError(
+                    "Placed-door bindings require CanvasOpeningReference values."
+                )
+            if reference.kind != CANVAS_OPENING_DOORWAY:
+                raise ValueError("Placed doors can only be bound to doorways.")
+            if object_id in normalized_bindings:
+                raise ValueError(f"Duplicate placed-door object ID: {object_id!r}.")
+            normalized_bindings[object_id] = reference
+
+        if normalized_bindings == self._placed_door_opening_references:
+            return False
+        self._placed_door_opening_references = normalized_bindings
+
+        selected_door_ids = tuple(
+            object_id
+            for object_id in self._selected_placed_object_ids
+            if object_id in normalized_bindings
+        )
+        if selected_door_ids:
+            self.set_selected_placed_object_ids(
+                self._selected_placed_object_ids,
+                active_object_id=self._selected_placed_object_id,
+            )
+        return True
+
     def set_canvas_opening_targets(
         self,
         targets: tuple[CanvasOpeningTarget, ...],
@@ -9070,10 +9114,17 @@ class GlbViewerWidget(QWidget):
             return False
         self._invalidate_external_canvas_rectangle_selection()
         normalized_id = None if object_id is None else str(object_id).strip()
-        if normalized_id is not None and normalized_id not in (
-            self._placed_object_render_groups
+        if (
+            normalized_id is not None
+            and normalized_id not in self._placed_object_render_groups
+            and normalized_id not in self._placed_door_opening_references
         ):
             return False
+        if normalized_id in self._placed_door_opening_references:
+            return self.set_selected_placed_object_ids(
+                (normalized_id,),
+                active_object_id=normalized_id,
+            )
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
@@ -9100,13 +9151,34 @@ class GlbViewerWidget(QWidget):
             )
         except TypeError:
             return False
-        normalized_ids = tuple(
+        known_ids = tuple(
             dict.fromkeys(
                 object_id
                 for object_id in requested_ids
-                if object_id in self._placed_object_render_groups
+                if (
+                    object_id in self._placed_object_render_groups
+                    or object_id in self._placed_door_opening_references
+                )
             )
         )
+        door_references = tuple(
+            self._placed_door_opening_references[object_id]
+            for object_id in known_ids
+            if object_id in self._placed_door_opening_references
+        )
+        normalized_ids = tuple(
+            object_id
+            for object_id in known_ids
+            if object_id not in self._placed_door_opening_references
+        )
+        if door_references and not normalized_ids:
+            reference = door_references[-1]
+            target = self._canvas_opening_targets.get(reference.key)
+            if (
+                target is not None
+                and target.wall_surface_id in self.get_visible_canvas_surface_ids()
+            ):
+                return self.select_canvas_opening(reference)
         if normalized_ids:
             self.set_selected_canvas_stair_face_refs(())
             self.set_selected_directional_light_id(None)
@@ -13059,6 +13131,9 @@ class GlbViewerWidget(QWidget):
             assert object_hit is not None
             object_id = object_hit[0].object_id
             self.set_selected_directional_light_id(None)
+            if object_id in self._placed_door_opening_references:
+                self.select_placed_object(object_id)
+                return
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
             if self._select_architectural_trim_placed_object(
