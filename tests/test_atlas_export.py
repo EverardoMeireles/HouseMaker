@@ -18,6 +18,7 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker.atlas_export import (
     MaterializedTextureAtlas,
+    _duplicate_reverse_wound_atlas_fragment,
     _map_uv_to_placement,
     apply_texture_atlases_to_export,
 )
@@ -27,6 +28,7 @@ from housemaker.glass_material import (
 )
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
+    PACKED_ORM_AO_UV_ATTRIBUTE,
     GeneratedModel,
     PlacedGeneratedModel,
     compose_generated_model_instance_sources,
@@ -75,6 +77,7 @@ def _textured_triangle(
     uv: np.ndarray | None = None,
     glass: bool = False,
     factor_only: bool = False,
+    double_sided: bool = False,
     x_offset: float = 0.0,
 ) -> trimesh.Trimesh:
     mesh = trimesh.Trimesh(
@@ -96,11 +99,13 @@ def _textured_triangle(
         material = PBRMaterial(
             name=name,
             baseColorFactor=[90, 100, 110, 255],
+            doubleSided=double_sided,
         )
     else:
         material = PBRMaterial(
             name=name,
             baseColorTexture=Image.new("RGBA", (2, 2), (80, 90, 100, 255)),
+            doubleSided=double_sided,
         )
     mesh.visual = TextureVisuals(
         uv=(
@@ -434,6 +439,128 @@ def _load_glb_z_up_meshes(payload: bytes) -> tuple[trimesh.Trimesh, ...]:
 
 # ### Export tests ###
 class TextureAtlasExportTests(unittest.TestCase):
+    def test_reverse_wound_atlas_copy_preserves_both_uv_sets(self) -> None:
+        fragment = _textured_triangle(
+            name="Double-sided source",
+            metadata={"housemaker_object_id": "double-sided"},
+            double_sided=True,
+        )
+        source_uv1 = np.asarray(
+            ((0.1, 0.2), (0.7, 0.2), (0.1, 0.8)),
+            dtype=np.float32,
+        )
+        fragment.vertex_attributes[PACKED_ORM_AO_UV_ATTRIBUTE] = source_uv1
+        source_normals = np.asarray(fragment.vertex_normals, dtype=float).copy()
+
+        duplicated = _duplicate_reverse_wound_atlas_fragment(fragment)
+
+        np.testing.assert_array_equal(
+            duplicated.faces,
+            np.asarray(((0, 1, 2), (3, 5, 4)), dtype=np.int64),
+        )
+        np.testing.assert_allclose(
+            duplicated.vertices[:3],
+            duplicated.vertices[3:],
+        )
+        np.testing.assert_allclose(
+            duplicated.vertex_normals[:3],
+            source_normals,
+        )
+        np.testing.assert_allclose(
+            duplicated.vertex_normals[3:],
+            -source_normals,
+        )
+        duplicated_uv = np.asarray(duplicated.visual.uv, dtype=float)
+        np.testing.assert_allclose(duplicated_uv[:3], duplicated_uv[3:])
+        duplicated_uv1 = np.asarray(
+            duplicated.vertex_attributes[PACKED_ORM_AO_UV_ATTRIBUTE],
+            dtype=float,
+        )
+        np.testing.assert_allclose(duplicated_uv1[:3], source_uv1)
+        np.testing.assert_allclose(duplicated_uv1[3:], source_uv1)
+        self.assertEqual(duplicated.metadata, fragment.metadata)
+        self.assertIsNot(duplicated.metadata, fragment.metadata)
+
+    def test_atlas_batches_only_explicit_double_sided_source_faces_twice(
+        self,
+    ) -> None:
+        resolution = 2048
+        atlas = TextureAtlasRecord(
+            atlas_id="selective-sides",
+            name="Selective sides",
+            resolution=resolution,
+            placements=[
+                TextureAtlasPlacement(
+                    object_id="single-sided",
+                    texture_path="single.png",
+                    texture_resolution=512,
+                    x=0,
+                    y=0,
+                    size=512,
+                ),
+                TextureAtlasPlacement(
+                    object_id="double-sided",
+                    texture_path="double.png",
+                    texture_resolution=512,
+                    x=512,
+                    y=0,
+                    size=512,
+                ),
+            ],
+        )
+        single_sided = _textured_triangle(
+            name="Single-sided",
+            metadata={"housemaker_object_id": "single-sided"},
+        )
+        double_sided = _textured_triangle(
+            name="Double-sided",
+            metadata={"housemaker_object_id": "double-sided"},
+            double_sided=True,
+            x_offset=2.0,
+        )
+        scene = trimesh.Scene()
+        scene.add_geometry(single_sided, node_name="single-sided")
+        scene.add_geometry(double_sided, node_name="double-sided")
+        model = GeneratedModel(
+            mesh=trimesh.util.concatenate((single_sided, double_sided)),
+            scene=scene,
+            glb_bytes=b"",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = apply_texture_atlases_to_export(
+                model,
+                (
+                    MaterializedTextureAtlas(
+                        atlas,
+                        _write_atlas_maps(Path(temporary_directory), resolution),
+                        active_map_types=frozenset({ATLAS_MAP_BASE_COLOR}),
+                    ),
+                ),
+            )
+
+        self.assertEqual(len(result.scene.geometry), 1)
+        atlas_geometry = next(iter(result.scene.geometry.values()))
+        self.assertEqual(len(atlas_geometry.faces), 3)
+        triangles = np.asarray(atlas_geometry.triangles, dtype=float)
+        single_faces = np.all(triangles[:, :, 0] < 1.5, axis=1)
+        double_faces = np.all(triangles[:, :, 0] > 1.5, axis=1)
+        self.assertEqual(int(np.count_nonzero(single_faces)), 1)
+        self.assertEqual(int(np.count_nonzero(double_faces)), 2)
+        double_normals = np.asarray(atlas_geometry.face_normals)[double_faces]
+        np.testing.assert_allclose(double_normals[0], -double_normals[1])
+
+        document = _read_glb_json(result.glb_bytes)
+        self.assertEqual(len(document["materials"]), 1)
+        self.assertIsNot(document["materials"][0].get("doubleSided"), True)
+        self.assertEqual(
+            sum(
+                len(mesh["primitives"])
+                for mesh in document["meshes"]
+            ),
+            1,
+        )
+
     def test_atlas_maps_share_an_explicit_trilinear_clamped_sampler(
         self,
     ) -> None:
@@ -674,7 +801,11 @@ class TextureAtlasExportTests(unittest.TestCase):
             scene=trimesh.Scene(ordinary),
             glb_bytes=b"",
         )
-        source_mesh = _textured_triangle(name="Chair", metadata={})
+        source_mesh = _textured_triangle(
+            name="Chair",
+            metadata={},
+            double_sided=True,
+        )
         source_model = GeneratedModel(
             mesh=source_mesh,
             scene=trimesh.Scene(source_mesh),
@@ -736,7 +867,26 @@ class TextureAtlasExportTests(unittest.TestCase):
             ]["primitives"]
         }
         self.assertEqual(source_material_indices, {atlas_material_index})
-        self.assertGreaterEqual(
+        source_child_nodes = [
+            node_name
+            for node_name in result.scene.graph.nodes_geometry
+            if result.scene.graph.transforms.parents.get(node_name)
+            == "chair_prototype"
+        ]
+        self.assertEqual(len(source_child_nodes), 1)
+        _transform, source_geometry_name = result.scene.graph.get(
+            source_child_nodes[0]
+        )
+        source_geometry = result.scene.geometry[source_geometry_name]
+        self.assertEqual(len(source_geometry.faces), 2)
+        np.testing.assert_allclose(
+            source_geometry.face_normals[0],
+            -source_geometry.face_normals[1],
+        )
+        source_uv = np.asarray(source_geometry.visual.uv, dtype=float)
+        np.testing.assert_allclose(source_uv[:3], source_uv[3:])
+        self.assertIsNot(materials[atlas_material_index].get("doubleSided"), True)
+        self.assertEqual(
             sum(
                 primitive.get("material") == atlas_material_index
                 for mesh in document["meshes"]
@@ -1033,7 +1183,7 @@ class TextureAtlasExportTests(unittest.TestCase):
             for material in document["materials"]
             if material["name"] == atlas.name
         )
-        self.assertIs(atlas_material.get("doubleSided"), True)
+        self.assertIsNot(atlas_material.get("doubleSided"), True)
 
         atlas_meshes = [
             mesh
@@ -1196,7 +1346,7 @@ class TextureAtlasExportTests(unittest.TestCase):
             if material["name"] == atlas.name
         )
         atlas_material = document["materials"][atlas_material_index]
-        self.assertIs(atlas_material.get("doubleSided"), True)
+        self.assertIsNot(atlas_material.get("doubleSided"), True)
         self.assertIn("normalTexture", atlas_material)
         self.assertIn(
             "baseColorTexture",

@@ -94,7 +94,12 @@ GUIDE_COLOR = QColor("#39d98a")
 VERTEX_FILL_COLOR = QColor("#ffffff")
 ACTIVE_VERTEX_FILL_COLOR = QColor("#ff7f50")
 SELECTED_VERTEX_FILL_COLOR = QColor("#90cdf4")
-WALL_MIRROR_VERTEX_FILL_COLOR = QColor("#39d98a")
+OUTER_WALL_MARK_VERTEX_FILL_COLOR = QColor("#39d98a")
+OUTER_WALL_REFERENCE_EDGE_COLOR = QColor("#ffd54f")
+OUTER_WALL_REFERENCE_VERTEX_FILL_COLOR = QColor("#ef5350")
+OUTER_WALL_REFERENCE_VERTEX_OUTLINE_COLOR = QColor("#5d1717")
+OUTER_WALL_REFERENCE_EDGE_WIDTH_SCREEN = 2.5
+OUTER_WALL_REFERENCE_VERTEX_RADIUS_SCREEN = 6.0
 VERTEX_OUTLINE_COLOR = QColor("#20242a")
 VERTEX_SELECTION_FILL_COLOR = QColor(144, 205, 244, 48)
 VERTEX_SELECTION_OUTLINE_COLOR = QColor("#90cdf4")
@@ -233,6 +238,17 @@ class CanvasLevelComparisonOverlay:
     doorways: tuple[DoorwayData, ...]
     windows: tuple[WindowData, ...]
     open_spaces: tuple[OpenSpaceData, ...]
+
+
+@dataclass(frozen=True)
+class OuterWallReferenceOverlay:
+    """Immutable cross-level wall guides projected into the active plan."""
+
+    points: tuple[tuple[float, float], ...] = ()
+    edges: tuple[
+        tuple[tuple[float, float], tuple[float, float]],
+        ...,
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -588,6 +604,8 @@ class BlueprintCanvas(QWidget):
     window_placement_changed = Signal(bool)
     placed_object_selection_requested = Signal(object, object)
     placed_object_transform_committed = Signal(str, float, float, float)
+    outer_wall_mark_vertex_toggled = Signal(int)
+    outer_wall_mark_cancel_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -613,7 +631,9 @@ class BlueprintCanvas(QWidget):
         self._generated_wall_preview: GeneratedWallPreview | None = None
         self.active_vertex_id: int | None = None
         self._selected_vertex_ids: tuple[int, ...] = ()
-        self._wall_mirror_vertex_ids: frozenset[int] = frozenset()
+        self._outer_wall_mark_vertex_ids: frozenset[int] = frozenset()
+        self._outer_wall_reference_overlay = OuterWallReferenceOverlay()
+        self._outer_wall_marking_active = False
         self.preview_point: tuple[float, float] | None = None
         self.preview_guides: list[SnapGuide] = []
         self.undo_stack: list[CanvasSnapshot] = []
@@ -774,20 +794,77 @@ class BlueprintCanvas(QWidget):
             selected_ids.append(vertex_id)
         return self.set_selected_vertex_ids(selected_ids)
 
-    def set_wall_mirror_vertex_ids(self, vertex_ids: Iterable[int]) -> bool:
-        """Set the local vertices drawn as mirrored wall references."""
+    # ### Outer-wall marking state ###
+    def set_outer_wall_mark_vertex_ids(
+        self,
+        vertex_ids: Iterable[int],
+    ) -> bool:
+        """Set the local vertices painted as committed or staged marks."""
 
         normalized_ids = frozenset(int(vertex_id) for vertex_id in vertex_ids)
-        if normalized_ids == self._wall_mirror_vertex_ids:
+        if normalized_ids == self._outer_wall_mark_vertex_ids:
             return False
-        self._wall_mirror_vertex_ids = normalized_ids
+        self._outer_wall_mark_vertex_ids = normalized_ids
         self.update()
         return True
 
-    def get_wall_mirror_vertex_ids(self) -> frozenset[int]:
-        """Return the local vertex IDs currently marked as wall mirrors."""
+    def get_outer_wall_mark_vertex_ids(self) -> frozenset[int]:
+        """Return the local vertices currently painted as outer-wall marks."""
 
-        return self._wall_mirror_vertex_ids
+        return self._outer_wall_mark_vertex_ids
+
+    def set_outer_wall_reference_overlay(
+        self,
+        points: Iterable[tuple[float, float]],
+        edges: Iterable[
+            tuple[tuple[float, float], tuple[float, float]]
+        ] = (),
+    ) -> bool:
+        """Replace noninteractive cross-level wall guides in image coordinates."""
+
+        normalized_overlay = OuterWallReferenceOverlay(
+            points=_normalize_outer_wall_reference_points(points),
+            edges=_normalize_outer_wall_reference_edges(edges),
+        )
+        if normalized_overlay == self._outer_wall_reference_overlay:
+            return False
+        self._outer_wall_reference_overlay = normalized_overlay
+        self.update()
+        return True
+
+    def get_outer_wall_reference_overlay(self) -> OuterWallReferenceOverlay:
+        """Return the immutable cross-level guide overlay."""
+
+        return self._outer_wall_reference_overlay
+
+    def set_outer_wall_marking_active(self, active: bool) -> bool:
+        """Enable staged vertex toggles without editing Canvas topology."""
+
+        normalized_active = bool(active)
+        if normalized_active == self._outer_wall_marking_active:
+            return False
+        self._outer_wall_marking_active = normalized_active
+        self._reset_vertex_selection_gesture()
+        self._set_active_vertex_id(None)
+        self.preview_point = None
+        self.preview_guides = []
+        self._reset_pointer_state()
+        self.update()
+        return True
+
+    def is_outer_wall_marking_active(self) -> bool:
+        """Return whether local vertex clicks toggle staged marks."""
+
+        return self._outer_wall_marking_active
+
+    def _cancel_outer_wall_marking(self) -> bool:
+        """End staged marking and ask the owner to restore its baseline."""
+
+        if not self._outer_wall_marking_active:
+            return False
+        self.set_outer_wall_marking_active(False)
+        self.outer_wall_mark_cancel_requested.emit()
+        return True
 
     def prune_missing_vertex_references(self) -> bool:
         """Clear interaction state that refers to deleted local vertices."""
@@ -800,6 +877,12 @@ class BlueprintCanvas(QWidget):
             for vertex_id in self._selected_vertex_ids
             if vertex_id in known_vertex_ids
         )
+        retained_mark_ids = self._outer_wall_mark_vertex_ids.intersection(
+            known_vertex_ids
+        )
+        if retained_mark_ids != self._outer_wall_mark_vertex_ids:
+            self._outer_wall_mark_vertex_ids = retained_mark_ids
+            changed = True
         if (
             self.active_vertex_id is not None
             and self.active_vertex_id not in known_vertex_ids
@@ -2170,7 +2253,9 @@ class BlueprintCanvas(QWidget):
         )
         self._level_comparison_overlay = None
         self._generated_wall_preview = None
-        self._wall_mirror_vertex_ids = frozenset()
+        self._outer_wall_mark_vertex_ids = frozenset()
+        self._outer_wall_reference_overlay = OuterWallReferenceOverlay()
+        self._outer_wall_marking_active = False
         self._set_active_vertex_id(None)
         self.selected_vertex_id = None
         self.selected_open_space_id = None
@@ -2265,6 +2350,20 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._cancel_outer_wall_marking()
+        ):
+            event.accept()
+            return
+
+        if (
+            self._outer_wall_marking_active
+            and event.key() == Qt.Key.Key_Delete
+        ):
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Shift
             and not event.isAutoRepeat()
@@ -2479,6 +2578,13 @@ class BlueprintCanvas(QWidget):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         self.setFocus(Qt.FocusReason.MouseFocusReason)
 
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._cancel_outer_wall_marking()
+        ):
+            event.accept()
+            return
+
         if self.blueprint_image is None:
             super().mousePressEvent(event)
             return
@@ -2567,6 +2673,13 @@ class BlueprintCanvas(QWidget):
 
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+
+        if self._outer_wall_marking_active:
+            vertex = self._find_vertex_at(event.position())
+            if vertex is not None:
+                self.outer_wall_mark_vertex_toggled.emit(vertex.id)
+            event.accept()
             return
 
         if self._directional_light_placement_active:
@@ -2800,6 +2913,25 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        outer_wall_reference_point = self._find_outer_wall_reference_snap_point(
+            (image_point.x(), image_point.y())
+        )
+        snap_preview = self._build_connection_preview(
+            image_point,
+            event.modifiers(),
+        )
+        if (
+            outer_wall_reference_point is not None
+            or self._snap_preview_uses_outer_wall_reference(snap_preview)
+        ):
+            self._begin_new_vertex_at_snap_preview(
+                image_point,
+                event.position(),
+                snap_preview,
+            )
+            event.accept()
+            return
+
         hit_edge = self._find_edge_at(event.position())
         if hit_edge is not None:
             self._begin_wall_vertex_interaction()
@@ -2808,7 +2940,6 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        snap_preview = self._build_connection_preview(image_point, event.modifiers())
         self._begin_vertex_selection_gesture(
             image_point,
             event.position(),
@@ -3004,11 +3135,31 @@ class BlueprintCanvas(QWidget):
             return
 
         self._update_edit_hover_cursor(event.position())
+        image_point = self._widget_to_image(event.position())
         if self.active_vertex_id is None:
+            if image_point is not None:
+                snap_preview = self._build_connection_preview(
+                    image_point,
+                    event.modifiers(),
+                )
+                if (
+                    snap_preview.guides
+                    and self._snap_preview_uses_outer_wall_reference(
+                        snap_preview
+                    )
+                ):
+                    self.preview_point = snap_preview.point
+                    self.preview_guides = snap_preview.guides
+                    self.update()
+                    event.accept()
+                    return
+            if self.preview_guides:
+                self.preview_point = None
+                self.preview_guides = []
+                self.update()
             super().mouseMoveEvent(event)
             return
 
-        image_point = self._widget_to_image(event.position())
         if image_point is None:
             self.preview_point = None
             self.preview_guides = []
@@ -3164,7 +3315,9 @@ class BlueprintCanvas(QWidget):
             self.update()
         if self._open_space_placement_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
-        if self.drag_vertex_id is None and self.active_vertex_id is not None:
+        if self.drag_vertex_id is None and (
+            self.active_vertex_id is not None or self.preview_guides
+        ):
             self.preview_point = None
             self.preview_guides = []
             self.update()
@@ -3201,6 +3354,7 @@ class BlueprintCanvas(QWidget):
         self._paint_pending_window(painter)
         self._paint_doorways(painter)
         self._paint_pending_doorway(painter)
+        self._paint_outer_wall_reference_edges(painter)
         self._paint_preview_guides(painter)
         self._paint_preview_edge(painter)
         self._paint_vertices(painter)
@@ -3213,6 +3367,7 @@ class BlueprintCanvas(QWidget):
         self._paint_placed_object_profiles(painter)
         self._paint_directional_light_profiles(painter)
         self._paint_directional_light_hover(painter)
+        self._paint_outer_wall_reference_points(painter)
         self._paint_vertex_selection_marquee(painter)
         self._paint_plan_image_erase_selection(painter)
 
@@ -3990,6 +4145,31 @@ class BlueprintCanvas(QWidget):
         self.wall_vertex_added.emit()
         self.geometry_changed.emit()
 
+    def _begin_new_vertex_at_snap_preview(
+        self,
+        image_point: QPointF,
+        widget_point: QPointF,
+        preview: SnapPreview,
+    ) -> None:
+        """Start a wall vertex click without losing its displayed snap."""
+
+        snapped_point = preview.point
+        hit_edge = self._find_edge_at(self._image_to_widget(*snapped_point))
+        if (
+            hit_edge is not None
+            and self._point_distance(hit_edge.point, snapped_point) <= 1e-6
+        ):
+            self._begin_wall_vertex_interaction()
+            self._handle_new_vertex_on_edge_click(snapped_point, hit_edge.edge)
+        else:
+            self._begin_vertex_selection_gesture(
+                image_point,
+                widget_point,
+                additive=False,
+                pending_blank_vertex_point=snapped_point,
+            )
+        self.update()
+
     def _join_dragged_vertex_to_edge(self, vertex_id: int) -> None:
         vertex = self.vertex_data.get_vertex(vertex_id)
         if vertex is None:
@@ -4000,6 +4180,16 @@ class BlueprintCanvas(QWidget):
             excluded_vertex_ids={vertex_id},
         )
         if hit_edge is None:
+            return
+
+        vertex_point = (vertex.x, vertex.y)
+        if (
+            self._snap_state_uses_outer_wall_reference(
+                vertex_point,
+                self.preview_guides,
+            )
+            and self._point_distance(hit_edge.point, vertex_point) > 1e-6
+        ):
             return
 
         self.vertex_data.move_vertex(vertex_id, hit_edge.point[0], hit_edge.point[1])
@@ -4536,8 +4726,7 @@ class BlueprintCanvas(QWidget):
             )
         if not self._stair_drag_active:
             return
-        image_point = self._widget_to_image_clamped(widget_point)
-        preview = (image_point.x(), image_point.y())
+        preview = self._resolve_stair_drag_wall_point(widget_point)
         self._stair_drag_preview_point = (
             None
             if math.hypot(
@@ -4548,6 +4737,23 @@ class BlueprintCanvas(QWidget):
         )
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         self.update()
+
+    def _resolve_stair_drag_wall_point(
+        self,
+        widget_point: QPointF,
+    ) -> tuple[float, float]:
+        """Snap a dragged stair point only to walls on the displayed level."""
+
+        hit_vertex = self._find_vertex_at(widget_point)
+        if hit_vertex is not None:
+            return hit_vertex.x, hit_vertex.y
+
+        hit_edge = self._find_edge_at(widget_point)
+        if hit_edge is not None:
+            return hit_edge.point
+
+        image_point = self._widget_to_image_clamped(widget_point)
+        return image_point.x(), image_point.y()
 
     def _finish_stair_drag(self) -> None:
         """Emit one geometry edit after release, never during pointer motion."""
@@ -6933,6 +7139,12 @@ class BlueprintCanvas(QWidget):
         image_point: QPointF,
         modifiers: Qt.KeyboardModifier,
     ) -> SnapPreview:
+        reference_point = self._find_outer_wall_reference_snap_point(
+            (image_point.x(), image_point.y())
+        )
+        if reference_point is not None:
+            return SnapPreview(point=reference_point, guides=[])
+
         base_vertex = (
             None
             if self.active_vertex_id is None
@@ -6943,6 +7155,9 @@ class BlueprintCanvas(QWidget):
             modifiers=modifiers,
             base_vertex=base_vertex,
             extra_axis_candidates=(
+                *self._find_outer_wall_reference_axis_snap_candidates(
+                    (image_point.x(), image_point.y())
+                ),
                 *self._find_stair_axis_snap_candidates(
                     (image_point.x(), image_point.y())
                 ),
@@ -6950,6 +7165,66 @@ class BlueprintCanvas(QWidget):
                     (image_point.x(), image_point.y())
                 ),
             ),
+        )
+
+    def _find_outer_wall_reference_snap_point(
+        self,
+        image_point: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Return the nearest immutable guide point inside vertex tolerance."""
+
+        tolerance = self._screen_distance_to_image(VERTEX_HIT_RADIUS_SCREEN)
+        closest_point: tuple[float, float] | None = None
+        closest_distance = tolerance
+        for reference_point in self._outer_wall_reference_overlay.points:
+            distance = self._point_distance(image_point, reference_point)
+            if distance <= closest_distance:
+                closest_point = reference_point
+                closest_distance = distance
+        return closest_point
+
+    def _find_outer_wall_reference_axis_snap_candidates(
+        self,
+        image_point: tuple[float, float],
+    ) -> list[AxisSnapCandidate]:
+        """Find horizontal and vertical guides to cross-level wall points."""
+
+        return self._find_reference_point_axis_snap_candidates(
+            image_point,
+            self._outer_wall_reference_overlay.points,
+        )
+
+    def _snap_preview_uses_outer_wall_reference(
+        self,
+        preview: SnapPreview,
+    ) -> bool:
+        """Return whether a preview is constrained by another level's mark."""
+
+        return self._snap_state_uses_outer_wall_reference(
+            preview.point,
+            preview.guides,
+        )
+
+    def _snap_state_uses_outer_wall_reference(
+        self,
+        point: tuple[float, float],
+        guides: Iterable[SnapGuide],
+    ) -> bool:
+        """Return whether a committed point or guide uses a red reference."""
+
+        reference_points = self._outer_wall_reference_overlay.points
+        if any(
+            self._point_distance(point, reference_point) <= 1e-6
+            for reference_point in reference_points
+        ):
+            return True
+        return any(
+            guide.source_point is not None
+            and any(
+                self._point_distance(guide.source_point, reference_point) <= 1e-6
+                for reference_point in reference_points
+            )
+            for guide in guides
         )
 
     def _build_connection_preview_from_base(
@@ -7029,6 +7304,10 @@ class BlueprintCanvas(QWidget):
         dragged_vertex_id: int,
     ) -> SnapPreview:
         raw_point = self._clamp_image_point(image_point.x(), image_point.y())
+        reference_point = self._find_outer_wall_reference_snap_point(raw_point)
+        if reference_point is not None:
+            return SnapPreview(point=reference_point, guides=[])
+
         center_candidate = self._find_center_snap_candidate(
             raw_point,
             excluded_vertex_ids={dragged_vertex_id},
@@ -7038,6 +7317,7 @@ class BlueprintCanvas(QWidget):
 
         axis_candidates = self._select_nearest_axis_snap_candidates(
             (
+                *self._find_outer_wall_reference_axis_snap_candidates(raw_point),
                 *self._find_axis_snap_candidates(
                     raw_point,
                     excluded_vertex_ids={dragged_vertex_id},
@@ -8869,10 +9149,10 @@ class BlueprintCanvas(QWidget):
             )
             is_active = vertex.id == self.active_vertex_id
             is_selected = vertex.id in self.selected_vertex_ids
-            is_wall_mirror = vertex.id in self._wall_mirror_vertex_ids
+            is_outer_wall_mark = vertex.id in self._outer_wall_mark_vertex_ids
 
-            if is_wall_mirror:
-                fill_color = WALL_MIRROR_VERTEX_FILL_COLOR
+            if is_outer_wall_mark:
+                fill_color = OUTER_WALL_MARK_VERTEX_FILL_COLOR
             elif is_active:
                 fill_color = ACTIVE_VERTEX_FILL_COLOR
             elif is_selected:
@@ -8886,6 +9166,49 @@ class BlueprintCanvas(QWidget):
                 center + QPointF(10.0, -10.0),
                 str(vertex.id),
             )
+
+    def _paint_outer_wall_reference_edges(self, painter: QPainter) -> None:
+        """Paint cross-level edges below active green snap guides."""
+
+        edges = self._outer_wall_reference_overlay.edges
+        if not edges:
+            return
+
+        painter.save()
+        edge_pen = QPen(
+            OUTER_WALL_REFERENCE_EDGE_COLOR,
+            OUTER_WALL_REFERENCE_EDGE_WIDTH_SCREEN,
+        )
+        edge_pen.setCosmetic(True)
+        edge_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(edge_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for start_point, end_point in edges:
+            painter.drawLine(
+                self._image_to_widget(*start_point),
+                self._image_to_widget(*end_point),
+            )
+        painter.restore()
+
+    def _paint_outer_wall_reference_points(self, painter: QPainter) -> None:
+        """Paint immutable red cross-level points above scene geometry."""
+
+        points = self._outer_wall_reference_overlay.points
+        if not points:
+            return
+
+        painter.save()
+        vertex_pen = QPen(OUTER_WALL_REFERENCE_VERTEX_OUTLINE_COLOR, 1.5)
+        vertex_pen.setCosmetic(True)
+        painter.setPen(vertex_pen)
+        painter.setBrush(OUTER_WALL_REFERENCE_VERTEX_FILL_COLOR)
+        for point in points:
+            painter.drawEllipse(
+                self._image_to_widget(*point),
+                OUTER_WALL_REFERENCE_VERTEX_RADIUS_SCREEN,
+                OUTER_WALL_REFERENCE_VERTEX_RADIUS_SCREEN,
+            )
+        painter.restore()
 
     @staticmethod
     def _paint_vertex_marker(
@@ -9397,6 +9720,85 @@ def _normalize_canvas_offset_pixels(raw_offset: object) -> float:
         max(offset, MIN_CANVAS_OFFSET_PIXELS),
         MAX_CANVAS_OFFSET_PIXELS,
     )
+
+
+# ### Outer-wall reference validation ###
+def _normalize_outer_wall_reference_points(
+    raw_points: Iterable[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    """Return finite, de-duplicated guide points in stable order."""
+
+    normalized_points: list[tuple[float, float]] = []
+    known_points: set[tuple[float, float]] = set()
+    for raw_point in raw_points:
+        point = _normalize_outer_wall_reference_point(raw_point)
+        if point in known_points:
+            continue
+        known_points.add(point)
+        normalized_points.append(point)
+    return tuple(normalized_points)
+
+
+def _normalize_outer_wall_reference_edges(
+    raw_edges: Iterable[
+        tuple[tuple[float, float], tuple[float, float]]
+    ],
+) -> tuple[
+    tuple[tuple[float, float], tuple[float, float]],
+    ...,
+]:
+    """Return finite, nondegenerate, direction-independent guide edges."""
+
+    normalized_edges: list[
+        tuple[tuple[float, float], tuple[float, float]]
+    ] = []
+    known_edges: set[
+        tuple[tuple[float, float], tuple[float, float]]
+    ] = set()
+    for raw_edge in raw_edges:
+        try:
+            start_raw, end_raw = raw_edge
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "An outer-wall reference edge requires exactly two points."
+            ) from error
+        start_point = _normalize_outer_wall_reference_point(start_raw)
+        end_point = _normalize_outer_wall_reference_point(end_raw)
+        if start_point == end_point:
+            continue
+        edge_key = tuple(sorted((start_point, end_point)))
+        if edge_key in known_edges:
+            continue
+        known_edges.add(edge_key)
+        normalized_edges.append((start_point, end_point))
+    return tuple(normalized_edges)
+
+
+def _normalize_outer_wall_reference_point(
+    raw_point: object,
+) -> tuple[float, float]:
+    """Return one finite image-space guide point."""
+
+    if isinstance(raw_point, QPointF):
+        raw_x, raw_y = raw_point.x(), raw_point.y()
+    else:
+        try:
+            raw_x, raw_y = raw_point  # type: ignore[misc]
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "An outer-wall reference point requires two coordinates."
+            ) from error
+    if isinstance(raw_x, bool) or isinstance(raw_y, bool):
+        raise TypeError("Outer-wall reference coordinates must be numbers.")
+    try:
+        point = float(raw_x), float(raw_y)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "Outer-wall reference coordinates must be numbers."
+        ) from error
+    if not all(math.isfinite(component) for component in point):
+        raise ValueError("Outer-wall reference coordinates must be finite.")
+    return point
 
 
 # ### Geometry helpers ###

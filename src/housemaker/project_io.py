@@ -42,7 +42,6 @@ from housemaker.models import (
     MAX_DOORWAY_ID_LENGTH,
     MAX_DOORWAY_WIDTH_METERS,
     MAX_FLOOR_THICKNESS_METERS,
-    MAX_LEVEL_INDEX,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_CANVAS_LEVEL_SCALE,
@@ -52,7 +51,6 @@ from housemaker.models import (
     MIN_DOORWAY_HEIGHT_METERS,
     MIN_DOORWAY_WIDTH_METERS,
     MIN_FLOOR_THICKNESS_METERS,
-    MIN_LEVEL_INDEX,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     ArchitecturalTrimData,
@@ -75,16 +73,18 @@ from housemaker.models import (
     normalize_doorway_arch_amount,
     normalize_doorway_shape,
 )
+from housemaker.outer_wall_marking import (
+    OuterWallMark,
+    normalize_outer_wall_marks,
+    outer_wall_marks_from_legacy_links,
+    outer_wall_marks_from_legacy_vertex_payload,
+    outer_wall_marks_from_payload,
+    outer_wall_marks_to_dicts,
+    reconcile_outer_wall_marks,
+)
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.tour_state import TourData, tours_from_payload, tours_to_dicts
-from housemaker.wall_mirroring import (
-    WallMirrorVertexLink,
-    materialize_legacy_wall_mirrors,
-    reconcile_wall_mirror_topology,
-    wall_mirror_links_from_payload,
-    wall_mirror_links_to_dicts,
-)
 
 # ### Constants ###
 PROJECT_FILE_VERSION = 1
@@ -108,7 +108,7 @@ class ProjectData:
     )
     stairs: list[StairData] = field(default_factory=list)
     texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
-    wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
+    outer_wall_marks: tuple[OuterWallMark, ...] = ()
     tours: tuple[TourData, ...] = ()
     doors: DoorLibraryData = field(default_factory=DoorLibraryData)
     directional_lights: tuple[DirectionalLightData, ...] = ()
@@ -120,6 +120,10 @@ class ProjectData:
         tours_to_dicts(self.tours)
         self.directional_lights = tuple(self.directional_lights)
         directional_lights_to_dicts(self.directional_lights)
+        self.outer_wall_marks = reconcile_outer_wall_marks(
+            self.levels,
+            self.outer_wall_marks,
+        )
 
 
 # ### Public helpers ###
@@ -133,12 +137,16 @@ def save_project(
     surface_texture_generation: SurfaceTextureData | None = None,
     stairs: list[StairData] | None = None,
     texture_atlases: TextureAtlasData | None = None,
-    wall_mirror_links: Iterable[WallMirrorVertexLink] | None = None,
+    outer_wall_marks: Iterable[OuterWallMark] | None = None,
     tours: Iterable[TourData] | None = None,
     doors: DoorLibraryData | None = None,
     directional_lights: Iterable[DirectionalLightData] | None = None,
 ) -> Path:
     export_path = Path(path)
+    resolved_outer_wall_marks = reconcile_outer_wall_marks(
+        levels,
+        outer_wall_marks or (),
+    )
     payload = {
         "project_version": PROJECT_FILE_VERSION,
         "blueprint_path": None,
@@ -167,7 +175,9 @@ def save_project(
             else TextureAtlasData().to_dict()
         ),
         "stairs": _serialize_stairs(stairs or []),
-        "wall_mirror_links": wall_mirror_links_to_dicts(wall_mirror_links or ()),
+        "outer_wall_marks": outer_wall_marks_to_dicts(
+            resolved_outer_wall_marks
+        ),
         "tours": tours_to_dicts(tours or ()),
         "doors": (
             doors.to_dict()
@@ -237,10 +247,7 @@ def load_project(path: str | Path) -> ProjectData:
 
     levels = create_default_levels()
     level_lookup = {level.index: level for level in levels}
-    legacy_wall_mirror_targets: dict[
-        tuple[int, int],
-        tuple[int, ...],
-    ] = {}
+    legacy_outer_wall_marks: list[OuterWallMark] = []
 
     for raw_level in payload.get("levels", []):
         level_index = int(raw_level.get("index", -1))
@@ -297,8 +304,8 @@ def load_project(path: str | Path) -> ProjectData:
         )
         raw_vertex_data = raw_level.get("vertex_data", {})
         level.vertex_data = VertexData.from_dict(raw_vertex_data)
-        legacy_wall_mirror_targets.update(
-            _deserialize_legacy_wall_mirror_targets(
+        legacy_outer_wall_marks.extend(
+            outer_wall_marks_from_legacy_vertex_payload(
                 raw_vertex_data,
                 source_level_index=level.index,
                 known_vertex_ids={vertex.id for vertex in level.vertex_data.vertices},
@@ -351,19 +358,24 @@ def load_project(path: str | Path) -> ProjectData:
     directional_lights = directional_lights_from_payload(
         payload.get("directional_lights")
     )
-    loaded_wall_mirror_links = wall_mirror_links_from_payload(
-        payload.get("wall_mirror_links"),
-        levels=levels,
-    )
-    reconciled_wall_mirrors = reconcile_wall_mirror_topology(
-        levels,
-        loaded_wall_mirror_links,
-    )
-    materialized_wall_mirrors = materialize_legacy_wall_mirrors(
-        levels,
-        legacy_wall_mirror_targets,
-        reconciled_wall_mirrors.links,
-    )
+    if "outer_wall_marks" in payload:
+        outer_wall_marks = outer_wall_marks_from_payload(
+            payload.get("outer_wall_marks"),
+            levels=levels,
+        )
+    else:
+        outer_wall_marks = reconcile_outer_wall_marks(
+            levels,
+            normalize_outer_wall_marks(
+                (
+                    *legacy_outer_wall_marks,
+                    *outer_wall_marks_from_legacy_links(
+                        payload.get("wall_mirror_links"),
+                        levels=levels,
+                    ),
+                )
+            ),
+        )
     _clear_image_library_paths_from_levels(levels, image_library_paths)
 
     current_level_index = int(payload.get("current_level_index", GROUND_LEVEL_INDEX))
@@ -380,7 +392,7 @@ def load_project(path: str | Path) -> ProjectData:
         surface_texture_generation=surface_texture_generation,
         texture_atlases=texture_atlases,
         stairs=stairs,
-        wall_mirror_links=materialized_wall_mirrors.links,
+        outer_wall_marks=outer_wall_marks,
         tours=tours,
         doors=doors,
         directional_lights=directional_lights,
@@ -1133,50 +1145,6 @@ def _deserialize_flipped_surface_ids(
         ):
             flipped_surface_ids.add(surface_id)
     return flipped_surface_ids
-
-
-# ### Legacy wall-mirror migration helpers ###
-def _deserialize_legacy_wall_mirror_targets(
-    raw_vertex_data: object,
-    *,
-    source_level_index: int,
-    known_vertex_ids: set[int],
-) -> dict[tuple[int, int], tuple[int, ...]]:
-    """Read the former per-vertex flags without retaining them in VertexData."""
-
-    if not isinstance(raw_vertex_data, dict):
-        return {}
-    raw_levels_by_vertex_id = raw_vertex_data.get("wall_mirror_levels")
-    if not isinstance(raw_levels_by_vertex_id, dict):
-        return {}
-
-    targets_by_source: dict[tuple[int, int], tuple[int, ...]] = {}
-    for raw_vertex_id, raw_target_indices in raw_levels_by_vertex_id.items():
-        if isinstance(raw_vertex_id, bool):
-            continue
-        try:
-            vertex_id = int(raw_vertex_id)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if vertex_id <= 0 or vertex_id not in known_vertex_ids:
-            continue
-        if not isinstance(raw_target_indices, list | tuple):
-            continue
-        target_indices = tuple(
-            sorted(
-                {
-                    target_index
-                    for target_index in raw_target_indices
-                    if isinstance(target_index, int)
-                    and not isinstance(target_index, bool)
-                    and MIN_LEVEL_INDEX <= target_index <= MAX_LEVEL_INDEX
-                    and target_index != source_level_index
-                }
-            )
-        )
-        if target_indices:
-            targets_by_source[(source_level_index, vertex_id)] = target_indices
-    return targets_by_source
 
 
 # ### Room serialization helpers ###

@@ -8,12 +8,13 @@ import shapely
 import trimesh
 from shapely import Point, Polygon
 
+from housemaker.floor_geometry import FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS
 from housemaker.glb import (
     build_stair_slab_openings_by_level,
     convert_to_preview_model,
 )
 from housemaker.models import LevelData, OpenSpaceData, StairData, VertexData
-from housemaker.surface_geometry import build_fixed_surfaces
+from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
 
 
 # ### Fixture helpers ###
@@ -99,8 +100,8 @@ def _build_stair(*, descending: bool = False) -> StairData:
 
 
 # ### Geometry inspection helpers ###
-def _surface_geometry(surface: object) -> object:
-    mesh = getattr(surface, "mesh")
+def _surface_geometry(surface: FixedSurface) -> object:
+    mesh = surface.mesh
     return shapely.union_all(
         [
             Polygon(triangle[:, :2])
@@ -187,9 +188,60 @@ class StairSlabOpeningTests(unittest.TestCase):
         self.assertIn("level:3/floor", surfaces)
         upper_floor = surfaces["level:3/floor"]
         upper_floor_geometry = _surface_geometry(upper_floor)
-        self.assertAlmostEqual(upper_floor.area_square_meters, 4.0)
+        fascia_guard = FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS
+        self.assertAlmostEqual(
+            upper_floor.area_square_meters,
+            4.0 + 8.0 * fascia_guard - 2.0 * fascia_guard**2,
+        )
         self.assertTrue(upper_floor_geometry.covers(Point(2.5, -2.0)))
         self.assertFalse(upper_floor_geometry.covers(Point(1.0, -2.0)))
+
+    def test_wall_orientation_ignores_snapped_stair_opening_perimeter(
+        self,
+    ) -> None:
+        lower = _build_square_level(2)
+        upper = _build_interrupted_upper_hallway()
+        stair = StairData(
+            start_level_index=2,
+            start_a_x=200.0,
+            start_a_y=50.0,
+            start_b_x=150.0,
+            start_b_y=50.0,
+            end_level_index=3,
+            end_a_x=150.0,
+            end_a_y=200.0,
+            end_b_x=100.0,
+            end_b_y=200.0,
+        )
+
+        baseline_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces((lower, upper))
+        }
+        stair_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces(
+                (lower, upper),
+                stairs=(stair,),
+            )
+        }
+        baseline_wall = baseline_surfaces["level:3/wall:2:3"]
+        stair_wall = stair_surfaces["level:3/wall:2:3"]
+
+        self.assertAlmostEqual(
+            stair_wall.area_square_meters,
+            baseline_wall.area_square_meters,
+        )
+        np.testing.assert_allclose(
+            stair_wall.mesh.vertices,
+            baseline_wall.mesh.vertices,
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            stair_wall.mesh.face_normals,
+            baseline_wall.mesh.face_normals,
+            atol=1e-9,
+        )
 
     def test_descending_stair_owns_the_same_upper_slab_opening(self) -> None:
         levels = (_build_square_level(2), _build_square_level(3))
@@ -224,6 +276,92 @@ class StairSlabOpeningTests(unittest.TestCase):
         self.assertAlmostEqual(surfaces["level:3/floor"].area_square_meters, 14.0)
         self.assertAlmostEqual(
             surfaces["level:2/ceiling"].area_square_meters,
+            14.0,
+        )
+
+    def test_explicit_opening_overrides_mostly_overlapping_stair_route(
+        self,
+    ) -> None:
+        lower = _build_square_level(2)
+        upper = _build_square_level(3)
+        upper.open_spaces.append(
+            OpenSpaceData(
+                "manual-stairwell",
+                minimum_x=55.0,
+                minimum_y=50.0,
+                maximum_x=150.0,
+                maximum_y=100.0,
+            )
+        )
+
+        surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces(
+                (lower, upper),
+                stairs=(_build_stair(),),
+            )
+        }
+
+        self.assertAlmostEqual(surfaces["level:3/floor"].area_square_meters, 14.1)
+        self.assertAlmostEqual(
+            surfaces["level:2/ceiling"].area_square_meters,
+            14.1,
+        )
+        self.assertTrue(
+            _surface_geometry(surfaces["level:3/floor"]).covers(
+                Point(1.05, -1.5)
+            )
+        )
+        model = convert_to_preview_model(
+            (lower, upper),
+            stairs=(_build_stair(),),
+        )
+        self.assertAlmostEqual(
+            _upward_cap_area(
+                _world_scene_mesh(model.scene, "l3_upper_floor")
+            ),
+            14.1,
+        )
+
+    def test_small_explicit_overlap_keeps_complete_stair_route(self) -> None:
+        lower = _build_square_level(2)
+        upper = _build_square_level(3)
+        upper.open_spaces.append(
+            OpenSpaceData(
+                "adjacent-opening",
+                minimum_x=50.0,
+                minimum_y=50.0,
+                maximum_x=75.0,
+                maximum_y=100.0,
+            )
+        )
+
+        surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces(
+                (lower, upper),
+                stairs=(_build_stair(),),
+            )
+        }
+
+        self.assertAlmostEqual(surfaces["level:3/floor"].area_square_meters, 14.0)
+        self.assertAlmostEqual(
+            surfaces["level:2/ceiling"].area_square_meters,
+            14.0,
+        )
+        self.assertFalse(
+            _surface_geometry(surfaces["level:3/floor"]).covers(
+                Point(2.0, -1.5)
+            )
+        )
+        model = convert_to_preview_model(
+            (lower, upper),
+            stairs=(_build_stair(),),
+        )
+        self.assertAlmostEqual(
+            _upward_cap_area(
+                _world_scene_mesh(model.scene, "l3_upper_floor")
+            ),
             14.0,
         )
 

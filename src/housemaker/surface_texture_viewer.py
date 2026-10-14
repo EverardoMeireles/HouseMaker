@@ -910,7 +910,10 @@ class SurfaceTextureViewer(QWidget):
             drawEdges=True,
             edgeColor=EDGE_COLOR,
             shader=self._ambient_shader,
-            cull_back_faces=bool(model.preview_textured_surfaces),
+            cull_back_faces=bool(
+                model.preview_textured_surfaces
+                or model.preview_cull_untextured_back_faces
+            ),
         )
         self.view.addItem(mesh_item)
         legacy_wall_items = self._add_canvas_legacy_wall_items(model)

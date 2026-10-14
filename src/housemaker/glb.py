@@ -355,6 +355,7 @@ class GeneratedModel:
     preview_architectural_trim_parts: list[object] = field(default_factory=list)
     preview_base_mesh: trimesh.Trimesh | None = None
     preview_only: bool = False
+    preview_cull_untextured_back_faces: bool = False
 
 
 @dataclass(frozen=True)
@@ -765,6 +766,8 @@ def convert_to_glb(
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
     export_untextured_surfaces: bool = True,
+    make_floors_double_sided: bool = False,
+    make_ceilings_double_sided: bool = False,
 ) -> GeneratedModel:
     """Build an export-ready house model and serialize its GLB payload.
 
@@ -785,6 +788,8 @@ def convert_to_glb(
         stairs=stairs,
         serialize_glb=True,
         export_untextured_surfaces=export_untextured_surfaces,
+        make_floors_double_sided=make_floors_double_sided,
+        make_ceilings_double_sided=make_ceilings_double_sided,
     )
 
 
@@ -795,6 +800,8 @@ def convert_to_export_scene_model(
     surface_materials: Mapping[str, object] | None = None,
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
+    make_floors_double_sided: bool = False,
+    make_ceilings_double_sided: bool = False,
 ) -> GeneratedModel:
     """Build the complete export scene without serializing an intermediate GLB."""
 
@@ -807,6 +814,8 @@ def convert_to_export_scene_model(
         stairs=stairs,
         serialize_glb=False,
         export_untextured_surfaces=True,
+        make_floors_double_sided=make_floors_double_sided,
+        make_ceilings_double_sided=make_ceilings_double_sided,
     )
 
 
@@ -817,6 +826,8 @@ def convert_to_preview_model(
     surface_materials: Mapping[str, object] | None = None,
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
+    make_floors_double_sided: bool = False,
+    make_ceilings_double_sided: bool = False,
 ) -> GeneratedModel:
     """Build the complete interactive house model without GLB serialization."""
 
@@ -829,6 +840,8 @@ def convert_to_preview_model(
         stairs=stairs,
         serialize_glb=False,
         export_untextured_surfaces=True,
+        make_floors_double_sided=make_floors_double_sided,
+        make_ceilings_double_sided=make_ceilings_double_sided,
     )
 
 
@@ -872,7 +885,13 @@ def _build_blueprint_model(
     stairs: Sequence[StairData],
     serialize_glb: bool,
     export_untextured_surfaces: bool,
+    make_floors_double_sided: bool,
+    make_ceilings_double_sided: bool,
 ) -> GeneratedModel:
+    if not isinstance(make_floors_double_sided, bool):
+        raise TypeError("The floor double-sided option must be boolean.")
+    if not isinstance(make_ceilings_double_sided, bool):
+        raise TypeError("The ceiling double-sided option must be boolean.")
     fixed_surfaces: Sequence[object] | None = None
     preview_stair_parts: list[PreviewStairPart] = []
     preview_architectural_trim_parts: list[object] = []
@@ -974,9 +993,17 @@ def _build_blueprint_model(
         preview_textured_walls=preview_textured_walls,
         preview_stair_parts=preview_stair_parts,
         preview_architectural_trim_parts=preview_architectural_trim_parts,
+        preview_cull_untextured_back_faces=True,
     )
     if not surface_materials and export_untextured_surfaces:
-        return model
+        return _append_untextured_surface_backfaces(
+            model,
+            named_meshes,
+            fixed_surfaces,
+            serialize_glb=serialize_glb,
+            make_floors_double_sided=make_floors_double_sided,
+            make_ceilings_double_sided=make_ceilings_double_sided,
+        )
     return _apply_surface_materials(
         model=model,
         named_meshes=named_meshes,
@@ -986,6 +1013,8 @@ def _build_blueprint_model(
         serialize_glb=serialize_glb,
         export_untextured_surfaces=export_untextured_surfaces,
         fixed_surfaces=fixed_surfaces,
+        make_floors_double_sided=make_floors_double_sided,
+        make_ceilings_double_sided=make_ceilings_double_sided,
     )
 
 
@@ -1016,6 +1045,86 @@ def _build_untextured_ceiling_named_meshes(
             )
         )
     return named_meshes
+
+
+def _append_untextured_surface_backfaces(
+    model: GeneratedModel,
+    named_meshes: Sequence[NamedMesh],
+    fixed_surfaces: Sequence[object] | None,
+    *,
+    serialize_glb: bool,
+    make_floors_double_sided: bool,
+    make_ceilings_double_sided: bool,
+) -> GeneratedModel:
+    """Add only the requested untextured semantic backfaces to one model."""
+
+    backface_meshes = _build_untextured_surface_backface_named_meshes(
+        fixed_surfaces or (),
+        make_floors_double_sided=make_floors_double_sided,
+        make_ceilings_double_sided=make_ceilings_double_sided,
+    )
+    if not backface_meshes:
+        return model
+    complete_named_meshes = [*named_meshes, *backface_meshes]
+    combined_mesh = _combine_preview_mesh_geometry(
+        [
+            _build_transformed_named_mesh_copy(named_mesh)
+            for named_mesh in complete_named_meshes
+        ]
+    )
+    scene = _build_export_scene(complete_named_meshes)
+    return replace(
+        model,
+        mesh=combined_mesh,
+        scene=scene,
+        glb_bytes=(scene.export(file_type="glb") if serialize_glb else b""),
+    )
+
+
+def _build_untextured_surface_backface_named_meshes(
+    fixed_surfaces: Sequence[object],
+    *,
+    make_floors_double_sided: bool,
+    make_ceilings_double_sided: bool,
+    excluded_surface_ids: Collection[str] = frozenset(),
+) -> list[NamedMesh]:
+    """Build reverse-wound copies for enabled, unassigned horizontal faces."""
+
+    enabled_types = {
+        surface_type
+        for surface_type, enabled in (
+            ("floor", make_floors_double_sided),
+            ("ceiling", make_ceilings_double_sided),
+        )
+        if enabled
+    }
+    if not enabled_types:
+        return []
+
+    backfaces: list[NamedMesh] = []
+    for surface in fixed_surfaces:
+        surface_id = str(getattr(surface, "surface_id", ""))
+        if (
+            not surface_id
+            or surface_id in excluded_surface_ids
+            or str(getattr(surface, "surface_type", "")) not in enabled_types
+        ):
+            continue
+        mesh = _copy_mesh_with_reversed_winding(surface.mesh.copy())
+        mesh.metadata = copy.deepcopy(dict(getattr(mesh, "metadata", {}) or {}))
+        mesh.metadata.update(
+            {
+                "housemaker_surface_id": surface_id,
+                "housemaker_double_sided_backface": True,
+            }
+        )
+        backfaces.append(
+            NamedMesh(
+                name=f"{_get_surface_object_name(surface_id)}_backface",
+                mesh=mesh,
+            )
+        )
+    return backfaces
 
 
 def _apply_editable_surface_geometry(
@@ -1551,6 +1660,9 @@ def _compose_placed_generated_models(
         preview_only=(
             base_model.preview_only
             or any(placement.model.preview_only for placement in normalized_placements)
+        ),
+        preview_cull_untextured_back_faces=(
+            base_model.preview_cull_untextured_back_faces
         ),
     )
 
@@ -5328,6 +5440,8 @@ def _apply_surface_materials(
     serialize_glb: bool,
     export_untextured_surfaces: bool,
     fixed_surfaces: Sequence[object] | None = None,
+    make_floors_double_sided: bool = False,
+    make_ceilings_double_sided: bool = False,
 ) -> GeneratedModel:
     """Replace assigned faces and optionally omit unassigned export surfaces."""
 
@@ -5360,7 +5474,14 @@ def _apply_surface_materials(
         if str(surface_id) in known_surface_ids
     }
     if not live_sources and export_untextured_surfaces:
-        return model
+        return _append_untextured_surface_backfaces(
+            model,
+            named_meshes,
+            fixed_surfaces,
+            serialize_glb=serialize_glb,
+            make_floors_double_sided=make_floors_double_sided,
+            make_ceilings_double_sided=make_ceilings_double_sided,
+        )
     texture_world_size = normalize_texture_world_size(surface_texture_world_size_meters)
     resolved_materials = resolve_surface_materials(live_sources)
     (
@@ -5371,6 +5492,8 @@ def _apply_surface_materials(
         resolved_materials=resolved_materials,
         texture_world_size_meters=texture_world_size,
         build_textured_mesh=build_world_planar_textured_mesh,
+        make_floors_double_sided=make_floors_double_sided,
+        make_ceilings_double_sided=make_ceilings_double_sided,
     )
     (
         textured_stair_named_meshes,
@@ -5384,7 +5507,14 @@ def _apply_surface_materials(
     textured_named_meshes.extend(textured_stair_named_meshes)
     preview_textured_surfaces.extend(preview_textured_stair_surfaces)
     if not textured_named_meshes and export_untextured_surfaces:
-        return model
+        return _append_untextured_surface_backfaces(
+            model,
+            named_meshes,
+            fixed_surfaces,
+            serialize_glb=serialize_glb,
+            make_floors_double_sided=make_floors_double_sided,
+            make_ceilings_double_sided=make_ceilings_double_sided,
+        )
     if not textured_named_meshes:
         export_named_meshes = _build_assigned_surface_export_named_meshes(
             named_meshes,
@@ -5442,6 +5572,15 @@ def _apply_surface_materials(
         stair_parts,
         set(resolved_materials),
     )
+    if export_untextured_surfaces:
+        retained_named_meshes.extend(
+            _build_untextured_surface_backface_named_meshes(
+                base_surfaces,
+                make_floors_double_sided=make_floors_double_sided,
+                make_ceilings_double_sided=make_ceilings_double_sided,
+                excluded_surface_ids=replacement_surface_ids,
+            )
+        )
     retained_named_meshes.extend(
         NamedMesh(
             name=f"{_get_surface_object_name(surface.surface_id)}_untextured",
@@ -5518,6 +5657,9 @@ def _apply_surface_materials(
         preview_architectural_trim_parts=(
             model.preview_architectural_trim_parts
         ),
+        preview_cull_untextured_back_faces=(
+            model.preview_cull_untextured_back_faces
+        ),
     )
 
 
@@ -5527,6 +5669,8 @@ def _build_surface_named_meshes(
     resolved_materials: Mapping[str, object],
     texture_world_size_meters: float,
     build_textured_mesh: Callable[..., trimesh.Trimesh],
+    make_floors_double_sided: bool,
+    make_ceilings_double_sided: bool,
 ) -> tuple[list[NamedMesh], list[PreviewTexturedSurface]]:
     named_meshes: list[NamedMesh] = []
     preview_surfaces: list[PreviewTexturedSurface] = []
@@ -5537,9 +5681,12 @@ def _build_surface_named_meshes(
         if material is None:
             continue
 
-        # Every semantic surface has authoritative winding. Keeping plain walls
-        # one-sided makes a manual orientation flip visible in Canvas and glTF.
-        double_sided = False
+        # Every semantic surface has authoritative winding. Walls remain
+        # one-sided so manual orientation flips stay visible in Canvas and glTF.
+        double_sided = bool(
+            (surface_type == "floor" and make_floors_double_sided)
+            or (surface_type == "ceiling" and make_ceilings_double_sided)
+        )
 
         object_name = _get_surface_object_name(surface_id)
         mesh = build_textured_mesh(

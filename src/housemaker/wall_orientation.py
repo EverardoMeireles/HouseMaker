@@ -427,16 +427,25 @@ def build_level_wall_orientation_resolver(
         lines,
         maximum_gap=closing_radius * 2.0,
     )
-    resolved_footprint = (
-        floor_footprint
-        if floor_footprint is not None
-        else _build_level_world_floor_footprint(
+    # Temporary opening perimeters may complete a floor shell, but they are
+    # not authored walls and must not influence which side wall faces expose.
+    if floor_footprint is not None:
+        resolved_footprint = floor_footprint
+        orientation_footprint = floor_footprint
+    else:
+        orientation_footprint = _build_level_world_floor_footprint(
             level,
             point_to_world,
-            additional_floor_coherency_geometry,
         )
-    )
-    orientation_footprint = resolved_footprint
+        resolved_footprint = (
+            orientation_footprint
+            if additional_floor_coherency_geometry is None
+            else _build_level_world_floor_footprint(
+                level,
+                point_to_world,
+                additional_floor_coherency_geometry,
+            )
+        )
     if orientation_footprint is None and lines:
         # Preserve the legacy broad topology hint only for wall orientation.
         # Floor and ceiling generation continue to use clustered footprints.

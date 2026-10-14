@@ -581,6 +581,27 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             self.workspace._generation_settings.ignore_top_down_ceiling
         )
 
+    def test_surface_sidedness_settings_rebuild_the_shared_scene(self) -> None:
+        settings_widget = self.workspace.settings_widget
+
+        with patch.object(
+            self.workspace,
+            "_schedule_viewer_preview_refresh",
+        ) as schedule_refresh:
+            settings_widget.make_floors_double_sided_checkbox.setChecked(True)
+            _qt_application.processEvents()
+            settings_widget.make_ceilings_double_sided_checkbox.setChecked(True)
+            _qt_application.processEvents()
+
+        self.assertTrue(
+            self.workspace._generation_settings.make_floors_double_sided
+        )
+        self.assertTrue(
+            self.workspace._generation_settings.make_ceilings_double_sided
+        )
+        self.assertEqual(schedule_refresh.call_count, 2)
+        schedule_refresh.assert_called_with(preserve_camera=True)
+
     def test_include_control_is_export_only_for_scene_preview(self) -> None:
         level = self.workspace.current_level
         self.assertTrue(level.include_in_export)

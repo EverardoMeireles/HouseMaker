@@ -92,6 +92,16 @@ def _scene_horizontal_area(mesh, normal_y_sign: float) -> float:
     return float(np.sum(mesh.area_faces[face_mask]))
 
 
+def _scene_horizontal_geometry(mesh, normal_y_sign: float) -> object:
+    face_mask = mesh.face_normals[:, 1] * normal_y_sign > 0.9
+    return shapely.union_all(
+        [
+            Polygon(triangle[:, (0, 2)])
+            for triangle in mesh.triangles[face_mask]
+        ]
+    )
+
+
 def _scene_interior_vertical_area(mesh) -> float:
     vertical_mask = np.abs(mesh.face_normals[:, 1]) < 0.1
     centers = mesh.triangles_center
@@ -233,6 +243,141 @@ class OpenSpaceGeometryTests(unittest.TestCase):
         self.assertTrue(exported_floor.is_volume)
         self.assertAlmostEqual(_scene_interior_vertical_area(preview_floor), 1.2)
         self.assertAlmostEqual(_scene_interior_vertical_area(exported_floor), 1.2)
+
+    def test_open_space_crossing_inner_wall_keeps_floor_fascia(self) -> None:
+        level = _build_square_level(2, 100.0)
+        wall_start = level.vertex_data.add_vertex(50.0, 0.0)
+        wall_end = level.vertex_data.add_vertex(50.0, 100.0)
+        level.vertex_data.add_edge(wall_start.id, wall_end.id)
+        level.open_spaces.append(
+            OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0)
+        )
+
+        models = (
+            convert_to_preview_model((level,)),
+            convert_to_glb((level,)),
+        )
+
+        for model in models:
+            with self.subTest(model_type=type(model).__name__):
+                floor = model.scene.geometry["l2_level_2_floor"]
+                cap = _scene_horizontal_geometry(floor, 1.0)
+                self.assertTrue(floor.is_watertight)
+                self.assertTrue(floor.is_volume)
+                self.assertTrue(cap.covers(Point(1.0, 1.0)))
+                self.assertFalse(cap.covers(Point(1.25, 1.0)))
+
+                face_centers = floor.triangles_center
+                protected_fascia_mask = (
+                    (np.abs(floor.face_normals[:, 1]) < 0.1)
+                    & (np.abs(face_centers[:, 0] - 1.0) < 0.001)
+                    & (np.abs(face_centers[:, 2] - 1.0) < 0.45)
+                )
+                self.assertAlmostEqual(
+                    float(np.sum(floor.area_faces[protected_fascia_mask])),
+                    0.6,
+                )
+
+        lower_level = _build_square_level(1, 100.0)
+        surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces((lower_level, level))
+        }
+        for surface_id in ("level:2/floor", "level:1/ceiling"):
+            with self.subTest(surface_id=surface_id):
+                surface_geometry = _horizontal_surface_geometry(
+                    surfaces[surface_id]
+                )
+                self.assertTrue(surface_geometry.covers(Point(1.0, -1.0)))
+                self.assertFalse(
+                    surface_geometry.covers(Point(1.25, -1.0))
+                )
+
+    def test_open_space_touching_boundary_keeps_exterior_floor_fascia(
+        self,
+    ) -> None:
+        level = _build_square_level(2, 100.0)
+        level.open_spaces.append(
+            OpenSpaceData("opening-a", 0.0, 25.0, 50.0, 75.0)
+        )
+
+        floor = convert_to_glb((level,)).scene.geometry[
+            "l2_level_2_floor"
+        ]
+        cap = _scene_horizontal_geometry(floor, 1.0)
+        vertical_centers = floor.triangles_center[
+            np.abs(floor.face_normals[:, 1]) < 0.1
+        ]
+
+        self.assertTrue(floor.is_watertight)
+        self.assertTrue(floor.is_volume)
+        self.assertFalse(cap.covers(Point(0.25, 1.0)))
+        self.assertTrue(
+            np.any(
+                np.isclose(vertical_centers[:, 0], 0.0)
+                & (vertical_centers[:, 2] > 0.5)
+                & (vertical_centers[:, 2] < 1.5)
+            )
+        )
+
+    def test_open_space_covering_whole_footprint_removes_floor(self) -> None:
+        level = _build_square_level(2, 100.0)
+        level.open_spaces.append(
+            OpenSpaceData("opening-a", 0.0, 0.0, 100.0, 100.0)
+        )
+
+        model = convert_to_glb((level,))
+        floor_surfaces = [
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_type == "floor"
+        ]
+
+        self.assertNotIn("l2_level_2_floor", model.scene.geometry)
+        self.assertEqual(floor_surfaces, [])
+
+    def test_scaled_level_uses_same_fascia_guard_in_mesh_and_surfaces(
+        self,
+    ) -> None:
+        level = _build_square_level(2, 100.0)
+        level.scale = 2.0
+        wall_start = level.vertex_data.add_vertex(50.0, 0.0)
+        wall_end = level.vertex_data.add_vertex(50.0, 100.0)
+        level.vertex_data.add_edge(wall_start.id, wall_end.id)
+        level.open_spaces.append(
+            OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0)
+        )
+
+        model = convert_to_glb((level,))
+        floor_mesh = model.scene.geometry["l2_level_2_floor"].copy()
+        floor_transform, _geometry_name = model.scene.graph.get(
+            "l2_level_2_floor"
+        )
+        floor_mesh.apply_transform(floor_transform)
+        fixed_floor = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_id == "level:2/floor"
+        )
+        lower_level = _build_square_level(1, 100.0)
+        lower_level.scale = 2.0
+        lower_ceiling = next(
+            surface
+            for surface in build_fixed_surfaces((lower_level, level))
+            if surface.surface_id == "level:1/ceiling"
+        )
+
+        self.assertAlmostEqual(
+            _scene_horizontal_area(floor_mesh, 1.0),
+            fixed_floor.area_square_meters,
+            places=7,
+        )
+        self.assertAlmostEqual(fixed_floor.area_square_meters, 12.0008, places=7)
+        self.assertAlmostEqual(
+            lower_ceiling.area_square_meters,
+            fixed_floor.area_square_meters,
+            places=7,
+        )
 
     def test_open_space_clips_existing_authored_floor(self) -> None:
         level = _build_square_level(2, 100.0)

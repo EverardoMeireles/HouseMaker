@@ -316,6 +316,14 @@ from housemaker.models import (
 from housemaker.object_symmetry import (
     SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
 )
+from housemaker.outer_wall_marking import (
+    OuterWallMark,
+    find_outer_wall_vertex_ids,
+    get_outer_wall_mark_vertex_ids,
+    normalize_outer_wall_marks,
+    project_world_points_to_level_image,
+    reconcile_outer_wall_marks,
+)
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
@@ -439,19 +447,12 @@ from housemaker.viewer import (
     build_scene_object_placement_group_candidate,
     build_texture_preview_bundle,
 )
-from housemaker.wall_mirroring import (
-    WallMirrorTopologyResult,
-    WallMirrorVertexLink,
-    find_next_wall_mirror_target_level_index,
-    get_wall_mirror_vertex_ids,
-    mirror_wall_vertex_group,
-    reconcile_wall_mirror_topology,
-    remove_wall_vertex_mirrors,
-)
 
 # ### Constants ###
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
 STARTUP_PROJECT_RESTORE_DELAY_MILLISECONDS = 50
+OUTER_WALL_MARKING_MODE_AUTO = "auto"
+OUTER_WALL_MARKING_MODE_EDIT = "edit"
 STARTUP_PROJECT_RESTORE_CANCEL_EVENT_TYPES = frozenset(
     (
         QEvent.Type.KeyPress,
@@ -1148,9 +1149,7 @@ class _CanvasBlueprintUndoState:
     assignments: tuple[SurfaceTextureAssignment, ...] = ()
     assignment_targets_after: tuple[SurfaceTextureAssignment, ...] | None = ()
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
-    wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
-    other_level_vertex_data: tuple[tuple[int, VertexData], ...] = ()
-    other_level_doorways: tuple[tuple[int, tuple[DoorwayData, ...]], ...] = ()
+    outer_wall_marks: tuple[OuterWallMark, ...] = ()
     level_offsets_meters: tuple[float, float] | None = None
     architectural_trims_by_level: tuple[
         tuple[int, tuple[ArchitecturalTrimData, ...]],
@@ -1213,12 +1212,10 @@ class _CanvasLevelPropertiesUndoState:
 
 
 @dataclass(frozen=True)
-class _CanvasWallMirrorUndoState:
-    """Cross-level wall topology before one mirror side-panel action."""
+class _CanvasOuterWallMarkUndoState:
+    """Outer-wall marks and selection before one marking action."""
 
-    vertex_data_by_level: tuple[tuple[int, VertexData], ...]
-    doorways_by_level: tuple[tuple[int, tuple[DoorwayData, ...]], ...]
-    wall_mirror_links: tuple[WallMirrorVertexLink, ...]
+    outer_wall_marks: tuple[OuterWallMark, ...]
     selected_level_index: int
     selected_vertex_ids: tuple[int, ...]
 
@@ -1335,7 +1332,7 @@ _CanvasUndoState = (
     | _CanvasTopologyUndoState
     | _CanvasSurfaceEditUndoState
     | _CanvasLevelPropertiesUndoState
-    | _CanvasWallMirrorUndoState
+    | _CanvasOuterWallMarkUndoState
     | _CanvasOpeningEditUndoState
     | _CanvasWindowAdditionUndoState
     | _CanvasPlacedObjectUndoState
@@ -1525,7 +1522,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.current_project_path: str | None = None
         self.levels: list[LevelData] = create_default_levels()
-        self.wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
+        self.outer_wall_marks: tuple[OuterWallMark, ...] = ()
+        self._staged_outer_wall_marks: tuple[OuterWallMark, ...] | None = None
+        self._outer_wall_marking_mode: str | None = None
         self.image_library_paths: list[str] = []
         self.doorway_presets: list[DoorwayPreset] = create_default_doorway_presets()
         self.stairs: list[StairData] = []
@@ -3865,43 +3864,48 @@ class BlueprintWorkspace(QWidget):
         self._refresh_directional_light_button_tooltip()
         side_layout.addWidget(self.add_directional_light_button)
 
-        self.wall_mirrors_group = QGroupBox("Wall mirrors")
-        wall_mirrors_layout = QHBoxLayout(self.wall_mirrors_group)
-        wall_mirrors_layout.setSpacing(10)
+        self.outer_wall_marking_group = QGroupBox("Outer wall marking")
+        outer_wall_marking_layout = QHBoxLayout(self.outer_wall_marking_group)
+        outer_wall_marking_layout.setSpacing(10)
 
-        self.wall_mirror_up_button = QPushButton("Up")
-        self.wall_mirror_up_button.setObjectName("canvas-wall-mirror-up-button")
-        self.wall_mirror_up_button.setMinimumHeight(40)
-        self.wall_mirror_up_button.setToolTip(
-            "Copy the selected wall vertices and their shared edges to the "
-            "next level above."
+        self.outer_wall_mark_button = QPushButton("Mark")
+        self.outer_wall_mark_button.setObjectName("canvas-outer-wall-mark-button")
+        self.outer_wall_mark_button.setMinimumHeight(40)
+        self.outer_wall_mark_button.setToolTip(
+            "Mark the selected wall vertices as cross-level alignment guides."
         )
-        self.wall_mirror_up_button.clicked.connect(self._handle_wall_mirror_up_clicked)
-        wall_mirrors_layout.addWidget(self.wall_mirror_up_button)
+        self.outer_wall_mark_button.clicked.connect(
+            self._handle_outer_wall_mark_clicked
+        )
+        outer_wall_marking_layout.addWidget(self.outer_wall_mark_button)
 
-        self.wall_mirror_undo_button = QPushButton("Undo")
-        self.wall_mirror_undo_button.setObjectName("canvas-wall-mirror-undo-button")
-        self.wall_mirror_undo_button.setMinimumHeight(40)
-        self.wall_mirror_undo_button.setToolTip(
-            "Remove mirrors owned by or represented by the selected vertices."
+        self.outer_wall_auto_mark_button = QPushButton("Auto mark")
+        self.outer_wall_auto_mark_button.setObjectName(
+            "canvas-outer-wall-auto-mark-button"
         )
-        self.wall_mirror_undo_button.clicked.connect(
-            self._handle_wall_mirror_undo_clicked
+        self.outer_wall_auto_mark_button.setMinimumHeight(40)
+        self.outer_wall_auto_mark_button.setToolTip(
+            "Find the current level's outer wall boundary, then review and "
+            "confirm its guide points."
         )
-        wall_mirrors_layout.addWidget(self.wall_mirror_undo_button)
+        self.outer_wall_auto_mark_button.clicked.connect(
+            self._handle_outer_wall_auto_mark_clicked
+        )
+        outer_wall_marking_layout.addWidget(self.outer_wall_auto_mark_button)
 
-        self.wall_mirror_down_button = QPushButton("Down")
-        self.wall_mirror_down_button.setObjectName("canvas-wall-mirror-down-button")
-        self.wall_mirror_down_button.setMinimumHeight(40)
-        self.wall_mirror_down_button.setToolTip(
-            "Copy the selected wall vertices and their shared edges to the "
-            "next level below."
+        self.outer_wall_edit_button = QPushButton("Edit")
+        self.outer_wall_edit_button.setObjectName(
+            "canvas-outer-wall-edit-button"
         )
-        self.wall_mirror_down_button.clicked.connect(
-            self._handle_wall_mirror_down_clicked
+        self.outer_wall_edit_button.setMinimumHeight(40)
+        self.outer_wall_edit_button.setToolTip(
+            "Edit the current level's existing outer-wall guide points."
         )
-        wall_mirrors_layout.addWidget(self.wall_mirror_down_button)
-        side_layout.addWidget(self.wall_mirrors_group)
+        self.outer_wall_edit_button.clicked.connect(
+            self._handle_outer_wall_edit_clicked
+        )
+        outer_wall_marking_layout.addWidget(self.outer_wall_edit_button)
+        side_layout.addWidget(self.outer_wall_marking_group)
 
         self.levels_group = QGroupBox("Levels")
         levels_layout = QVBoxLayout(self.levels_group)
@@ -4105,8 +4109,8 @@ class BlueprintWorkspace(QWidget):
             tooltip=(
                 "Generated vertex candidates at or closer than this distance are "
                 "consolidated, reusing an existing wall vertex when possible. "
-                "Existing and mirrored wall lines within this distance also anchor "
-                "nearby detections so they are not generated twice. Opposite "
+                "Existing wall lines within this distance also anchor nearby "
+                "detections so they are not generated twice. Opposite "
                 "parallel wall faces are protected. Increase it to remove "
                 "near-duplicate geometry; 0 disables this extra alignment and "
                 "merge. Values that are too high can merge distinct nearby corners "
@@ -4271,6 +4275,12 @@ class BlueprintWorkspace(QWidget):
         self.canvas.selected_vertices_changed.connect(
             self._handle_canvas_selected_vertex_changed
         )
+        self.canvas.outer_wall_mark_vertex_toggled.connect(
+            self._handle_outer_wall_mark_vertex_toggled
+        )
+        self.canvas.outer_wall_mark_cancel_requested.connect(
+            self._cancel_outer_wall_marking_preview
+        )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
         self.canvas.open_spaces_changed.connect(self._handle_open_spaces_changed)
         self.canvas.open_space_corner_edit_committed.connect(
@@ -4345,7 +4355,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.stair_point_drag_finished.connect(
             self._handle_stair_point_drag_finished
         )
-        self._update_wall_mirror_button_state()
+        self._update_outer_wall_marking_controls()
         self._refresh_levels_list()
         self._update_stair_button_state()
         self._update_open_space_controls()
@@ -6503,17 +6513,7 @@ class BlueprintWorkspace(QWidget):
                     for placement in atlas.placements
                     if placement.object_id in assignment_source_ids
                 ),
-                wall_mirror_links=self.wall_mirror_links,
-                other_level_vertex_data=tuple(
-                    (level.index, level.vertex_data.clone())
-                    for level in self.levels
-                    if level.index != self.current_level.index
-                ),
-                other_level_doorways=tuple(
-                    (level.index, self._copy_doorways(level.doorways))
-                    for level in self.levels
-                    if level.index != self.current_level.index
-                ),
+                outer_wall_marks=self.outer_wall_marks,
                 level_offsets_meters=(
                     (
                         float(self.current_level.offset_x_meters),
@@ -6768,6 +6768,11 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_undo_requested(self) -> None:
         """Undo the latest committed Canvas action from either Canvas view."""
 
+        if self._cancel_outer_wall_marking_preview():
+            self.viewer.set_surface_tools_status(
+                "Outer-wall marking changes cancelled."
+            )
+            return
         if self._pending_stair_parameters is not None or self._staged_stair is not None:
             self._discard_staged_stair_edit(clear_selection=False)
             self.viewer.set_surface_tools_status("Current stair changes discarded.")
@@ -6849,8 +6854,8 @@ class BlueprintWorkspace(QWidget):
                 self._restore_canvas_surface_edit_undo_state(state)
             elif isinstance(state, _CanvasLevelPropertiesUndoState):
                 self._restore_canvas_level_properties_undo_state(state)
-            elif isinstance(state, _CanvasWallMirrorUndoState):
-                self._restore_canvas_wall_mirror_undo_state(state)
+            elif isinstance(state, _CanvasOuterWallMarkUndoState):
+                self._restore_canvas_outer_wall_mark_undo_state(state)
             elif isinstance(state, _CanvasOpeningEditUndoState):
                 self._restore_canvas_opening_edit_undo_state(state)
             elif isinstance(state, _CanvasWindowAdditionUndoState):
@@ -7104,44 +7109,23 @@ class BlueprintWorkspace(QWidget):
             )
             self.canvas.update()
             self._sync_canvas_placed_object_profiles()
-        self._sync_canvas_wall_mirror_state()
+        self._sync_canvas_outer_wall_marking()
         self._reconcile_surface_assignments_with_scene()
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
-    def _restore_canvas_wall_mirror_undo_state(
+    def _restore_canvas_outer_wall_mark_undo_state(
         self,
-        state: _CanvasWallMirrorUndoState,
+        state: _CanvasOuterWallMarkUndoState,
     ) -> None:
-        """Restore every level touched by one atomic wall-mirror action."""
+        """Restore one atomic change to the cross-level alignment marks."""
 
-        restored_level_indices: set[int] = set()
-        for level_index, vertex_data in state.vertex_data_by_level:
-            level = self._get_level_by_index(level_index)
-            if level is None:
-                raise ValueError(
-                    "A wall-mirror level in this undo step no longer exists."
-                )
-            level.vertex_data.copy_from(vertex_data)
-            restored_level_indices.add(level_index)
-        for level_index, doorways in state.doorways_by_level:
-            level = self._get_level_by_index(level_index)
-            if level is None:
-                raise ValueError(
-                    "A wall-mirror doorway level in this undo step no longer exists."
-                )
-            level.doorways[:] = copy.deepcopy(doorways)
-            self._viewer_doorways_by_level_index[level_index] = self._copy_doorways(
-                level.doorways
-            )
-
-        self.wall_mirror_links = state.wall_mirror_links
+        self._cancel_outer_wall_marking_preview()
+        self.outer_wall_marks = state.outer_wall_marks
         if self.current_level.index == state.selected_level_index:
             self.canvas.set_selected_vertex_ids(state.selected_vertex_ids)
-        self._sync_canvas_wall_mirror_state()
-        self._update_wall_mirror_button_state()
-        if restored_level_indices:
-            self._reconcile_canvas_surface_edit_and_refresh()
+        self._sync_canvas_outer_wall_marking()
+        self._update_outer_wall_marking_controls()
 
     def _restore_canvas_opening_edit_undo_state(
         self,
@@ -7475,26 +7459,6 @@ class BlueprintWorkspace(QWidget):
             self._reset_viewer_doorway_snapshots()
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
-        for other_level_index, vertex_data in state.other_level_vertex_data:
-            other_level = self._get_level_by_index(other_level_index)
-            if other_level is None:
-                raise ValueError(
-                    "A wall-mirror level in this undo step no longer exists."
-                )
-            other_level.vertex_data.copy_from(vertex_data)
-        other_doorways_changed = False
-        for other_level_index, doorways in state.other_level_doorways:
-            other_level = self._get_level_by_index(other_level_index)
-            if other_level is None:
-                raise ValueError(
-                    "A wall-mirror doorway level in this undo step no longer exists."
-                )
-            if self._copy_doorways(other_level.doorways) != doorways:
-                other_level.doorways[:] = copy.deepcopy(doorways)
-                self._viewer_doorways_by_level_index[other_level_index] = (
-                    self._copy_doorways(other_level.doorways)
-                )
-                other_doorways_changed = True
         for level_index, architectural_trims in state.architectural_trims_by_level:
             trim_level = self._get_level_by_index(level_index)
             if trim_level is None:
@@ -7502,9 +7466,9 @@ class BlueprintWorkspace(QWidget):
                     "An architectural-trim level in this undo step no longer exists."
                 )
             trim_level.architectural_trims = list(architectural_trims)
-        self.wall_mirror_links = state.wall_mirror_links
-        self._sync_canvas_wall_mirror_state()
-        if other_doorways_changed or state.architectural_trims_by_level:
+        self.outer_wall_marks = state.outer_wall_marks
+        self._sync_canvas_outer_wall_marking()
+        if state.architectural_trims_by_level:
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
         return self._restore_blueprint_surface_bindings(
@@ -8094,7 +8058,7 @@ class BlueprintWorkspace(QWidget):
             synced_level_ids.add(level_identity)
             self._sync_live_canvas_surface_edit(applied)
         if synced_level_ids:
-            self._sync_canvas_wall_mirror_state()
+            self._sync_canvas_outer_wall_marking()
 
     def _handle_canvas_surface_edit_started(self, raw_edit: object) -> None:
         """Remember the immutable baseline for one live structural drag."""
@@ -11372,7 +11336,7 @@ class BlueprintWorkspace(QWidget):
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
             self._clear_canvas_undo_history()
-            self._sync_canvas_wall_mirror_state()
+            self._sync_canvas_outer_wall_marking()
             self._mark_viewer_preview_dirty(preserve_camera=False)
 
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
@@ -16963,7 +16927,7 @@ class BlueprintWorkspace(QWidget):
                 self.viewer.set_doorway_preview_outline(None)
             return
         if topology_changed:
-            self._sync_canvas_wall_mirror_state()
+            self._sync_canvas_outer_wall_marking()
             self._reconcile_canvas_surface_edit_and_refresh()
         else:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -17008,6 +16972,12 @@ class BlueprintWorkspace(QWidget):
                 self.surface_texture_generation.get_surface_material_sources()
             ),
             export_untextured_surfaces=True,
+            make_floors_double_sided=(
+                self._generation_settings.make_floors_double_sided
+            ),
+            make_ceilings_double_sided=(
+                self._generation_settings.make_ceilings_double_sided
+            ),
         )
         authored_models, instance_models = self._build_export_placed_models()
         runtime_source_ids = {
@@ -17204,6 +17174,12 @@ class BlueprintWorkspace(QWidget):
                     preview_levels,
                     stairs=self.stairs,
                     surface_materials=self._build_surface_preview_material_sources(),
+                    make_floors_double_sided=(
+                        self._generation_settings.make_floors_double_sided
+                    ),
+                    make_ceilings_double_sided=(
+                        self._generation_settings.make_ceilings_double_sided
+                    ),
                 )
             except NoUsableBlueprintGeometryError:
                 base_model = GeneratedModel(
@@ -19276,7 +19252,7 @@ class BlueprintWorkspace(QWidget):
                 surface_texture_generation=(self.surface_texture_generation.get_data()),
                 texture_atlases=self.texture_atlas_workspace.get_data(),
                 stairs=self.stairs,
-                wall_mirror_links=self.wall_mirror_links,
+                outer_wall_marks=self.outer_wall_marks,
                 tours=self.tour_workspace.tours(),
                 doors=self.doors_workspace.data(),
                 directional_lights=self.directional_lights,
@@ -20890,6 +20866,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         if level_index != self.current_level_index:
+            self._cancel_outer_wall_marking_preview()
             self.canvas.clear_level_comparison_keys()
             self._canvas_keyboard_comparison_direction = None
             self._level_transform_button_comparison_active = False
@@ -21308,7 +21285,7 @@ class BlueprintWorkspace(QWidget):
             self.canvas.update()
             self._sync_canvas_placed_object_profiles()
             self._sync_canvas_directional_light_profiles()
-        self._sync_canvas_wall_mirror_state()
+        self._sync_canvas_outer_wall_marking()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         self._level_transform_outline_commit_revision = self._viewer_preview_revision
         return True
@@ -25625,209 +25602,240 @@ class BlueprintWorkspace(QWidget):
             f"{selection_text}"
         )
 
-    # ### Wall level mirror controls ###
-    def _handle_wall_mirror_up_clicked(self) -> None:
-        """Mirror the selected wall-vertex group onto the next upper level."""
+    # ### Outer wall marking controls ###
+    def _handle_outer_wall_mark_clicked(self) -> None:
+        """Mark the selected real wall vertices as cross-level guides."""
 
-        self._mirror_selected_wall_vertices(1)
-
-    def _handle_wall_mirror_down_clicked(self) -> None:
-        """Mirror the selected wall-vertex group onto the next lower level."""
-
-        self._mirror_selected_wall_vertices(-1)
-
-    def _handle_wall_mirror_undo_clicked(self) -> None:
-        """Remove mirrors owned by, or materialized as, selected vertices."""
-
+        if self._staged_outer_wall_marks is not None:
+            return
         selected_vertex_ids = self._get_selected_canvas_wall_vertex_ids()
-        if not self._selected_vertices_have_wall_mirrors(selected_vertex_ids):
-            self._update_wall_mirror_button_state()
-            return
-
-        self._commit_pending_wall_mirror_prerequisites()
-        undo_state = self._capture_canvas_wall_mirror_undo_state()
-        result = remove_wall_vertex_mirrors(
-            self.levels,
-            self.wall_mirror_links,
+        existing_ids = get_outer_wall_mark_vertex_ids(
+            self.outer_wall_marks,
             self.current_level.index,
-            selected_vertex_ids,
         )
-        if not result.changed:
-            self._update_wall_mirror_button_state()
+        added_ids = tuple(
+            vertex_id
+            for vertex_id in selected_vertex_ids
+            if vertex_id not in existing_ids
+        )
+        if not added_ids:
+            self._update_outer_wall_marking_controls()
             return
+        undo_state = self._capture_canvas_outer_wall_mark_undo_state()
+        self.outer_wall_marks = normalize_outer_wall_marks(
+            (
+                *self.outer_wall_marks,
+                *(
+                    OuterWallMark(self.current_level.index, vertex_id)
+                    for vertex_id in added_ids
+                ),
+            )
+        )
         self._record_canvas_undo_state(
             undo_state,
             commit_pending_surface_edit=False,
         )
-        self.wall_mirror_links = result.links
-        self._finalize_wall_mirror_topology_change(result)
+        self._sync_canvas_outer_wall_marking()
+        self._update_outer_wall_marking_controls()
 
-    def _mirror_selected_wall_vertices(self, direction: int) -> None:
-        """Copy one selected group and its internal edges to another level."""
+    def _handle_outer_wall_auto_mark_clicked(self) -> None:
+        """Start an editable auto-mark preview or confirm the staged marks."""
 
-        selected_vertex_ids = self._get_selected_canvas_wall_vertex_ids()
-        if not selected_vertex_ids:
-            self._update_wall_mirror_button_state()
+        if self._outer_wall_marking_mode == OUTER_WALL_MARKING_MODE_AUTO:
+            self._confirm_outer_wall_marking_preview()
             return
-        target_level_index = find_next_wall_mirror_target_level_index(
-            self.levels,
-            self.wall_mirror_links,
+        if self._staged_outer_wall_marks is not None:
+            return
+
+        detected_vertex_ids = find_outer_wall_vertex_ids(self.current_level)
+        current_level_index = self.current_level.index
+        staged_marks = normalize_outer_wall_marks(
+            (
+                *self.outer_wall_marks,
+                *(
+                    OuterWallMark(current_level_index, vertex_id)
+                    for vertex_id in detected_vertex_ids
+                ),
+            )
+        )
+        self._begin_outer_wall_marking_preview(
+            OUTER_WALL_MARKING_MODE_AUTO,
+            staged_marks,
+        )
+
+    def _handle_outer_wall_edit_clicked(self) -> None:
+        """Edit the current level's committed outer-wall marks in place."""
+
+        if self._outer_wall_marking_mode == OUTER_WALL_MARKING_MODE_EDIT:
+            self._confirm_outer_wall_marking_preview()
+            return
+        if self._staged_outer_wall_marks is not None:
+            return
+        marked_vertex_ids = get_outer_wall_mark_vertex_ids(
+            self.outer_wall_marks,
             self.current_level.index,
-            selected_vertex_ids,
-            direction,
         )
-        if target_level_index is None:
-            self._update_wall_mirror_button_state()
+        if not marked_vertex_ids:
+            self._update_outer_wall_marking_controls()
             return
-
-        self._commit_pending_wall_mirror_prerequisites()
-        undo_state = self._capture_canvas_wall_mirror_undo_state()
-        result = mirror_wall_vertex_group(
-            self.levels,
-            self.wall_mirror_links,
-            self.current_level.index,
-            selected_vertex_ids,
-            target_level_index,
+        self._begin_outer_wall_marking_preview(
+            OUTER_WALL_MARKING_MODE_EDIT,
+            self.outer_wall_marks,
         )
-        if not result.changed:
-            self._update_wall_mirror_button_state()
-            return
-        self._record_canvas_undo_state(
-            undo_state,
-            commit_pending_surface_edit=False,
-        )
-        self.wall_mirror_links = result.links
-        self._finalize_wall_mirror_topology_change(result)
 
-    def _commit_pending_wall_mirror_prerequisites(self) -> None:
-        """Commit older delayed edits before a cross-level topology action."""
-
-        self._finish_level_transform_drag()
-        self._commit_pending_level_transform_update()
-        self._commit_pending_canvas_surface_mesh_update()
-        self._commit_pending_architectural_trim_mesh_update()
-        self._commit_pending_wall_vertex_update()
-
-    def _capture_canvas_wall_mirror_undo_state(
+    def _begin_outer_wall_marking_preview(
         self,
-    ) -> _CanvasWallMirrorUndoState:
-        """Snapshot cross-level wall topology and its current selection."""
+        mode: str,
+        marks: Sequence[OuterWallMark],
+    ) -> None:
+        """Start one atomic editable outer-wall marking preview."""
 
-        return _CanvasWallMirrorUndoState(
-            vertex_data_by_level=tuple(
-                (level.index, level.vertex_data.clone()) for level in self.levels
-            ),
-            doorways_by_level=tuple(
-                (level.index, self._copy_doorways(level.doorways))
-                for level in self.levels
-            ),
-            wall_mirror_links=self.wall_mirror_links,
+        self._staged_outer_wall_marks = normalize_outer_wall_marks(marks)
+        self._outer_wall_marking_mode = mode
+        self.canvas.set_outer_wall_marking_active(True)
+        self._sync_canvas_outer_wall_marking()
+        self._update_outer_wall_marking_controls()
+
+    def _confirm_outer_wall_marking_preview(self) -> None:
+        """Commit the active marking preview as one undoable change."""
+
+        staged_marks = self._staged_outer_wall_marks
+        if staged_marks is None:
+            return
+        undo_state = self._capture_canvas_outer_wall_mark_undo_state()
+        changed = staged_marks != self.outer_wall_marks
+        self.outer_wall_marks = staged_marks
+        self._staged_outer_wall_marks = None
+        self._outer_wall_marking_mode = None
+        self.canvas.set_outer_wall_marking_active(False)
+        if changed:
+            self._record_canvas_undo_state(
+                undo_state,
+                commit_pending_surface_edit=False,
+            )
+        self._sync_canvas_outer_wall_marking()
+        self._update_outer_wall_marking_controls()
+
+    def _handle_outer_wall_mark_vertex_toggled(self, vertex_id: int) -> None:
+        """Toggle one real wall vertex inside the active marking preview."""
+
+        staged_marks = self._staged_outer_wall_marks
+        if staged_marks is None or not self._is_valid_canvas_wall_vertex_id(vertex_id):
+            return
+        mark = OuterWallMark(self.current_level.index, vertex_id)
+        if mark in staged_marks:
+            self._staged_outer_wall_marks = tuple(
+                candidate for candidate in staged_marks if candidate != mark
+            )
+        else:
+            self._staged_outer_wall_marks = normalize_outer_wall_marks(
+                (*staged_marks, mark)
+            )
+        self._sync_canvas_outer_wall_marking()
+
+    def _cancel_outer_wall_marking_preview(self) -> bool:
+        """Discard staged marking changes without touching committed data."""
+
+        if self._staged_outer_wall_marks is None:
+            return False
+        self._staged_outer_wall_marks = None
+        self._outer_wall_marking_mode = None
+        self.canvas.set_outer_wall_marking_active(False)
+        self._sync_canvas_outer_wall_marking()
+        self._update_outer_wall_marking_controls()
+        return True
+
+    def _capture_canvas_outer_wall_mark_undo_state(
+        self,
+    ) -> _CanvasOuterWallMarkUndoState:
+        """Snapshot committed outer-wall marks and the local selection."""
+
+        return _CanvasOuterWallMarkUndoState(
+            outer_wall_marks=self.outer_wall_marks,
             selected_level_index=self.current_level.index,
             selected_vertex_ids=self.canvas.selected_vertex_ids,
         )
-
-    def _finalize_wall_mirror_topology_change(
-        self,
-        result: WallMirrorTopologyResult,
-    ) -> None:
-        """Refresh mirror markers and debounce one resulting mesh rebuild."""
-
-        self._sync_canvas_wall_mirror_state()
-        self._update_wall_mirror_button_state()
-        if result.changed_level_indices:
-            self._pending_wall_vertex_doorway_level_indices.update(
-                result.changed_level_indices
-            )
-            self._pending_wall_vertex_mesh_update = True
-            self._restart_pending_wall_vertex_update_if_idle()
 
     def _handle_canvas_selected_vertex_changed(
         self,
         _vertex_ids: object,
     ) -> None:
-        """Keep Wall mirrors availability aligned with Canvas selection."""
+        """Keep outer-wall marking actions aligned with Canvas selection."""
 
-        self._update_wall_mirror_button_state()
+        self._update_outer_wall_marking_controls()
 
-    def _update_wall_mirror_button_state(self) -> None:
-        """Enable only mirror operations valid for the selected vertex group."""
+    def _update_outer_wall_marking_controls(self) -> None:
+        """Reflect the current selection and marking transaction in the UI."""
 
-        if not hasattr(self, "wall_mirror_up_button"):
+        if not hasattr(self, "outer_wall_mark_button"):
             return
         selected_vertex_ids = self._get_selected_canvas_wall_vertex_ids()
-        has_selection = bool(selected_vertex_ids)
-        upper_target_index = (
-            find_next_wall_mirror_target_level_index(
-                self.levels,
-                self.wall_mirror_links,
-                self.current_level.index,
-                selected_vertex_ids,
-                1,
+        marked_vertex_ids = get_outer_wall_mark_vertex_ids(
+            self.outer_wall_marks,
+            self.current_level.index,
+        )
+        is_staging = self._staged_outer_wall_marks is not None
+        is_auto_marking = (
+            self._outer_wall_marking_mode == OUTER_WALL_MARKING_MODE_AUTO
+        )
+        is_editing = (
+            self._outer_wall_marking_mode == OUTER_WALL_MARKING_MODE_EDIT
+        )
+        self.outer_wall_mark_button.setEnabled(
+            not is_staging
+            and any(
+                vertex_id not in marked_vertex_ids
+                for vertex_id in selected_vertex_ids
             )
-            if has_selection
-            else None
         )
-        lower_target_index = (
-            find_next_wall_mirror_target_level_index(
-                self.levels,
-                self.wall_mirror_links,
-                self.current_level.index,
-                selected_vertex_ids,
-                -1,
+        self.outer_wall_auto_mark_button.setText(
+            "Confirm" if is_auto_marking else "Auto mark"
+        )
+        self.outer_wall_auto_mark_button.setEnabled(
+            is_auto_marking
+            or (
+                not is_staging
+                and bool(self._get_canvas_wall_vertex_ids())
             )
-            if has_selection
-            else None
         )
-        self.wall_mirror_up_button.setEnabled(upper_target_index is not None)
-        self.wall_mirror_undo_button.setEnabled(
-            self._selected_vertices_have_wall_mirrors(selected_vertex_ids)
+        self.outer_wall_edit_button.setText(
+            "Confirm" if is_editing else "Edit"
         )
-        self.wall_mirror_down_button.setEnabled(lower_target_index is not None)
+        self.outer_wall_edit_button.setEnabled(
+            is_editing or (not is_staging and bool(marked_vertex_ids))
+        )
 
     def _get_selected_canvas_wall_vertex_ids(self) -> tuple[int, ...]:
         """Return valid selected vertices, excluding room-center helpers."""
 
         vertex_data = self.current_level.vertex_data
-        room_center_vertex_ids = {
-            room.center_vertex_id for room in self.current_level.rooms
-        }
-        wall_vertex_ids = {
-            vertex_id
-            for edge in vertex_data.edges
-            for vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
-        }
-        wall_vertex_ids.update(
-            get_wall_mirror_vertex_ids(
-                self.wall_mirror_links,
-                self.current_level.index,
-            )
-        )
+        wall_vertex_ids = self._get_canvas_wall_vertex_ids()
         return tuple(
             vertex_id
             for vertex_id in self.canvas.selected_vertex_ids
             if vertex_data.get_vertex(vertex_id) is not None
-            and vertex_id not in room_center_vertex_ids
             and vertex_id in wall_vertex_ids
         )
 
-    def _selected_vertices_have_wall_mirrors(
-        self,
-        selected_vertex_ids: Sequence[int],
-    ) -> bool:
-        """Return whether selected vertices own or are owned mirror copies."""
+    def _get_canvas_wall_vertex_ids(self) -> frozenset[int]:
+        """Return connected structural vertices on the current level."""
 
-        selected_ids = set(selected_vertex_ids)
-        level_index = self.current_level.index
-        return any(
-            (
-                link.source_level_index == level_index
-                and link.source_vertex_id in selected_ids
-            )
-            or (
-                link.target_level_index == level_index
-                and link.target_vertex_id in selected_ids
-            )
-            for link in self.wall_mirror_links
+        room_center_vertex_ids = {
+            room.center_vertex_id for room in self.current_level.rooms
+        }
+        return frozenset(
+            vertex_id
+            for edge in self.current_level.vertex_data.edges
+            for vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
+            if vertex_id not in room_center_vertex_ids
+        )
+
+    def _is_valid_canvas_wall_vertex_id(self, vertex_id: int) -> bool:
+        """Return whether a Canvas vertex may be used as an outer-wall mark."""
+
+        return (
+            self.current_level.vertex_data.get_vertex(vertex_id) is not None
+            and vertex_id in self._get_canvas_wall_vertex_ids()
         )
 
     def _get_level_by_index(self, level_index: int) -> LevelData | None:
@@ -25838,26 +25846,116 @@ class BlueprintWorkspace(QWidget):
             None,
         )
 
-    def _sync_canvas_wall_mirror_state(self) -> WallMirrorTopologyResult:
-        """Reconcile owned copies and mark local mirror endpoints in green."""
+    def _sync_canvas_outer_wall_marking(self) -> None:
+        """Reconcile marks and publish immutable projected alignment guides."""
 
-        result = reconcile_wall_mirror_topology(
+        self.outer_wall_marks = reconcile_outer_wall_marks(
             self.levels,
-            self.wall_mirror_links,
+            self.outer_wall_marks,
         )
-        self._pending_wall_vertex_doorway_level_indices.update(
-            result.changed_level_indices
+        if self._staged_outer_wall_marks is not None:
+            self._staged_outer_wall_marks = reconcile_outer_wall_marks(
+                self.levels,
+                self._staged_outer_wall_marks,
+            )
+        effective_marks = (
+            self._staged_outer_wall_marks
+            if self._staged_outer_wall_marks is not None
+            else self.outer_wall_marks
         )
-        self.wall_mirror_links = result.links
-        self.canvas.set_wall_mirror_vertex_ids(
-            get_wall_mirror_vertex_ids(
-                self.wall_mirror_links,
+        self.canvas.set_outer_wall_mark_vertex_ids(
+            get_outer_wall_mark_vertex_ids(
+                effective_marks,
                 self.current_level.index,
             )
         )
+        points, edges = self._build_outer_wall_reference_overlay(effective_marks)
+        self.canvas.set_outer_wall_reference_overlay(points, edges)
         self.canvas.prune_missing_vertex_references()
+        self._update_outer_wall_marking_controls()
         self.canvas.update()
-        return result
+
+    def _build_outer_wall_reference_overlay(
+        self,
+        marks: Sequence[OuterWallMark],
+    ) -> tuple[
+        tuple[tuple[float, float], ...],
+        tuple[tuple[tuple[float, float], tuple[float, float]], ...],
+    ]:
+        """Project every other level's marked graph into the active image."""
+
+        marked_ids_by_level: dict[int, set[int]] = {}
+        for mark in marks:
+            marked_ids_by_level.setdefault(mark.level_index, set()).add(
+                mark.vertex_id
+            )
+
+        world_point_by_key: dict[tuple[int, int], tuple[float, float]] = {}
+        for source_level in self.levels:
+            if source_level is self.current_level:
+                continue
+            marked_ids = marked_ids_by_level.get(source_level.index, set())
+            for vertex_id in sorted(marked_ids):
+                vertex = source_level.vertex_data.get_vertex(vertex_id)
+                if vertex is None:
+                    continue
+                try:
+                    world_point_by_key[(source_level.index, vertex_id)] = (
+                        level_image_to_world_xy(
+                            source_level,
+                            vertex.x,
+                            vertex.y,
+                        )
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    continue
+
+        projected_by_key: dict[tuple[int, int], tuple[float, float]] = {}
+        ordered_keys = tuple(sorted(world_point_by_key))
+        try:
+            projected_points = project_world_points_to_level_image(
+                self.current_level,
+                tuple(world_point_by_key[key] for key in ordered_keys),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            pass
+        else:
+            projected_by_key.update(
+                zip(ordered_keys, projected_points, strict=True)
+            )
+
+        point_by_key = {
+            (round(point[0], 6), round(point[1], 6)): point
+            for point in projected_by_key.values()
+        }
+        edge_by_key: dict[
+            tuple[tuple[float, float], tuple[float, float]],
+            tuple[tuple[float, float], tuple[float, float]],
+        ] = {}
+        for source_level in self.levels:
+            if source_level is self.current_level:
+                continue
+            marked_ids = marked_ids_by_level.get(source_level.index, set())
+            for edge in source_level.vertex_data.edges:
+                if (
+                    edge.start_vertex_id not in marked_ids
+                    or edge.end_vertex_id not in marked_ids
+                ):
+                    continue
+                start = projected_by_key.get(
+                    (source_level.index, edge.start_vertex_id)
+                )
+                end = projected_by_key.get((source_level.index, edge.end_vertex_id))
+                if start is None or end is None or start == end:
+                    continue
+                start_key = (round(start[0], 6), round(start[1], 6))
+                end_key = (round(end[0], 6), round(end[1], 6))
+                key = tuple(sorted((start_key, end_key)))
+                edge_by_key[key] = (start, end)
+        return (
+            tuple(point_by_key[key] for key in sorted(point_by_key)),
+            tuple(edge_by_key[key] for key in sorted(edge_by_key)),
+        )
 
     def _handle_canvas_doorway_selection_changed(
         self,
@@ -25976,7 +26074,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._viewer_doorways_by_level_index[self.current_level.index] = next_snapshot
         if topology_changed:
-            self._sync_canvas_wall_mirror_state()
+            self._sync_canvas_outer_wall_marking()
             self._reconcile_canvas_surface_edit_and_refresh()
         else:
             self._schedule_viewer_preview_refresh()
@@ -26532,6 +26630,7 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh()
 
     def _handle_generation_settings_changed(self) -> None:
+        previous_settings = self._generation_settings
         settings = self.settings_widget.get_settings()
         self._generation_settings = settings
         self._set_mesh_edit_update_delay_seconds(
@@ -26563,6 +26662,13 @@ class BlueprintWorkspace(QWidget):
         self._apply_jobs_window_screen(settings.jobs_window_screen_id)
         self._apply_atlas_display_screen(settings.atlas_display_screen_id)
         self._refresh_scene_atlas_texture_requirements()
+        if (
+            settings.make_floors_double_sided
+            != previous_settings.make_floors_double_sided
+            or settings.make_ceilings_double_sided
+            != previous_settings.make_ceilings_double_sided
+        ):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     # ### Canvas wall drawing updates ###
     def _handle_canvas_surface_geometry_changed(self) -> None:
@@ -26576,7 +26682,7 @@ class BlueprintWorkspace(QWidget):
             != session.topology_signature
         ):
             self._clear_plan_wall_preview()
-        self._sync_canvas_wall_mirror_state()
+        self._sync_canvas_outer_wall_marking()
         if self._is_canvas_wall_vertex_interaction_active:
             self._pending_wall_vertex_mesh_update = True
             self._restart_pending_wall_vertex_update_if_idle()
@@ -26734,7 +26840,7 @@ class BlueprintWorkspace(QWidget):
             surface_texture_generation=(project_data.surface_texture_generation),
             texture_atlases=project_data.texture_atlases,
             stairs=project_data.stairs,
-            wall_mirror_links=project_data.wall_mirror_links,
+            outer_wall_marks=project_data.outer_wall_marks,
             tours=project_data.tours,
             doors=project_data.doors,
             directional_lights=project_data.directional_lights,
@@ -26750,7 +26856,7 @@ class BlueprintWorkspace(QWidget):
         surface_texture_generation: SurfaceTextureData | None = None,
         texture_atlases: TextureAtlasData | None = None,
         stairs: list[StairData] | None = None,
-        wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
+        outer_wall_marks: Sequence[OuterWallMark] | None = None,
         tours: Sequence[TourData] | None = None,
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
@@ -26774,7 +26880,7 @@ class BlueprintWorkspace(QWidget):
                 surface_texture_generation=surface_texture_generation,
                 texture_atlases=texture_atlases,
                 stairs=stairs,
-                wall_mirror_links=wall_mirror_links,
+                outer_wall_marks=outer_wall_marks,
                 tours=tours,
                 doors=doors,
                 directional_lights=directional_lights,
@@ -26832,7 +26938,7 @@ class BlueprintWorkspace(QWidget):
         surface_texture_generation: SurfaceTextureData | None = None,
         texture_atlases: TextureAtlasData | None = None,
         stairs: list[StairData] | None = None,
-        wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
+        outer_wall_marks: Sequence[OuterWallMark] | None = None,
         tours: Sequence[TourData] | None = None,
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
@@ -26907,11 +27013,13 @@ class BlueprintWorkspace(QWidget):
         self._clear_door_undo_history()
         self.viewer.set_window_undo_available(False)
         self.levels = levels
-        wall_mirror_result = reconcile_wall_mirror_topology(
+        self.outer_wall_marks = reconcile_outer_wall_marks(
             self.levels,
-            wall_mirror_links or (),
+            outer_wall_marks or (),
         )
-        self.wall_mirror_links = wall_mirror_result.links
+        self._staged_outer_wall_marks = None
+        self._outer_wall_marking_mode = None
+        self.canvas.set_outer_wall_marking_active(False)
         self.directional_lights = tuple(directional_lights or ())
         self._selected_directional_light_id = None
         self.viewer.set_directional_lights(self.directional_lights)
@@ -27046,6 +27154,7 @@ class BlueprintWorkspace(QWidget):
         *,
         original_image_path: str | None = None,
     ) -> None:
+        self._cancel_outer_wall_marking_preview()
         active_correction = self._plan_image_correction_runtimes.get(
             self.current_level.index
         )
@@ -27085,7 +27194,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_placed_object_profiles()
         self._sync_canvas_directional_light_profiles()
-        self._sync_canvas_wall_mirror_state()
+        self._sync_canvas_outer_wall_marking()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
         self._update_open_space_controls()
@@ -27129,8 +27238,8 @@ class BlueprintWorkspace(QWidget):
         if not self._is_applying_project_state:
             self._sync_canvas_placed_object_profiles()
         self._sync_canvas_directional_light_profiles()
-        self._sync_canvas_wall_mirror_state()
-        self._update_wall_mirror_button_state()
+        self._sync_canvas_outer_wall_marking()
+        self._update_outer_wall_marking_controls()
         self._sync_selected_canvas_wall_highlight(
             self.viewer.get_active_canvas_surface_id()
         )

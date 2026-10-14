@@ -16,6 +16,7 @@ from housemaker.surface_geometry import SURFACE_TYPE_FLOOR, FixedSurface
 from housemaker.viewer import (
     CANVAS_SURFACE_SELECTION_COLOR,
     GlbViewerWidget,
+    _build_mesh_feature_line_positions,
     _DepthTestedOverlayLineItem,
 )
 
@@ -180,6 +181,28 @@ class ViewerLevelTransformPreviewTests(unittest.TestCase):
         self.viewer.clear_level_transform_preview()
 
         self.assertTrue(self.viewer.add_surface_vertex_button.isEnabled())
+
+    def test_floor_slab_feature_outline_keeps_sides_without_face_diagonals(
+        self,
+    ) -> None:
+        floor_slab = trimesh.creation.box(extents=(4.0, 3.0, 0.4))
+
+        positions = _build_mesh_feature_line_positions(floor_slab)
+
+        self.assertIsNotNone(positions)
+        assert positions is not None
+        segments = np.asarray(positions, dtype=float).reshape(-1, 2, 3)
+        self.assertEqual(len(segments), 12)
+        vertical_segments = segments[
+            np.all(
+                np.isclose(segments[:, 0, :2], segments[:, 1, :2]),
+                axis=1,
+            )
+            & ~np.isclose(segments[:, 0, 2], segments[:, 1, 2])
+        ]
+        self.assertEqual(len(vertical_segments), 4)
+        self.assertAlmostEqual(float(np.min(positions[:, 2])), -0.2)
+        self.assertAlmostEqual(float(np.max(positions[:, 2])), 0.2)
 
 
 # ### Test entry point ###

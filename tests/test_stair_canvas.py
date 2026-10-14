@@ -1,6 +1,7 @@
 # ### Environment setup ###
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -834,6 +835,69 @@ class StairCanvasTests(unittest.TestCase):
         self.assertAlmostEqual(finished[0][3], 42.0, delta=0.1)
         self.assertTrue(finished[0][4])
         self.assertIsNone(canvas._stair_drag_preview_point)
+
+    def test_dragging_stair_point_snaps_only_to_walls_without_mutation(
+        self,
+    ) -> None:
+        level = _build_level(2)
+        wall_start = level.vertex_data.add_vertex(10.0, 60.0)
+        wall_end = level.vertex_data.add_vertex(80.0, 60.0)
+        level.vertex_data.add_edge(wall_start.id, wall_end.id)
+        canvas = self._build_canvas(level)
+        canvas.set_stair_context([_four_point_stair_dict()], level)
+        finished: list[tuple[int, str, float, float, bool]] = []
+        canvas.stair_point_drag_finished.connect(
+            lambda *args: finished.append(args)
+        )
+        wall_bytes_before = json.dumps(
+            level.vertex_data.to_dict(),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        wall_revision_before = level.vertex_data.revision
+        start = _image_position(canvas, 20.0, 30.0)
+
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+        historical_axis_target = _image_position(canvas, 20.8, 45.0)
+        QTest.mouseMove(canvas, historical_axis_target)
+        free_preview = canvas._stair_drag_preview_point
+        self.assertIsNotNone(free_preview)
+        self.assertGreater(abs(free_preview[0] - 20.0), 0.2)  # type: ignore[index]
+
+        edge_target = _image_position(canvas, 35.0, 59.0)
+        QTest.mouseMove(canvas, edge_target)
+        edge_preview = canvas._stair_drag_preview_point
+        self.assertIsNotNone(edge_preview)
+        self.assertAlmostEqual(edge_preview[0], 35.0, delta=0.2)  # type: ignore[index]
+        self.assertEqual(edge_preview[1], 60.0)  # type: ignore[index]
+
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=edge_target)
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0][:2], (0, "start_a"))
+        self.assertAlmostEqual(finished[0][2], 35.0, delta=0.2)
+        self.assertEqual(finished[0][3], 60.0)
+        self.assertTrue(finished[0][4])
+
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+        vertex_target = _image_position(canvas, 79.2, 60.8)
+        QTest.mouseMove(canvas, vertex_target)
+        vertex_preview = canvas._stair_drag_preview_point
+        self.assertEqual(vertex_preview, (wall_end.x, wall_end.y))
+
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=vertex_target)
+
+        self.assertEqual(len(finished), 2)
+        self.assertEqual(finished[1][:2], (0, "start_a"))
+        self.assertEqual(finished[1][2:4], (wall_end.x, wall_end.y))
+        self.assertTrue(finished[1][4])
+        self.assertEqual(
+            json.dumps(
+                level.vertex_data.to_dict(),
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            wall_bytes_before,
+        )
+        self.assertEqual(level.vertex_data.revision, wall_revision_before)
 
     def test_clicking_stair_point_does_not_emit_drag_edit(self) -> None:
         level = _build_level(2)

@@ -50,6 +50,7 @@ from housemaker.surface_materials import (
     build_world_planar_face_uvs,
 )
 from housemaker.surface_texture_state import (
+    SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
@@ -412,6 +413,80 @@ class StableRoomSurfaceIdentityTests(unittest.TestCase):
 
 # ### GLB material tests ###
 class SurfaceMaterialGlbTests(unittest.TestCase):
+    def test_floor_and_ceiling_double_sided_options_are_independent(
+        self,
+    ) -> None:
+        level, _room = _build_one_room_level()
+        surfaces_by_type = {
+            surface.surface_type: surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_type
+            in {
+                SURFACE_TYPE_FLOOR,
+                SURFACE_TYPE_CEILING,
+                SURFACE_TYPE_WALL,
+            }
+        }
+        surface_materials = {
+            surface.surface_id: _solid_png((80, 120, 190, 255))
+            for surface in surfaces_by_type.values()
+        }
+
+        for floor_double_sided, ceiling_double_sided in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
+            with self.subTest(
+                floor=floor_double_sided,
+                ceiling=ceiling_double_sided,
+            ):
+                model = convert_to_glb(
+                    [level],
+                    surface_materials=surface_materials,
+                    make_floors_double_sided=floor_double_sided,
+                    make_ceilings_double_sided=ceiling_double_sided,
+                )
+                expected_by_type = {
+                    SURFACE_TYPE_FLOOR: floor_double_sided,
+                    SURFACE_TYPE_CEILING: ceiling_double_sided,
+                    SURFACE_TYPE_WALL: False,
+                }
+                preview_by_type = {
+                    surface.surface_type: surface
+                    for surface in model.preview_textured_surfaces
+                }
+                self.assertEqual(
+                    set(preview_by_type),
+                    set(expected_by_type),
+                )
+                for surface_type, expected in expected_by_type.items():
+                    self.assertEqual(
+                        preview_by_type[surface_type].double_sided,
+                        expected,
+                    )
+
+                exported_scene = trimesh.load(
+                    BytesIO(model.glb_bytes),
+                    file_type="glb",
+                    force="scene",
+                    process=False,
+                )
+                exported_materials = {
+                    getattr(mesh.visual.material, "name", ""): (
+                        mesh.visual.material
+                    )
+                    for mesh in exported_scene.geometry.values()
+                    if getattr(mesh.visual, "material", None) is not None
+                }
+                for surface_type, expected in expected_by_type.items():
+                    surface = surfaces_by_type[surface_type]
+                    material = exported_materials[
+                        f"Surface {surface.surface_id}"
+                    ]
+                    self.assertEqual(material.doubleSided, expected)
+
     def test_export_scene_model_retains_untextured_surfaces(self) -> None:
         level, _room = _build_one_room_level()
 
@@ -423,6 +498,63 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             model.mesh.area,
         )
         self.assertEqual(model.glb_bytes, b"")
+
+    def test_untextured_floor_and_ceiling_double_sided_options_are_independent(
+        self,
+    ) -> None:
+        level, _room = _build_one_room_level()
+        horizontal_surfaces = {
+            surface.surface_type: surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_type
+            in {
+                SURFACE_TYPE_FLOOR,
+                SURFACE_TYPE_CEILING,
+            }
+        }
+        baseline = convert_to_export_scene_model([level])
+
+        for floor_double_sided, ceiling_double_sided in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
+            with self.subTest(
+                floor=floor_double_sided,
+                ceiling=ceiling_double_sided,
+            ):
+                model = convert_to_export_scene_model(
+                    [level],
+                    make_floors_double_sided=floor_double_sided,
+                    make_ceilings_double_sided=ceiling_double_sided,
+                )
+                expected_surface_ids = {
+                    horizontal_surfaces[surface_type].surface_id
+                    for surface_type, enabled in (
+                        (SURFACE_TYPE_FLOOR, floor_double_sided),
+                        (SURFACE_TYPE_CEILING, ceiling_double_sided),
+                    )
+                    if enabled
+                }
+                backfaces = [
+                    mesh
+                    for mesh in model.scene.geometry.values()
+                    if mesh.metadata.get("housemaker_double_sided_backface")
+                ]
+                self.assertEqual(
+                    {
+                        mesh.metadata["housemaker_surface_id"]
+                        for mesh in backfaces
+                    },
+                    expected_surface_ids,
+                )
+                self.assertEqual(
+                    len(model.mesh.faces),
+                    len(baseline.mesh.faces)
+                    + sum(len(mesh.faces) for mesh in backfaces),
+                )
+                self.assertTrue(model.preview_cull_untextured_back_faces)
 
     def test_repeat_size_reaches_preview_and_exported_surface_uvs(self) -> None:
         level, room = _build_one_room_level()
@@ -1155,6 +1287,8 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
                         floor_surface_id: texture_path.resolve(),
                     },
                     export_untextured_surfaces=True,
+                    make_floors_double_sided=False,
+                    make_ceilings_double_sided=False,
                 )
                 with patch.object(
                     workspace,

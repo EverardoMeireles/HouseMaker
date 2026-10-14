@@ -11,9 +11,11 @@ from shapely import LineString, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from housemaker.floor_geometry import (
+    FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS,
     _build_floor_prism_mesh,
     _build_straight_gap_closures,
     _build_wall_linework_clusters,
+    build_level_floor_footprint,
 )
 from housemaker.glb import convert_to_glb
 from housemaker.models import LevelData, OpenSpaceData, StairData, VertexData
@@ -1079,7 +1081,11 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
         ]
         floor_cap = _get_horizontal_cap_geometry(floor_mesh, 1.0)
 
-        self.assertAlmostEqual(float(floor_cap.area), 16.0)
+        fascia_guard = FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS
+        self.assertAlmostEqual(
+            float(floor_cap.area),
+            16.0 + 12.0 * fascia_guard - 2.0 * fascia_guard**2,
+        )
         self.assertTrue(floor_cap.contains(shapely.Point(3.0, 4.0)))
         self.assertFalse(floor_cap.covers(shapely.Point(1.0, 4.0)))
 
@@ -1114,7 +1120,11 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
         ).scene.geometry["l3_upper_floor"]
         floor_cap = _get_horizontal_cap_geometry(floor_mesh, 1.0)
 
-        self.assertAlmostEqual(float(floor_cap.area), 16.0)
+        fascia_guard = FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS
+        self.assertAlmostEqual(
+            float(floor_cap.area),
+            16.0 + 12.0 * fascia_guard - 2.0 * fascia_guard**2,
+        )
         self.assertTrue(floor_cap.contains(shapely.Point(3.0, 4.0)))
         self.assertFalse(floor_cap.covers(shapely.Point(1.0, 4.0)))
 
@@ -1165,6 +1175,38 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
             self.assertAlmostEqual(triangle_area, 4.0)
             self.assertAlmostEqual(union_area, 4.0)
             self.assertEqual(component_count, 1)
+
+    def test_automatic_opening_can_recover_a_second_floor_island(self) -> None:
+        level = _build_level_from_segments(
+            (
+                ((0.0, 0.0), (100.0, 0.0)),
+                ((100.0, 0.0), (100.0, 100.0)),
+                ((100.0, 100.0), (0.0, 100.0)),
+                ((0.0, 100.0), (0.0, 0.0)),
+                ((350.0, 0.0), (500.0, 0.0)),
+                ((500.0, 0.0), (500.0, 400.0)),
+                ((500.0, 400.0), (400.0, 400.0)),
+            )
+        )
+        automatic_opening = Polygon(
+            ((6.0, 0.0), (8.0, 0.0), (8.0, -8.0), (6.0, -8.0))
+        )
+
+        footprint = build_level_floor_footprint(
+            level,
+            None,
+            lambda point, _size: np.asarray(
+                (point[0] * 0.02, -point[1] * 0.02),
+                dtype=float,
+            ),
+            additional_coherency_geometry=automatic_opening,
+        )
+
+        self.assertIsNotNone(footprint)
+        assert footprint is not None
+        self.assertAlmostEqual(float(footprint.area), 36.0)
+        self.assertTrue(footprint.covers(shapely.Point(1.0, -1.0)))
+        self.assertTrue(footprint.covers(shapely.Point(9.0, -4.0)))
 
     def test_invalid_floor_thickness_is_rejected(self) -> None:
         for invalid_thickness in (0.0, -0.1, float("nan"), True):

@@ -679,6 +679,9 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
             );
             surface_normal = normalize(tangent_basis * tangent_normal);
         }
+        if (!gl_FrontFacing) {
+            surface_normal = -surface_normal;
+        }
         vec3 light_direction = normalize(vec3(1.0, -1.0, -1.0));
         vec3 point_light_delta = u_point_light_position_view - v_view_position;
         vec3 point_light_direction = point_light_delta
@@ -876,6 +879,7 @@ class _CanvasSceneLevelMesh:
     """One complete named level primitive adapted for face filtering."""
 
     mesh: trimesh.Trimesh
+    is_floor: bool = False
 
 
 @dataclass(frozen=True)
@@ -6710,17 +6714,18 @@ class GlbViewerWidget(QWidget):
         meshes_by_level: dict[int, list[_CanvasSceneLevelMesh]] = {}
         for node_name in self.model.scene.graph.nodes_geometry:
             normalized_node_name = str(node_name).casefold()
-            level_index = next(
+            level_match = next(
                 (
-                    candidate_index
+                    (candidate_index, prefix)
                     for candidate_index, prefix in prefixes
                     if normalized_node_name == prefix
                     or normalized_node_name.startswith(f"{prefix}_")
                 ),
                 None,
             )
-            if level_index is None:
+            if level_match is None:
                 continue
+            level_index, level_prefix = level_match
             node_transform, geometry_name = self.model.scene.graph.get(node_name)
             source_mesh = self.model.scene.geometry.get(geometry_name)
             if not isinstance(source_mesh, trimesh.Trimesh):
@@ -6730,12 +6735,20 @@ class GlbViewerWidget(QWidget):
                 GLTF_Y_UP_TO_Z_UP_TRANSFORM @ np.asarray(node_transform, dtype=float)
             )
             meshes_by_level.setdefault(level_index, []).append(
-                _CanvasSceneLevelMesh(mesh=mesh)
+                _CanvasSceneLevelMesh(
+                    mesh=mesh,
+                    is_floor=_canvas_scene_node_is_level_floor(
+                        normalized_node_name,
+                        level_prefix,
+                    ),
+                )
             )
         self._canvas_scene_level_meshes = {
             level_index: tuple(meshes)
             for level_index, meshes in meshes_by_level.items()
         }
+        if self._level_transform_preview_level_index is not None:
+            self._rebuild_level_transform_preview_source_positions()
 
     def _canvas_source_surface_id_is_visible(self, surface_id: str) -> bool:
         """Resolve authored drawing overlays through their source surface."""
@@ -15605,12 +15618,12 @@ class GlbViewerWidget(QWidget):
 
     # ### Level transform preview rendering ###
     def _rebuild_level_transform_preview_source_positions(self) -> None:
-        """Rebuild cached source boundaries after Canvas targets change."""
+        """Rebuild cached wall, surface, and floor-slab preview boundaries."""
 
         level_index = self._level_transform_preview_level_index
         if level_index is None:
             return
-        level_boundaries = tuple(
+        semantic_boundaries = tuple(
             positions
             for surface in self._canvas_surface_targets.values()
             if surface.level_index == level_index
@@ -15618,6 +15631,25 @@ class GlbViewerWidget(QWidget):
             if (positions := _build_fixed_surface_boundary_line_positions(surface))
             is not None
         )
+        floor_boundaries = (
+            tuple(
+                positions
+                for level_mesh in self._canvas_scene_level_meshes.get(
+                    level_index,
+                    (),
+                )
+                if level_mesh.is_floor
+                if (
+                    positions := _build_mesh_feature_line_positions(
+                        level_mesh.mesh
+                    )
+                )
+                is not None
+            )
+            if self._canvas_level_is_visible(level_index)
+            else ()
+        )
+        level_boundaries = (*semantic_boundaries, *floor_boundaries)
         self._level_transform_preview_source_positions = (
             None
             if not level_boundaries
@@ -18675,7 +18707,10 @@ class GlbViewerWidget(QWidget):
                 drawEdges=True,
                 edgeColor=EDGE_COLOR,
                 shader=self._ambient_shader,
-                cull_back_faces=bool(self.model.preview_textured_surfaces),
+                cull_back_faces=bool(
+                    self.model.preview_textured_surfaces
+                    or self.model.preview_cull_untextured_back_faces
+                ),
             )
             self.view.addItem(self.mesh_item)
         self._add_textured_surface_items()
@@ -26538,6 +26573,18 @@ def _build_fixed_surface_boundary_line_positions(
     if len(boundary_edges) == 0:
         boundary_edges = unique_edges
     return np.asarray(vertices[boundary_edges].reshape(-1, 3), dtype=float)
+
+
+def _canvas_scene_node_is_level_floor(
+    normalized_node_name: str,
+    normalized_level_prefix: str,
+) -> bool:
+    """Identify the procedural slab node belonging to one scene level."""
+
+    floor_prefix = f"{normalized_level_prefix}_floor"
+    return normalized_node_name == floor_prefix or normalized_node_name.startswith(
+        f"{floor_prefix}_"
+    )
 
 
 def _build_canvas_face_orientation_geometry(

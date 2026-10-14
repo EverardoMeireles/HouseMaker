@@ -57,6 +57,39 @@ def _is_yellow_outline_item(item: object) -> bool:
     )
 
 
+def _get_cached_floor_mesh(workspace: BlueprintWorkspace) -> object:
+    """Return the one rendered floor slab cached for the current level."""
+
+    floor_meshes = tuple(
+        cached.mesh
+        for cached in workspace.viewer._canvas_scene_level_meshes.get(
+            workspace.current_level.index,
+            (),
+        )
+        if getattr(cached, "is_floor", False)
+    )
+    if len(floor_meshes) != 1:
+        raise AssertionError(
+            "The level-transform fixture requires exactly one cached floor slab."
+        )
+    return floor_meshes[0]
+
+
+def _wait_for_current_viewer_preview(workspace: BlueprintWorkspace) -> None:
+    """Wait briefly for the asynchronous Canvas preview to reach its revision."""
+
+    for _attempt in range(100):
+        _qt_application.processEvents()
+        if (
+            workspace.viewer.model is not None
+            and workspace._canvas_viewer_preview_revision
+            == workspace._viewer_preview_revision
+        ):
+            return
+        QTest.qWait(20)
+    raise AssertionError("The Canvas 3D preview did not reach its current revision.")
+
+
 # ### Delayed transform integration tests ###
 class CanvasLevelTransformPreviewTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -232,6 +265,92 @@ class CanvasLevelTransformPreviewTests(unittest.TestCase):
         self.assertEqual(
             self.workspace._canvas_viewer_preview_revision,
             self.workspace._viewer_preview_revision,
+        )
+        self.assertIsNone(
+            self.workspace.viewer._level_transform_preview_outline_positions
+        )
+
+    def test_delayed_transform_outlines_and_commits_the_rendered_floor_slab(
+        self,
+    ) -> None:
+        _wait_for_current_viewer_preview(self.workspace)
+        floor_before = _get_cached_floor_mesh(self.workspace)
+        floor_vertices_before = np.asarray(floor_before.vertices, dtype=float)
+        floor_bounds_before = np.asarray(floor_before.bounds, dtype=float)
+        self.assertGreater(
+            floor_bounds_before[1, 2] - floor_bounds_before[0, 2],
+            0.0,
+        )
+
+        self.workspace._set_mesh_edit_update_delay_seconds(0.01)
+        self.workspace._handle_level_scale_changed(1.25)
+        self.workspace._handle_level_x_offset_changed(0.75)
+
+        source_positions = (
+            self.workspace.viewer._level_transform_preview_source_positions
+        )
+        delta_matrix = self.workspace.viewer._level_transform_preview_delta_matrix
+        self.assertIsNotNone(source_positions)
+        self.assertIsNotNone(delta_matrix)
+        assert source_positions is not None and delta_matrix is not None
+        self.assertAlmostEqual(
+            float(np.min(source_positions[:, 2])),
+            float(floor_bounds_before[0, 2]),
+        )
+        preview_segments = np.asarray(source_positions, dtype=float).reshape(
+            -1,
+            2,
+            3,
+        )
+        vertical_segments = preview_segments[
+            np.all(
+                np.isclose(
+                    preview_segments[:, 0, :2],
+                    preview_segments[:, 1, :2],
+                ),
+                axis=1,
+            )
+            & ~np.isclose(
+                preview_segments[:, 0, 2],
+                preview_segments[:, 1, 2],
+            )
+        ]
+        self.assertGreater(len(vertical_segments), 0)
+
+        expected_floor_vertices = (
+            np.column_stack(
+                (
+                    floor_vertices_before,
+                    np.ones(len(floor_vertices_before), dtype=float),
+                )
+            )
+            @ np.asarray(delta_matrix, dtype=float).T
+        )[:, :3]
+        expected_floor_bounds = np.asarray(
+            (
+                np.min(expected_floor_vertices, axis=0),
+                np.max(expected_floor_vertices, axis=0),
+            ),
+            dtype=float,
+        )
+
+        for _attempt in range(100):
+            QTest.qWait(20)
+            _qt_application.processEvents()
+            if (
+                self.workspace._pending_level_transform is None
+                and self.workspace._canvas_viewer_preview_revision
+                == self.workspace._viewer_preview_revision
+            ):
+                break
+        else:
+            self.fail("The delayed level transform did not finish rebuilding.")
+
+        floor_after = _get_cached_floor_mesh(self.workspace)
+        np.testing.assert_allclose(
+            np.asarray(floor_after.bounds, dtype=float),
+            expected_floor_bounds,
+            atol=1e-6,
         )
         self.assertIsNone(
             self.workspace.viewer._level_transform_preview_outline_positions

@@ -358,6 +358,7 @@ class _PendingAtlasPart:
     source_id: str
     is_surface: bool
     placement: TextureAtlasPlacement
+    double_sided: bool
     half_context: _HalfModelContext | None
     node_metadata: dict[str, object]
     mirror_plane: (
@@ -822,6 +823,7 @@ def _apply_texture_atlases_to_export(
                     source_id=source_id,
                     is_surface=is_surface,
                     placement=placement,
+                    double_sided=_material_is_explicitly_double_sided(material),
                     half_context=half_context,
                     node_metadata=node_metadata,
                     mirror_plane=mirror_plane,
@@ -960,7 +962,11 @@ def _apply_texture_atlases_to_export(
             ) from error
         instance_source_parts[pending.source_id].append(
             _InstanceSourcePart(
-                fragment=remapped,
+                fragment=(
+                    _duplicate_reverse_wound_atlas_fragment(remapped)
+                    if pending.double_sided
+                    else remapped
+                ),
                 world_transform=pending.world_transform,
                 source_id=pending.source_id,
                 root_name=pending_source.root_name,
@@ -1782,6 +1788,8 @@ def _route_bound_atlas_fragment(
                     mirror_plane_normal=mirror_normal,
                 )
             )
+        if pending.double_sided:
+            remapped = _duplicate_reverse_wound_atlas_fragment(remapped)
         half_parts_by_marker[half_context.source_marker_name].append(
             _HalfModelPart(
                 fragment=remapped,
@@ -1800,6 +1808,8 @@ def _route_bound_atlas_fragment(
                 atlas_pixel_bounds=_placement_pixel_bounds(pending.placement),
             )
         )
+    if pending.double_sided:
+        remapped = _duplicate_reverse_wound_atlas_fragment(remapped)
     atlas_parts[atlas_id].append(remapped)
     atlas_source_ids[atlas_id].add(pending.source_id)
 
@@ -1821,6 +1831,12 @@ def _get_atlas_material(
         )
         material_cache[atlas_id] = material
     return material
+
+
+def _material_is_explicitly_double_sided(material: object | None) -> bool:
+    """Return whether one incoming material explicitly renders both sides."""
+
+    return getattr(material, "doubleSided", False) is True
 
 
 def _apply_shared_glass_material(
@@ -1925,7 +1941,7 @@ def _build_atlas_material(
         metallicRoughnessTexture=metallic_roughness_texture,
         metallicFactor=1.0 if has_metallic else 0.0,
         roughnessFactor=1.0,
-        doubleSided=True,
+        doubleSided=False,
     )
 
 
@@ -2149,6 +2165,50 @@ def _valid_surface_ao_uv(mesh: trimesh.Trimesh) -> np.ndarray | None:
     ):
         raise ValueError("Surface AO UVs are invalid.")
     return np.ascontiguousarray(np.clip(uv, 0.0, 1.0))
+
+
+# ### Double-sided Atlas geometry ###
+def _duplicate_reverse_wound_atlas_fragment(
+    fragment: trimesh.Trimesh,
+) -> trimesh.Trimesh:
+    """Encode an explicit double-sided source for one-sided Atlas rendering.
+
+    The reversed copy reuses both UV sets, but owns distinct vertices so its
+    normals can point away from the authored side. Keeping both copies in one
+    mesh preserves the Atlas's single material and primitive.
+    """
+
+    uv = _valid_uv(fragment)
+    if uv is None:
+        raise ValueError("Double-sided Atlas geometry requires valid UVs.")
+    vertices = np.asarray(fragment.vertices, dtype=float)
+    faces = np.asarray(fragment.faces, dtype=np.int64)
+    normals = np.asarray(fragment.vertex_normals, dtype=float)
+    vertex_count = len(vertices)
+    result = trimesh.Trimesh(
+        vertices=np.vstack((vertices, vertices)),
+        faces=np.vstack(
+            (
+                faces,
+                faces[:, (0, 2, 1)] + vertex_count,
+            )
+        ),
+        vertex_normals=np.vstack((normals, -normals)),
+        visual=TextureVisuals(
+            uv=np.vstack((uv, uv)),
+            material=copy.deepcopy(
+                getattr(getattr(fragment, "visual", None), "material", None)
+            ),
+        ),
+        metadata=copy.deepcopy(dict(getattr(fragment, "metadata", {}) or {})),
+        process=False,
+    )
+    surface_ao_uv = _valid_surface_ao_uv(fragment)
+    if surface_ao_uv is not None:
+        result.vertex_attributes[PACKED_ORM_AO_UV_ATTRIBUTE] = np.vstack(
+            (surface_ao_uv, surface_ao_uv)
+        ).astype(np.float32, copy=False)
+    return result
 
 
 # ### UV remapping helpers ###

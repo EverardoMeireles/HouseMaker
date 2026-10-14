@@ -5,6 +5,7 @@ import math
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 
 import numpy as np
 import shapely
@@ -12,7 +13,13 @@ import trimesh
 from shapely import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from housemaker.floor_geometry import build_level_open_space_geometry
+from housemaker.floor_geometry import (
+    FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS,
+    build_level_floor_footprint,
+    build_level_open_space_geometry,
+    exclude_floor_fascia_from_opening_geometry,
+    filter_automatic_slab_opening_geometry,
+)
 from housemaker.glb import (
     WALL_OPENING_EPSILON,
     DoorwayReveal,
@@ -310,30 +317,74 @@ def _build_slab_openings_by_level(
 ) -> dict[int, BaseGeometry]:
     """Combine explicit rectangles and stair corridors by owning floor."""
 
+    openings_by_level, _automatic_openings_by_level = (
+        _build_resolved_slab_opening_maps(levels, stairs)
+    )
+    return openings_by_level
+
+
+def _build_resolved_slab_opening_maps(
+    levels: Sequence[LevelData],
+    stairs: Sequence[StairData],
+) -> tuple[dict[int, BaseGeometry], dict[int, BaseGeometry]]:
+    """Return combined openings and retained automatic opening components."""
+
     included_levels = {
         level.index: level
         for level in levels
         if level.include_in_export
     }
-    geometries_by_level: dict[int, list[BaseGeometry]] = {}
-    for level in included_levels.values():
-        geometry = _build_level_world_open_space_geometry(level)
-        if geometry is not None:
-            geometries_by_level.setdefault(level.index, []).append(geometry)
-    for level_index, geometry in build_stair_slab_openings_by_level(
+    explicit_openings_by_level = {
+        level.index: geometry
+        for level in included_levels.values()
+        if (geometry := _build_level_world_open_space_geometry(level))
+        is not None
+    }
+    automatic_openings_by_level = build_stair_slab_openings_by_level(
         levels,
         stairs,
-    ).items():
-        if level_index in included_levels:
-            geometries_by_level.setdefault(level_index, []).append(geometry)
+    )
 
     openings_by_level: dict[int, BaseGeometry] = {}
-    for level_index, geometries in geometries_by_level.items():
+    resolved_automatic_openings_by_level: dict[int, BaseGeometry] = {}
+    for level_index, level in included_levels.items():
+        explicit_geometry = explicit_openings_by_level.get(level_index)
+        automatic_geometry = filter_automatic_slab_opening_geometry(
+            explicit_geometry,
+            automatic_openings_by_level.get(level_index),
+        )
+        if automatic_geometry is not None:
+            resolved_automatic_openings_by_level[level_index] = (
+                automatic_geometry
+            )
+        geometries = tuple(
+            geometry
+            for geometry in (explicit_geometry, automatic_geometry)
+            if geometry is not None
+        )
+        if not geometries:
+            continue
         union = shapely.union_all(geometries)
         if union.is_empty or float(union.area) <= SURFACE_GEOMETRY_EPSILON:
             continue
+        floor_footprint = _build_level_world_floor_footprint(
+            level,
+            automatic_geometry,
+        )
+        if floor_footprint is not None:
+            union = exclude_floor_fascia_from_opening_geometry(
+                level,
+                level.image_size_pixels,
+                partial(_level_image_point_to_world_xy, level),
+                floor_footprint,
+                union,
+                guard_half_width_meters=(
+                    FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS
+                    * float(level.scale)
+                ),
+            )
         openings_by_level[level_index] = union
-    return openings_by_level
+    return openings_by_level, resolved_automatic_openings_by_level
 
 
 def _clip_horizontal_surface(
@@ -393,13 +444,18 @@ def build_base_fixed_surfaces(
 
     level_base_z = build_level_base_z_lookup(levels)
     level_by_index = {level.index: level for level in levels}
-    slab_openings_by_level = _build_slab_openings_by_level(levels, stairs)
+    (
+        slab_openings_by_level,
+        automatic_openings_by_level,
+    ) = _build_resolved_slab_opening_maps(levels, stairs)
     surfaces: list[FixedSurface] = []
     for level in sorted(levels, key=lambda item: item.index):
         if not level.include_in_export:
             continue
         base_z_meters = level_base_z.get(level.index, 0.0)
-        floor_coherency_geometry = slab_openings_by_level.get(level.index)
+        floor_coherency_geometry = automatic_openings_by_level.get(
+            level.index
+        )
         wall_orientation = build_level_wall_orientation_resolver(
             level,
             additional_floor_coherency_geometry=floor_coherency_geometry,
@@ -414,7 +470,9 @@ def build_base_fixed_surfaces(
             _build_level_window_reveals(level, wall_orientation)
         )
         floor_open_spaces = (
-            floor_coherency_geometry if clip_open_spaces else None
+            slab_openings_by_level.get(level.index)
+            if clip_open_spaces
+            else None
         )
         upper_level = level_by_index.get(level.index + 1)
         ceiling_open_spaces = (
@@ -1161,24 +1219,42 @@ def _append_connected_doorway_reveals(
 
 
 # ### Horizontal geometry helpers ###
+def _level_image_point_to_world_xy(
+    level: LevelData,
+    image_point: tuple[float, float],
+    _blueprint_size_pixels: tuple[float, float] | None,
+) -> np.ndarray:
+    """Transform one image point through the owning level."""
+
+    return np.asarray(
+        level_image_to_world_xy(level, image_point[0], image_point[1]),
+        dtype=float,
+    )
+
+
 def _build_level_world_open_space_geometry(
     level: LevelData,
 ) -> BaseGeometry | None:
     """Resolve one level's image rectangles through that level's transform."""
 
-    def point_to_world_xy(
-        image_point: tuple[float, float],
-        _blueprint_size_pixels: tuple[float, float] | None,
-    ) -> np.ndarray:
-        return np.asarray(
-            level_image_to_world_xy(level, image_point[0], image_point[1]),
-            dtype=float,
-        )
-
     return build_level_open_space_geometry(
         level,
         level.image_size_pixels,
-        point_to_world_xy,
+        partial(_level_image_point_to_world_xy, level),
+    )
+
+
+def _build_level_world_floor_footprint(
+    level: LevelData,
+    additional_coherency_geometry: BaseGeometry | None,
+) -> BaseGeometry | None:
+    """Resolve one level's slab footprint through its world transform."""
+
+    return build_level_floor_footprint(
+        level,
+        level.image_size_pixels,
+        partial(_level_image_point_to_world_xy, level),
+        additional_coherency_geometry=additional_coherency_geometry,
     )
 
 

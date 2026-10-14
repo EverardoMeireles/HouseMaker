@@ -44,6 +44,8 @@ from housemaker.settings_widget import (
     DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
+    DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED,
+    DEFAULT_MAKE_FLOORS_DOUBLE_SIDED,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_MESHY_TARGET_POLYCOUNT,
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
@@ -55,6 +57,8 @@ from housemaker.settings_widget import (
     GENERATION_DISPLAY_SCREEN_SETTING_KEY,
     HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
     IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+    MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY,
+    MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY,
     MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
@@ -90,6 +94,8 @@ from housemaker.settings_widget import (
     read_generation_display_screen_id,
     read_hide_stair_mesh_when_previewing,
     read_ignore_top_down_ceiling,
+    read_make_ceilings_double_sided,
+    read_make_floors_double_sided,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
     read_scene_3d_display_screen_id,
@@ -152,6 +158,8 @@ class SettingsWidgetTests(unittest.TestCase):
                         widget.canvas_3d_navigation_toggle_hotkey_edit,
                         widget.first_person_navigation_combo,
                         widget.ignore_top_down_ceiling_checkbox,
+                        widget.make_floors_double_sided_checkbox,
+                        widget.make_ceilings_double_sided_checkbox,
                         widget.snap_middle_equal_angle_only_checkbox,
                         widget.mesh_edit_update_delay_spinbox,
                     ),
@@ -443,6 +451,88 @@ class SettingsWidgetTests(unittest.TestCase):
                     self.assertTrue(
                         read_ignore_top_down_ceiling(application_settings)
                     )
+
+    def test_floor_and_ceiling_double_sided_settings_are_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertFalse(DEFAULT_MAKE_FLOORS_DOUBLE_SIDED)
+            self.assertFalse(DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED)
+            self.assertFalse(
+                widget.make_floors_double_sided_checkbox.isChecked()
+            )
+            self.assertFalse(
+                widget.make_ceilings_double_sided_checkbox.isChecked()
+            )
+
+            widget.make_floors_double_sided_checkbox.setChecked(True)
+
+            settings = widget.get_settings()
+            self.assertTrue(settings.make_floors_double_sided)
+            self.assertFalse(settings.make_ceilings_double_sided)
+            self.assertTrue(store.get(MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY))
+            self.assertFalse(
+                store.get(MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY, False)
+            )
+
+            widget.make_ceilings_double_sided_checkbox.setChecked(True)
+            widget.make_floors_double_sided_checkbox.setChecked(False)
+
+            settings = widget.get_settings()
+            self.assertFalse(settings.make_floors_double_sided)
+            self.assertTrue(settings.make_ceilings_double_sided)
+            self.assertEqual(emitted_changes, [True, True, True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            restored_settings = restored.get_settings()
+            self.assertFalse(restored_settings.make_floors_double_sided)
+            self.assertTrue(restored_settings.make_ceilings_double_sided)
+            widget.dispose()
+            restored.dispose()
+
+    def test_floor_and_ceiling_double_sided_settings_reject_bad_values(
+        self,
+    ) -> None:
+        for field_name in (
+            "make_floors_double_sided",
+            "make_ceilings_double_sided",
+        ):
+            for value in (0, 1, "true", None):
+                with self.subTest(
+                    field=field_name,
+                    model_value=value,
+                ), self.assertRaisesRegex(ValueError, "double-sided"):
+                    GenerationServiceSettings(
+                        **{field_name: value}  # type: ignore[arg-type]
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            for setting_key, reader in (
+                (
+                    MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY,
+                    read_make_floors_double_sided,
+                ),
+                (
+                    MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY,
+                    read_make_ceilings_double_sided,
+                ),
+            ):
+                for value in (0, 1, "true", None):
+                    with self.subTest(
+                        setting_key=setting_key,
+                        persisted_value=value,
+                    ):
+                        store.set(setting_key, value)
+                        self.assertFalse(reader(store))
 
     def test_hide_stair_mesh_preview_defaults_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

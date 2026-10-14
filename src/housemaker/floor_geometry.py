@@ -22,6 +22,11 @@ LINE_ATTACHMENT_TOLERANCE_METERS = LINE_COVERAGE_TOLERANCE_METERS * 2.0
 MINIMUM_RECOVERED_FOOTPRINT_AREA_SQUARE_METERS = 1.0
 MINIMUM_RECOVERED_BOUNDARY_SUPPORT_RATIO = 0.8
 WALL_GAP_ALIGNMENT_MINIMUM_DOT = math.cos(math.radians(10.0))
+EXPLICIT_OPENING_AUTHORITY_MINIMUM_COVERAGE_RATIO = 0.75
+# This is a numerical guard, not an assumed wall thickness.  One tenth of a
+# millimetre is imperceptible at architectural scale while remaining safely
+# representable after GLB positions are converted to 32-bit floats.
+FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS = 1e-4
 
 
 # ### Type aliases ###
@@ -50,25 +55,40 @@ def build_level_floor_mesh(
     stairwell itself.
     """
 
-    footprint = build_level_floor_footprint(
-        level,
-        blueprint_size_pixels,
-        point_to_world_xy,
-        additional_coherency_geometry=additional_opening_geometry,
-    )
-    if footprint is None:
-        return None
-
     explicit_opening_geometry = build_level_open_space_geometry(
         level,
         blueprint_size_pixels,
         point_to_world_xy,
     )
+    resolved_additional_opening_geometry = (
+        filter_automatic_slab_opening_geometry(
+            explicit_opening_geometry,
+            additional_opening_geometry,
+        )
+    )
+    footprint = build_level_floor_footprint(
+        level,
+        blueprint_size_pixels,
+        point_to_world_xy,
+        additional_coherency_geometry=(
+            resolved_additional_opening_geometry
+        ),
+    )
+    if footprint is None:
+        return None
+
     opening_geometry = _union_polygon_geometries(
         explicit_opening_geometry,
-        additional_opening_geometry,
+        resolved_additional_opening_geometry,
     )
     if opening_geometry is not None:
+        opening_geometry = exclude_floor_fascia_from_opening_geometry(
+            level,
+            blueprint_size_pixels,
+            point_to_world_xy,
+            footprint,
+            opening_geometry,
+        )
         footprint = footprint.difference(opening_geometry)
         if (
             footprint.is_empty
@@ -108,14 +128,41 @@ def build_level_floor_footprint(
         blueprint_size_pixels,
         point_to_world_xy,
     )
-    coherency_geometry = _union_polygon_geometries(
+    authored_lines = [
+        *structural_lines,
+        *_build_polygon_boundary_lines(explicit_opening_geometry),
+    ]
+    authored_footprint = _build_outer_wall_envelope(
+        authored_lines,
+        closing_radius_meters,
+    )
+    authored_linework = shapely.union_all(authored_lines)
+    if (
+        authored_footprint is not None
+        and shapely.buffer(
+            authored_footprint,
+            LINE_COVERAGE_TOLERANCE_METERS,
+        ).covers(authored_linework)
+    ):
+        return authored_footprint
+
+    resolved_additional_geometry = filter_automatic_slab_opening_geometry(
         explicit_opening_geometry,
         additional_coherency_geometry,
     )
-    structural_lines.extend(_build_polygon_boundary_lines(coherency_geometry))
-    return _build_outer_wall_envelope(
-        structural_lines,
+    if resolved_additional_geometry is None:
+        return authored_footprint
+    fallback_lines = [
+        *authored_lines,
+        *_build_polygon_boundary_lines(resolved_additional_geometry),
+    ]
+    fallback_footprint = _build_outer_wall_envelope(
+        fallback_lines,
         closing_radius_meters,
+    )
+    return _union_polygon_geometries(
+        authored_footprint,
+        fallback_footprint,
     )
 
 
@@ -163,7 +210,99 @@ def build_level_open_space_geometry(
     return geometry
 
 
+def filter_automatic_slab_opening_geometry(
+    explicit_opening_geometry: BaseGeometry | None,
+    automatic_opening_geometry: BaseGeometry | None,
+) -> BaseGeometry | None:
+    """Drop automatic components already defined by an explicit opening.
+
+    A user-drawn open space is the authoritative slab boundary when it covers
+    at least three quarters of one automatic component.  Small incidental
+    overlaps keep the automatic component intact, so adjacent stair routes
+    continue to cut their complete required opening.
+    """
+
+    automatic_geometry = _union_polygon_geometries(
+        automatic_opening_geometry
+    )
+    if automatic_geometry is None:
+        return None
+    explicit_geometry = _union_polygon_geometries(explicit_opening_geometry)
+    if explicit_geometry is None:
+        return automatic_geometry
+
+    retained_parts: list[Polygon] = []
+    for automatic_part in shapely.get_parts(automatic_geometry):
+        if not isinstance(automatic_part, Polygon):
+            continue
+        automatic_area = float(automatic_part.area)
+        if automatic_area <= GEOMETRY_EPSILON:
+            continue
+        covered_area = float(
+            automatic_part.intersection(explicit_geometry).area
+        )
+        coverage_ratio = covered_area / automatic_area
+        if (
+            coverage_ratio
+            >= EXPLICIT_OPENING_AUTHORITY_MINIMUM_COVERAGE_RATIO
+        ):
+            continue
+        retained_parts.append(automatic_part)
+
+    return _union_polygon_geometries(*retained_parts)
+
+
 # ### Slab opening helpers ###
+def exclude_floor_fascia_from_opening_geometry(
+    level: LevelData,
+    blueprint_size_pixels: tuple[float, float] | None,
+    point_to_world_xy: PointToWorld,
+    footprint: BaseGeometry,
+    opening_geometry: BaseGeometry,
+    *,
+    guard_half_width_meters: float = FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS,
+) -> BaseGeometry:
+    """Keep slab fascia beneath walls and around the footprint perimeter.
+
+    Open spaces remove the horizontal slab and retain their internal reveal
+    faces.  A microscopic support strip beneath every wall prevents that cut
+    from also removing the visible floor-thickness fascia at a wall crossing.
+    The footprint boundary is included because recovered wall gaps may form a
+    valid outer slab edge without a corresponding authored wall segment.
+    """
+
+    raw_remaining_footprint = footprint.difference(opening_geometry)
+    if (
+        raw_remaining_footprint.is_empty
+        or float(raw_remaining_footprint.area) <= GEOMETRY_EPSILON
+    ):
+        return opening_geometry
+
+    protection_linework = shapely.union_all(
+        (
+            *_build_structural_lines(
+                level,
+                blueprint_size_pixels,
+                point_to_world_xy,
+            ),
+            footprint.boundary,
+        )
+    )
+    if protection_linework.is_empty:
+        return opening_geometry
+    fascia_guards = shapely.buffer(
+        protection_linework,
+        guard_half_width_meters,
+        cap_style="flat",
+        join_style="mitre",
+        mitre_limit=OUTER_ENVELOPE_MITRE_LIMIT,
+    )
+    protected_opening = opening_geometry.difference(fascia_guards)
+    if protected_opening.is_empty:
+        return protected_opening
+    return shapely.make_valid(protected_opening)
+
+
 def _union_polygon_geometries(
     *geometries: BaseGeometry | None,
 ) -> BaseGeometry | None:

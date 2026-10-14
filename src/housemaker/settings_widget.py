@@ -82,6 +82,10 @@ FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
 IGNORE_TOP_DOWN_CEILING_SETTING_KEY = "navigation/ignore_top_down_ceiling"
+MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY = "canvas/make_floors_double_sided"
+MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY = (
+    "canvas/make_ceilings_double_sided"
+)
 HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY = (
     "canvas/hide_stair_mesh_when_previewing"
 )
@@ -133,6 +137,8 @@ MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
 DEFAULT_IGNORE_TOP_DOWN_CEILING = True
+DEFAULT_MAKE_FLOORS_DOUBLE_SIDED = False
+DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED = False
 DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING = True
 DEFAULT_MAKE_WALLS_CONTINUOUS = False
 MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
@@ -239,6 +245,8 @@ class GenerationServiceSettings:
     doors_and_windows_point_light_intensity: float = (
         DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY
     )
+    make_floors_double_sided: bool = DEFAULT_MAKE_FLOORS_DOUBLE_SIDED
+    make_ceilings_double_sided: bool = DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED
 
     def __post_init__(self) -> None:
         try:
@@ -264,6 +272,14 @@ class GenerationServiceSettings:
         if not isinstance(self.ignore_top_down_ceiling, bool):
             raise ValueError(
                 "Top-down ceiling suppression must be enabled or disabled."
+            )
+        if not isinstance(self.make_floors_double_sided, bool):
+            raise ValueError(
+                "Floor double-sided rendering must be enabled or disabled."
+            )
+        if not isinstance(self.make_ceilings_double_sided, bool):
+            raise ValueError(
+                "Ceiling double-sided rendering must be enabled or disabled."
             )
         if not isinstance(self.hide_stair_mesh_when_previewing, bool):
             raise ValueError(
@@ -561,6 +577,12 @@ class SettingsWidget(QWidget):
             ),
             ignore_top_down_ceiling=(
                 self.ignore_top_down_ceiling_checkbox.isChecked()
+            ),
+            make_floors_double_sided=(
+                self.make_floors_double_sided_checkbox.isChecked()
+            ),
+            make_ceilings_double_sided=(
+                self.make_ceilings_double_sided_checkbox.isChecked()
             ),
             hide_stair_mesh_when_previewing=(
                 self.hide_stair_mesh_when_previewing_checkbox.isChecked()
@@ -981,6 +1003,36 @@ class SettingsWidget(QWidget):
             self.ignore_top_down_ceiling_checkbox,
         )
 
+        self.make_floors_double_sided_checkbox = QCheckBox()
+        self.make_floors_double_sided_checkbox.setObjectName(
+            "make_floors_double_sided_checkbox"
+        )
+        self.make_floors_double_sided_checkbox.setToolTip(
+            "Render and export floor surfaces from both sides."
+        )
+        self.make_floors_double_sided_checkbox.toggled.connect(
+            self._handle_make_floors_double_sided_changed
+        )
+        canvas_form.addRow(
+            "Make floors double sided",
+            self.make_floors_double_sided_checkbox,
+        )
+
+        self.make_ceilings_double_sided_checkbox = QCheckBox()
+        self.make_ceilings_double_sided_checkbox.setObjectName(
+            "make_ceilings_double_sided_checkbox"
+        )
+        self.make_ceilings_double_sided_checkbox.setToolTip(
+            "Render and export ceiling surfaces from both sides."
+        )
+        self.make_ceilings_double_sided_checkbox.toggled.connect(
+            self._handle_make_ceilings_double_sided_changed
+        )
+        canvas_form.addRow(
+            "Make ceilings double sided",
+            self.make_ceilings_double_sided_checkbox,
+        )
+
         self.hide_stair_mesh_when_previewing_checkbox = QCheckBox()
         self.hide_stair_mesh_when_previewing_checkbox.setObjectName(
             "hide_stair_mesh_when_previewing_checkbox"
@@ -1271,6 +1323,12 @@ class SettingsWidget(QWidget):
         )
         self.ignore_top_down_ceiling_checkbox.setChecked(
             read_ignore_top_down_ceiling(self._application_settings)
+        )
+        self.make_floors_double_sided_checkbox.setChecked(
+            read_make_floors_double_sided(self._application_settings)
+        )
+        self.make_ceilings_double_sided_checkbox.setChecked(
+            read_make_ceilings_double_sided(self._application_settings)
         )
         self.hide_stair_mesh_when_previewing_checkbox.setChecked(
             read_hide_stair_mesh_when_previewing(self._application_settings)
@@ -1818,6 +1876,31 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_make_floors_double_sided_changed(self, enabled: bool) -> None:
+        """Persist whether floor surfaces render from both sides."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
+    def _handle_make_ceilings_double_sided_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Persist whether ceiling surfaces render from both sides."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
     def _handle_hide_stair_mesh_when_previewing_changed(
         self, enabled: bool
     ) -> None:
@@ -2247,6 +2330,34 @@ def read_ignore_top_down_ceiling(
     if isinstance(value, bool):
         return value
     return DEFAULT_IGNORE_TOP_DOWN_CEILING
+
+
+def read_make_floors_double_sided(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted floor-sidedness preference safely."""
+
+    value = application_settings.get(
+        MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY,
+        DEFAULT_MAKE_FLOORS_DOUBLE_SIDED,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_MAKE_FLOORS_DOUBLE_SIDED
+
+
+def read_make_ceilings_double_sided(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted ceiling-sidedness preference safely."""
+
+    value = application_settings.get(
+        MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY,
+        DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED
 
 
 def read_hide_stair_mesh_when_previewing(

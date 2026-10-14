@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QLabel,
+    QPushButton,
     QScrollArea,
     QWidget,
 )
@@ -160,38 +161,30 @@ class CanvasControlGroupingTests(unittest.TestCase):
             side_layout.indexOf(self.workspace.windows_group) + 1,
         )
 
-    def test_wall_mirrors_group_follows_directional_light_with_three_actions(
+    def test_outer_wall_marking_follows_light_with_edit_action(
         self,
     ) -> None:
-        self._assert_group_contains(
-            "Wall mirrors",
-            self.workspace.wall_mirror_up_button,
-            self.workspace.wall_mirror_undo_button,
-            self.workspace.wall_mirror_down_button,
+        marking_group = self._group_named("Outer wall marking")
+        buttons = marking_group.findChildren(QPushButton)
+        buttons_by_text = {button.text(): button for button in buttons}
+        self.assertEqual(set(buttons_by_text), {"Mark", "Auto mark", "Edit"})
+        self.assertFalse(
+            hasattr(self.workspace, "outer_wall_mark_undo_button")
         )
-        self.assertEqual(self.workspace.wall_mirror_up_button.text(), "Up")
-        self.assertEqual(self.workspace.wall_mirror_undo_button.text(), "Undo")
-        self.assertEqual(self.workspace.wall_mirror_down_button.text(), "Down")
 
-        mirrors_layout = self.workspace.wall_mirrors_group.layout()
-        assert mirrors_layout is not None
+        marking_layout = marking_group.layout()
+        assert marking_layout is not None
+        self.assertIs(marking_layout.itemAt(0).widget(), buttons_by_text["Mark"])
         self.assertIs(
-            mirrors_layout.itemAt(0).widget(),
-            self.workspace.wall_mirror_up_button,
+            marking_layout.itemAt(1).widget(),
+            buttons_by_text["Auto mark"],
         )
-        self.assertIs(
-            mirrors_layout.itemAt(1).widget(),
-            self.workspace.wall_mirror_undo_button,
-        )
-        self.assertIs(
-            mirrors_layout.itemAt(2).widget(),
-            self.workspace.wall_mirror_down_button,
-        )
+        self.assertIs(marking_layout.itemAt(2).widget(), buttons_by_text["Edit"])
 
         side_layout = self.workspace.doorways_group.parentWidget().layout()
         assert side_layout is not None
         self.assertEqual(
-            side_layout.indexOf(self.workspace.wall_mirrors_group),
+            side_layout.indexOf(marking_group),
             side_layout.indexOf(self.workspace.add_directional_light_button) + 1,
         )
 

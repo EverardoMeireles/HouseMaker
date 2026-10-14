@@ -46,7 +46,12 @@ from housemaker.texture_atlas_state import (
 
 
 # ### Fixture helpers ###
-def _textured_triangle(metadata: dict[str, str], x_offset: float) -> trimesh.Trimesh:
+def _textured_triangle(
+    metadata: dict[str, str],
+    x_offset: float,
+    *,
+    double_sided: bool = False,
+) -> trimesh.Trimesh:
     vertices = np.asarray(
         (
             (x_offset, 0.0, 0.0),
@@ -62,7 +67,8 @@ def _textured_triangle(metadata: dict[str, str], x_offset: float) -> trimesh.Tri
         visual=TextureVisuals(
             uv=np.asarray(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
             material=PBRMaterial(
-                baseColorTexture=Image.new("RGBA", (2, 2), "white")
+                baseColorTexture=Image.new("RGBA", (2, 2), "white"),
+                doubleSided=double_sided,
             ),
         ),
         metadata=metadata,
@@ -209,6 +215,7 @@ class SurfaceAmbientOcclusionAtlasExportTests(unittest.TestCase):
         placed_object = _textured_triangle(
             {"housemaker_object_id": "object-only"},
             0.0,
+            double_sided=True,
         )
         model = GeneratedModel(
             mesh=placed_object,
@@ -242,9 +249,13 @@ class SurfaceAmbientOcclusionAtlasExportTests(unittest.TestCase):
                 ),
             )
             receiver_keys: list[str] = []
+            receiver_face_counts: list[int] = []
 
             def fake_bake(layout, occluders, **_kwargs):
                 receiver_keys.extend(receiver.key for receiver in layout.receivers)
+                receiver_face_counts.extend(
+                    len(receiver.faces) for receiver in layout.receivers
+                )
                 return CoreSurfaceAoBakeResult(
                     layout=layout,
                     ambient_occlusion=np.full(
@@ -266,6 +277,7 @@ class SurfaceAmbientOcclusionAtlasExportTests(unittest.TestCase):
 
             self.assertEqual(len(receiver_keys), 1)
             self.assertIn("object-only", receiver_keys[0])
+            self.assertEqual(receiver_face_counts, [1])
             ao_path = directory / "object-only-ao.png"
             Image.fromarray(bake.ambient_occlusion, mode="L").save(ao_path)
             cached_source = MaterializedTextureAtlas(
@@ -290,8 +302,52 @@ class SurfaceAmbientOcclusionAtlasExportTests(unittest.TestCase):
 
         atlas_mesh = next(iter(result.scene.geometry.values()))
         self.assertGreater(len(preview.scene.geometry), 0)
+        self.assertEqual(len(atlas_mesh.faces), 2)
         self.assertIn(PACKED_ORM_AO_UV_ATTRIBUTE, atlas_mesh.vertex_attributes)
         self.assertIsNotNone(atlas_mesh.visual.material.occlusionTexture)
+        vertex_count = len(atlas_mesh.vertices)
+        self.assertEqual(vertex_count % 2, 0)
+        authored_vertex_count = vertex_count // 2
+        np.testing.assert_allclose(
+            atlas_mesh.vertex_normals[:authored_vertex_count],
+            -atlas_mesh.vertex_normals[authored_vertex_count:],
+        )
+        atlas_uv0 = np.asarray(atlas_mesh.visual.uv, dtype=float)
+        np.testing.assert_allclose(
+            atlas_uv0[:authored_vertex_count],
+            atlas_uv0[authored_vertex_count:],
+        )
+        atlas_uv1 = np.asarray(
+            atlas_mesh.vertex_attributes[PACKED_ORM_AO_UV_ATTRIBUTE],
+            dtype=float,
+        )
+        np.testing.assert_allclose(
+            atlas_uv1[:authored_vertex_count],
+            atlas_uv1[authored_vertex_count:],
+        )
+
+        document = _read_glb_json(result.glb_bytes)
+        material_index = next(
+            index
+            for index, material in enumerate(document["materials"])
+            if material["name"] == atlas.name
+        )
+        self.assertIsNot(
+            document["materials"][material_index].get("doubleSided"),
+            True,
+        )
+        atlas_primitives = [
+            primitive
+            for mesh in document["meshes"]
+            for primitive in mesh["primitives"]
+            if primitive.get("material") == material_index
+        ]
+        self.assertEqual(len(atlas_primitives), 1)
+        self.assertIn("TEXCOORD_1", atlas_primitives[0]["attributes"])
+        self.assertEqual(
+            document["accessors"][atlas_primitives[0]["indices"]]["count"],
+            6,
+        )
 
     def test_bake_uses_export_order_for_duplicate_source_ownership(self) -> None:
         duplicated_surface = _textured_triangle(

@@ -904,7 +904,7 @@ class ExistingWallAnchorTests(unittest.TestCase):
             _edge_coordinates(result.vertex_data),
         )
 
-    def test_out_of_bounds_mirrored_walls_remain_valid_anchors(self) -> None:
+    def test_out_of_bounds_existing_walls_remain_valid_anchors(self) -> None:
         existing = VertexData()
         _add_parallel_existing_walls(
             existing,
