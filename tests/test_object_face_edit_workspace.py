@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,7 +28,10 @@ from housemaker.generation_state import GeneratedObjectRecord, GenerationData
 from housemaker.generation_workspace import (
     FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY,
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
+    GLASS_CONVERSION_PIPELINE_KEY,
+    GLASS_MATERIAL_SOURCE_PREFAB,
     LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
+    OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
     OBJECT_OPERATION_CREATE_FACE,
     OBJECT_OPERATION_DELETE_FACES,
     TEXTURE_VARIANTS_PIPELINE_KEY,
@@ -36,6 +40,7 @@ from housemaker.generation_workspace import (
     _get_object_operation_undo_stack,
     _map_face_edit_vertex_indices,
 )
+from housemaker.glass_material import is_housemaker_glass_material
 from housemaker.object_face_edit import ObjectFaceGeometry, load_object_face_geometry
 
 # ### Module state ###
@@ -236,6 +241,296 @@ class ObjectFaceEditWorkspaceTests(unittest.TestCase):
                 self.fail("The background face-edit fixture did not respond.")
             QTest.qWait(5)
             _qt_application.processEvents()
+
+    def _install_second_object_record(self) -> GeneratedObjectRecord:
+        """Add object B while keeping the original object A selected."""
+
+        second_record = replace(
+            self.original_record,
+            object_id="table",
+            object_name="Table",
+            provider_task_id="task-table",
+        )
+        self.workspace.set_data(
+            GenerationData(
+                generated_objects=[self.original_record, second_record]
+            )
+        )
+        self.assertTrue(self.workspace.select_generated_object("cabinet"))
+        self.assertEqual(self.workspace._selected_object_id, "cabinet")
+        return second_record
+
+    def _assert_face_edit_paths_are_windows_safe(
+        self,
+        record: GeneratedObjectRecord,
+    ) -> None:
+        """Verify every rewritten GLB has a bounded portable basename."""
+
+        raw_paths: list[object] = [record.asset_path]
+        raw_paths.append(record.pipeline.get("postprocessed_asset_path"))
+        raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
+        if isinstance(raw_variants, dict):
+            raw_paths.extend(
+                variant.get("glb_asset_path")
+                for variant in raw_variants.values()
+                if isinstance(variant, dict)
+            )
+        face_edit_paths = tuple(
+            str(path)
+            for path in raw_paths
+            if isinstance(path, str) and ".face-edit-" in path
+        )
+        self.assertTrue(face_edit_paths)
+        for raw_path in face_edit_paths:
+            file_name = Path(raw_path).name
+            self.assertFalse(set(file_name).intersection('<>:"/\\|?*'))
+            self.assertLessEqual(len(file_name), 180)
+            self.assertTrue((self.asset_directory / raw_path).is_file())
+
+    def test_explicit_face_deletion_targets_unselected_object(self) -> None:
+        second_record = self._install_second_object_record()
+
+        with patch.object(
+            self.workspace,
+            "_start_object_face_deletion",
+            return_value=True,
+        ) as start_deletion:
+            started = self.workspace.delete_object_faces(
+                second_record.object_id,
+                (4, 1, 4),
+            )
+
+        self.assertTrue(started)
+        start_deletion.assert_called_once()
+        request, target_record = start_deletion.call_args.args
+        self.assertEqual(request.object_id, second_record.object_id)
+        self.assertEqual(request.selected_face_indices, (1, 4))
+        self.assertEqual(target_record, second_record)
+        self.assertEqual(self.workspace._selected_object_id, "cabinet")
+
+    def test_explicit_face_creation_targets_unselected_object(self) -> None:
+        second_record = self._install_second_object_record()
+
+        with patch.object(
+            self.workspace,
+            "_start_object_face_creation",
+            return_value=True,
+        ) as start_creation:
+            started = self.workspace.create_object_face(
+                second_record.object_id,
+                (0, 1, 2),
+            )
+
+        self.assertTrue(started)
+        start_creation.assert_called_once()
+        request, target_record = start_creation.call_args.args
+        self.assertEqual(request.object_id, second_record.object_id)
+        self.assertEqual(request.selected_vertex_indices, (0, 1, 2))
+        self.assertEqual(target_record, second_record)
+        self.assertEqual(self.workspace._selected_object_id, "cabinet")
+
+    def test_explicit_glass_conversion_targets_unselected_object(self) -> None:
+        second_record = self._install_second_object_record()
+
+        with (
+            patch.object(
+                self.workspace,
+                "_start_object_face_glass_conversion",
+                return_value=True,
+            ) as start_conversion,
+            patch.object(
+                self.workspace,
+                "_build_texture_regeneration_request",
+            ) as build_texture_request,
+        ):
+            started = self.workspace.convert_object_faces_to_glass(
+                second_record.object_id,
+                (4, 1, 4),
+            )
+
+        self.assertTrue(started)
+        start_conversion.assert_called_once()
+        request, target_record = start_conversion.call_args.args
+        self.assertEqual(request.object_id, second_record.object_id)
+        self.assertEqual(request.selected_face_indices, (1, 4))
+        self.assertFalse(request.double_sided)
+        self.assertEqual(target_record, second_record)
+        build_texture_request.assert_not_called()
+        self.assertEqual(self.workspace._selected_object_id, "cabinet")
+
+    def test_face_deletion_saves_colon_rich_opening_object_id(self) -> None:
+        """Door/window component IDs never leak into Windows filenames."""
+
+        opening_object_id = ".window:frame-a:slot:body"
+        opening_record = replace(
+            self.original_record,
+            object_id=opening_object_id,
+            object_name="Window body",
+        )
+        self.workspace.set_data(
+            GenerationData(generated_objects=[opening_record])
+        )
+
+        self.assertTrue(
+            self.workspace.delete_object_faces(opening_object_id, (0, 1))
+        )
+        self._wait_for_jobs()
+
+        edited_record = self.workspace._data.generated_objects[0]
+        self.assertEqual(edited_record.object_id, opening_object_id)
+        self.assertEqual(
+            edited_record.pipeline["face_edit_deleted_face_count"],
+            2,
+        )
+        self._assert_face_edit_paths_are_windows_safe(edited_record)
+
+    def test_local_glass_conversion_preserves_variants_for_colon_rich_id(
+        self,
+    ) -> None:
+        """Doors glass conversion needs neither Meshy nor a video reference."""
+
+        opening_object_id = ".window:frame-a:slot:body"
+        opening_record = replace(
+            self.original_record,
+            object_id=opening_object_id,
+            object_name="Window body",
+        )
+        source_uvs: dict[str, np.ndarray] = {}
+        source_pixels: dict[str, np.ndarray] = {}
+        for resolution, variant in self.variant_paths.items():
+            source_scene = trimesh.load(
+                self.asset_directory / variant["glb_asset_path"],
+                force="scene",
+                process=False,
+            )
+            self.assertIsInstance(source_scene, trimesh.Scene)
+            assert isinstance(source_scene, trimesh.Scene)
+            source_mesh = next(iter(source_scene.geometry.values()))
+            source_faces = np.asarray(source_mesh.faces, dtype=np.int64)
+            source_uvs[resolution] = np.asarray(
+                source_mesh.visual.uv,
+                dtype=float,
+            )[source_faces[1:]].copy()
+            source_pixels[resolution] = np.asarray(
+                source_mesh.visual.material.baseColorTexture.convert("RGBA"),
+                dtype=np.uint8,
+            ).copy()
+        self.workspace.set_data(
+            GenerationData(generated_objects=[opening_record])
+        )
+
+        self.assertFalse(self.workspace._settings.meshy_api_key)
+        self.assertFalse(
+            self.workspace._has_current_object_generation_reference()
+        )
+        self.assertTrue(
+            self.workspace.convert_object_faces_to_glass(
+                opening_object_id,
+                (0,),
+            )
+        )
+        self._wait_for_jobs()
+
+        edited_record = self.workspace._data.generated_objects[0]
+        self.assertEqual(edited_record.object_id, opening_object_id)
+        self.assertTrue(edited_record.pipeline["face_edit_texture_preserved"])
+        glass_metadata = edited_record.pipeline[GLASS_CONVERSION_PIPELINE_KEY]
+        self.assertEqual(
+            glass_metadata["material_source"],
+            GLASS_MATERIAL_SOURCE_PREFAB,
+        )
+        self.assertTrue(glass_metadata["atlas_independent"])
+        self.assertTrue(glass_metadata["local_material_edit"])
+        self.assertEqual(glass_metadata["source_face_count"], 1)
+        self._assert_face_edit_paths_are_windows_safe(edited_record)
+
+        edited_variants = edited_record.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]
+        for resolution, original_variant in self.variant_paths.items():
+            edited_variant = edited_variants[resolution]
+            self.assertEqual(
+                edited_variant["texture_asset_path"],
+                original_variant["texture_asset_path"],
+            )
+            output_scene = trimesh.load(
+                self.asset_directory / edited_variant["glb_asset_path"],
+                force="scene",
+                process=False,
+            )
+            self.assertIsInstance(output_scene, trimesh.Scene)
+            assert isinstance(output_scene, trimesh.Scene)
+            glass_meshes = tuple(
+                mesh
+                for mesh in output_scene.geometry.values()
+                if is_housemaker_glass_material(mesh.visual.material)
+            )
+            opaque_meshes = tuple(
+                mesh
+                for mesh in output_scene.geometry.values()
+                if not is_housemaker_glass_material(mesh.visual.material)
+            )
+            self.assertEqual(len(glass_meshes), 1)
+            self.assertEqual(len(opaque_meshes), 1)
+            self.assertEqual(len(glass_meshes[0].faces), 1)
+            opaque_mesh = opaque_meshes[0]
+            np.testing.assert_array_equal(
+                np.asarray(opaque_mesh.visual.uv)[opaque_mesh.faces],
+                source_uvs[resolution],
+            )
+            np.testing.assert_array_equal(
+                np.asarray(
+                    opaque_mesh.visual.material.baseColorTexture.convert(
+                        "RGBA"
+                    ),
+                    dtype=np.uint8,
+                ),
+                source_pixels[resolution],
+            )
+            self.assertIsNone(
+                glass_meshes[0].visual.material.baseColorTexture
+            )
+        for png_name, original_payload in self.original_png_payloads.items():
+            self.assertEqual(
+                (self.asset_directory / png_name).read_bytes(),
+                original_payload,
+            )
+        undo_stack = _get_object_operation_undo_stack(edited_record)
+        self.assertEqual(
+            undo_stack[-1]["operation"],
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
+        )
+
+    def test_face_creation_saves_colon_rich_opening_object_id(self) -> None:
+        """F-created faces use the same portable revision naming."""
+
+        hole_record, _hole_variants = self._install_triangle_hole_variants()
+        opening_object_id = ".window:frame-a:slot:body"
+        opening_record = replace(
+            hole_record,
+            object_id=opening_object_id,
+            object_name="Window body",
+        )
+        self.workspace.set_data(
+            GenerationData(generated_objects=[opening_record])
+        )
+        selected_vertices = _triangle_hole_vertex_indices(
+            (self.asset_directory / opening_record.asset_path).read_bytes()
+        )
+
+        self.assertTrue(
+            self.workspace.create_object_face(
+                opening_object_id,
+                selected_vertices,
+            )
+        )
+        self._wait_for_jobs()
+
+        edited_record = self.workspace._data.generated_objects[0]
+        self.assertEqual(edited_record.object_id, opening_object_id)
+        self.assertEqual(
+            edited_record.pipeline["face_edit_added_triangle_count"],
+            1,
+        )
+        self._assert_face_edit_paths_are_windows_safe(edited_record)
 
     def test_selected_vertices_map_across_reindexed_texture_variants(
         self,

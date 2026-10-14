@@ -62,6 +62,7 @@ class DoorProjectPersistenceTests(unittest.TestCase):
                     level_index=levels[2].index,
                     doorway_id=doorway.doorway_id,
                     mirrored_horizontally=True,
+                    mirrored_depthwise=True,
                 )
             ],
         )
@@ -161,6 +162,7 @@ class DoorProjectPersistenceTests(unittest.TestCase):
                     window_id=window.window_id,
                     level_index=levels[2].index,
                     window_frame_id="window-frame-ground-b",
+                    mirrored_depthwise=True,
                 )
             ],
         )
@@ -180,6 +182,9 @@ class DoorProjectPersistenceTests(unittest.TestCase):
         restored_window = restored.doors.windows[0]
         self.assertTrue(restored_window.make_double)
         self.assertTrue(restored_window.make_double_sided)
+        self.assertTrue(
+            restored.doors.window_placements[0].mirrored_depthwise
+        )
 
     def test_project_without_doors_loads_an_empty_library(self) -> None:
         levels = create_default_levels()

@@ -2798,7 +2798,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertIs(result, provider_result)
         self.assertIs(request_model.call_args.kwargs["enable_pbr"], True)
 
-    def test_glass_conversion_snapshots_faces_maps_and_button_prerequisites(
+    def test_glass_conversion_snapshots_faces_without_provider_prerequisites(
         self,
     ) -> None:
         button = self.workspace.convert_faces_to_glass_button
@@ -2812,78 +2812,53 @@ class GenerationWorkspaceTests(unittest.TestCase):
             asset_directory = temporary_path / "generation_assets"
             asset_directory.mkdir()
             self.workspace._asset_directory = asset_directory
-            self.workspace._video_source = Mock()
-            with (
-                patch.object(
-                    self.workspace.video_view,
-                    "get_frame_bgr",
-                    return_value=np.zeros((8, 8, 3), dtype=np.uint8),
+            model = _test_textured_model((80, 110, 140, 255))
+            self.workspace._handle_generation_succeeded(
+                MeshyGenerationResult(
+                    "task-test-chair",
+                    model.glb_bytes,
+                    "Glass cabinet",
                 ),
-                patch.object(
-                    self.workspace.video_view,
-                    "has_selection",
-                    return_value=True,
-                ),
-                patch.object(
-                    self.workspace.video_view,
-                    "build_selected_object_crop",
-                    return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
-                ),
-            ):
-                self.workspace.set_runtime_settings(
-                    GenerationServiceSettings(meshy_api_key="meshy-key")
-                )
-                model = _test_textured_model((80, 110, 140, 255))
-                self.workspace._handle_generation_succeeded(
-                    MeshyGenerationResult(
-                        "task-test-chair",
-                        model.glb_bytes,
-                        "Glass cabinet",
-                    ),
-                    model,
-                )
+                model,
+            )
 
-                self.assertFalse(button.isEnabled())
-                self.workspace.result_view.set_selected_face_indices((4, 1))
-                _qt_application.processEvents()
-                self.assertTrue(button.isEnabled())
+            self.assertFalse(button.isEnabled())
+            self.workspace.result_view.set_selected_face_indices((4, 1))
+            _qt_application.processEvents()
+            self.assertTrue(button.isEnabled())
 
-                self.workspace.set_runtime_settings(GenerationServiceSettings())
-                self.assertFalse(button.isEnabled())
-                self.workspace.set_runtime_settings(
-                    GenerationServiceSettings(meshy_api_key="meshy-key")
+            self.workspace.set_runtime_settings(GenerationServiceSettings())
+            self.assertTrue(button.isEnabled())
+            pbr_state_before = {
+                map_type: checkbox.isChecked()
+                for map_type, checkbox in (
+                    self.workspace.pbr_map_checkboxes.items()
                 )
-                self.assertTrue(button.isEnabled())
+            }
 
-                with patch.object(
-                    self.workspace,
-                    "_start_texture_regeneration",
-                    return_value=True,
-                ) as start_regeneration:
-                    converted = self.workspace.convert_selected_faces_to_glass()
+            with patch.object(
+                self.workspace,
+                "_start_object_face_glass_conversion",
+                return_value=True,
+            ) as start_conversion:
+                converted = self.workspace.convert_selected_faces_to_glass()
 
         self.assertTrue(converted)
-        start_regeneration.assert_called_once()
-        request = start_regeneration.call_args.args[0]
-        self.assertEqual(request.glass_face_indices, (1, 4))
-        self.assertFalse(request.glass_double_sided)
-        self.assertEqual(request.enabled_pbr_maps, PBR_MAP_TYPES)
-        self.assertTrue(request.enable_original_uv)
+        start_conversion.assert_called_once()
+        request, record = start_conversion.call_args.args
+        self.assertEqual(request.selected_face_indices, (1, 4))
+        self.assertFalse(request.double_sided)
+        self.assertEqual(request.object_id, record.object_id)
+        self.assertEqual(start_conversion.call_args.kwargs, {})
         self.assertEqual(
-            start_regeneration.call_args.kwargs,
-            {},
+            {
+                map_type: checkbox.isChecked()
+                for map_type, checkbox in (
+                    self.workspace.pbr_map_checkboxes.items()
+                )
+            },
+            pbr_state_before,
         )
-        self.assertTrue(
-            all(
-                checkbox.isChecked()
-                for checkbox in self.workspace.pbr_map_checkboxes.values()
-            )
-        )
-        self.assertEqual(
-            self.workspace.result_view.get_pbr_maps_enabled(),
-            {map_type: True for map_type in PBR_MAP_TYPES},
-        )
-        self.assertFalse(request.glass_double_sided)
 
     def test_glass_conversion_rejects_faces_covering_the_whole_object(
         self,
@@ -2960,67 +2935,47 @@ class GenerationWorkspaceTests(unittest.TestCase):
 
             with patch.object(
                 self.workspace,
-                "_start_texture_regeneration",
+                "_start_object_face_glass_conversion",
                 return_value=True,
-            ) as start_regeneration:
+            ) as start_conversion:
                 converted = self.workspace.convert_selected_faces_to_glass()
 
         self.assertFalse(converted)
-        start_regeneration.assert_not_called()
+        start_conversion.assert_not_called()
         self.assertIn(
             "leave at least one non-glass face",
             self.workspace.status_label.text(),
         )
 
-    def test_glass_conversion_can_texture_geometry_only_object(self) -> None:
+    def test_glass_conversion_accepts_geometry_only_object_locally(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             asset_directory = Path(temporary_directory) / "generation_assets"
             asset_directory.mkdir()
             self.workspace._asset_directory = asset_directory
-            self.workspace._video_source = Mock()
-            with (
-                patch.object(
-                    self.workspace.video_view,
-                    "get_frame_bgr",
-                    return_value=np.zeros((8, 8, 3), dtype=np.uint8),
-                ),
-                patch.object(
-                    self.workspace.video_view,
-                    "has_selection",
-                    return_value=True,
-                ),
-                patch.object(
-                    self.workspace.video_view,
-                    "build_selected_object_crop",
-                    return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
-                ),
-            ):
-                self.workspace.set_runtime_settings(
-                    GenerationServiceSettings(meshy_api_key="meshy-key")
-                )
-                model = _test_model()
-                self.workspace._handle_generation_succeeded(
-                    _test_meshy_result("Untextured cabinet"),
-                    model,
-                )
-                self.workspace.result_view.set_selected_face_indices((0,))
-                _qt_application.processEvents()
+            self.workspace.set_runtime_settings(GenerationServiceSettings())
+            model = _test_model()
+            self.workspace._handle_generation_succeeded(
+                _test_meshy_result("Untextured cabinet"),
+                model,
+            )
+            self.workspace.result_view.set_selected_face_indices((0,))
+            _qt_application.processEvents()
 
+            self.assertTrue(
+                self.workspace.convert_faces_to_glass_button.isEnabled()
+            )
+            with patch.object(
+                self.workspace,
+                "_start_object_face_glass_conversion",
+                return_value=True,
+            ) as start_conversion:
                 self.assertTrue(
-                    self.workspace.convert_faces_to_glass_button.isEnabled()
+                    self.workspace.convert_selected_faces_to_glass()
                 )
-                with patch.object(
-                    self.workspace,
-                    "_start_texture_regeneration",
-                    return_value=True,
-                ) as start_regeneration:
-                    self.assertTrue(
-                        self.workspace.convert_selected_faces_to_glass()
-                    )
 
-                request = start_regeneration.call_args.args[0]
-                self.assertEqual(request.glass_face_indices, (0,))
-                self.assertFalse(request.enable_original_uv)
+            request = start_conversion.call_args.args[0]
+            self.assertEqual(request.selected_face_indices, (0,))
+            self.assertFalse(request.double_sided)
 
     def test_glass_face_remap_survives_face_and_winding_reordering(self) -> None:
         source_mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))

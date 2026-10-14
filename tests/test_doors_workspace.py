@@ -11,6 +11,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+import numpy as np
 import pyqtgraph.opengl as gl
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.door_geometry import (
     assemble_door_model,
+    assemble_window_model,
     build_default_door_slot_models,
     build_door_body_model,
 )
@@ -37,9 +39,12 @@ from housemaker.door_state import (
     WindowPlacement,
 )
 from housemaker.doors_workspace import (
+    ASSET_KIND_DOOR,
     ASSET_KIND_WINDOW,
+    OPENING_PREVIEW_FRONT_ARROW_ROLE,
     DoorsWorkspace,
 )
+from housemaker.viewer import GlbViewerWidget
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -125,6 +130,36 @@ def _complete_door_model(door: DoorDefinition):
         slot_models,
         include_unjoined=True,
     )
+
+
+def _preview_face_geometry(
+    model: object,
+    object_id: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flatten one placed preview part into the viewer's coordinate space."""
+
+    preview = next(
+        item
+        for item in model.preview_placed_objects
+        if item.object_id == object_id
+    )
+    vertices: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    vertex_offset = 0
+    for mesh in preview.meshes:
+        local_vertices = np.asarray(mesh.vertices, dtype=float)
+        homogeneous = np.column_stack(
+            (local_vertices, np.ones(len(local_vertices), dtype=float))
+        )
+        transformed = (
+            np.asarray(preview.placement_transform, dtype=float)
+            @ homogeneous.T
+        ).T[:, :3]
+        mesh_faces = np.asarray(mesh.faces, dtype=np.int64)
+        vertices.append(transformed)
+        faces.append(mesh_faces + vertex_offset)
+        vertex_offset += len(local_vertices)
+    return np.concatenate(vertices), np.concatenate(faces)
 
 
 # ### Doors workspace tests ###
@@ -262,6 +297,56 @@ class DoorsWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.workspace.data(), original_data)
         self.workspace.set_data(DoorLibraryData())
         self.assertFalse(self.workspace.delete_asset_button.isEnabled())
+
+    def test_flip_mesh_button_requires_slot_and_emits_asset_aware_request(
+        self,
+    ) -> None:
+        """Route explicit door/window slot flips without mutating local data."""
+
+        door = _door()
+        window = _window()
+        original_data = DoorLibraryData(doors=[door], windows=[window])
+        requests: list[tuple[str, str, str]] = []
+        self.workspace.asset_slot_horizontal_flip_requested.connect(
+            lambda *values: requests.append(values)
+        )
+
+        self.assertEqual(
+            self.workspace.flip_mesh_horizontally_button.text(),
+            "Flip mesh horizontally",
+        )
+        self.assertEqual(
+            self.workspace.flip_mesh_horizontally_button.objectName(),
+            "flip_opening_slot_mesh_horizontally_button",
+        )
+        self.assertFalse(
+            self.workspace.flip_mesh_horizontally_button.isEnabled()
+        )
+
+        self.workspace.set_data(original_data)
+        self.assertTrue(
+            self.workspace.select_door_slot(door.door_id, DOOR_SLOT_BODY)
+        )
+        self.assertTrue(self.workspace.flip_mesh_horizontally_button.isEnabled())
+        self.workspace.flip_mesh_horizontally_button.click()
+
+        self.assertTrue(
+            self.workspace.select_window_slot(
+                window.window_id,
+                DOOR_SLOT_KNOB,
+            )
+        )
+        self.assertTrue(self.workspace.flip_mesh_horizontally_button.isEnabled())
+        self.workspace.flip_mesh_horizontally_button.click()
+
+        self.assertEqual(
+            requests,
+            [
+                (ASSET_KIND_DOOR, door.door_id, DOOR_SLOT_BODY),
+                (ASSET_KIND_WINDOW, window.window_id, DOOR_SLOT_KNOB),
+            ],
+        )
+        self.assertEqual(self.workspace.data(), original_data)
 
     def test_window_double_controls_emit_only_asset_aware_requests(self) -> None:
         window = _window()
@@ -822,6 +907,335 @@ class DoorsWorkspaceTests(unittest.TestCase):
         self.workspace.set_preview_model(None)
 
         self.assertIsNone(self.workspace.preview_viewer.model)
+
+    def test_preview_front_arrow_points_toward_local_negative_y_and_rebuilds(
+        self,
+    ) -> None:
+        door = _door()
+        first_model = _complete_door_model(door)
+
+        self.workspace.set_preview_model(first_model)
+
+        first_item = self.workspace._preview_front_direction_arrow_item
+        self.assertIsNotNone(first_item)
+        assert first_item is not None
+        first_positions = np.asarray(first_item.pos, dtype=float).copy()
+        first_bounds = np.asarray(first_model.mesh.bounds, dtype=float)
+        self.assertAlmostEqual(
+            first_positions[0, 0],
+            float(np.mean(first_bounds[:, 0])),
+        )
+        self.assertLess(first_positions[0, 1], first_bounds[0, 1])
+        first_direction = first_positions[1] - first_positions[0]
+        self.assertLess(first_direction[1], 0.0)
+        np.testing.assert_allclose(first_direction[[0, 2]], (0.0, 0.0))
+
+        larger_model = _complete_door_model(
+            replace(
+                door,
+                width_meters=1.8,
+                height_meters=3.0,
+            )
+        )
+        self.workspace.set_preview_model(larger_model)
+
+        rebuilt_item = self.workspace._preview_front_direction_arrow_item
+        self.assertIsNotNone(rebuilt_item)
+        assert rebuilt_item is not None
+        self.assertIsNot(rebuilt_item, first_item)
+        self.assertNotIn(first_item, self.workspace.preview_viewer.view.items)
+        rebuilt_positions = np.asarray(rebuilt_item.pos, dtype=float)
+        self.assertFalse(np.allclose(rebuilt_positions, first_positions))
+        self.assertLess(rebuilt_positions[1, 1], rebuilt_positions[0, 1])
+
+        self.workspace.set_preview_model(None)
+
+        self.assertIsNone(self.workspace._preview_front_direction_arrow_item)
+        self.assertFalse(
+            any(
+                getattr(item, "_housemaker_doors_preview_role", None)
+                == OPENING_PREVIEW_FRONT_ARROW_ROLE
+                for item in self.workspace.preview_viewer.view.items
+            )
+        )
+
+    def test_window_preview_front_arrow_uses_the_same_local_negative_y(self) -> None:
+        window_model = assemble_window_model(
+            _window(),
+            include_unjoined=True,
+        )
+
+        self.workspace.set_preview_model(window_model)
+
+        arrow_item = self.workspace._preview_front_direction_arrow_item
+        self.assertIsNotNone(arrow_item)
+        assert arrow_item is not None
+        positions = np.asarray(arrow_item.pos, dtype=float)
+        direction = positions[1] - positions[0]
+        self.assertLess(direction[1], 0.0)
+        np.testing.assert_allclose(direction[[0, 2]], (0.0, 0.0))
+
+    def test_preview_front_arrow_is_doors_only_and_not_pickable(self) -> None:
+        complete_model = _complete_door_model(_door())
+        self.workspace.set_preview_model(complete_model)
+        viewer = self.workspace.preview_viewer
+        arrow_item = self.workspace._preview_front_direction_arrow_item
+        self.assertIsNotNone(arrow_item)
+        assert arrow_item is not None
+        self.assertFalse(viewer.view._item_click_selection_enabled)
+        self.assertNotIn(arrow_item, viewer._transform_gizmo_items)
+        self.assertNotIn(arrow_item, viewer._placed_object_instance_gizmo_items)
+
+        arrow_tip = np.asarray(arrow_item.pos[1], dtype=float)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(
+                arrow_tip + np.asarray((0.0, 0.0, 1.0)),
+                np.asarray((0.0, 0.0, -1.0)),
+            ),
+        ):
+            self.assertIsNone(viewer._pick_preview_placed_object_id(QPoint()))
+
+        plain_viewer = GlbViewerWidget()
+        self.addCleanup(plain_viewer.deleteLater)
+        self.addCleanup(plain_viewer.close)
+        plain_viewer.set_model(complete_model)
+        self.assertFalse(
+            any(
+                getattr(item, "_housemaker_doors_preview_role", None)
+                == OPENING_PREVIEW_FRONT_ARROW_ROLE
+                for item in plain_viewer.view.items
+            )
+        )
+
+    def test_selected_faces_switch_glass_button_action_for_a_door(self) -> None:
+        door = _door()
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        complete_model = _complete_door_model(door)
+        vertices, faces = _preview_face_geometry(
+            complete_model,
+            body.source_object_id,
+        )
+        area_requests: list[tuple[object, ...]] = []
+        conversion_requests: list[tuple[object, ...]] = []
+        self.workspace.glass_area_creation_requested.connect(
+            lambda *values: area_requests.append(values)
+        )
+        self.workspace.face_glass_conversion_requested.connect(
+            lambda *values: conversion_requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+        self.workspace.select_door_slot(door.door_id, DOOR_SLOT_BODY)
+        self.workspace.set_preview_model(complete_model)
+
+        self.assertTrue(
+            self.workspace.set_preview_face_edit_geometry(
+                body.source_object_id,
+                vertices,
+                faces,
+            )
+        )
+        self.assertEqual(
+            self.workspace.add_glass_area_button.text(),
+            "Add glass area",
+        )
+
+        self.workspace.preview_viewer.set_selected_face_indices((3, 1))
+
+        self.assertEqual(
+            self.workspace.add_glass_area_button.text(),
+            "Convert faces to glass",
+        )
+        self.workspace.add_glass_area_button.click()
+        self.assertEqual(
+            conversion_requests,
+            [
+                (
+                    ASSET_KIND_DOOR,
+                    door.door_id,
+                    body.source_object_id,
+                    (1, 3),
+                )
+            ],
+        )
+        self.assertEqual(area_requests, [])
+
+        self.workspace.preview_viewer.clear_face_selection()
+
+        self.assertEqual(
+            self.workspace.add_glass_area_button.text(),
+            "Add glass area",
+        )
+        self.workspace.add_glass_area_button.click()
+        self.assertEqual(
+            area_requests,
+            [
+                (
+                    ASSET_KIND_DOOR,
+                    door.door_id,
+                    body.source_object_id,
+                )
+            ],
+        )
+
+    def test_delete_routes_selected_window_faces_before_preview_removal(
+        self,
+    ) -> None:
+        window = _window()
+        body = window.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        fixture_door = _door(door_id=window.window_id)
+        complete_model = _complete_door_model(fixture_door)
+        vertices, faces = _preview_face_geometry(
+            complete_model,
+            body.source_object_id,
+        )
+        deletion_requests: list[tuple[object, ...]] = []
+        removal_requests: list[str] = []
+        self.workspace.face_deletion_requested.connect(
+            lambda *values: deletion_requests.append(values)
+        )
+        self.workspace.preview_viewer.placed_object_removal_requested.connect(
+            removal_requests.append
+        )
+        self.workspace.set_data(DoorLibraryData(windows=[window]))
+        self.workspace.select_window_slot(window.window_id, DOOR_SLOT_BODY)
+        self.workspace.set_preview_model(complete_model)
+        self.assertTrue(
+            self.workspace.set_preview_face_edit_geometry(
+                body.source_object_id,
+                vertices,
+                faces,
+            )
+        )
+        self.workspace.preview_viewer.set_selected_face_indices((2, 0))
+
+        QTest.keyClick(
+            self.workspace.preview_viewer.view,
+            Qt.Key.Key_Delete,
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            deletion_requests,
+            [
+                (
+                    ASSET_KIND_WINDOW,
+                    window.window_id,
+                    body.source_object_id,
+                    (0, 2),
+                )
+            ],
+        )
+        self.assertEqual(removal_requests, [])
+        self.assertEqual(
+            self.workspace.preview_viewer.get_selected_placed_object_ids(),
+            (body.source_object_id,),
+        )
+
+    def test_f_routes_selected_vertices_to_the_exact_door_component(
+        self,
+    ) -> None:
+        door = _door()
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        complete_model = _complete_door_model(door)
+        vertices, faces = _preview_face_geometry(
+            complete_model,
+            body.source_object_id,
+        )
+        creation_requests: list[tuple[object, ...]] = []
+        self.workspace.face_creation_requested.connect(
+            lambda *values: creation_requests.append(values)
+        )
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+        self.workspace.select_door_slot(door.door_id, DOOR_SLOT_BODY)
+        self.workspace.set_preview_model(complete_model)
+        self.assertTrue(
+            self.workspace.set_preview_face_edit_geometry(
+                body.source_object_id,
+                vertices,
+                faces,
+            )
+        )
+        selected_vertices = tuple(int(index) for index in faces[0])
+        self.workspace.preview_viewer.set_selected_vertex_indices(
+            selected_vertices
+        )
+
+        QTest.keyClick(
+            self.workspace.preview_viewer.view,
+            Qt.Key.Key_F,
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            creation_requests,
+            [
+                (
+                    ASSET_KIND_DOOR,
+                    door.door_id,
+                    body.source_object_id,
+                    selected_vertices,
+                )
+            ],
+        )
+
+    def test_plain_preview_click_still_selects_parts_during_face_editing(
+        self,
+    ) -> None:
+        """Face gestures must not consume ordinary part-selection clicks."""
+
+        door = _door()
+        body = door.get_slot(DOOR_SLOT_BODY)
+        knob = door.get_slot(DOOR_SLOT_KNOB)
+        assert body is not None and knob is not None
+        door = door.replace_slot(
+            knob.with_transform(position_meters=(2.0, 0.0, 0.0))
+        )
+        complete_model = _complete_door_model(door)
+        vertices, faces = _preview_face_geometry(
+            complete_model,
+            body.source_object_id,
+        )
+        viewer = self.workspace.preview_viewer
+        self.workspace.set_data(DoorLibraryData(doors=[door]))
+        self.workspace.select_door_slot(door.door_id, DOOR_SLOT_BODY)
+        self.workspace.set_preview_model(complete_model)
+        self.assertTrue(
+            self.workspace.set_preview_face_edit_geometry(
+                body.source_object_id,
+                vertices,
+                faces,
+            )
+        )
+        self.workspace.resize(1000, 700)
+        self.workspace.show()
+        _qt_application.processEvents()
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=((2.0, -5.0, 0.02), (0.0, 1.0, 0.0)),
+            ),
+            patch.object(viewer.view, "pixelSize", return_value=0.01),
+        ):
+            QTest.mouseClick(
+                viewer.view,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+                QPoint(160, 120),
+            )
+            _qt_application.processEvents()
+
+        self.assertEqual(self.workspace.selected_slot_id(), DOOR_SLOT_KNOB)
+        self.assertEqual(
+            viewer.get_selected_placed_object_ids(),
+            (knob.source_object_id,),
+        )
 
     def test_preview_owns_the_selected_generated_hardware_gizmo(self) -> None:
         door = _door()

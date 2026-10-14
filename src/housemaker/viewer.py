@@ -263,6 +263,7 @@ DOOR_PLACEMENT_PREVIEW_COLORS = {
     "handle": (0.10, 0.46, 1.0, 0.42),
 }
 DOOR_PLACEMENT_PREVIEW_EDGE_ALPHA = 0.96
+OPENING_FIXTURE_PLACEMENT_ORIENTATION_COUNT = 4
 TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
 TRANSFORM_GIZMO_RING_RADIUS_RATIO = 0.72
 TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
@@ -1189,6 +1190,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._object_scale_wheel_steps_enabled = False
         self._object_scale_wheel_delta_remainder = 0
         self._face_selection_gestures_enabled = False
+        self._face_selection_plain_click_passthrough_enabled = False
         self._face_selection_gesture_active = False
         self._face_selection_release_suppressed = False
         self._vertex_selection_gesture_active = False
@@ -1306,6 +1308,14 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         """Enable click positions for viewers that perform their own CPU picking."""
 
         self._viewport_click_selection_enabled = bool(enabled)
+
+    def set_face_selection_plain_click_passthrough_enabled(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Let plain clicks keep selecting objects while face gestures are active."""
+
+        self._face_selection_plain_click_passthrough_enabled = bool(enabled)
 
     def set_first_person_ctrl_interaction_enabled(self, enabled: bool) -> None:
         """Allow Ctrl to temporarily free the pointer in first-person mode."""
@@ -1836,7 +1846,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if (
             (
-                self._face_selection_gestures_enabled
+                (
+                    self._face_selection_gestures_enabled
+                    and not self._face_selection_plain_click_passthrough_enabled
+                )
                 or (
                     not self._item_click_selection_enabled
                     and not self._viewport_click_selection_enabled
@@ -1984,14 +1997,18 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
 
         if (
-            self._face_selection_gestures_enabled
-            or (
-                not self._item_click_selection_enabled
-                and not self._viewport_click_selection_enabled
+            (
+                (
+                    self._face_selection_gestures_enabled
+                    and not self._face_selection_plain_click_passthrough_enabled
+                )
+                or (
+                    not self._item_click_selection_enabled
+                    and not self._viewport_click_selection_enabled
+                )
+                or self._overlay_selection_enabled
             )
-            or self._overlay_selection_enabled
-        ) and (
-            event.button() == Qt.MouseButton.LeftButton
+            and event.button() == Qt.MouseButton.LeftButton
             and not self._primary_pointer_drag_reserved
         ):
             # Match the inert press above without invoking itemsAt().  In the
@@ -4324,19 +4341,31 @@ class DoorPlacementPreviewPart:
 
 @dataclass(frozen=True)
 class DoorPlacementPreviewCandidate:
-    """Normal and wheel-mirrored profiles for one compatible doorway."""
+    """Four exact wheel orientations for one compatible opening."""
 
     opening_key: str
     normal_parts: tuple[DoorPlacementPreviewPart, ...]
     normal_transform: np.ndarray
     mirrored_parts: tuple[DoorPlacementPreviewPart, ...]
     mirrored_transform: np.ndarray
+    depth_mirrored_parts: tuple[DoorPlacementPreviewPart, ...]
+    depth_mirrored_transform: np.ndarray
+    depth_and_horizontally_mirrored_parts: tuple[
+        DoorPlacementPreviewPart,
+        ...,
+    ]
+    depth_and_horizontally_mirrored_transform: np.ndarray
 
     def __post_init__(self) -> None:
         normalized_key = str(self.opening_key).strip()
         if not normalized_key:
             raise ValueError("Door placement previews require an opening key.")
-        for parts in (self.normal_parts, self.mirrored_parts):
+        for parts in (
+            self.normal_parts,
+            self.mirrored_parts,
+            self.depth_mirrored_parts,
+            self.depth_and_horizontally_mirrored_parts,
+        ):
             if not isinstance(parts, tuple) or not parts:
                 raise ValueError("Door placement previews require profile parts.")
             if not all(isinstance(part, DoorPlacementPreviewPart) for part in parts):
@@ -4347,9 +4376,27 @@ class DoorPlacementPreviewCandidate:
         mirrored_transform = _normalize_door_placement_preview_transform(
             self.mirrored_transform
         )
+        depth_mirrored_transform = _normalize_door_placement_preview_transform(
+            self.depth_mirrored_transform
+        )
+        depth_and_horizontal_transform = (
+            _normalize_door_placement_preview_transform(
+                self.depth_and_horizontally_mirrored_transform
+            )
+        )
         object.__setattr__(self, "opening_key", normalized_key)
         object.__setattr__(self, "normal_transform", normal_transform)
         object.__setattr__(self, "mirrored_transform", mirrored_transform)
+        object.__setattr__(
+            self,
+            "depth_mirrored_transform",
+            depth_mirrored_transform,
+        )
+        object.__setattr__(
+            self,
+            "depth_and_horizontally_mirrored_transform",
+            depth_and_horizontal_transform,
+        )
 
 
 @dataclass(frozen=True)
@@ -4483,6 +4530,7 @@ class GlbViewerWidget(QWidget):
     door_creation_requested = Signal(object)
     window_fixture_creation_requested = Signal(object)
     canvas_opening_selection_changed = Signal(object)
+    canvas_opening_fixture_deletion_requested = Signal(object)
     canvas_opening_edit_started = Signal(object)
     canvas_opening_edit_preview_changed = Signal(object)
     canvas_opening_edit_finished = Signal(object, bool)
@@ -4512,9 +4560,9 @@ class GlbViewerWidget(QWidget):
     placed_object_double_clicked = Signal(str)
     object_placement_selected = Signal(str, object)
     object_placement_cancelled = Signal(str)
-    door_placement_requested = Signal(str, object, bool)
+    door_placement_requested = Signal(str, object, bool, bool)
     door_placement_cancelled = Signal(str)
-    window_fixture_placement_requested = Signal(str, object, bool)
+    window_fixture_placement_requested = Signal(str, object, bool, bool)
     window_fixture_placement_cancelled = Signal(str)
     glass_area_placement_requested = Signal(object)
     glass_area_placement_cancelled = Signal(str, str)
@@ -4726,7 +4774,9 @@ class GlbViewerWidget(QWidget):
         self._door_placement_door_id: str | None = None
         self._door_placement_opening_kind: str | None = None
         self._door_placement_compatible_opening_keys: frozenset[str] = frozenset()
+        self._door_placement_orientation_index = 0
         self._door_placement_mirrored_horizontally = False
+        self._door_placement_mirrored_depthwise = False
         self._door_placement_press_position: QPointF | None = None
         self._door_placement_preview_candidates: dict[
             str,
@@ -5930,6 +5980,9 @@ class GlbViewerWidget(QWidget):
             self.first_person_camera_pose_changed.emit
         )
         self.view.set_face_selection_gestures_enabled(self._face_editing_enabled)
+        self.view.set_face_selection_plain_click_passthrough_enabled(
+            self._placed_object_click_selection_enabled
+        )
         self.view.overlay_selection_requested.connect(
             self._handle_projection_camera_selection_requested
         )
@@ -8485,7 +8538,9 @@ class GlbViewerWidget(QWidget):
         self._door_placement_door_id = normalized_fixture_id
         self._door_placement_opening_kind = opening_kind
         self._door_placement_compatible_opening_keys = normalized_keys
+        self._door_placement_orientation_index = 0
         self._door_placement_mirrored_horizontally = False
+        self._door_placement_mirrored_depthwise = False
         self._door_placement_press_position = None
         self._door_placement_preview_candidates = normalized_candidates
         self._door_placement_hover_opening_key = None
@@ -8511,7 +8566,9 @@ class GlbViewerWidget(QWidget):
         self._door_placement_door_id = None
         self._door_placement_opening_kind = None
         self._door_placement_compatible_opening_keys = frozenset()
+        self._door_placement_orientation_index = 0
         self._door_placement_mirrored_horizontally = False
+        self._door_placement_mirrored_depthwise = False
         self._door_placement_press_position = None
         self._door_placement_preview_candidates = {}
         self._door_placement_hover_opening_key = None
@@ -8537,21 +8594,37 @@ class GlbViewerWidget(QWidget):
         if message is not None:
             self._set_window_tools_status(message)
             return
-        orientation = (
-            "mirrored" if self._door_placement_mirrored_horizontally else "normal"
+        horizontal_orientation = (
+            "horizontally mirrored"
+            if self._door_placement_mirrored_horizontally
+            else "not horizontally mirrored"
+        )
+        opening_side = (
+            "opposite side"
+            if self._door_placement_mirrored_depthwise
+            else "initial side"
         )
         if self._door_placement_opening_kind == CANVAS_OPENING_WINDOW:
             self._set_window_tools_status(
                 "Click a compatible frame to place the window "
-                f"({orientation}). Use the mouse wheel to mirror it "
-                "horizontally. Right-click or Escape cancels."
+                f"({horizontal_orientation}, {opening_side}). Use the mouse "
+                "wheel to cycle its four orientations. Right-click or Escape "
+                "cancels."
             )
             return
         self._set_window_tools_status(
-            f"Click a compatible doorway to place the door ({orientation}). "
-            "Use the mouse wheel to mirror it horizontally. Right-click or "
-            "Escape cancels."
+            "Click a compatible doorway to place the door "
+            f"({horizontal_orientation}, {opening_side}). Use the mouse wheel "
+            "to cycle its four orientations. Right-click or Escape cancels."
         )
+
+    def _set_opening_fixture_placement_orientation(self, index: int) -> None:
+        """Apply one of the four horizontal/depth reflection combinations."""
+
+        normalized_index = int(index) % OPENING_FIXTURE_PLACEMENT_ORIENTATION_COUNT
+        self._door_placement_orientation_index = normalized_index
+        self._door_placement_mirrored_horizontally = normalized_index in {1, 2}
+        self._door_placement_mirrored_depthwise = normalized_index in {2, 3}
 
     def _get_door_placement_opening_at(
         self,
@@ -8622,7 +8695,7 @@ class GlbViewerWidget(QWidget):
         return True
 
     def _refresh_door_placement_preview_items(self) -> None:
-        """Render the active normal or wheel-mirrored colored door profile."""
+        """Render the active four-state colored fixture profile."""
 
         self._remove_door_placement_preview_items()
         if not self.is_opening_fixture_placement_active or not hasattr(self, "view"):
@@ -8631,16 +8704,19 @@ class GlbViewerWidget(QWidget):
         candidate = self._door_placement_preview_candidates.get(opening_key or "")
         if candidate is None:
             return
-        parts = (
-            candidate.mirrored_parts
-            if self._door_placement_mirrored_horizontally
-            else candidate.normal_parts
+        variants = (
+            (candidate.normal_parts, candidate.normal_transform),
+            (candidate.mirrored_parts, candidate.mirrored_transform),
+            (
+                candidate.depth_and_horizontally_mirrored_parts,
+                candidate.depth_and_horizontally_mirrored_transform,
+            ),
+            (
+                candidate.depth_mirrored_parts,
+                candidate.depth_mirrored_transform,
+            ),
         )
-        transform = (
-            candidate.mirrored_transform
-            if self._door_placement_mirrored_horizontally
-            else candidate.normal_transform
-        )
+        parts, transform = variants[self._door_placement_orientation_index]
         root = GLGraphicsItem()
         root.setTransform(_numpy_transform_to_qt(transform))
         self.view.addItem(root)
@@ -8705,16 +8781,23 @@ class GlbViewerWidget(QWidget):
         ):
             return False
         reference = target.reference
-        mirrored = self._door_placement_mirrored_horizontally
+        mirrored_horizontally = self._door_placement_mirrored_horizontally
+        mirrored_depthwise = self._door_placement_mirrored_depthwise
         self._clear_door_placement(notify=False)
         if opening_kind == CANVAS_OPENING_WINDOW:
             self.window_fixture_placement_requested.emit(
                 door_id,
                 reference,
-                mirrored,
+                mirrored_horizontally,
+                mirrored_depthwise,
             )
         else:
-            self.door_placement_requested.emit(door_id, reference, mirrored)
+            self.door_placement_requested.emit(
+                door_id,
+                reference,
+                mirrored_horizontally,
+                mirrored_depthwise,
+            )
         return True
 
     # ### Placed-object transform API ###
@@ -8901,6 +8984,14 @@ class GlbViewerWidget(QWidget):
         """Route Delete to Canvas placement removal or the generic consumer."""
 
         self._invalidate_external_canvas_rectangle_selection()
+        if self._face_editing_enabled and (
+            self.get_selected_face_indices()
+            or self.get_selected_vertex_indices()
+        ):
+            # A selected preview part is also represented as a placed object.
+            # Face deletion must win without clearing or removing that part.
+            self.delete_requested.emit()
+            return
         selected_light_id = self._selected_directional_light_id
         if selected_light_id is not None:
             self.set_selected_directional_light_id(None)
@@ -8936,9 +9027,13 @@ class GlbViewerWidget(QWidget):
             self.set_selected_architectural_trim_part_ids(())
             self.architectural_trim_deletion_requested.emit(selected_trim_ids)
             return
-        if self._get_selected_canvas_opening_target() is not None:
+        selected_opening = self._get_selected_canvas_opening_target()
+        if selected_opening is not None:
             # Openings are structural edits. Delete must never fall through to
             # an unrelated face/object consumer merely because one is selected.
+            self.canvas_opening_fixture_deletion_requested.emit(
+                selected_opening.reference
+            )
             return
         if self._window_editing_enabled and self._selected_canvas_surface_ids:
             selected_surfaces = tuple(
@@ -18194,12 +18289,11 @@ class GlbViewerWidget(QWidget):
         if normalized_steps == 0:
             return
         if self.is_opening_fixture_placement_active:
-            if abs(normalized_steps) % 2 == 1:
-                self._door_placement_mirrored_horizontally = (
-                    not self._door_placement_mirrored_horizontally
-                )
-                self._refresh_door_placement_preview_items()
-                self._set_door_placement_status()
+            self._set_opening_fixture_placement_orientation(
+                self._door_placement_orientation_index + normalized_steps
+            )
+            self._refresh_door_placement_preview_items()
+            self._set_door_placement_status()
             return
         selected_id = self._selected_projection_camera_id
         if selected_id is None:

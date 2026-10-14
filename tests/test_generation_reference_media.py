@@ -293,7 +293,7 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         self.assertFalse(hasattr(self.workspace, "reference_edit_prompt"))
         self.assertFalse(hasattr(self.workspace, "edit_reference_button"))
 
-    def test_paste_and_load_image_exit_handle_generation_mode(self) -> None:
+    def test_paste_and_load_image_keep_handle_generation_mode(self) -> None:
         reference = _reference_bgra()
         self._set_clipboard_reference(reference)
         target_arguments = {
@@ -309,8 +309,15 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         )
         self.workspace.paste_inpaint_button.click()
 
-        self.assertIsNone(self.objects._door_slot_editing_target)
-        self.assertTrue(self.objects.symmetric_division_checkbox.isEnabled())
+        pasted_target = self.objects._door_slot_editing_target
+        self.assertIsNotNone(pasted_target)
+        assert pasted_target is not None
+        self.assertEqual(pasted_target.object_id, "door-handle")
+        self.assertFalse(self.objects.symmetric_division_checkbox.isEnabled())
+        np.testing.assert_array_equal(
+            self.objects.get_temporary_object_reference(),
+            reference,
+        )
 
         self.assertTrue(
             self.objects.set_door_slot_editing_target(**target_arguments)
@@ -323,8 +330,15 @@ class GenerationReferenceMediaTests(unittest.TestCase):
         ):
             self.workspace.load_reference_image_button.click()
 
-        self.assertIsNone(self.objects._door_slot_editing_target)
-        self.assertTrue(self.objects.symmetric_division_checkbox.isEnabled())
+        loaded_target = self.objects._door_slot_editing_target
+        self.assertIsNotNone(loaded_target)
+        assert loaded_target is not None
+        self.assertEqual(loaded_target.object_id, "door-handle")
+        self.assertFalse(self.objects.symmetric_division_checkbox.isEnabled())
+        np.testing.assert_array_equal(
+            self.objects.get_temporary_object_reference(),
+            reference,
+        )
 
     def test_pasted_reference_is_used_for_surface_generation(self) -> None:
         surface = self._enable_surface_generation()

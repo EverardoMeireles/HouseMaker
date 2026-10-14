@@ -271,10 +271,43 @@ class DoorStateTests(unittest.TestCase):
                 ),
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             door_fits_doorway(
                 first,
                 replace(_doorway(), shape="arch", arch_amount=0.5),
+            )
+        )
+
+    def test_arch_factory_preserves_profile_and_fits_other_arch_amounts(
+        self,
+    ) -> None:
+        source_doorway = replace(
+            _doorway(),
+            shape="arch",
+            arch_amount=0.35,
+        )
+        door = create_door_definition_for_doorway(
+            source_doorway,
+            door_id="arched-door",
+            name="New door 1",
+        )
+
+        self.assertTrue(door.preserve_profile)
+        self.assertTrue(
+            door_fits_doorway(
+                door,
+                replace(
+                    source_doorway,
+                    width_meters=1.8,
+                    height_meters=2.4,
+                    arch_amount=0.8,
+                ),
+            )
+        )
+        self.assertFalse(
+            door_fits_doorway(
+                door,
+                replace(source_doorway, shape="rectangular"),
             )
         )
 
@@ -721,6 +754,7 @@ class DoorStateTests(unittest.TestCase):
             door_id=door.door_id,
             level_index=2,
             doorway_id="destination",
+            mirrored_depthwise=True,
         )
         library = DoorLibraryData(
             doors=[door],
@@ -735,6 +769,7 @@ class DoorStateTests(unittest.TestCase):
             "fit_mode",
             placement.to_dict(),
         )
+        self.assertTrue(placement.to_dict()["mirrored_depthwise"])
 
         with self.assertRaisesRegex(ValueError, "bindings must be unique"):
             DoorLibraryData(
@@ -759,6 +794,7 @@ class DoorStateTests(unittest.TestCase):
 
         self.assertEqual(placement.placement_id, "legacy-left")
         self.assertTrue(placement.mirrored_horizontally)
+        self.assertFalse(placement.mirrored_depthwise)
         self.assertNotIn("fit_mode", placement.to_dict())
 
     def test_window_definition_and_placement_round_trip(self) -> None:
@@ -786,6 +822,7 @@ class DoorStateTests(unittest.TestCase):
             level_index=2,
             window_frame_id="frame-destination",
             mirrored_horizontally=True,
+            mirrored_depthwise=True,
         )
         library = DoorLibraryData(
             windows=[first],
@@ -795,6 +832,7 @@ class DoorStateTests(unittest.TestCase):
         restored = DoorLibraryData.from_dict(library.to_dict())
 
         self.assertEqual(restored, library)
+        self.assertTrue(restored.window_placements[0].mirrored_depthwise)
         self.assertTrue(first.generate_displacement)
         self.assertFalse(first.preserve_profile)
         self.assertEqual(

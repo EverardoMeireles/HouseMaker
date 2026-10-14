@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.door_geometry import build_door_body_model
 from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_BACK,
     DOOR_SIDE_DUPLICATION_FRONT,
@@ -55,6 +56,7 @@ from housemaker.generation_workspace import (
     VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
     GenerationRequest,
     GenerationWorkspace,
+    MeshyImagePlanner,
     MeshyModelExecutor,
     MeshyTextureRegenerator,
     ObjectSymmetricDivisionMetadata,
@@ -109,6 +111,7 @@ from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
 )
@@ -723,6 +726,48 @@ class DoorDisplacementGeometryTests(unittest.TestCase):
                 )
             )
             self.assertGreaterEqual(len(distinct_depths), 3)
+
+    def test_profile_warp_accepts_an_already_arched_generated_body(self) -> None:
+        """An apex with one X coordinate is valid, not a missing silhouette."""
+
+        target_dimensions = (0.9, 0.06, 2.1)
+        arched_model = build_door_body_model(
+            target_dimensions[0],
+            target_dimensions[2],
+            target_dimensions[1],
+            shape="arch",
+            arch_amount=0.8,
+            geometry_name="generated_arched_body",
+        )
+        source = replace(
+            _relief_door_texture_variants(),
+            glb_by_resolution={
+                resolution: arched_model.glb_bytes
+                for resolution in TEXTURE_RESOLUTIONS
+            },
+        )
+        profile_outline = build_doorway_cross_section_outline(
+            target_dimensions[0],
+            target_dimensions[2],
+            "arch",
+            0.8,
+        )
+
+        fitted = _fit_generated_door_body_texture_variants(
+            source,
+            target_dimensions,
+            profile_outline=profile_outline,
+        )
+
+        fitted_model = import_generated_glb(
+            fitted.glb_by_resolution[max(TEXTURE_RESOLUTIONS)]
+        )
+        np.testing.assert_allclose(
+            np.asarray(fitted_model.mesh.extents, dtype=float),
+            np.asarray(target_dimensions, dtype=float),
+            rtol=1e-5,
+            atol=1e-7,
+        )
 
     def test_profile_warp_preserves_uvs_textures_and_depth_relief(self) -> None:
         source = _relief_door_texture_variants()
@@ -3247,6 +3292,144 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             QTest.qWait(10)
         self.assertTrue(event.is_set(), "Blocking provider did not start.")
 
+    # ### Opening-component generation settings ###
+    def test_opening_generation_mode_defaults_all_pbr_maps_once(self) -> None:
+        for asset_kind in ("door", "window"):
+            with self.subTest(asset_kind=asset_kind):
+                self.workspace.clear_door_slot_editing_target()
+                for checkbox in self.workspace.pbr_map_checkboxes.values():
+                    checkbox.setChecked(False)
+                target_arguments = {
+                    "door_id": f"{asset_kind}-1",
+                    "slot_id": "body",
+                    "object_id": f"{asset_kind}-body",
+                    "object_name": f"New {asset_kind} 1 - Body",
+                    "slot_display_name": "Body",
+                    "asset_kind": asset_kind,
+                    "generate_displacement": True,
+                    "door_body_fit_dimensions": (1.0, 0.1, 2.0),
+                }
+
+                self.assertTrue(
+                    self.workspace.set_door_slot_editing_target(
+                        **target_arguments,
+                        generation_ready=False,
+                    )
+                )
+                self.assertEqual(self.workspace._get_enabled_pbr_maps(), ())
+
+                self.assertTrue(
+                    self.workspace.set_door_slot_editing_target(
+                        **target_arguments,
+                        generation_ready=True,
+                    )
+                )
+                self.assertEqual(
+                    self.workspace._get_enabled_pbr_maps(),
+                    PBR_MAP_TYPES,
+                )
+
+                self.workspace.pbr_map_checkboxes[
+                    PBR_MAP_NORMAL
+                ].setChecked(False)
+                self.assertTrue(
+                    self.workspace.set_door_slot_editing_target(
+                        **target_arguments,
+                        generation_ready=True,
+                    )
+                )
+                self.assertFalse(
+                    self.workspace.pbr_map_checkboxes[
+                        PBR_MAP_NORMAL
+                    ].isChecked()
+                )
+
+    def test_window_generation_honors_unused_face_removal_setting(self) -> None:
+        self._load_reference()
+        target_arguments = {
+            "door_id": "window-1",
+            "slot_id": "body",
+            "object_id": "window-body",
+            "object_name": "New window 1 - Body",
+            "slot_display_name": "Body",
+            "asset_kind": "window",
+            "generate_displacement": True,
+            "door_body_fit_dimensions": (1.0, 0.1, 1.2),
+            "generation_ready": True,
+        }
+        provider_glb = _uv_glb(texture_resolution=8)
+        provider_result = MeshyGenerationResult(
+            "window-task",
+            provider_glb,
+            "Generated window",
+        )
+
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                meshy_api_key="msy-test-key",
+                unused_face_removal=False,
+            )
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(**target_arguments)
+        )
+        unchecked_request = self.workspace._build_generation_request()
+        self.assertIsNotNone(unchecked_request)
+        assert unchecked_request is not None
+        self.assertFalse(unchecked_request.settings.unused_face_removal)
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=provider_result,
+            ),
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb"
+            ) as remove_unused_faces,
+            patch(
+                "housemaker.generation_workspace.request_retextured_model"
+            ) as retexture,
+        ):
+            MeshyImagePlanner().plan(unchecked_request)
+        remove_unused_faces.assert_not_called()
+        retexture.assert_not_called()
+
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                meshy_api_key="msy-test-key",
+                unused_face_removal=True,
+            )
+        )
+        checked_request = self.workspace._build_generation_request()
+        self.assertIsNotNone(checked_request)
+        assert checked_request is not None
+        self.assertTrue(checked_request.settings.unused_face_removal)
+        retained_model = import_generated_glb(provider_glb)
+        removal_result = UnusedFaceRemovalResult(
+            model=retained_model,
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=2,
+            retained_face_count=2,
+            removed_face_count=0,
+            protected_face_count=2,
+        )
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=provider_result,
+            ),
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb",
+                side_effect=(removal_result, removal_result),
+            ) as remove_unused_faces,
+            patch(
+                "housemaker.generation_workspace.request_retextured_model",
+                return_value=provider_result,
+            ) as retexture,
+        ):
+            MeshyImagePlanner().plan(checked_request)
+        self.assertEqual(remove_unused_faces.call_count, 2)
+        retexture.assert_called_once()
+
     def test_empty_knob_slot_starts_one_model_generation(self) -> None:
         self.assertTrue(
             self.workspace.set_door_slot_editing_target(
@@ -3279,8 +3462,8 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertEqual(target.object_id, "door-knob")
         self.assertEqual(target.slot_display_name, "Door knob/handle")
 
-    def test_loaded_reference_exits_handle_mode_and_restores_division(self) -> None:
-        """Paste/Load-image input starts an ordinary object-generation session."""
+    def test_loaded_reference_keeps_handle_generation_mode(self) -> None:
+        """Paste/Load-image input replaces only the active reference."""
 
         self.assertTrue(
             self.workspace.set_door_slot_editing_target(
@@ -3297,8 +3480,11 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             np.full((8, 8, 4), 255, dtype=np.uint8)
         )
 
-        self.assertIsNone(self.workspace._door_slot_editing_target)
-        self.assertTrue(self.workspace.symmetric_division_checkbox.isEnabled())
+        target = self.workspace._door_slot_editing_target
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.object_id, "door-knob")
+        self.assertFalse(self.workspace.symmetric_division_checkbox.isEnabled())
 
     def test_video_seek_exits_handle_mode_and_restores_division(self) -> None:
         self._load_reference()
@@ -3364,6 +3550,96 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             start_generation.call_args.kwargs["requested_name"],
             target.object_name,
         )
+        self.assertEqual(
+            start_generation.call_args.kwargs["door_slot_target"],
+            target,
+        )
+        self.assertEqual(
+            start_generation.call_args.kwargs["replaced_object_record"],
+            original,
+        )
+
+    def test_generate_geometry_replaces_existing_opening_slot_model(
+        self,
+    ) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-body",
+            object_name="New door 1 - Body",
+            door_id="door-1",
+            slot_id="body",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="body",
+                object_id="door-body",
+                object_name="New door 1 - Body",
+                slot_display_name="Body",
+                generate_displacement=False,
+                preserve_profile=False,
+                door_body_fit_dimensions=(1.0, 0.04, 2.0),
+            )
+        )
+        target = self.workspace._door_slot_editing_target
+        assert target is not None
+        self._load_reference()
+
+        self.assertTrue(self.workspace.generate_geometry_button.isEnabled())
+        with patch.object(
+            self.workspace,
+            "_start_generation",
+            return_value="door-geometry-replacement-operation",
+        ) as start_generation:
+            self.workspace.generate_geometry()
+
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        self.assertTrue(request.geometry_only)
+        self.assertIsNone(request.door_body_fit_dimensions)
+        self.assertEqual(
+            start_generation.call_args.kwargs["door_slot_target"],
+            target,
+        )
+        self.assertEqual(
+            start_generation.call_args.kwargs["replaced_object_record"],
+            original,
+        )
+
+    def test_generate_geometry_replaces_existing_handle_model(self) -> None:
+        component_model = import_generated_glb(_uv_glb(texture_resolution=8))
+        original = self.workspace.register_door_component_model(
+            object_id="door-handle",
+            object_name="New door 1 - Handle",
+            door_id="door-1",
+            slot_id="door_knob",
+            model=component_model,
+        )
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="door-1",
+                slot_id="door_knob",
+                object_id="door-handle",
+                object_name="New door 1 - Handle",
+                slot_display_name="Handle",
+            )
+        )
+        target = self.workspace._door_slot_editing_target
+        assert target is not None
+        self._load_reference()
+
+        self.assertTrue(self.workspace.generate_geometry_button.isEnabled())
+        with patch.object(
+            self.workspace,
+            "_start_generation",
+            return_value="handle-geometry-replacement-operation",
+        ) as start_generation:
+            self.workspace.generate_geometry()
+
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        self.assertTrue(request.geometry_only)
         self.assertEqual(
             start_generation.call_args.kwargs["door_slot_target"],
             target,
@@ -3533,7 +3809,7 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             )
         )
 
-    def test_asymmetric_preserved_profile_rejects_symmetric_division(
+    def test_asymmetric_preserved_profile_ignores_symmetric_division(
         self,
     ) -> None:
         dimensions = (1.0, 0.04, 2.0)
@@ -3558,12 +3834,53 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.workspace.symmetric_division_checkbox.setChecked(True)
         self._load_reference()
 
-        self.assertIsNone(self.workspace._build_generation_request())
-        self.assertEqual(
-            self.workspace.status_label.text(),
-            "Symmetric division cannot preserve this asymmetric door profile. "
-            "Disable Symmetric division or Preserve door profile.",
+        request = self.workspace._build_generation_request()
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertFalse(request.symmetric_division_enabled)
+
+    def test_generate_starts_for_arched_double_door_right_body(self) -> None:
+        """A carried symmetric option must not turn a right leaf into a no-op."""
+
+        dimensions = (1.0, 0.04, 2.0)
+        profile_outline = build_double_door_leaf_source_outline(
+            dimensions[0],
+            dimensions[2],
+            "arch",
+            0.75,
         )
+        self.workspace.symmetric_division_checkbox.setChecked(True)
+        self.assertTrue(
+            self.workspace.set_door_slot_editing_target(
+                door_id="double-arched-door",
+                slot_id="body",
+                object_id="double-arched-door-right-body",
+                object_name="Double arched door - Body right",
+                slot_display_name="Body right",
+                generate_displacement=True,
+                preserve_profile=True,
+                door_body_fit_dimensions=dimensions,
+                door_body_profile_outline=profile_outline,
+            )
+        )
+        self.assertFalse(self.workspace.symmetric_division_checkbox.isChecked())
+        self.assertFalse(self.workspace.symmetric_division_checkbox.isEnabled())
+        self._load_reference()
+
+        self.assertTrue(self.workspace.generate_button.isEnabled())
+        with patch.object(
+            self.workspace,
+            "_start_generation",
+            return_value="arched-right-body-operation",
+        ) as start_generation:
+            self.workspace.generate_button.click()
+
+        start_generation.assert_called_once()
+        request = start_generation.call_args.args[0]
+        target = start_generation.call_args.kwargs["door_slot_target"]
+        self.assertEqual(target.slot_display_name, "Body right")
+        self.assertEqual(request.door_body_profile_outline, profile_outline)
+        self.assertFalse(request.symmetric_division_enabled)
 
     def test_profile_setting_does_not_change_texture_only_generation(self) -> None:
         component_model = import_generated_glb(_uv_glb(texture_resolution=8))

@@ -48,6 +48,7 @@ from housemaker.glb import (
     compose_placed_generated_models,
     compose_placed_generated_models_preview,
 )
+from housemaker.object_symmetry import split_scene_at_z_up_axis_planes
 from housemaker.opening_glass import apply_opening_glass_areas
 
 # ### Constants ###
@@ -258,6 +259,569 @@ def _mirror_closed_profile_horizontally(
     return tuple(ordered)
 
 
+# ### Body profile conformance ###
+def conform_door_body_model_to_profile(
+    model: GeneratedModel,
+    profile_outline: Sequence[Sequence[float]],
+    *,
+    body_mirror: DoorBodyMirrorConfiguration | None = None,
+) -> GeneratedModel:
+    """Cage one authored body under a closed X/Z profile.
+
+    The operation keeps the source model's effective bounds.  Assembly can
+    therefore continue to apply the door definition's ordinary width, depth,
+    height, and slot transforms after this step.  Only vertex positions and
+    triangles crossing profile breakpoints change; UVs, materials, texture
+    pixels, scene names, and metadata remain attached to their source data.
+
+    A vertically divided body is evaluated against the bounds reconstructed
+    by its mirror plane.  The retained half is not expanded into a full mesh.
+    """
+
+    if not isinstance(model, GeneratedModel):
+        raise TypeError("Door profile conformance requires a GeneratedModel.")
+    if body_mirror is not None and not isinstance(
+        body_mirror,
+        DoorBodyMirrorConfiguration,
+    ):
+        raise TypeError("Door body mirror configuration is invalid.")
+    normalized_profile = _normalize_closed_body_profile(profile_outline)
+    conformed_scene = copy.deepcopy(model.scene)
+    if not isinstance(conformed_scene, trimesh.Scene):
+        raise TypeError("Door profile conformance requires a mesh scene.")
+
+    source_bounds = _body_profile_effective_bounds(
+        conformed_scene,
+        body_mirror,
+    )
+    if _scene_matches_body_profile(
+        conformed_scene,
+        normalized_profile,
+        source_bounds,
+    ):
+        return model
+    split_planes = _body_profile_source_split_planes(
+        normalized_profile,
+        source_bounds,
+    )
+    if split_planes:
+        split_scene_at_z_up_axis_planes(
+            conformed_scene,
+            axis=0,
+            plane_coordinates=split_planes,
+        )
+    _cage_scene_to_body_profile(
+        conformed_scene,
+        normalized_profile,
+        source_bounds,
+    )
+
+    try:
+        exported = (
+            model.glb_bytes
+            if model.preview_only
+            else conformed_scene.export(file_type="glb")
+        )
+        preview_mesh = conformed_scene.to_geometry()
+    except Exception as error:
+        raise ValueError(
+            "The conformed door body could not be serialized."
+        ) from error
+    if not isinstance(exported, bytes) or not exported:
+        raise ValueError("The conformed door body could not be serialized.")
+    if not isinstance(preview_mesh, trimesh.Trimesh) or preview_mesh.is_empty:
+        raise ValueError("The conformed door body contains no mesh geometry.")
+    preview_mesh = preview_mesh.copy()
+    preview_mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
+    preview_mesh.metadata = copy.deepcopy(
+        dict(getattr(model.mesh, "metadata", {}) or {})
+    )
+    return replace(
+        model,
+        mesh=preview_mesh,
+        scene=conformed_scene,
+        glb_bytes=bytes(exported),
+    )
+
+
+def _normalize_closed_body_profile(
+    profile_outline: Sequence[Sequence[float]],
+) -> tuple[tuple[float, float], ...]:
+    """Validate the canonical bottom-and-upper-chain profile convention."""
+
+    if isinstance(profile_outline, str | bytes | bytearray):
+        raise TypeError("Door body profiles must be point sequences.")
+    try:
+        raw_points = tuple(profile_outline)
+    except TypeError as error:
+        raise TypeError("Door body profiles must be point sequences.") from error
+    points: list[tuple[float, float]] = []
+    for raw_point in raw_points:
+        if isinstance(raw_point, str | bytes | bytearray):
+            raise TypeError("Door body profile points must contain X and Z.")
+        try:
+            coordinates = tuple(raw_point)
+        except TypeError as error:
+            raise TypeError(
+                "Door body profile points must contain X and Z."
+            ) from error
+        if len(coordinates) != 2 or any(
+            isinstance(value, bool) for value in coordinates
+        ):
+            raise TypeError("Door body profile points must contain X and Z.")
+        try:
+            point = (float(coordinates[0]), float(coordinates[1]))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                "Door body profile coordinates must be finite numbers."
+            ) from error
+        if not all(math.isfinite(value) for value in point):
+            raise ValueError(
+                "Door body profile coordinates must be finite numbers."
+            )
+        points.append(point)
+
+    if len(points) < 4:
+        raise ValueError("Door body profiles require a closed polygon.")
+    coordinates = np.asarray(points, dtype=float)
+    spans = np.ptp(coordinates, axis=0)
+    tolerance = max(1e-9, float(np.max(spans)) * 1e-7)
+    if not np.allclose(
+        coordinates[0],
+        coordinates[-1],
+        rtol=0.0,
+        atol=tolerance,
+    ):
+        raise ValueError("Door body profiles must be closed.")
+    unique_points = coordinates[:-1]
+    if len(unique_points) < 3 or np.any(spans <= tolerance):
+        raise ValueError("Door body profiles require measurable X and Z spans.")
+    if any(
+        np.linalg.norm(unique_points[index] - unique_points[index - 1])
+        <= tolerance
+        for index in range(1, len(unique_points))
+    ):
+        raise ValueError("Door body profiles cannot contain zero-length edges.")
+
+    minimum_x, minimum_z = np.min(unique_points, axis=0)
+    maximum_x, _maximum_z = np.max(unique_points, axis=0)
+    if not np.allclose(
+        coordinates[0],
+        (minimum_x, minimum_z),
+        rtol=0.0,
+        atol=tolerance,
+    ) or not np.allclose(
+        coordinates[1],
+        (maximum_x, minimum_z),
+        rtol=0.0,
+        atol=tolerance,
+    ):
+        raise ValueError(
+            "Door body profiles must start with their lower-left and "
+            "lower-right points."
+        )
+    upper_chain = coordinates[2:-1]
+    if len(upper_chain) < 2 or (
+        not np.isclose(upper_chain[0, 0], maximum_x, atol=tolerance)
+        or not np.isclose(upper_chain[-1, 0], minimum_x, atol=tolerance)
+        or np.any(np.diff(upper_chain[:, 0]) > tolerance)
+        or np.any(upper_chain[:, 1] <= minimum_z + tolerance)
+    ):
+        raise ValueError(
+            "Door body profiles require one right-to-left upper boundary."
+        )
+    return tuple(points)
+
+
+def _collect_body_profile_geometry(
+    scene: trimesh.Scene,
+) -> list[tuple[trimesh.Trimesh, np.ndarray, np.ndarray, np.ndarray]]:
+    """Collect editable meshes and their finite Z-up scene transforms."""
+
+    records: list[
+        tuple[trimesh.Trimesh, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
+    referenced_geometry_names: set[object] = set()
+    for node_name in sorted(scene.graph.nodes_geometry, key=str):
+        node_transform, geometry_name = scene.graph.get(node_name)
+        if geometry_name in referenced_geometry_names:
+            raise ValueError(
+                "Door profile conformance does not support geometry shared "
+                "by multiple scene nodes."
+            )
+        referenced_geometry_names.add(geometry_name)
+        geometry = scene.geometry.get(geometry_name)
+        if not isinstance(geometry, trimesh.Trimesh):
+            continue
+        local_vertices = np.asarray(geometry.vertices, dtype=float)
+        faces = np.asarray(geometry.faces, dtype=np.int64)
+        if (
+            local_vertices.ndim != 2
+            or local_vertices.shape[1:] != (3,)
+            or not len(local_vertices)
+            or not np.all(np.isfinite(local_vertices))
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or not len(faces)
+            or np.any(faces < 0)
+            or np.any(faces >= len(local_vertices))
+        ):
+            raise ValueError("The door body contains invalid profile geometry.")
+        z_up_transform = (
+            GLTF_Y_UP_TO_Z_UP_TRANSFORM
+            @ np.asarray(node_transform, dtype=float)
+        )
+        if z_up_transform.shape != (4, 4) or not np.all(
+            np.isfinite(z_up_transform)
+        ):
+            raise ValueError("The door body contains an invalid node transform.")
+        try:
+            inverse_transform = np.linalg.inv(z_up_transform)
+        except np.linalg.LinAlgError as error:
+            raise ValueError(
+                "The door body contains a non-invertible node transform."
+            ) from error
+        world_vertices = trimesh.transform_points(
+            local_vertices,
+            z_up_transform,
+        )
+        records.append((geometry, world_vertices, inverse_transform, faces))
+    if not records:
+        raise ValueError("Door profile conformance found no mesh geometry.")
+    return records
+
+
+def _body_profile_effective_bounds(
+    scene: trimesh.Scene,
+    body_mirror: DoorBodyMirrorConfiguration | None,
+) -> np.ndarray:
+    """Return source bounds including a retained vertical half's reflection."""
+
+    records = _collect_body_profile_geometry(scene)
+    vertices = np.concatenate(
+        tuple(record[1] for record in records),
+        axis=0,
+    )
+    minimum = np.min(vertices, axis=0)
+    maximum = np.max(vertices, axis=0)
+    if (
+        body_mirror is not None
+        and body_mirror.symmetric_orientation == "vertical"
+    ):
+        mirror_plane = body_mirror.symmetric_plane_coordinate
+        assert mirror_plane is not None
+        reflected_minimum = 2.0 * mirror_plane - maximum[0]
+        reflected_maximum = 2.0 * mirror_plane - minimum[0]
+        minimum[0] = min(minimum[0], reflected_minimum)
+        maximum[0] = max(maximum[0], reflected_maximum)
+    bounds = np.stack((minimum, maximum))
+    extents = bounds[1] - bounds[0]
+    if np.any(~np.isfinite(bounds)) or np.any(
+        extents <= DOOR_GEOMETRY_EPSILON
+    ):
+        raise ValueError("The door body has no measurable profile bounds.")
+    return bounds
+
+
+def _body_profile_source_split_planes(
+    profile_outline: tuple[tuple[float, float], ...],
+    source_bounds: np.ndarray,
+) -> tuple[float, ...]:
+    """Map interior target-profile breakpoints into source X coordinates."""
+
+    target_points = np.asarray(profile_outline[:-1], dtype=float)
+    target_minimum_x = float(np.min(target_points[:, 0]))
+    target_maximum_x = float(np.max(target_points[:, 0]))
+    target_width = target_maximum_x - target_minimum_x
+    source_minimum_x = float(source_bounds[0, 0])
+    source_maximum_x = float(source_bounds[1, 0])
+    source_width = source_maximum_x - source_minimum_x
+    tolerance = max(1e-9, source_width * 1e-7)
+    planes: list[float] = []
+    for target_x, _target_z in profile_outline[2:-1]:
+        source_x = source_minimum_x + (
+            (float(target_x) - target_minimum_x)
+            / target_width
+            * source_width
+        )
+        if (
+            source_minimum_x + tolerance < source_x
+            and source_x < source_maximum_x - tolerance
+            and not any(
+                math.isclose(source_x, known, abs_tol=tolerance)
+                for known in planes
+            )
+        ):
+            planes.append(source_x)
+    return tuple(sorted(planes))
+
+
+def _body_profile_upper_heights(
+    x_coordinates: np.ndarray,
+    profile_outline: tuple[tuple[float, float], ...],
+) -> np.ndarray:
+    """Interpolate the profile's single-valued upper boundary."""
+
+    ascending_chain = np.asarray(profile_outline[2:-1], dtype=float)[::-1]
+    return np.interp(
+        np.asarray(x_coordinates, dtype=float),
+        ascending_chain[:, 0],
+        ascending_chain[:, 1],
+    )
+
+
+def _body_profile_has_curved_upper_boundary(
+    profile_outline: Sequence[Sequence[float]],
+) -> bool:
+    """Return whether a trusted default profile needs silhouette caging."""
+
+    normalized_profile = _normalize_closed_body_profile(profile_outline)
+    upper_heights = np.asarray(normalized_profile[2:-1], dtype=float)[:, 1]
+    tolerance = max(1e-9, float(np.max(np.abs(upper_heights))) * 1e-7)
+    return not np.allclose(
+        upper_heights,
+        upper_heights[0],
+        rtol=0.0,
+        atol=tolerance,
+    )
+
+
+def _scene_matches_body_profile(
+    scene: trimesh.Scene,
+    profile_outline: tuple[tuple[float, float], ...],
+    source_bounds: np.ndarray,
+) -> bool:
+    """Return whether a source already has the requested normalized outline."""
+
+    records = _collect_body_profile_geometry(scene)
+    triangles = np.concatenate(
+        tuple(world_vertices[faces] for _, world_vertices, _, faces in records),
+        axis=0,
+    )
+    actual_vertices = np.concatenate(
+        tuple(world_vertices for _, world_vertices, _, _faces in records),
+        axis=0,
+    )
+    actual_minimum_x = float(np.min(actual_vertices[:, 0]))
+    actual_maximum_x = float(np.max(actual_vertices[:, 0]))
+    source_minimum_x = float(source_bounds[0, 0])
+    source_maximum_x = float(source_bounds[1, 0])
+    source_minimum_z = float(source_bounds[0, 2])
+    source_maximum_z = float(source_bounds[1, 2])
+    source_width = source_maximum_x - source_minimum_x
+    source_height = source_maximum_z - source_minimum_z
+    target_points = np.asarray(profile_outline[:-1], dtype=float)
+    target_minimum = np.min(target_points, axis=0)
+    target_maximum = np.max(target_points, axis=0)
+    target_width = float(target_maximum[0] - target_minimum[0])
+    target_height = float(target_maximum[1] - target_minimum[1])
+    mapped_breakpoints = tuple(
+        source_minimum_x
+        + (float(target_x) - target_minimum[0])
+        / target_width
+        * source_width
+        for target_x, _target_z in profile_outline[2:-1]
+    )
+    sample_x = np.unique(
+        np.concatenate(
+            (
+                np.linspace(actual_minimum_x, actual_maximum_x, 65),
+                np.asarray(
+                    tuple(
+                        coordinate
+                        for coordinate in mapped_breakpoints
+                        if actual_minimum_x <= coordinate <= actual_maximum_x
+                    ),
+                    dtype=float,
+                ),
+            )
+        )
+    )
+    tolerance = max(1e-8, float(np.max(source_bounds[1] - source_bounds[0])) * 1e-6)
+    try:
+        lower_source_z, upper_source_z = _project_body_profile_envelopes(
+            sample_x,
+            triangles,
+            coordinate_axis=0,
+            envelope_axis=2,
+            tolerance=tolerance,
+        )
+    except ValueError:
+        return False
+    target_x = target_minimum[0] + (
+        (sample_x - source_minimum_x) / source_width * target_width
+    )
+    target_upper_z = _body_profile_upper_heights(target_x, profile_outline)
+    expected_upper_z = source_minimum_z + (
+        (target_upper_z - target_minimum[1])
+        / target_height
+        * source_height
+    )
+    return bool(
+        np.allclose(
+            lower_source_z,
+            source_minimum_z,
+            rtol=0.0,
+            atol=tolerance,
+        )
+        and np.allclose(
+            upper_source_z,
+            expected_upper_z,
+            rtol=0.0,
+            atol=tolerance,
+        )
+    )
+
+
+def _project_body_profile_envelopes(
+    coordinates: np.ndarray,
+    triangles: np.ndarray,
+    *,
+    coordinate_axis: int,
+    envelope_axis: int,
+    tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return projected mesh limits where triangles cross each coordinate."""
+
+    queries = np.asarray(coordinates, dtype=float)
+    source_triangles = np.asarray(triangles, dtype=float)
+    edge_starts = source_triangles[:, (0, 1, 2), :].reshape((-1, 3))
+    edge_ends = source_triangles[:, (1, 2, 0), :].reshape((-1, 3))
+    start_coordinates = edge_starts[:, coordinate_axis]
+    end_coordinates = edge_ends[:, coordinate_axis]
+    coordinate_deltas = end_coordinates - start_coordinates
+    minimum_coordinates = np.minimum(start_coordinates, end_coordinates)
+    maximum_coordinates = np.maximum(start_coordinates, end_coordinates)
+    nonparallel = np.abs(coordinate_deltas) > tolerance
+    unique_queries, inverse_indices = np.unique(queries, return_inverse=True)
+    lower_limits = np.empty_like(unique_queries)
+    upper_limits = np.empty_like(unique_queries)
+
+    for query_index, query_coordinate in enumerate(unique_queries):
+        crossing = (
+            nonparallel
+            & (query_coordinate >= minimum_coordinates - tolerance)
+            & (query_coordinate <= maximum_coordinates + tolerance)
+        )
+        crossing_factors = np.clip(
+            (query_coordinate - start_coordinates[crossing])
+            / coordinate_deltas[crossing],
+            0.0,
+            1.0,
+        )
+        crossing_values = edge_starts[crossing, envelope_axis] + (
+            crossing_factors
+            * (
+                edge_ends[crossing, envelope_axis]
+                - edge_starts[crossing, envelope_axis]
+            )
+        )
+        parallel = (
+            ~nonparallel
+            & (np.abs(query_coordinate - start_coordinates) <= tolerance)
+        )
+        intersections = np.concatenate(
+            (
+                crossing_values,
+                edge_starts[parallel, envelope_axis],
+                edge_ends[parallel, envelope_axis],
+            )
+        )
+        if not len(intersections) or not np.all(np.isfinite(intersections)):
+            raise ValueError(
+                "The door body has an incomplete projected silhouette."
+            )
+        lower_limits[query_index] = float(np.min(intersections))
+        upper_limits[query_index] = float(np.max(intersections))
+    return lower_limits[inverse_indices], upper_limits[inverse_indices]
+
+
+def _cage_scene_to_body_profile(
+    scene: trimesh.Scene,
+    profile_outline: tuple[tuple[float, float], ...],
+    source_bounds: np.ndarray,
+) -> None:
+    """Warp only Z positions while retaining the source body's XYZ bounds."""
+
+    records = _collect_body_profile_geometry(scene)
+    triangles = np.concatenate(
+        tuple(world_vertices[faces] for _, world_vertices, _, faces in records),
+        axis=0,
+    )
+    source_minimum_x = float(source_bounds[0, 0])
+    source_maximum_x = float(source_bounds[1, 0])
+    source_minimum_z = float(source_bounds[0, 2])
+    source_maximum_z = float(source_bounds[1, 2])
+    source_width = source_maximum_x - source_minimum_x
+    source_height = source_maximum_z - source_minimum_z
+    target_points = np.asarray(profile_outline[:-1], dtype=float)
+    target_minimum = np.min(target_points, axis=0)
+    target_maximum = np.max(target_points, axis=0)
+    target_width = float(target_maximum[0] - target_minimum[0])
+    target_height = float(target_maximum[1] - target_minimum[1])
+    tolerance = max(1e-9, float(np.max(source_bounds[1] - source_bounds[0])) * 1e-7)
+    output_vertices: list[np.ndarray] = []
+
+    for geometry, world_vertices, inverse_transform, _faces in records:
+        safe_source_x = np.clip(
+            world_vertices[:, 0],
+            source_minimum_x,
+            source_maximum_x,
+        )
+        lower_source_z, upper_source_z = _project_body_profile_envelopes(
+            safe_source_x,
+            triangles,
+            coordinate_axis=0,
+            envelope_axis=2,
+            tolerance=tolerance,
+        )
+        source_spans = upper_source_z - lower_source_z
+        if np.any(~np.isfinite(source_spans)) or np.any(
+            source_spans <= tolerance
+        ):
+            raise ValueError(
+                "The door body has no measurable vertical silhouette."
+            )
+        normalized_heights = np.clip(
+            (world_vertices[:, 2] - lower_source_z) / source_spans,
+            0.0,
+            1.0,
+        )
+        target_x = target_minimum[0] + (
+            (safe_source_x - source_minimum_x)
+            / source_width
+            * target_width
+        )
+        target_upper_z = _body_profile_upper_heights(
+            target_x,
+            profile_outline,
+        )
+        normalized_target_upper = (
+            target_upper_z - target_minimum[1]
+        ) / target_height
+        source_target_upper = (
+            source_minimum_z + normalized_target_upper * source_height
+        )
+        world_vertices[:, 2] = source_minimum_z + (
+            normalized_heights * (source_target_upper - source_minimum_z)
+        )
+        local_vertices = trimesh.transform_points(
+            world_vertices,
+            inverse_transform,
+        )
+        if not np.all(np.isfinite(local_vertices)):
+            raise ValueError("The conformed door profile is invalid.")
+        geometry.vertices = local_vertices
+        output_vertices.append(world_vertices)
+
+    combined_vertices = np.concatenate(output_vertices, axis=0)
+    if (
+        np.min(combined_vertices[:, 2]) < source_minimum_z - tolerance
+        or np.max(combined_vertices[:, 2]) > source_maximum_z + tolerance
+    ):
+        raise ValueError("The door body could not be constrained to its profile.")
+
+
 # ### Door assembly ###
 def assemble_door_model(
     door: DoorDefinition,
@@ -266,6 +830,11 @@ def assemble_door_model(
     include_unjoined: bool = False,
     body_mirror: DoorBodyMirrorConfiguration | None = None,
     body_mirrors: Mapping[str, DoorBodyMirrorConfiguration] | None = None,
+    body_profile_overrides: Mapping[
+        str,
+        Sequence[Sequence[float]],
+    ]
+    | None = None,
 ) -> GeneratedModel:
     """Join a door's confirmed slots while retaining each slot material.
 
@@ -291,6 +860,17 @@ def assemble_door_model(
         for slot_id, configuration in normalized_body_mirrors.items()
     ):
         raise TypeError("Door body mirror configurations are invalid.")
+    if body_profile_overrides is not None and not isinstance(
+        body_profile_overrides,
+        Mapping,
+    ):
+        raise TypeError("Door body profile overrides must be a mapping.")
+    normalized_profile_overrides = dict(body_profile_overrides or {})
+    if any(
+        not isinstance(profile_key, str) or not profile_key.strip()
+        for profile_key in normalized_profile_overrides
+    ):
+        raise TypeError("Door body profile override keys must be strings.")
     models = (
         build_default_door_slot_models(door)
         if slot_models is None
@@ -310,12 +890,32 @@ def assemble_door_model(
             if is_door_body_slot(slot.slot_id):
                 raise ValueError("The door body has no generated source model.")
             continue
+        source_body_mirror = normalized_body_mirrors.get(slot.slot_id)
+        if is_door_body_slot(slot.slot_id):
+            has_profile_override = slot.slot_id in normalized_profile_overrides
+            if has_profile_override:
+                requested_profile = normalized_profile_overrides[slot.slot_id]
+            elif slot.source_object_id in normalized_profile_overrides:
+                has_profile_override = True
+                requested_profile = normalized_profile_overrides[
+                    slot.source_object_id
+                ]
+            else:
+                requested_profile = build_door_body_source_outline(door, slot)
+            if has_profile_override or _body_profile_has_curved_upper_boundary(
+                requested_profile
+            ):
+                component_model = conform_door_body_model_to_profile(
+                    component_model,
+                    requested_profile,
+                    body_mirror=source_body_mirror,
+                )
         slot_side = door_slot_side(slot.slot_id)
         depth_mirrored = slot_side != DOOR_SIDE_DUPLICATION_FRONT
         if depth_mirrored:
             component_model = mirror_door_model_depthwise(component_model)
         slot_body_mirror = _transform_body_mirror_configuration(
-            normalized_body_mirrors.get(slot.slot_id),
+            source_body_mirror,
             horizontal_mirror=slot.mirrored_horizontally,
             depth_mirror=depth_mirrored,
         )
@@ -1000,13 +1600,21 @@ def _mirror_door_model_across_axis(
 
     preview_mesh = copy.deepcopy(model.mesh)
     _reflect_mesh_axis(preview_mesh, axis)
-    scene = copy.deepcopy(model.scene)
-    scene.apply_transform(
+    scene = _build_reflected_door_scene(
+        model.scene,
         Z_UP_TO_GLTF_Y_UP_TRANSFORM
         @ reflection
-        @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+        @ GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     )
-    glb_bytes = scene.export(file_type="glb") if scene.geometry else b""
+    glb_bytes = (
+        model.glb_bytes
+        if model.preview_only
+        else scene.export(file_type="glb") if scene.geometry else b""
+    )
+    # trimesh caches ``SceneGraph.nodes`` as a ``dict_keys`` view during GLB
+    # export.  Clear that derived value so later immutable-model copies remain
+    # deepcopy-safe when a back-side body is assembled.
+    scene.graph._cache.clear()
 
     preview_untextured_mesh = None
     if model.preview_untextured_mesh is not None:
@@ -1034,7 +1642,33 @@ def _mirror_door_model_across_axis(
             model.preview_architectural_trim_parts
         ),
         preview_base_mesh=preview_base_mesh,
+        preview_only=model.preview_only,
     )
+
+
+def _build_reflected_door_scene(
+    source_scene: trimesh.Scene,
+    reflection: np.ndarray,
+) -> trimesh.Scene:
+    """Copy and reflect one scene without serializing its preview assets."""
+
+    if not isinstance(source_scene, trimesh.Scene):
+        raise TypeError("Door models must contain a trimesh scene.")
+    normalized_reflection = np.asarray(reflection, dtype=float)
+    if normalized_reflection.shape != (4, 4) or not np.all(
+        np.isfinite(normalized_reflection)
+    ):
+        raise ValueError("Door reflection transforms must be finite 4x4 matrices.")
+
+    # trimesh may cache ``SceneGraph.nodes`` as a non-pickleable ``dict_keys``
+    # view after export or traversal. It is derived state, so dropping it before
+    # the copy preserves the authored hierarchy while keeping deepcopy safe.
+    source_scene._cache.clear()
+    source_scene.graph._cache.clear()
+    reflected_scene = copy.deepcopy(source_scene)
+    reflected_scene.apply_transform(normalized_reflection)
+    reflected_scene.graph._cache.clear()
+    return reflected_scene
 
 
 def _reflect_symmetric_previews(

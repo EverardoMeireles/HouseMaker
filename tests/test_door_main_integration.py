@@ -8,12 +8,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import copy
+import math
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import numpy as np
 import trimesh
@@ -41,12 +43,14 @@ from housemaker.door_state import (
     DOOR_SLOT_LEFT_KNOB,
     DoorSideDuplication,
     DoorSideDuplicationMetadata,
+    GlassAreaData,
 )
 from housemaker.doors_workspace import ASSET_KIND_DOOR, ASSET_KIND_WINDOW
 from housemaker.doorway_geometry import build_double_door_leaf_source_outline
 from housemaker.generation_workspace import (
     DOOR_SIDE_DUPLICATION_PIPELINE_KEY,
 )
+from housemaker.glass_material import is_housemaker_glass_material
 from housemaker.glb import (
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     build_gltf_mirror_plane_from_z_up_transform,
@@ -65,6 +69,7 @@ from housemaker.models import (
     LevelData,
     WindowData,
 )
+from housemaker.object_face_edit import ObjectFaceGeometry
 from housemaker.project_io import ProjectData
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
@@ -121,6 +126,23 @@ def _build_level_and_wall() -> tuple[LevelData, FixedSurface]:
             ],
         ),
         wall,
+    )
+
+
+def _arch_profile_height_at_x(
+    width_meters: float,
+    height_meters: float,
+    arch_amount: float,
+    x_coordinate: float,
+) -> float:
+    """Return the curved profile height used by an arched doorway."""
+
+    half_width = width_meters / 2.0
+    arch_rise = min(half_width, height_meters) * arch_amount
+    spring_height = height_meters - arch_rise
+    normalized_x = min(1.0, abs(x_coordinate) / half_width)
+    return spring_height + arch_rise * math.sqrt(
+        max(0.0, 1.0 - normalized_x * normalized_x)
     )
 
 
@@ -185,6 +207,19 @@ class DoorMainIntegrationTests(unittest.TestCase):
         self.workspace._handle_window_creation_requested(reference)
         return self.workspace.doors_workspace.windows()[0], reference
 
+    def _wait_for_generation_jobs(
+        self,
+        timeout_milliseconds: int = 15_000,
+    ) -> None:
+        """Process GUI events until every object mutation worker finishes."""
+
+        deadline = time.monotonic() + timeout_milliseconds / 1000.0
+        while self.workspace.generation._object_job_runtimes:
+            if time.monotonic() >= deadline:
+                self.fail("The opening-component edit did not finish in time.")
+            _qt_application.processEvents()
+            time.sleep(0.01)
+
     def _register_generated_component(self, door, slot_id):
         """Supply and join one hardware model that has no default mesh."""
 
@@ -238,6 +273,79 @@ class DoorMainIntegrationTests(unittest.TestCase):
         """Supply the knob model used by the existing transform tests."""
 
         return self._register_generated_component(door, DOOR_SLOT_KNOB)
+
+    def _register_asymmetric_handle(self, asset, *, asset_kind):
+        """Join a handle whose overhang makes the assembly bounds asymmetric."""
+
+        slot = asset.get_slot(DOOR_SLOT_KNOB)
+        assert slot is not None
+        model = build_door_body_model(
+            0.08,
+            0.12,
+            0.04,
+            shape="rectangular",
+            arch_amount=0.0,
+            geometry_name=f"asymmetric_{asset_kind}_placement_handle",
+        )
+        self.workspace.generation.register_door_component_model(
+            object_id=slot.source_object_id,
+            object_name=f"{asset.name} - Handle",
+            door_id=(
+                asset.door_id
+                if asset_kind == ASSET_KIND_DOOR
+                else asset.window_id
+            ),
+            slot_id=slot.slot_id,
+            model=model,
+            asset_kind=asset_kind,
+        )
+        updated_slot = slot.with_transform(
+            position_meters=(
+                asset.width_meters * 1.5,
+                asset.thickness_meters + 0.5,
+                asset.height_meters * 0.5,
+            ),
+            joined=True,
+        )
+        updated = asset.replace_slot(updated_slot)
+        if asset_kind == ASSET_KIND_DOOR:
+            self.workspace.doors_workspace.upsert_door(updated)
+        else:
+            self.workspace.doors_workspace.upsert_window(updated)
+        return updated
+
+    @staticmethod
+    def _combine_door_preview_parts(parts):
+        """Combine each preview component into one assertion-friendly mesh."""
+
+        return {
+            part.component_kind: trimesh.util.concatenate(part.meshes)
+            for part in parts
+        }
+
+    def _assert_preview_body_bottom_center(
+        self,
+        parts,
+        transform,
+        expected_center,
+    ) -> None:
+        """Assert that one colored body stays centered on its opening anchor."""
+
+        body_part = next(
+            part for part in parts if part.component_kind == DOOR_SLOT_BODY
+        )
+        body = trimesh.util.concatenate(body_part.meshes)
+        body.apply_transform(transform)
+        minimum, maximum = np.asarray(body.bounds, dtype=float)
+        bottom_center = np.asarray(
+            (
+                (minimum[0] + maximum[0]) * 0.5,
+                (minimum[1] + maximum[1]) * 0.5,
+                minimum[2],
+            ),
+            dtype=float,
+        )
+        np.testing.assert_allclose(bottom_center, expected_center, atol=1e-8)
 
     def test_plus_creation_builds_hidden_slot_records_and_selects_body(self) -> None:
         door = self._create_door()
@@ -371,6 +479,320 @@ class DoorMainIntegrationTests(unittest.TestCase):
             self.workspace.doors_workspace.selected_window_id(),
             window.window_id,
         )
+
+    def test_scene_delete_removes_installed_door_before_its_doorway(self) -> None:
+        door = self._create_door()
+        reference = self._doorway_reference()
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            reference,
+            False,
+        )
+
+        self.assertTrue(self.workspace.viewer.select_canvas_opening(reference))
+        self.workspace.viewer._handle_view_delete_requested()
+
+        library = self.workspace.doors_workspace.data()
+        self.assertEqual(library.placements, [])
+        self.assertEqual(library.get_door(door.door_id), door)
+        self.assertEqual(len(self.level.doorways), 1)
+
+    def test_scene_delete_detaches_window_without_deleting_reusable_asset(
+        self,
+    ) -> None:
+        """Delete on a selected frame removes only its installed window."""
+
+        window, reference = self._create_window()
+        body = window.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        self.workspace._handle_window_fixture_placement_requested(
+            window.window_id,
+            reference,
+            False,
+        )
+        self.assertEqual(
+            len(self.workspace.doors_workspace.data().window_placements),
+            1,
+        )
+        self.assertIsNotNone(
+            self.workspace.generation.get_generated_object_model(
+                body.source_object_id
+            )
+        )
+
+        self.assertTrue(self.workspace.viewer.select_canvas_opening(reference))
+        self.workspace.viewer._handle_view_delete_requested()
+
+        detached = self.workspace.doors_workspace.data()
+        self.assertEqual(detached.window_placements, [])
+        self.assertEqual(detached.get_window(window.window_id), window)
+        self.assertEqual(self.level.windows[0].window_id, reference.stable_id)
+        self.assertIsNotNone(
+            self.workspace.generation.get_generated_object_model(
+                body.source_object_id
+            )
+        )
+
+        self.workspace._handle_window_fixture_placement_requested(
+            window.window_id,
+            reference,
+            False,
+        )
+        self.assertEqual(
+            len(self.workspace.doors_workspace.data().window_placements),
+            1,
+        )
+
+    def test_horizontal_mesh_flip_toggles_door_slot_and_is_undoable(self) -> None:
+        """Flip one door component through the asset-aware main handler."""
+
+        door = self._create_door()
+        original_slot = door.get_slot(DOOR_SLOT_BODY)
+        assert original_slot is not None
+
+        self.workspace._handle_opening_asset_slot_horizontal_flip_requested(
+            ASSET_KIND_DOOR,
+            door.door_id,
+            original_slot.slot_id,
+        )
+
+        flipped_door = self.workspace.doors_workspace.data().get_door(
+            door.door_id
+        )
+        assert flipped_door is not None
+        flipped_slot = flipped_door.get_slot(original_slot.slot_id)
+        assert flipped_slot is not None
+        self.assertEqual(
+            flipped_slot.mirrored_horizontally,
+            not original_slot.mirrored_horizontally,
+        )
+
+        self.workspace._handle_doors_undo_requested()
+
+        restored = self.workspace.doors_workspace.data().get_door(door.door_id)
+        assert restored is not None
+        self.assertEqual(restored.get_slot(original_slot.slot_id), original_slot)
+
+    def test_horizontal_mesh_flip_toggles_window_slot_and_is_undoable(
+        self,
+    ) -> None:
+        """Flip one window component through the shared opening handler."""
+
+        window, _reference = self._create_window()
+        original_slot = window.get_slot(DOOR_SLOT_KNOB)
+        assert original_slot is not None
+
+        self.workspace._handle_opening_asset_slot_horizontal_flip_requested(
+            ASSET_KIND_WINDOW,
+            window.window_id,
+            original_slot.slot_id,
+        )
+
+        flipped_window = self.workspace.doors_workspace.data().get_window(
+            window.window_id
+        )
+        assert flipped_window is not None
+        flipped_slot = flipped_window.get_slot(original_slot.slot_id)
+        assert flipped_slot is not None
+        self.assertEqual(
+            flipped_slot.mirrored_horizontally,
+            not original_slot.mirrored_horizontally,
+        )
+
+        self.workspace._handle_doors_undo_requested()
+
+        restored = self.workspace.doors_workspace.data().get_window(
+            window.window_id
+        )
+        assert restored is not None
+        self.assertEqual(restored.get_slot(original_slot.slot_id), original_slot)
+
+    def test_proportional_horizontal_flip_toggles_both_door_leaves_and_undoes(
+        self,
+    ) -> None:
+        """Flip paired double-door meshes as one undoable edit."""
+
+        door = self._create_door()
+        self.workspace._handle_door_make_double_changed(door.door_id, True)
+        self.assertTrue(
+            self.workspace.doors_workspace.select_door_slot(
+                door.door_id,
+                DOOR_SLOT_BODY,
+            )
+        )
+        self.assertTrue(
+            self.workspace.doors_workspace.is_proportional_editing_enabled()
+        )
+        original = self.workspace.doors_workspace.data().get_door(door.door_id)
+        assert original is not None
+        original_right = original.get_slot(DOOR_SLOT_BODY)
+        original_left = original.get_slot(DOOR_SLOT_LEFT_BODY)
+        assert original_right is not None and original_left is not None
+
+        self.workspace._handle_opening_asset_slot_horizontal_flip_requested(
+            ASSET_KIND_DOOR,
+            door.door_id,
+            original_right.slot_id,
+        )
+
+        flipped = self.workspace.doors_workspace.data().get_door(door.door_id)
+        assert flipped is not None
+        flipped_right = flipped.get_slot(DOOR_SLOT_BODY)
+        flipped_left = flipped.get_slot(DOOR_SLOT_LEFT_BODY)
+        assert flipped_right is not None and flipped_left is not None
+        self.assertEqual(
+            flipped_right.mirrored_horizontally,
+            not original_right.mirrored_horizontally,
+        )
+        self.assertEqual(
+            flipped_left.mirrored_horizontally,
+            not original_left.mirrored_horizontally,
+        )
+
+        self.workspace._handle_doors_undo_requested()
+
+        restored = self.workspace.doors_workspace.data().get_door(door.door_id)
+        self.assertEqual(restored, original)
+
+    def test_proportional_horizontal_flip_toggles_both_window_leaves_and_undoes(
+        self,
+    ) -> None:
+        """Flip paired double-window meshes as one undoable edit."""
+
+        window, _reference = self._create_window()
+        self.workspace._handle_window_make_double_changed(
+            window.window_id,
+            True,
+        )
+        self.assertTrue(
+            self.workspace.doors_workspace.select_window_slot(
+                window.window_id,
+                DOOR_SLOT_KNOB,
+            )
+        )
+        self.assertTrue(
+            self.workspace.doors_workspace.is_proportional_editing_enabled()
+        )
+        original = self.workspace.doors_workspace.data().get_window(
+            window.window_id
+        )
+        assert original is not None
+        original_right = original.get_slot(DOOR_SLOT_KNOB)
+        original_left = original.get_slot(DOOR_SLOT_LEFT_KNOB)
+        assert original_right is not None and original_left is not None
+
+        self.workspace._handle_opening_asset_slot_horizontal_flip_requested(
+            ASSET_KIND_WINDOW,
+            window.window_id,
+            original_right.slot_id,
+        )
+
+        flipped = self.workspace.doors_workspace.data().get_window(
+            window.window_id
+        )
+        assert flipped is not None
+        flipped_right = flipped.get_slot(DOOR_SLOT_KNOB)
+        flipped_left = flipped.get_slot(DOOR_SLOT_LEFT_KNOB)
+        assert flipped_right is not None and flipped_left is not None
+        self.assertEqual(
+            flipped_right.mirrored_horizontally,
+            not original_right.mirrored_horizontally,
+        )
+        self.assertEqual(
+            flipped_left.mirrored_horizontally,
+            not original_left.mirrored_horizontally,
+        )
+
+        self.workspace._handle_doors_undo_requested()
+
+        restored = self.workspace.doors_workspace.data().get_window(
+            window.window_id
+        )
+        self.assertEqual(restored, original)
+
+    def test_horizontal_flip_leaves_counterpart_when_proportional_is_off(
+        self,
+    ) -> None:
+        """Flip only the selected double-door leaf when pairing is disabled."""
+
+        door = self._create_door()
+        self.workspace._handle_door_make_double_changed(door.door_id, True)
+        self.workspace.doors_workspace.select_door_slot(
+            door.door_id,
+            DOOR_SLOT_BODY,
+        )
+        self.workspace.doors_workspace.proportional_editing_checkbox.setChecked(
+            False
+        )
+        original = self.workspace.doors_workspace.data().get_door(door.door_id)
+        assert original is not None
+        original_right = original.get_slot(DOOR_SLOT_BODY)
+        original_left = original.get_slot(DOOR_SLOT_LEFT_BODY)
+        assert original_right is not None and original_left is not None
+
+        self.workspace._handle_opening_asset_slot_horizontal_flip_requested(
+            ASSET_KIND_DOOR,
+            door.door_id,
+            original_right.slot_id,
+        )
+
+        flipped = self.workspace.doors_workspace.data().get_door(door.door_id)
+        assert flipped is not None
+        flipped_right = flipped.get_slot(DOOR_SLOT_BODY)
+        flipped_left = flipped.get_slot(DOOR_SLOT_LEFT_BODY)
+        assert flipped_right is not None and flipped_left is not None
+        self.assertEqual(
+            flipped_right.mirrored_horizontally,
+            not original_right.mirrored_horizontally,
+        )
+        self.assertEqual(flipped_left, original_left)
+
+        self.workspace._handle_doors_undo_requested()
+
+        restored = self.workspace.doors_workspace.data().get_door(door.door_id)
+        self.assertEqual(restored, original)
+
+    def test_canvas_delete_removes_installed_door_before_its_doorway(self) -> None:
+        door = self._create_door()
+        reference = self._doorway_reference()
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            reference,
+            False,
+        )
+        self.workspace._sync_canvas_to_current_level(preserve_view=True)
+        self.workspace.canvas._set_selected_doorway_index(reference.item_index)
+
+        self.assertTrue(
+            self.workspace.canvas._request_selected_opening_fixture_deletion()
+        )
+
+        library = self.workspace.doors_workspace.data()
+        self.assertEqual(library.placements, [])
+        self.assertEqual(library.get_door(door.door_id), door)
+        self.assertEqual(len(self.level.doorways), 1)
+
+    def test_canvas_delete_removes_installed_window_before_its_frame(self) -> None:
+        window, reference = self._create_window()
+        self.workspace._handle_window_fixture_placement_requested(
+            window.window_id,
+            reference,
+            False,
+        )
+        self.workspace._sync_canvas_to_current_level(preserve_view=True)
+        self.workspace.canvas._set_selected_window_id(
+            reference.stable_id,
+            notify=False,
+        )
+
+        self.assertTrue(
+            self.workspace.canvas._request_selected_opening_fixture_deletion()
+        )
+
+        library = self.workspace.doors_workspace.data()
+        self.assertEqual(library.window_placements, [])
+        self.assertEqual(library.get_window(window.window_id), window)
+        self.assertEqual(len(self.level.windows), 1)
 
     def test_delete_undo_preserves_assets_created_after_deletion(self) -> None:
         door = self._create_door()
@@ -1168,6 +1590,248 @@ class DoorMainIntegrationTests(unittest.TestCase):
             self.workspace.generation._door_slot_editing_target
         )
 
+    def test_door_and_window_face_actions_target_the_exact_component(
+        self,
+    ) -> None:
+        door = self._create_door()
+        window, _reference = self._create_window()
+        door_body = door.get_slot(DOOR_SLOT_BODY)
+        window_body = window.get_slot(DOOR_SLOT_BODY)
+        assert door_body is not None and window_body is not None
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "delete_object_faces",
+                return_value=True,
+            ) as delete_faces,
+            patch.object(
+                self.workspace.generation,
+                "convert_object_faces_to_glass",
+                return_value=True,
+            ) as convert_faces,
+            patch.object(
+                self.workspace.generation,
+                "create_object_face",
+                return_value=True,
+            ) as create_face,
+            patch("housemaker.main.QMessageBox.warning") as warning,
+        ):
+            self.assertTrue(
+                self.workspace.doors_workspace.select_door_slot(
+                    door.door_id,
+                    DOOR_SLOT_BODY,
+                )
+            )
+            self.workspace.doors_workspace.face_deletion_requested.emit(
+                ASSET_KIND_DOOR,
+                door.door_id,
+                door_body.source_object_id,
+                (1, 3),
+            )
+            self.workspace.doors_workspace.face_glass_conversion_requested.emit(
+                ASSET_KIND_DOOR,
+                door.door_id,
+                door_body.source_object_id,
+                (0, 2),
+            )
+            self.workspace.doors_workspace.face_creation_requested.emit(
+                ASSET_KIND_DOOR,
+                door.door_id,
+                door_body.source_object_id,
+                (0, 1, 2),
+            )
+
+            self.assertTrue(
+                self.workspace.doors_workspace.select_window_slot(
+                    window.window_id,
+                    DOOR_SLOT_BODY,
+                )
+            )
+            self.workspace.doors_workspace.face_deletion_requested.emit(
+                ASSET_KIND_WINDOW,
+                window.window_id,
+                window_body.source_object_id,
+                (4,),
+            )
+            self.workspace.doors_workspace.face_glass_conversion_requested.emit(
+                ASSET_KIND_WINDOW,
+                window.window_id,
+                window_body.source_object_id,
+                (5, 7),
+            )
+            self.workspace.doors_workspace.face_creation_requested.emit(
+                ASSET_KIND_WINDOW,
+                window.window_id,
+                window_body.source_object_id,
+                (3, 4, 5),
+            )
+            # A queued action from the previously selected door must not edit
+            # either source after the selected asset changes.
+            self.workspace.doors_workspace.face_deletion_requested.emit(
+                ASSET_KIND_DOOR,
+                door.door_id,
+                door_body.source_object_id,
+                (6,),
+            )
+            self.workspace.doors_workspace.face_glass_conversion_requested.emit(
+                ASSET_KIND_DOOR,
+                door.door_id,
+                door_body.source_object_id,
+                (8,),
+            )
+            self.workspace.doors_workspace.face_creation_requested.emit(
+                ASSET_KIND_DOOR,
+                door.door_id,
+                door_body.source_object_id,
+                (4, 5, 6),
+            )
+
+        warning.assert_not_called()
+
+        self.assertEqual(
+            delete_faces.call_args_list,
+            [
+                call(door_body.source_object_id, (1, 3)),
+                call(window_body.source_object_id, (4,)),
+            ],
+        )
+        self.assertEqual(
+            convert_faces.call_args_list,
+            [
+                call(door_body.source_object_id, (0, 2)),
+                call(window_body.source_object_id, (5, 7)),
+            ],
+        )
+        self.assertEqual(
+            create_face.call_args_list,
+            [
+                call(door_body.source_object_id, (0, 1, 2)),
+                call(window_body.source_object_id, (3, 4, 5)),
+            ],
+        )
+
+    def test_opening_face_glass_is_local_and_refreshes_selected_preview(
+        self,
+    ) -> None:
+        """The Doors action needs no Meshy key or video reference."""
+
+        door = self._create_door()
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        self.assertIn(":", body.source_object_id)
+        self.assertTrue(
+            self.workspace.doors_workspace.select_door_slot(
+                door.door_id,
+                body.slot_id,
+            )
+        )
+        viewer = self.workspace.doors_workspace.preview_viewer
+        initial_preview = viewer.model
+        self.assertIsNotNone(initial_preview)
+        assert initial_preview is not None
+        initial_body = next(
+            preview
+            for preview in initial_preview.preview_placed_objects
+            if preview.object_id == body.source_object_id
+        )
+        self.assertFalse(
+            any(
+                is_housemaker_glass_material(mesh.visual.material)
+                for mesh in initial_body.meshes
+            )
+        )
+        self.assertFalse(self.workspace.generation._settings.meshy_api_key)
+        self.assertFalse(
+            self.workspace.generation
+            ._has_current_object_generation_reference()
+        )
+        viewer.set_selected_face_indices((0,))
+        self.assertEqual(
+            self.workspace.doors_workspace.add_glass_area_button.text(),
+            "Convert faces to glass",
+        )
+
+        with patch("housemaker.main.QMessageBox.warning") as warning:
+            self.workspace.doors_workspace.add_glass_area_button.click()
+            self._wait_for_generation_jobs()
+
+        warning.assert_not_called()
+        self.assertIn(
+            "to glass",
+            self.workspace.generation.status_label.text().lower(),
+        )
+        updated_preview = viewer.model
+        self.assertIsNotNone(updated_preview)
+        assert updated_preview is not None
+        self.assertIsNot(updated_preview, initial_preview)
+        updated_body = next(
+            preview
+            for preview in updated_preview.preview_placed_objects
+            if preview.object_id == body.source_object_id
+        )
+        self.assertTrue(
+            any(
+                is_housemaker_glass_material(mesh.visual.material)
+                for mesh in updated_body.meshes
+            )
+        )
+        self.assertEqual(
+            self.workspace.doors_workspace.selected_slot_id(),
+            body.slot_id,
+        )
+        record = next(
+            candidate
+            for candidate in self.workspace.generation
+            .get_generated_object_records()
+            if candidate.object_id == body.source_object_id
+        )
+        self.assertFalse(
+            set(Path(record.asset_path).name).intersection('<>:"/\\|?*')
+        )
+
+    def test_mismatched_slot_topology_disables_preview_face_editing(
+        self,
+    ) -> None:
+        door = self._create_door()
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        mismatched_geometry = ObjectFaceGeometry(
+            vertices=np.asarray(
+                (
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+                dtype=float,
+            ),
+            faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+            uv_triangles=np.empty((0, 3, 2), dtype=float),
+            uv_face_indices=np.empty((0,), dtype=np.int64),
+        )
+        viewer = self.workspace.doors_workspace.preview_viewer
+        viewer.set_face_editing_enabled(True)
+        viewer.set_face_edit_geometry(
+            mismatched_geometry.vertices,
+            mismatched_geometry.faces,
+        )
+
+        with patch.object(
+            self.workspace.generation,
+            "get_object_face_geometry",
+            return_value=mismatched_geometry,
+        ) as get_geometry:
+            self.workspace._sync_selected_opening_asset_preview()
+
+        get_geometry.assert_called_once_with(body.source_object_id)
+        self.assertFalse(viewer._face_editing_enabled)
+        self.assertEqual(viewer.face_edit_face_count, 0)
+        self.assertEqual(viewer.get_selected_face_indices(), ())
+        self.assertEqual(
+            self.workspace.doors_workspace.add_glass_area_button.text(),
+            "Add glass area",
+        )
+
     def test_successful_part_generation_returns_from_detached_generation(
         self,
     ) -> None:
@@ -1427,8 +2091,10 @@ class DoorMainIntegrationTests(unittest.TestCase):
         )
         self.workspace._set_canvas_viewer_targets((self.wall,))
         door = self._create_door()
-        self.workspace.generation.preserve_door_profile_checkbox.click()
-        _qt_application.processEvents()
+        self.assertTrue(door.preserve_profile)
+        self.assertTrue(
+            self.workspace.generation.preserve_door_profile_checkbox.isChecked()
+        )
         self.workspace._handle_opening_asset_make_double_changed(
             ASSET_KIND_DOOR,
             door.door_id,
@@ -1863,6 +2529,228 @@ class DoorMainIntegrationTests(unittest.TestCase):
             scaled_knob.position_meters[2] * 1.2,
         )
 
+    def test_arch_door_preview_and_commit_use_destination_profile(self) -> None:
+        """An arch can be assembled into a differently sized, deeper arch."""
+
+        source_doorway = replace(
+            self.level.doorways[0],
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.35,
+        )
+        self.level.doorways[0] = source_doorway
+        self.workspace._set_canvas_viewer_targets((self.wall,))
+        door = self._create_door()
+        self._register_generated_component(door, DOOR_SLOT_KNOB)
+        door = self.workspace.doors_workspace.data().get_door(door.door_id)
+        assert door is not None
+
+        destination = replace(
+            source_doorway,
+            width_meters=1.6,
+            height_meters=2.4,
+            arch_amount=0.8,
+        )
+        self.level.doorways[0] = destination
+        self.workspace._set_canvas_viewer_targets((self.wall,))
+        target = next(
+            target
+            for target in self.workspace._canvas_opening_targets_by_key.values()
+            if target.reference.kind == CANVAS_OPENING_DOORWAY
+        )
+
+        fitted, assembled = self.workspace._assemble_door_for_doorway(
+            door,
+            destination,
+            include_unjoined=False,
+        )
+        candidates = self.workspace._build_door_placement_preview_candidates(
+            door,
+            (target,),
+        )
+
+        self.assertEqual(len(candidates), 1)
+        assembled_meshes = self._combine_door_preview_parts(
+            self.workspace._build_door_placement_preview_parts(
+                fitted,
+                assembled,
+            )
+        )
+        preview_meshes = self._combine_door_preview_parts(
+            candidates[0].normal_parts
+        )
+        self.assertEqual(
+            set(preview_meshes),
+            {DOOR_SLOT_BODY, DOOR_SLOT_KNOB},
+        )
+        body_mesh = preview_meshes[DOOR_SLOT_BODY]
+        np.testing.assert_allclose(
+            body_mesh.extents[[0, 2]],
+            (destination.width_meters, destination.height_meters),
+            atol=1e-8,
+        )
+        body_vertices = np.asarray(body_mesh.vertices, dtype=float)
+        side_vertices = body_vertices[
+            np.isclose(
+                np.abs(body_vertices[:, 0]),
+                destination.width_meters / 2.0,
+                atol=1e-8,
+            )
+        ]
+        self.assertGreater(len(side_vertices), 0)
+        expected_spring_height = _arch_profile_height_at_x(
+            destination.width_meters,
+            destination.height_meters,
+            destination.arch_amount,
+            destination.width_meters / 2.0,
+        )
+        self.assertAlmostEqual(
+            float(side_vertices[:, 2].max()),
+            expected_spring_height,
+        )
+
+        for component_kind in (DOOR_SLOT_BODY, DOOR_SLOT_KNOB):
+            with self.subTest(component_kind=component_kind):
+                np.testing.assert_allclose(
+                    preview_meshes[component_kind].bounds,
+                    assembled_meshes[component_kind].bounds,
+                    atol=1e-9,
+                )
+
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            target.reference,
+            False,
+        )
+        self.assertEqual(
+            len(self.workspace.doors_workspace.data().placements),
+            1,
+        )
+        placed_door = next(
+            model
+            for model in self.workspace._build_placed_generated_models(
+                include_excluded_levels=True
+            )
+            if model.object_id.startswith("door-placement:")
+        )
+        committed_meshes = self._combine_door_preview_parts(
+            self.workspace._build_door_placement_preview_parts(
+                fitted,
+                placed_door.model,
+            )
+        )
+        for component_kind in (DOOR_SLOT_BODY, DOOR_SLOT_KNOB):
+            with self.subTest(committed_component=component_kind):
+                candidate_mesh = preview_meshes[component_kind]
+                committed_mesh = committed_meshes[component_kind]
+                np.testing.assert_allclose(
+                    committed_mesh.bounds,
+                    candidate_mesh.bounds,
+                    atol=1e-9,
+                )
+                self.assertEqual(
+                    len(committed_mesh.faces),
+                    len(candidate_mesh.faces),
+                )
+                np.testing.assert_allclose(
+                    np.unique(
+                        np.round(committed_mesh.vertices, decimals=9),
+                        axis=0,
+                    ),
+                    np.unique(
+                        np.round(candidate_mesh.vertices, decimals=9),
+                        axis=0,
+                    ),
+                    atol=1e-9,
+                )
+
+    def test_arch_door_fit_preserves_handle_height_below_curve(self) -> None:
+        """The handle keeps its local height ratio under the changed arch."""
+
+        source_doorway = replace(
+            self.level.doorways[0],
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.35,
+        )
+        self.level.doorways[0] = source_doorway
+        self.workspace._set_canvas_viewer_targets((self.wall,))
+        door = self._create_door()
+        source_handle = door.get_slot(DOOR_SLOT_KNOB)
+        assert source_handle is not None
+        destination = replace(
+            source_doorway,
+            width_meters=1.6,
+            height_meters=2.4,
+            arch_amount=0.8,
+        )
+
+        fitted = self.workspace._fit_door_definition_to_doorway(
+            door,
+            destination,
+        )
+
+        fitted_handle = fitted.get_slot(DOOR_SLOT_KNOB)
+        assert fitted_handle is not None
+        source_profile_height = _arch_profile_height_at_x(
+            door.width_meters,
+            door.height_meters,
+            door.arch_amount,
+            source_handle.position_meters[0],
+        )
+        destination_profile_height = _arch_profile_height_at_x(
+            destination.width_meters,
+            destination.height_meters,
+            destination.arch_amount,
+            fitted_handle.position_meters[0],
+        )
+        self.assertAlmostEqual(
+            fitted_handle.position_meters[2] / destination_profile_height,
+            source_handle.position_meters[2] / source_profile_height,
+        )
+        self.assertNotAlmostEqual(
+            fitted_handle.position_meters[2],
+            source_handle.position_meters[2]
+            * destination.height_meters
+            / door.height_meters,
+        )
+
+    def test_rectangular_door_remains_incompatible_with_arch_doorway(
+        self,
+    ) -> None:
+        """A profile topology change removes and cannot recreate a binding."""
+
+        door = self._create_door()
+        reference = self._doorway_reference()
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            reference,
+            False,
+        )
+        self.assertEqual(
+            len(self.workspace.doors_workspace.data().placements),
+            1,
+        )
+
+        self.level.doorways[0] = replace(
+            self.level.doorways[0],
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.65,
+        )
+
+        self.assertTrue(self.workspace._reconcile_door_placements())
+        self.assertEqual(
+            self.workspace.doors_workspace.data().placements,
+            [],
+        )
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            reference,
+            False,
+        )
+        self.assertEqual(
+            self.workspace.doors_workspace.data().placements,
+            [],
+        )
+
     def test_door_body_refits_when_destination_doorway_size_changes(self) -> None:
         door = self._create_door()
         body = door.get_slot(DOOR_SLOT_BODY)
@@ -1944,10 +2832,14 @@ class DoorMainIntegrationTests(unittest.TestCase):
             self.workspace.viewer,
             "begin_door_placement",
             return_value=True,
-        ) as begin_placement:
+        ) as begin_placement, patch.object(
+            self.workspace,
+            "_sync_selected_door_slot_preview",
+        ) as refresh_editor_preview:
             self.workspace._handle_place_selected_door_clicked()
 
         begin_placement.assert_called_once()
+        refresh_editor_preview.assert_not_called()
         self.assertEqual(begin_placement.call_args.args[0], door.door_id)
         self.assertEqual(begin_placement.call_args.args[1], (target.key,))
         preview_candidates = begin_placement.call_args.kwargs[
@@ -2003,6 +2895,368 @@ class DoorMainIntegrationTests(unittest.TestCase):
             build_placed_generated_model_transform(mirrored_placement),
             atol=1e-9,
         )
+
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            target.reference,
+            False,
+            True,
+        )
+        depth_mirrored_placement = next(
+            model
+            for model in self.workspace._build_placed_generated_models(
+                include_excluded_levels=True
+            )
+            if model.object_id.startswith("door-placement:")
+        )
+        np.testing.assert_allclose(
+            preview_candidate.depth_mirrored_transform,
+            build_placed_generated_model_transform(depth_mirrored_placement),
+            atol=1e-9,
+        )
+
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            target.reference,
+            True,
+            True,
+        )
+        fully_mirrored_placement = next(
+            model
+            for model in self.workspace._build_placed_generated_models(
+                include_excluded_levels=True
+            )
+            if model.object_id.startswith("door-placement:")
+        )
+        np.testing.assert_allclose(
+            preview_candidate.depth_and_horizontally_mirrored_transform,
+            build_placed_generated_model_transform(fully_mirrored_placement),
+            atol=1e-9,
+        )
+
+    def test_door_wheel_states_keep_body_on_canonical_opening_anchor(
+        self,
+    ) -> None:
+        """An asymmetric handle cannot pull any door state off its doorway."""
+
+        door = self._register_asymmetric_handle(
+            self._create_door(),
+            asset_kind=ASSET_KIND_DOOR,
+        )
+        target = next(
+            target
+            for target in self.workspace._canvas_opening_targets_by_key.values()
+            if target.reference.kind == CANVAS_OPENING_DOORWAY
+        )
+        candidate = self.workspace._build_door_placement_preview_candidates(
+            door,
+            (target,),
+        )[0]
+        center_x, center_y = level_image_to_world_xy(
+            self.level,
+            self.level.doorways[0].center_x,
+            self.level.doorways[0].center_y,
+        )
+        expected_center = np.asarray(
+            (
+                center_x,
+                center_y,
+                build_level_base_z_lookup(self.workspace.levels)[self.level.index]
+                + self.level.doorways[0].bottom_height_meters,
+            ),
+            dtype=float,
+        )
+        variants = (
+            (candidate.normal_parts, candidate.normal_transform, False, False),
+            (candidate.mirrored_parts, candidate.mirrored_transform, True, False),
+            (
+                candidate.depth_and_horizontally_mirrored_parts,
+                candidate.depth_and_horizontally_mirrored_transform,
+                True,
+                True,
+            ),
+            (
+                candidate.depth_mirrored_parts,
+                candidate.depth_mirrored_transform,
+                False,
+                True,
+            ),
+        )
+
+        for state_index, (
+            preview_parts,
+            preview_transform,
+            mirrored_horizontally,
+            mirrored_depthwise,
+        ) in enumerate(variants):
+            with self.subTest(state_index=state_index):
+                np.testing.assert_allclose(
+                    preview_transform,
+                    candidate.normal_transform,
+                    atol=1e-9,
+                )
+                self._assert_preview_body_bottom_center(
+                    preview_parts,
+                    preview_transform,
+                    expected_center,
+                )
+                self.workspace._handle_door_placement_requested(
+                    door.door_id,
+                    target.reference,
+                    mirrored_horizontally,
+                    mirrored_depthwise,
+                )
+                placed = next(
+                    model
+                    for model in self.workspace._build_placed_generated_models(
+                        include_excluded_levels=True
+                    )
+                    if model.object_id.startswith("door-placement:")
+                )
+                committed_transform = build_placed_generated_model_transform(
+                    placed
+                )
+                np.testing.assert_allclose(
+                    committed_transform,
+                    candidate.normal_transform,
+                    atol=1e-9,
+                )
+                self._assert_preview_body_bottom_center(
+                    self.workspace._build_door_placement_preview_parts(
+                        door,
+                        placed.model,
+                    ),
+                    committed_transform,
+                    expected_center,
+                )
+
+    def test_window_wheel_states_keep_body_on_canonical_opening_anchor(
+        self,
+    ) -> None:
+        """An asymmetric handle cannot pull any window state through its wall."""
+
+        window, _reference = self._create_window()
+        window = self._register_asymmetric_handle(
+            window,
+            asset_kind=ASSET_KIND_WINDOW,
+        )
+        target = next(
+            target
+            for target in self.workspace._canvas_opening_targets_by_key.values()
+            if target.reference.kind == CANVAS_OPENING_WINDOW
+        )
+        candidate = self.workspace._build_window_placement_preview_candidates(
+            window,
+            (target,),
+        )[0]
+        midpoint = (target.bounds.start_ratio + target.bounds.end_ratio) * 0.5
+        expected_center = target.local_to_world(
+            midpoint,
+            target.bounds.bottom_ratio,
+        )
+        variants = (
+            (candidate.normal_parts, candidate.normal_transform, False, False),
+            (candidate.mirrored_parts, candidate.mirrored_transform, True, False),
+            (
+                candidate.depth_and_horizontally_mirrored_parts,
+                candidate.depth_and_horizontally_mirrored_transform,
+                True,
+                True,
+            ),
+            (
+                candidate.depth_mirrored_parts,
+                candidate.depth_mirrored_transform,
+                False,
+                True,
+            ),
+        )
+
+        for state_index, (
+            preview_parts,
+            preview_transform,
+            mirrored_horizontally,
+            mirrored_depthwise,
+        ) in enumerate(variants):
+            with self.subTest(state_index=state_index):
+                np.testing.assert_allclose(
+                    preview_transform,
+                    candidate.normal_transform,
+                    atol=1e-9,
+                )
+                self._assert_preview_body_bottom_center(
+                    preview_parts,
+                    preview_transform,
+                    expected_center,
+                )
+                self.workspace._handle_window_fixture_placement_requested(
+                    window.window_id,
+                    target.reference,
+                    mirrored_horizontally,
+                    mirrored_depthwise,
+                )
+                placed = next(
+                    model
+                    for model in self.workspace._build_placed_generated_models(
+                        include_excluded_levels=True
+                    )
+                    if model.object_id.startswith("window-placement:")
+                )
+                committed_transform = build_placed_generated_model_transform(
+                    placed
+                )
+                np.testing.assert_allclose(
+                    committed_transform,
+                    candidate.normal_transform,
+                    atol=1e-9,
+                )
+                self._assert_preview_body_bottom_center(
+                    self.workspace._build_door_placement_preview_parts(
+                        window,
+                        placed.model,
+                    ),
+                    committed_transform,
+                    expected_center,
+                )
+
+    def test_window_place_previews_joined_handle_in_all_wheel_states(self) -> None:
+        """Window placement keeps its generated Handle blue in every state."""
+
+        window, reference = self._create_window()
+        handle = window.get_slot(DOOR_SLOT_KNOB)
+        assert handle is not None
+        handle_model = build_door_body_model(
+            0.08,
+            0.12,
+            0.04,
+            shape="rectangular",
+            arch_amount=0.0,
+            geometry_name="generated_window_placement_handle",
+        )
+        self.workspace.generation.register_door_component_model(
+            object_id=handle.source_object_id,
+            object_name=f"{window.name} - Handle",
+            door_id=window.window_id,
+            slot_id=handle.slot_id,
+            model=handle_model,
+            asset_kind=ASSET_KIND_WINDOW,
+        )
+
+        reflected_scene_error = AssertionError(
+            "placement preview built a reflected model scene"
+        )
+        with patch.object(
+            self.workspace.viewer,
+            "begin_window_fixture_placement",
+            return_value=True,
+        ) as begin_placement, patch.object(
+            self.workspace,
+            "_sync_selected_opening_asset_preview",
+        ) as refresh_editor_preview, patch(
+            "housemaker.main.mirror_door_model_horizontally",
+            side_effect=reflected_scene_error,
+        ), patch(
+            "housemaker.main.mirror_door_model_depthwise",
+            side_effect=reflected_scene_error,
+        ):
+            self.workspace._handle_place_selected_window_clicked()
+
+        begin_placement.assert_called_once()
+        refresh_editor_preview.assert_not_called()
+        preview_candidates = begin_placement.call_args.kwargs[
+            "preview_candidates"
+        ]
+        self.assertEqual(len(preview_candidates), 1)
+        candidate = preview_candidates[0]
+        for parts in (
+            candidate.normal_parts,
+            candidate.mirrored_parts,
+            candidate.depth_mirrored_parts,
+            candidate.depth_and_horizontally_mirrored_parts,
+        ):
+            self.assertEqual(
+                {part.component_kind for part in parts},
+                {DOOR_SLOT_BODY, DOOR_SLOT_KNOB},
+            )
+
+        updated_window = self.workspace.doors_workspace.data().get_window(
+            window.window_id
+        )
+        assert updated_window is not None
+        updated_handle = updated_window.get_slot(DOOR_SLOT_KNOB)
+        assert updated_handle is not None
+        self.assertTrue(updated_handle.joined)
+        self.workspace._handle_window_fixture_placement_requested(
+            window.window_id,
+            reference,
+            True,
+            True,
+        )
+        placement = self.workspace.doors_workspace.data().window_placements[0]
+        self.assertTrue(placement.mirrored_horizontally)
+        self.assertTrue(placement.mirrored_depthwise)
+
+    def test_glass_placement_preview_never_serializes_a_glb(self) -> None:
+        """The Place button may cut preview glass but never exports its scene."""
+
+        door = self._create_door()
+        door = replace(
+            door,
+            glass_areas=(
+                GlassAreaData(
+                    glass_area_id="glass-preview",
+                    source_object_id="glass-preview-source",
+                    name="Glass area 1",
+                    minimum_x_ratio=0.25,
+                    maximum_x_ratio=0.75,
+                    minimum_z_ratio=0.25,
+                    maximum_z_ratio=0.75,
+                ),
+            ),
+        )
+        self.workspace.doors_workspace.upsert_door(door)
+        target = next(
+            target
+            for target in self.workspace._canvas_opening_targets_by_key.values()
+            if target.reference.kind == CANVAS_OPENING_DOORWAY
+        )
+        self.workspace._handle_door_placement_requested(
+            door.door_id,
+            target.reference,
+            True,
+            True,
+        )
+
+        serialization_error = AssertionError(
+            "placement preview serialized a GLB"
+        )
+        with patch.object(
+            trimesh.Scene,
+            "export",
+            side_effect=serialization_error,
+        ), patch(
+            "housemaker.glb._serialize_scene_glb_with_half_mesh_extras",
+            side_effect=serialization_error,
+        ), patch(
+            "housemaker.opening_glass._serialize_scene_glb_with_half_mesh_extras",
+            side_effect=serialization_error,
+        ):
+            candidates = self.workspace._build_door_placement_preview_candidates(
+                door,
+                (target,),
+            )
+            placed = tuple(
+                model
+                for model in self.workspace._build_placed_generated_models(
+                    include_excluded_levels=True,
+                    preview_only=True,
+                )
+                if model.object_id.startswith("door-placement:")
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].normal_parts)
+        self.assertEqual(len(placed), 1)
+        self.assertTrue(placed[0].model.preview_only)
 
     def test_new_hardware_auto_joins_and_appears_in_preview_and_placement(
         self,

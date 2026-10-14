@@ -18,6 +18,8 @@ from housemaker.door_geometry import (
     build_default_door_slot_models,
     build_default_window_slot_models,
     build_door_body_model,
+    build_door_body_source_outline,
+    conform_door_body_model_to_profile,
     mirror_door_model_horizontally,
 )
 from housemaker.door_state import (
@@ -250,9 +252,120 @@ class DoorBodyGeometryTests(unittest.TestCase):
                 imported = import_generated_glb(model.glb_bytes)
                 _assert_complete_uvs(self, imported.mesh)
 
+    def test_profile_conformance_preserves_attributes_and_source_bounds(
+        self,
+    ) -> None:
+        source = _with_solid_texture(
+            build_door_body_model(
+                1.0,
+                2.2,
+                0.05,
+                shape=DOORWAY_SHAPE_RECTANGULAR,
+                arch_amount=0.0,
+            ),
+            (28, 84, 190, 255),
+        )
+        source.scene.metadata["profile-test"] = {"retained": True}
+        for geometry in source.scene.geometry.values():
+            geometry.metadata["geometry-test"] = "retained"
+        source_bounds = source.mesh.bounds.copy()
+        source_nodes = set(source.scene.graph.nodes_geometry)
+        profile = build_doorway_cross_section_outline(
+            1.0,
+            2.2,
+            DOORWAY_SHAPE_ARCH,
+            0.75,
+        )
+
+        conformed = conform_door_body_model_to_profile(source, profile)
+
+        np.testing.assert_allclose(conformed.mesh.bounds, source_bounds, atol=1e-8)
+        self.assertGreater(len(conformed.mesh.faces), len(source.mesh.faces))
+        self.assertEqual(set(conformed.scene.graph.nodes_geometry), source_nodes)
+        self.assertEqual(
+            conformed.scene.metadata["profile-test"],
+            {"retained": True},
+        )
+        self.assertTrue(
+            all(
+                geometry.metadata["geometry-test"] == "retained"
+                for geometry in conformed.scene.geometry.values()
+            )
+        )
+        for geometry in conformed.scene.geometry.values():
+            _assert_complete_uvs(self, geometry)
+            texture = geometry.visual.material.baseColorTexture
+            self.assertIsNotNone(texture)
+            np.testing.assert_array_equal(
+                np.asarray(texture.convert("RGBA"), dtype=np.uint8)[0, 0],
+                (28, 84, 190, 255),
+            )
+
+        vertices = np.asarray(conformed.mesh.vertices, dtype=float)
+        upper_chain = np.asarray(profile[2:-1], dtype=float)[::-1]
+        upper_heights = np.interp(
+            vertices[:, 0],
+            upper_chain[:, 0],
+            upper_chain[:, 1],
+        )
+        self.assertTrue(np.all(vertices[:, 2] <= upper_heights + 1e-7))
+
+    def test_matching_profile_returns_the_unchanged_generated_model(self) -> None:
+        source = build_door_body_model(
+            1.0,
+            2.2,
+            0.05,
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.75,
+        )
+        profile = build_doorway_cross_section_outline(
+            1.0,
+            2.2,
+            DOORWAY_SHAPE_ARCH,
+            0.75,
+        )
+
+        conformed = conform_door_body_model_to_profile(source, profile)
+
+        self.assertIs(conformed, source)
+
 
 # ### Door assembly and mirror tests ###
 class DoorAssemblyGeometryTests(unittest.TestCase):
+    def test_rectangular_default_does_not_reprofile_authored_body_contour(
+        self,
+    ) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
+            door_id="authored-contour-door",
+            name="New door 1",
+        )
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        authored_body = build_door_body_model(
+            door.width_meters,
+            door.height_meters,
+            door.thickness_meters,
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.5,
+        )
+
+        assembled = assemble_door_model(
+            door,
+            {body.source_object_id: authored_body},
+        )
+
+        preview = assembled.preview_placed_objects[0]
+        self.assertEqual(len(preview.meshes[0].faces), len(authored_body.mesh.faces))
+        side_vertices = np.asarray(preview.meshes[0].vertices, dtype=float)[
+            np.isclose(
+                np.abs(np.asarray(preview.meshes[0].vertices)[:, 0]),
+                door.width_meters * 0.5,
+                atol=1e-8,
+            )
+        ]
+        self.assertLess(float(np.max(side_vertices[:, 2])), door.height_meters)
+
     def test_glass_area_cuts_and_tags_the_complete_body_assembly(self) -> None:
         door = create_door_definition_for_doorway(
             _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
@@ -476,6 +589,179 @@ class DoorAssemblyGeometryTests(unittest.TestCase):
             np.maximum(0.0, 1.0 - normalized_widths**2)
         )
         self.assertTrue(np.all(vertices[:, 2] <= arch_ceiling + 1e-7))
+
+    def test_generated_full_arch_is_reprofiled_after_making_door_double(
+        self,
+    ) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_ARCH, arch_amount=0.75),
+            door_id="generated-double-arch-door",
+            name="New door 1",
+        ).with_double(True)
+        right_body = door.get_slot(DOOR_SLOT_BODY)
+        left_body = door.get_slot(DOOR_SLOT_LEFT_BODY)
+        assert right_body is not None and left_body is not None
+        generated_full_body = build_door_body_model(
+            door.width_meters,
+            door.height_meters,
+            door.thickness_meters,
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=door.arch_amount,
+            geometry_name="generated_full_arch",
+        )
+
+        assembled = assemble_door_model(
+            door,
+            {
+                right_body.source_object_id: generated_full_body,
+                left_body.source_object_id: generated_full_body,
+            },
+        )
+
+        transformed_vertices: list[np.ndarray] = []
+        transformed_bounds: dict[str, np.ndarray] = {}
+        for preview in assembled.preview_placed_objects:
+            mesh = preview.meshes[0].copy()
+            mesh.apply_transform(preview.placement_transform)
+            transformed_vertices.append(np.asarray(mesh.vertices, dtype=float))
+            transformed_bounds[preview.object_id] = mesh.bounds
+        vertices = np.concatenate(transformed_vertices, axis=0)
+        expected_profile = build_doorway_cross_section_outline(
+            door.width_meters,
+            door.height_meters,
+            door.shape,
+            door.arch_amount,
+        )
+        upper_chain = np.asarray(expected_profile[2:-1], dtype=float)[::-1]
+        upper_heights = np.interp(
+            vertices[:, 0],
+            upper_chain[:, 0],
+            upper_chain[:, 1],
+        )
+        self.assertTrue(np.all(vertices[:, 2] <= upper_heights + 1e-7))
+        self.assertAlmostEqual(
+            transformed_bounds[left_body.source_object_id][1, 0],
+            transformed_bounds[right_body.source_object_id][0, 0],
+        )
+        for expected_point in expected_profile[:-1]:
+            self.assertTrue(
+                np.any(
+                    np.all(
+                        np.isclose(
+                            vertices[:, (0, 2)],
+                            expected_point,
+                            atol=1e-7,
+                        ),
+                        axis=1,
+                    )
+                )
+            )
+
+    def test_arch_profile_conformance_keeps_vertical_symmetric_body_authored_half(
+        self,
+    ) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_ARCH, arch_amount=0.75),
+            door_id="symmetric-arch-door",
+            name="New door 1",
+        )
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        retained_half = _translated_model_x(
+            build_door_body_model(
+                door.width_meters * 0.5,
+                door.height_meters,
+                door.thickness_meters,
+                shape=DOORWAY_SHAPE_RECTANGULAR,
+                arch_amount=0.0,
+            ),
+            -door.width_meters * 0.25,
+        )
+
+        assembled = assemble_door_model(
+            door,
+            {body.source_object_id: retained_half},
+            body_mirror=DoorBodyMirrorConfiguration(
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.0,
+            ),
+        )
+
+        preview = next(
+            item
+            for item in assembled.preview_symmetric_objects
+            if item.object_id == body.source_object_id
+        )
+        self.assertLessEqual(preview.meshes[0].bounds[1, 0], 1e-9)
+        vertices = np.concatenate(
+            tuple(
+                np.asarray(mesh.vertices, dtype=float)
+                for mesh in (*preview.meshes, *preview.mirrored_meshes)
+            ),
+            axis=0,
+        )
+        expected_profile = build_doorway_cross_section_outline(
+            door.width_meters,
+            door.height_meters,
+            door.shape,
+            door.arch_amount,
+        )
+        upper_chain = np.asarray(expected_profile[2:-1], dtype=float)[::-1]
+        upper_heights = np.interp(
+            vertices[:, 0],
+            upper_chain[:, 0],
+            upper_chain[:, 1],
+        )
+        self.assertTrue(np.all(vertices[:, 2] <= upper_heights + 1e-7))
+        np.testing.assert_allclose(
+            (np.min(vertices[:, 0]), np.max(vertices[:, 0])),
+            (-door.width_meters * 0.5, door.width_meters * 0.5),
+            atol=1e-8,
+        )
+
+    def test_body_profile_override_prefers_slot_id_over_source_id(self) -> None:
+        door = create_door_definition_for_doorway(
+            _doorway(shape=DOORWAY_SHAPE_RECTANGULAR),
+            door_id="profile-override-door",
+            name="New door 1",
+        )
+        body = door.get_slot(DOOR_SLOT_BODY)
+        assert body is not None
+        source = build_default_door_slot_models(door)[DOOR_SLOT_BODY]
+        rectangular_profile = build_door_body_source_outline(door, body)
+        arch_profile = build_doorway_cross_section_outline(
+            door.width_meters,
+            door.height_meters,
+            DOORWAY_SHAPE_ARCH,
+            0.75,
+        )
+
+        assembled = assemble_door_model(
+            door,
+            {body.source_object_id: source},
+            body_profile_overrides={
+                body.source_object_id: rectangular_profile,
+                DOOR_SLOT_BODY: arch_profile,
+            },
+        )
+
+        preview = assembled.preview_placed_objects[0]
+        mesh = preview.meshes[0].copy()
+        mesh.apply_transform(preview.placement_transform)
+        side_vertices = np.asarray(mesh.vertices, dtype=float)[
+            np.isclose(
+                np.abs(np.asarray(mesh.vertices, dtype=float)[:, 0]),
+                door.width_meters * 0.5,
+                atol=1e-8,
+            )
+        ]
+        expected_spring_height = door.height_meters - (
+            min(door.width_meters * 0.5, door.height_meters) * 0.75
+        )
+        self.assertAlmostEqual(
+            float(np.max(side_vertices[:, 2])),
+            expected_spring_height,
+        )
 
     def test_double_symmetric_half_bodies_reconstruct_without_a_center_gap(
         self,

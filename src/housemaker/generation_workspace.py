@@ -129,7 +129,9 @@ from housemaker.object_face_edit import (
     ObjectFaceAdditionResult,
     ObjectFaceDeletionResult,
     ObjectFaceGeometry,
+    ObjectFaceGlassConversionResult,
     _add_object_face_preserving_uvs_with_geometry,
+    _convert_object_faces_to_glass_with_geometry,
     _delete_object_faces_preserving_uvs_with_geometry,
     load_object_face_geometry,
     load_object_face_geometry_from_scene,
@@ -296,6 +298,7 @@ OBJECT_OPERATION_REPLACE_MODEL = "replace_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_CREATE_FACE = "create_face"
 OBJECT_OPERATION_DELETE_FACES = "delete_faces"
+OBJECT_OPERATION_CONVERT_FACES_TO_GLASS = "convert_faces_to_glass"
 OBJECT_OPERATION_COLOR_BALANCE = "color_balance"
 FACE_EDIT_REVISION_PIPELINE_KEY = "face_edit_revision"
 FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY = "face_edit_texture_stale"
@@ -583,6 +586,7 @@ class _ObjectJobRuntime:
         | TextureRegenerationWorker
         | ObjectFaceDeletionWorker
         | ObjectFaceCreationWorker
+        | ObjectFaceGlassConversionWorker
     )
     relay: _ObjectJobSignalRelay
     generation_request: GenerationRequest | None = None
@@ -1727,6 +1731,58 @@ class ObjectFaceCreationRequest:
 
 
 @dataclass(frozen=True)
+class ObjectFaceGlassConversionRequest:
+    """Saved GLB revisions and canonical faces for one local material edit."""
+
+    object_id: str
+    reference_asset_path: str
+    source_asset_paths: tuple[str, ...]
+    selected_face_indices: tuple[int, ...]
+    double_sided: bool = False
+
+    def __post_init__(self) -> None:
+        normalized_object_id = str(self.object_id).strip()
+        reference_asset_path = _normalize_face_edit_asset_path(
+            self.reference_asset_path
+        )
+        source_asset_paths = tuple(
+            dict.fromkeys(
+                _normalize_face_edit_asset_path(path)
+                for path in self.source_asset_paths
+            )
+        )
+        requested_faces = tuple(self.selected_face_indices)
+        if any(
+            isinstance(index, bool)
+            or not isinstance(index, int | np.integer)
+            for index in requested_faces
+        ):
+            raise TypeError("Glass conversion requires integer face indices.")
+        selected_faces = tuple(sorted({int(index) for index in requested_faces}))
+        if not normalized_object_id:
+            raise ValueError("Glass conversion requires an object ID.")
+        if (
+            not source_asset_paths
+            or reference_asset_path not in source_asset_paths
+        ):
+            raise ValueError(
+                "Glass conversion requires its displayed GLB revision."
+            )
+        if not selected_faces or any(index < 0 for index in selected_faces):
+            raise ValueError("Glass conversion requires selected faces.")
+        if not isinstance(self.double_sided, bool):
+            raise TypeError("Glass sidedness must be a boolean.")
+        object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(
+            self,
+            "reference_asset_path",
+            reference_asset_path,
+        )
+        object.__setattr__(self, "source_asset_paths", source_asset_paths)
+        object.__setattr__(self, "selected_face_indices", selected_faces)
+
+
+@dataclass(frozen=True)
 class PreparedObjectFaceDeletion:
     """Every edited GLB revision plus reference face-count metadata."""
 
@@ -1742,6 +1798,16 @@ class PreparedObjectFaceCreation:
 
     request: ObjectFaceCreationRequest
     reference_result: ObjectFaceAdditionResult
+    edited_glbs: tuple[tuple[str, bytes], ...]
+    preview_model: GeneratedModel
+
+
+@dataclass(frozen=True)
+class PreparedObjectFaceGlassConversion:
+    """Every locally glass-converted GLB plus reference metadata."""
+
+    request: ObjectFaceGlassConversionRequest
+    reference_result: ObjectFaceGlassConversionResult
     edited_glbs: tuple[tuple[str, bytes], ...]
     preview_model: GeneratedModel
 
@@ -3063,9 +3129,9 @@ class ObjectGenerationViewerPanel(QWidget):
             "convert_generated_object_faces_to_glass_button"
         )
         self.convert_faces_to_glass_button.setToolTip(
-            "Join the selection into one best-fit two-triangle rectangle, "
-            "rebuild the object's UVs, generate its PBR maps, and assign an "
-            "atlas-independent reflective glass material."
+            "Assign the shared atlas-independent glass material to the "
+            "selected faces while preserving the object's geometry, UVs, "
+            "and existing opaque textures."
         )
         self.convert_faces_to_glass_button.setEnabled(False)
         self.convert_faces_to_glass_button.setSizePolicy(
@@ -3794,6 +3860,34 @@ def _normalize_face_edit_asset_path(raw_path: object) -> str:
     return path.as_posix()
 
 
+def _build_face_edit_revision_asset_name(
+    object_id: str,
+    face_edit_id: str,
+    source_index: int,
+) -> str:
+    """Build a bounded cross-platform filename for one edited GLB revision."""
+
+    normalized_object_id = str(object_id).strip()
+    normalized_face_edit_id = str(face_edit_id).strip()
+    normalized_source_index = int(source_index)
+    if (
+        not normalized_object_id
+        or not normalized_face_edit_id
+        or normalized_source_index < 1
+    ):
+        raise ValueError("Face-edit revision identity is invalid.")
+    object_key = hashlib.sha256(
+        normalized_object_id.encode("utf-8")
+    ).hexdigest()
+    edit_key = hashlib.sha256(
+        normalized_face_edit_id.encode("utf-8")
+    ).hexdigest()[:32]
+    return (
+        f"{object_key}.face-edit-{edit_key}."
+        f"revision-{normalized_source_index}.glb"
+    )
+
+
 def _get_face_edit_glb_asset_paths(
     record: GeneratedObjectRecord,
 ) -> tuple[str, ...]:
@@ -3989,6 +4083,75 @@ def _prepare_object_face_creation(
     if len(preview_model.mesh.faces) != reference_result.result_face_count:
         raise ValueError("Face creation exported an unexpected face count.")
     return PreparedObjectFaceCreation(
+        request=request,
+        reference_result=reference_result,
+        edited_glbs=tuple(edited_glbs),
+        preview_model=preview_model,
+    )
+
+
+def _prepare_object_face_glass_conversion(
+    asset_directory: Path,
+    request: ObjectFaceGlassConversionRequest,
+) -> PreparedObjectFaceGlassConversion:
+    """Assign glass in every saved GLB without using a provider reference."""
+
+    source_glbs = tuple(
+        (
+            raw_path,
+            _resolve_face_edit_source_path(
+                asset_directory,
+                raw_path,
+            ).read_bytes(),
+        )
+        for raw_path in request.source_asset_paths
+    )
+    reference_geometry: ObjectFaceGeometry | None = None
+    reference_result: ObjectFaceGlassConversionResult | None = None
+    edited_glbs: list[tuple[str, bytes]] = []
+    ordered_source_glbs = tuple(
+        sorted(
+            source_glbs,
+            key=lambda pair: pair[0] != request.reference_asset_path,
+        )
+    )
+    for raw_path, source_glb in ordered_source_glbs:
+        result, source_geometry = _convert_object_faces_to_glass_with_geometry(
+            source_glb,
+            request.selected_face_indices,
+            double_sided=request.double_sided,
+            validate_export=False,
+        )
+        if reference_geometry is None:
+            reference_geometry = source_geometry
+        elif not _face_edit_geometry_matches(
+            reference_geometry,
+            source_geometry,
+        ):
+            raise ValueError(
+                "Saved texture revisions do not share the displayed face "
+                "index layout. The existing object was kept."
+            )
+        if raw_path == request.reference_asset_path:
+            reference_result = result
+        edited_glbs.append((raw_path, result.glb_bytes))
+    if reference_result is None:
+        raise ValueError("The displayed glass-conversion revision is unavailable.")
+    if any(
+        result_face_count != reference_result.face_count
+        for result_face_count in (
+            load_object_face_geometry(edited_glb).face_count
+            for _raw_path, edited_glb in edited_glbs
+        )
+    ):
+        raise ValueError("Glass conversion changed inconsistent saved revisions.")
+    edited_by_path = dict(edited_glbs)
+    preview_model = import_generated_glb(
+        edited_by_path[request.reference_asset_path]
+    )
+    if len(preview_model.mesh.faces) != reference_result.face_count:
+        raise ValueError("Glass conversion changed the object's face count.")
+    return PreparedObjectFaceGlassConversion(
         request=request,
         reference_result=reference_result,
         edited_glbs=tuple(edited_glbs),
@@ -4217,6 +4380,54 @@ class ObjectFaceCreationWorker(QObject):
             self.finished.emit()
 
 
+class ObjectFaceGlassConversionWorker(QObject):
+    """Assign selected faces to prefab glass without blocking Qt."""
+
+    succeeded = Signal(object, object)
+    failed = Signal(str)
+    finished = Signal()
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        request: ObjectFaceGlassConversionRequest,
+        asset_directory: Path,
+    ) -> None:
+        super().__init__()
+        self._request = request
+        self._asset_directory = Path(asset_directory)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Converting selected faces to glass (10%)")
+            request = self._request
+            result = _run_interruptible_stage(
+                lambda: _prepare_object_face_glass_conversion(
+                    self._asset_directory,
+                    request,
+                ),
+                self._cancel_event,
+            )
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Existing UVs and textures retained (90%)")
+        except _GenerationCancelled:
+            return
+        except Exception as error:
+            if not self._cancel_event.is_set():
+                self.failed.emit(str(error).strip() or error.__class__.__name__)
+            return
+        else:
+            self.succeeded.emit(result, None)
+        finally:
+            self.finished.emit()
+
+
 # ### External GLB import worker ###
 class ExternalGlbImportThread(QThread):
     """Clean and persist one external model without blocking the Atlas UI."""
@@ -4356,6 +4567,7 @@ class GenerationWorkspace(QWidget):
             | TextureRegenerationWorker
             | ObjectFaceDeletionWorker
             | ObjectFaceCreationWorker
+            | ObjectFaceGlassConversionWorker
             | None
         ) = None
         self._generated_model: GeneratedModel | None = None
@@ -4420,7 +4632,7 @@ class GenerationWorkspace(QWidget):
         self,
         reference_bgra: np.ndarray,
     ) -> None:
-        """Use an external image and return to ordinary object generation."""
+        """Use an external image in the current generation context."""
 
         reference = np.asarray(reference_bgra)
         if (
@@ -4434,7 +4646,6 @@ class GenerationWorkspace(QWidget):
         if not np.any(reference[:, :, 3] > 0):
             raise ValueError("The object reference is fully transparent.")
 
-        self.clear_door_slot_editing_target()
         self._temporary_object_reference_bgra = (
             np.ascontiguousarray(reference).copy()
         )
@@ -4865,6 +5076,15 @@ class GenerationWorkspace(QWidget):
             and previous_target.slot_id == next_target.slot_id
             and previous_target.asset_kind == next_target.asset_kind
         )
+        entering_generation_mode = bool(
+            next_target.generation_ready
+            and (
+                not same_target
+                or previous_target is None
+                or not previous_target.generation_ready
+                or previous_target.object_id != next_target.object_id
+            )
+        )
         if announce_generation is not None:
             self._door_slot_generation_prompt_visible = bool(
                 announce_generation and next_target.generation_ready
@@ -4876,6 +5096,8 @@ class GenerationWorkspace(QWidget):
         if self._architectural_trim_editing_target is not None:
             self.clear_architectural_trim_editing_target()
         self._door_slot_editing_target = next_target
+        if entering_generation_mode:
+            self._set_all_pbr_maps_enabled()
         self.result_view.cancel_transient_pointer_interactions()
         self.result_view.set_face_editing_enabled(False)
         self.result_view.set_selected_placed_object_ids(())
@@ -6018,6 +6240,23 @@ class GenerationWorkspace(QWidget):
         except Exception:
             return None
 
+    def get_object_face_geometry(
+        self,
+        object_id: str,
+    ) -> ObjectFaceGeometry | None:
+        """Return immutable source-indexed face geometry for one exact object."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None:
+            return None
+        model = self.get_generated_object_model(record.object_id)
+        if model is None:
+            return None
+        try:
+            return self._load_object_face_geometry(record, model)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+
     def get_generated_object_preview_model(
         self,
         object_id: str,
@@ -7063,18 +7302,38 @@ class GenerationWorkspace(QWidget):
                 "pressing F."
             )
             return False
+        return self.create_object_face(record.object_id, selected_vertices)
+
+    def create_object_face(
+        self,
+        object_id: str,
+        vertex_indices: Sequence[int],
+    ) -> bool:
+        """Create one face on an object using its canonical source vertices."""
+
+        normalized_object_id = str(object_id).strip()
+        record = self._find_generated_object_record(normalized_object_id)
+        try:
+            selected_vertices = tuple(int(index) for index in vertex_indices)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if record is None or len(selected_vertices) < 3:
+            return False
         if self._object_has_active_mutation_job(record.object_id):
             self.status_label.setText(
                 "Wait for this object's active job to finish before editing it."
             )
             return False
-        generated_model = self._generated_model
-        if (
-            generated_model is None
-            or self.result_view.model is not generated_model
-        ):
+        generated_model = self.get_generated_object_model(record.object_id)
+        if generated_model is None:
             return False
         try:
+            geometry = self._load_object_face_geometry(record, generated_model)
+            if any(
+                index < 0 or index >= len(geometry.vertices)
+                for index in selected_vertices
+            ):
+                raise ValueError("A selected vertex is outside the object.")
             request = ObjectFaceCreationRequest(
                 object_id=record.object_id,
                 reference_asset_path=record.asset_path,
@@ -7100,23 +7359,49 @@ class GenerationWorkspace(QWidget):
         selected_faces = self.result_view.get_selected_face_indices()
         if record is None or not selected_faces:
             return False
+        return self.delete_object_faces(record.object_id, selected_faces)
+
+    def delete_object_faces(
+        self,
+        object_id: str,
+        face_indices: Sequence[int],
+    ) -> bool:
+        """Delete canonical faces from one object without changing selection."""
+
+        normalized_object_id = str(object_id).strip()
+        record = self._find_generated_object_record(normalized_object_id)
+        try:
+            selected_faces = tuple(
+                sorted({int(index) for index in face_indices})
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if record is None or not selected_faces:
+            return False
         if self._object_has_active_mutation_job(record.object_id):
             self.status_label.setText(
                 "Wait for this object's active job to finish before editing it."
             )
             return False
-        generated_model = self._generated_model
-        if (
-            generated_model is None
-            or self.result_view.model is not generated_model
-        ):
+        generated_model = self.get_generated_object_model(record.object_id)
+        if generated_model is None:
             return False
-        request = ObjectFaceDeletionRequest(
-            object_id=record.object_id,
-            reference_asset_path=record.asset_path,
-            source_asset_paths=_get_face_edit_glb_asset_paths(record),
-            selected_face_indices=selected_faces,
-        )
+        try:
+            geometry = self._load_object_face_geometry(record, generated_model)
+            if any(
+                index < 0 or index >= geometry.face_count
+                for index in selected_faces
+            ):
+                raise ValueError("A selected face is outside the object.")
+            request = ObjectFaceDeletionRequest(
+                object_id=record.object_id,
+                reference_asset_path=record.asset_path,
+                source_asset_paths=_get_face_edit_glb_asset_paths(record),
+                selected_face_indices=selected_faces,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.status_label.setText(f"Face deletion failed: {error}")
+            return False
         return self._start_object_face_deletion(request, record)
 
     def regenerate_selected_object_texture(self) -> bool:
@@ -7176,6 +7461,8 @@ class GenerationWorkspace(QWidget):
     def _start_door_slot_model_generation(
         self,
         target: _DoorSlotEditingTarget,
+        *,
+        geometry_only: bool = False,
     ) -> bool:
         """Generate or replace one eligible door component model."""
 
@@ -7183,7 +7470,8 @@ class GenerationWorkspace(QWidget):
             self._door_body_side_duplication_requires_rebuild(target)
         )
         if (
-            is_door_body_slot(target.slot_id)
+            not geometry_only
+            and is_door_body_slot(target.slot_id)
             and not target.generate_displacement
             and not target.preserve_profile
             and not side_duplication_rebuild
@@ -7207,7 +7495,7 @@ class GenerationWorkspace(QWidget):
                 f"Wait for {target.slot_display_name} generation to finish."
             )
             return False
-        request = self._build_generation_request()
+        request = self._build_generation_request(geometry_only=geometry_only)
         if request is None:
             return False
         replaced_record = self._find_generated_object_record(target.object_id)
@@ -7259,7 +7547,7 @@ class GenerationWorkspace(QWidget):
         return True
 
     def convert_selected_faces_to_glass(self) -> bool:
-        """Run a PBR texture job for the authoritative selected faces."""
+        """Assign the prefab glass material to authoritative selected faces."""
 
         if self._architectural_trim_editing_target is not None:
             self.status_label.setText(
@@ -7271,13 +7559,64 @@ class GenerationWorkspace(QWidget):
         selected_faces = self.result_view.get_selected_face_indices()
         if not selected_faces:
             return False
-        generated_model = self._generated_model
+        if self._selected_object_id is None:
+            return False
+        return self.convert_object_faces_to_glass(
+            self._selected_object_id,
+            selected_faces,
+        )
+
+    def convert_object_faces_to_glass(
+        self,
+        object_id: str,
+        face_indices: Sequence[int],
+    ) -> bool:
+        """Convert canonical object faces through the shared glass pipeline."""
+
+        normalized_object_id = str(object_id).strip()
+        record = self._find_generated_object_record(normalized_object_id)
+        if record is None or is_architectural_trim_component_record(record):
+            return False
+        try:
+            selected_faces = tuple(
+                sorted({int(index) for index in face_indices})
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not selected_faces:
+            return False
+        if self._object_has_active_mutation_job(record.object_id):
+            self.status_label.setText(
+                "Wait for this object's active job to finish before editing it."
+            )
+            return False
+        generated_model = self.get_generated_object_model(record.object_id)
+        if generated_model is None:
+            return False
+        geometry = self.get_object_face_geometry(record.object_id)
+        if geometry is None or any(
+            index < 0 or index >= geometry.face_count
+            for index in selected_faces
+        ):
+            self.status_label.setText("Selected glass faces are invalid.")
+            return False
         existing_glass_faces = (
             None
             if generated_model is None
             else _collect_scene_glass_face_indices(generated_model.scene)
         )
-        face_count = self.result_view.face_edit_face_count
+        if existing_glass_faces is not None:
+            selected_faces = tuple(
+                face_index
+                for face_index in selected_faces
+                if face_index not in existing_glass_faces
+            )
+            if not selected_faces:
+                self.status_label.setText(
+                    "The selected faces already use the shared glass material."
+                )
+                return False
+        face_count = geometry.face_count
         if (
             face_count > 0
             and (
@@ -7293,15 +7632,18 @@ class GenerationWorkspace(QWidget):
                 "Glass conversion must leave at least one non-glass face."
             )
             return False
-        request = self._build_texture_regeneration_request(
-            glass_face_indices=selected_faces,
-            glass_double_sided=False,
-        )
-        if request is None:
+        try:
+            request = ObjectFaceGlassConversionRequest(
+                object_id=record.object_id,
+                reference_asset_path=record.asset_path,
+                source_asset_paths=_get_face_edit_glb_asset_paths(record),
+                selected_face_indices=selected_faces,
+                double_sided=False,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.status_label.setText(f"Glass conversion failed: {error}")
             return False
-        for checkbox in self.pbr_map_checkboxes.values():
-            checkbox.setChecked(True)
-        return self._start_texture_regeneration(request)
+        return self._start_object_face_glass_conversion(request, record)
 
     def undo_selected_object_change(self) -> bool:
         """Undo the selected object's latest local or texture operation."""
@@ -7402,6 +7744,7 @@ class GenerationWorkspace(QWidget):
             OBJECT_OPERATION_GENERATE_TEXTURE: "texture generation",
             OBJECT_OPERATION_CREATE_FACE: "face creation",
             OBJECT_OPERATION_DELETE_FACES: "face deletion",
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS: "glass conversion",
             OBJECT_OPERATION_COLOR_BALANCE: "texture color balance",
         }.get(operation, "object change")
         status_suffix = (
@@ -7627,10 +7970,11 @@ class GenerationWorkspace(QWidget):
                 geometry_only=True,
             )
             return
-        if self._door_slot_editing_target is not None:
-            self.status_label.setText(
-                "Door components use Generate for model creation or Generate "
-                "texture for texture-only updates."
+        door_slot_target = self._door_slot_editing_target
+        if door_slot_target is not None:
+            self._start_door_slot_model_generation(
+                door_slot_target,
+                geometry_only=True,
             )
             return
         if self.symmetric_division_checkbox.isChecked():
@@ -8062,6 +8406,71 @@ class GenerationWorkspace(QWidget):
         thread.finished.connect(relay.forward_thread_finished)
         thread.finished.connect(thread.deleteLater)
         self.status_label.setText("Preparing face creation...")
+        thread.start()
+        self._sync_controls()
+        return True
+
+    def _start_object_face_glass_conversion(
+        self,
+        request: ObjectFaceGlassConversionRequest,
+        record: GeneratedObjectRecord,
+    ) -> bool:
+        """Run one reference-free glass material edit in the background."""
+
+        if (
+            request.object_id != record.object_id
+            or self._object_has_active_mutation_job(record.object_id)
+        ):
+            return False
+        self.result_view.cancel_transient_pointer_interactions()
+        operation = _ActiveObjectOperation(
+            kind=OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
+            target_object_id=record.object_id,
+        )
+        thread = QThread(self)
+        worker = ObjectFaceGlassConversionWorker(request, self._asset_directory)
+        relay = _ObjectJobSignalRelay(operation.operation_id, self)
+        managed_job_id = self._create_managed_job(
+            operation,
+            kind=GENERATION_JOB_KIND_FACE_EDIT,
+            requested_name=None,
+            default_name=f"Convert faces to glass: {record.object_name}",
+            stage="Preparing glass conversion...",
+        )
+        runtime = _ObjectJobRuntime(
+            operation=operation,
+            thread=thread,
+            worker=worker,
+            relay=relay,
+            managed_job_id=managed_job_id,
+            record_snapshot=replace(
+                record,
+                pipeline=copy.deepcopy(record.pipeline),
+            ),
+            source_asset_revision=_build_face_edit_source_revisions(
+                self._asset_directory,
+                request.source_asset_paths,
+            ),
+        )
+        self._register_object_job_runtime(runtime)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(relay.forward_pair_succeeded)
+        worker.failed.connect(relay.forward_failed)
+        worker.progress.connect(relay.forward_progress)
+        relay.pair_succeeded.connect(
+            self._handle_job_face_glass_conversion_succeeded
+        )
+        relay.failed.connect(self._handle_job_face_glass_conversion_failed)
+        relay.progress.connect(self._handle_job_generation_progress)
+        relay.thread_finished.connect(
+            self._handle_object_job_thread_finished
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(relay.forward_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self.status_label.setText("Preparing glass conversion...")
         thread.start()
         self._sync_controls()
         return True
@@ -8739,6 +9148,12 @@ class GenerationWorkspace(QWidget):
             if self.pbr_map_checkboxes[map_type].isChecked()
         )
 
+    def _set_all_pbr_maps_enabled(self) -> None:
+        """Enable every supported map when an opening part enters generation."""
+
+        for checkbox in self.pbr_map_checkboxes.values():
+            checkbox.setChecked(True)
+
     @Slot(bool)
     def _handle_pbr_map_toggled(self, _enabled: bool) -> None:
         """Apply PBR contribution changes without reloading the model."""
@@ -9061,8 +9476,11 @@ class GenerationWorkspace(QWidget):
                 start=1,
             ):
                 persisted_path = self._persist_meshy_named_asset(
-                    f"{record.object_id}.face-edit-{face_edit_id}."
-                    f"revision-{source_index}.glb",
+                    _build_face_edit_revision_asset_name(
+                        record.object_id,
+                        face_edit_id,
+                        source_index,
+                    ),
                     edited_glb,
                 )
                 persisted_paths.append(persisted_path)
@@ -9253,8 +9671,11 @@ class GenerationWorkspace(QWidget):
                 start=1,
             ):
                 persisted_path = self._persist_meshy_named_asset(
-                    f"{record.object_id}.face-edit-{face_edit_id}."
-                    f"revision-{source_index}.glb",
+                    _build_face_edit_revision_asset_name(
+                        record.object_id,
+                        face_edit_id,
+                        source_index,
+                    ),
                     edited_glb,
                 )
                 persisted_paths.append(persisted_path)
@@ -9380,6 +9801,200 @@ class GenerationWorkspace(QWidget):
             return
         self._set_legacy_active_job_runtime(runtime)
         message = f"Face creation failed: {error_message!s}"
+        self.status_label.setText(message)
+        self._fail_managed_job(runtime, message)
+
+    @Slot(str, object, object)
+    def _handle_job_face_glass_conversion_succeeded(
+        self,
+        operation_id: str,
+        raw_result: object,
+        _unused_preview: object,
+    ) -> None:
+        """Commit one local prefab-glass edit if its source is unchanged."""
+
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
+            operation_id,
+        ):
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        prepared = raw_result
+        snapshot = runtime.record_snapshot
+        if (
+            not isinstance(prepared, PreparedObjectFaceGlassConversion)
+            or snapshot is None
+        ):
+            self._handle_job_face_glass_conversion_failed(
+                operation_id,
+                "The local glass-conversion result is invalid.",
+            )
+            return
+        record = self._find_generated_object_record(snapshot.object_id)
+        if (
+            record is None
+            or record != snapshot
+            or _build_face_edit_source_revisions(
+                self._asset_directory,
+                prepared.request.source_asset_paths,
+            )
+            != runtime.source_asset_revision
+        ):
+            self._handle_job_face_glass_conversion_failed(
+                operation_id,
+                "The object changed before its glass edit could be applied.",
+            )
+            return
+
+        persisted_paths: list[str] = []
+        try:
+            if prepared.request.object_id != record.object_id:
+                raise ValueError(
+                    "The glass-conversion result targets a different object."
+                )
+            result = prepared.reference_result
+            face_edit_id = uuid.uuid4().hex
+            replacement_paths: dict[str, str] = {}
+            for source_index, (source_path, edited_glb) in enumerate(
+                prepared.edited_glbs,
+                start=1,
+            ):
+                persisted_path = self._persist_meshy_named_asset(
+                    _build_face_edit_revision_asset_name(
+                        record.object_id,
+                        face_edit_id,
+                        source_index,
+                    ),
+                    edited_glb,
+                )
+                persisted_paths.append(persisted_path)
+                replacement_paths[source_path] = persisted_path
+
+            next_pipeline = copy.deepcopy(record.pipeline)
+            next_asset_path = _rewrite_face_edit_glb_paths(
+                record,
+                next_pipeline,
+                replacement_paths,
+            )
+            preview_model = prepared.preview_model
+            preview_revision = _build_generation_asset_revision(
+                self._asset_directory,
+                next_asset_path,
+            )
+            if preview_revision[1] is None:
+                raise OSError(
+                    "The saved glass-conversion revision is unavailable."
+                )
+            prefab_glass_material = build_housemaker_glass_material(
+                prepared.request.double_sided
+            )
+            runtime_material_key = get_housemaker_glass_runtime_key(
+                prefab_glass_material
+            )
+            if runtime_material_key is None:
+                raise RuntimeError(
+                    "The prefab glass runtime key could not be resolved."
+                )
+            next_pipeline.update(
+                {
+                    FACE_EDIT_REVISION_PIPELINE_KEY: (
+                        _next_nonnegative_revision_count(
+                            record.pipeline.get(
+                                FACE_EDIT_REVISION_PIPELINE_KEY,
+                                0,
+                            )
+                        )
+                    ),
+                    "face_edit_texture_preserved": (
+                        result.preserved_textured_uvs
+                    ),
+                    GLASS_CONVERSION_PIPELINE_KEY: {
+                        "material_name": HOUSEMAKER_GLASS_MATERIAL_NAME,
+                        "material_source": GLASS_MATERIAL_SOURCE_PREFAB,
+                        "material_profile": HOUSEMAKER_GLASS_MATERIAL_PROFILE,
+                        "atlas_independent": True,
+                        "runtime_material_key": runtime_material_key,
+                        "double_sided": prepared.request.double_sided,
+                        "source_face_count": result.glass_face_count,
+                        "output_face_count": result.glass_face_count,
+                        "atlas_pixel_count": 0,
+                        "local_material_edit": True,
+                    },
+                }
+            )
+            replacement = replace(
+                record,
+                asset_path=next_asset_path,
+                pipeline=_push_object_operation_undo_snapshot(
+                    record,
+                    next_pipeline,
+                    operation=OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
+                ),
+            )
+        except Exception as error:
+            self._remove_newly_persisted_assets(persisted_paths)
+            self._handle_job_face_glass_conversion_failed(
+                operation_id,
+                f"The edited object could not be saved: {error}",
+            )
+            return
+
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+            preview_asset_revision=preview_revision,
+        ):
+            self._remove_newly_persisted_assets(persisted_paths)
+            self._handle_job_face_glass_conversion_failed(
+                operation_id,
+                "The Atlas packing change could not be committed.",
+            )
+            return
+
+        self._record_operation_commit(
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
+            record.object_id,
+            operation_id,
+        )
+        cleanup_failed = self._delete_unreferenced_object_assets(record)
+        status = (
+            f"Converted {result.converted_face_count:,} face"
+            + ("" if result.converted_face_count == 1 else "s")
+            + f" on {record.object_name} to glass. Existing geometry, UVs, "
+            "and opaque textures were retained."
+            + (
+                " Some superseded files could not be removed."
+                if cleanup_failed
+                else ""
+            )
+        )
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.generated_object_changed.emit(replacement, preview_model)
+        self._complete_managed_job(runtime, status)
+
+    @Slot(str, str)
+    def _handle_job_face_glass_conversion_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+    ) -> None:
+        """Keep the source object when local glass assignment fails."""
+
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
+            operation_id,
+        ):
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        message = f"Glass conversion failed: {error_message!s}"
         self.status_label.setText(message)
         self._fail_managed_job(runtime, message)
 
@@ -10526,6 +11141,7 @@ class GenerationWorkspace(QWidget):
             OBJECT_OPERATION_GENERATE_TEXTURE,
             OBJECT_OPERATION_CREATE_FACE,
             OBJECT_OPERATION_DELETE_FACES,
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
         }:
             return False
         if operation.target_object_id != object_id:
@@ -10588,6 +11204,14 @@ class GenerationWorkspace(QWidget):
             )
             self.status_label.setText("Face creation cancelled. " + outcome)
             return
+        if operation.kind == OBJECT_OPERATION_CONVERT_FACES_TO_GLASS:
+            outcome = (
+                "The previous materials were restored."
+                if had_commit
+                else "The existing materials were kept."
+            )
+            self.status_label.setText("Glass conversion cancelled. " + outcome)
+            return
         self.status_label.setText("Operation cancelled.")
 
     @Slot(str)
@@ -10646,6 +11270,7 @@ class GenerationWorkspace(QWidget):
         if operation.kind in {
             OBJECT_OPERATION_CREATE_FACE,
             OBJECT_OPERATION_DELETE_FACES,
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
         }:
             self.result_view.cancel_transient_pointer_interactions()
             self._sync_face_selection_outputs()
@@ -10687,7 +11312,7 @@ class GenerationWorkspace(QWidget):
                 )
             )
         )
-        symmetric_division_enabled = (
+        symmetric_division_requested = (
             not geometry_only
             and self.symmetric_division_checkbox.isChecked()
             and self._architectural_trim_editing_target is None
@@ -10696,21 +11321,10 @@ class GenerationWorkspace(QWidget):
                 or is_door_body_slot(door_slot_target.slot_id)
             )
         )
-        if (
-            symmetric_division_enabled
-            and door_slot_target is not None
-            and door_slot_target.preserve_profile
-            and door_slot_target.door_body_profile_outline is not None
-            and not _door_body_profile_is_x_symmetric(
-                door_slot_target.door_body_profile_outline
-            )
-        ):
-            self.status_label.setText(
-                "Symmetric division cannot preserve this asymmetric door "
-                "profile. Disable Symmetric division or Preserve door "
-                "profile."
-            )
-            return None
+        symmetric_division_enabled = bool(
+            symmetric_division_requested
+            and _door_slot_supports_symmetric_division(door_slot_target)
+        )
         architectural_trim_uv_texture_domain = (
             ARCHITECTURAL_TRIM_UV_TEXTURE_DOMAIN_LEFT_HALF
             if (
@@ -10852,10 +11466,16 @@ class GenerationWorkspace(QWidget):
     def _build_texture_regeneration_request(
         self,
         *,
+        object_id: str | None = None,
         glass_face_indices: Sequence[int] = (),
         glass_double_sided: bool | None = None,
     ) -> _TextureRegenerationPreflight | None:
-        record = self._find_generated_object_record(self._selected_object_id)
+        target_object_id = (
+            self._selected_object_id
+            if object_id is None
+            else str(object_id).strip()
+        )
+        record = self._find_generated_object_record(target_object_id)
         if not self._can_regenerate_object_texture(record):
             self.status_label.setText(
                 "Select a generated object and paint or accept a current video "
@@ -10944,6 +11564,10 @@ class GenerationWorkspace(QWidget):
                 if (
                     is_door_component
                     and is_door_body_slot(door_component_slot_id)
+                    and self._door_slot_editing_target is not None
+                    and self._door_slot_editing_target.generation_ready
+                    and self._door_slot_editing_target.object_id
+                    == record.object_id
                     and self.symmetric_division_checkbox.isChecked()
                     and not preserve_symmetric_uvs
                 )
@@ -10954,7 +11578,7 @@ class GenerationWorkspace(QWidget):
                 Mapping,
             )
             has_complete_texture_uvs = (
-                self._selected_object_has_complete_texture_uvs(record)
+                self._object_has_complete_texture_uvs(record)
             )
             trim_target = self._architectural_trim_editing_target
             is_active_architectural_trim = bool(
@@ -11204,15 +11828,13 @@ class GenerationWorkspace(QWidget):
         selected_record = self._find_generated_object_record(
             self._selected_object_id
         )
-        door_slot_can_generate_model = bool(
+        door_slot_can_generate_geometry = bool(
             self._door_slot_editing_target is not None
+            and self._door_slot_editing_target.generation_ready
             and (
-                not is_door_body_slot(
-                    self._door_slot_editing_target.slot_id
-                )
-                or self._door_slot_editing_target.generate_displacement
-                or self._door_slot_editing_target.preserve_profile
-                or self._door_body_side_duplication_requires_rebuild()
+                not door_body_slot_mode
+                or self._door_slot_editing_target.door_body_fit_dimensions
+                is not None
             )
             and not self._object_has_active_mutation_job(
                 self._door_slot_editing_target.object_id
@@ -11221,6 +11843,16 @@ class GenerationWorkspace(QWidget):
             and has_reference_source
             and has_generation_reference
             and self._settings.meshy_api_key
+        )
+        door_slot_can_generate_model = bool(
+            door_slot_can_generate_geometry
+            and self._door_slot_editing_target is not None
+            and (
+                not door_body_slot_mode
+                or self._door_slot_editing_target.generate_displacement
+                or self._door_slot_editing_target.preserve_profile
+                or self._door_body_side_duplication_requires_rebuild()
+            )
         )
         missing_door_slot_can_generate = bool(
             door_slot_can_generate_model
@@ -11339,10 +11971,6 @@ class GenerationWorkspace(QWidget):
             and selected_record is not None
             and selected_face_count > 0
             and not selected_object_is_busy
-            and required_key_is_available
-            and has_reference_source
-            and has_generation_reference
-            and projection_camera_percentages_are_valid
         )
         self.result_view.set_face_editing_enabled(
             face_selection_is_available
@@ -11368,6 +11996,18 @@ class GenerationWorkspace(QWidget):
                 and self._legacy_active_job_runtime() is not None
                 and not self._active_object_operation.cancel_requested
             )
+        door_slot_supports_symmetric_division = (
+            _door_slot_supports_symmetric_division(opening_target)
+        )
+        if (
+            not door_slot_supports_symmetric_division
+            and self.symmetric_division_checkbox.isChecked()
+        ):
+            symmetric_division_blocker = QSignalBlocker(
+                self.symmetric_division_checkbox
+            )
+            self.symmetric_division_checkbox.setChecked(False)
+            del symmetric_division_blocker
         self.symmetric_division_checkbox.setEnabled(
             (
                 not architectural_trim_mode
@@ -11377,6 +12017,7 @@ class GenerationWorkspace(QWidget):
                 )
             )
             and (not door_slot_mode or door_body_slot_mode)
+            and door_slot_supports_symmetric_division
             and not has_untracked_legacy_job
         )
         if not self._shared_control_state_managed_externally:
@@ -11415,9 +12056,12 @@ class GenerationWorkspace(QWidget):
             not architectural_trim_mode
             and not self._external_surface_generation_target_selected
             and (
-                not door_slot_mode
-                and ordinary_geometry_generation_is_available
-                and not self.symmetric_division_checkbox.isChecked()
+                door_slot_can_generate_geometry
+                if door_slot_mode
+                else (
+                    ordinary_geometry_generation_is_available
+                    and not self.symmetric_division_checkbox.isChecked()
+                )
             )
         )
         self.place_button.setEnabled(not component_mode)
@@ -11442,9 +12086,24 @@ class GenerationWorkspace(QWidget):
             or self.result_view.model is not model
         ):
             return False
+        return self._object_has_complete_texture_uvs(record, model=model)
+
+    def _object_has_complete_texture_uvs(
+        self,
+        record: GeneratedObjectRecord | None,
+        *,
+        model: GeneratedModel | None = None,
+    ) -> bool:
+        """Return whether every face in one exact object has a finite UV."""
+
+        if record is None:
+            return False
+        resolved_model = model or self.get_generated_object_model(record.object_id)
+        if resolved_model is None:
+            return False
         try:
-            geometry = self._load_object_face_geometry(record, model)
-        except Exception:
+            geometry = self._load_object_face_geometry(record, resolved_model)
+        except (OSError, RuntimeError, TypeError, ValueError):
             return False
         uv_face_indices = np.asarray(
             geometry.uv_face_indices,
@@ -12861,6 +13520,22 @@ def _door_body_profile_is_x_symmetric(
     return bool(np.allclose(heights, mirrored_heights, rtol=0.0, atol=tolerance))
 
 
+def _door_slot_supports_symmetric_division(
+    target: _DoorSlotEditingTarget | None,
+) -> bool:
+    """Return whether vertical mirroring can preserve an opening body."""
+
+    return bool(
+        target is None
+        or not is_door_body_slot(target.slot_id)
+        or not target.preserve_profile
+        or target.door_body_profile_outline is None
+        or _door_body_profile_is_x_symmetric(
+            target.door_body_profile_outline
+        )
+    )
+
+
 def _door_body_profile_split_planes(
     fit_dimensions: tuple[float, float, float],
     profile_outline: tuple[tuple[float, float], ...],
@@ -12989,8 +13664,10 @@ def _normalize_door_body_lateral_silhouette(
     A global bounding-box fit leaves Meshy's small lateral tapers intact.  On
     paired leaves those tapers become a visible center gap.  This horizontal
     cage uses the projected mesh envelope at each existing vertex height, so
-    lateral boundary vertices land exactly on the authored side planes while
-    interior relief, depth, triangles, UVs, materials, and images are retained.
+    lateral boundary vertices land exactly on the authored side planes. A
+    valid pointed apex borrows the nearest measurable envelope instead of
+    being mistaken for missing geometry. Interior relief, depth, triangles,
+    UVs, materials, and images are retained.
     """
 
     if not isinstance(scene, trimesh.Scene):
@@ -13066,6 +13743,7 @@ def _normalize_door_body_lateral_silhouette(
             "Door silhouette preservation found no usable mesh geometry."
         )
     combined_triangles = np.concatenate(world_triangles, axis=0)
+    repair_envelopes: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
     for (
         geometry,
         world_vertices,
@@ -13080,6 +13758,54 @@ def _normalize_door_body_lateral_silhouette(
             tolerance=tolerance,
         )
         spans = right_limits - left_limits
+        measurable = np.isfinite(spans) & (spans > tolerance)
+        if not np.all(measurable):
+            if repair_envelopes is None:
+                candidate_coordinates = np.unique(
+                    combined_triangles[:, :, 2].reshape(-1)
+                )
+                candidate_left_limits, candidate_right_limits = (
+                    _projected_mesh_envelopes(
+                        candidate_coordinates,
+                        combined_triangles,
+                        coordinate_axis=2,
+                        envelope_axis=0,
+                        tolerance=tolerance,
+                    )
+                )
+                candidate_spans = (
+                    candidate_right_limits - candidate_left_limits
+                )
+                candidate_measurable = np.isfinite(candidate_spans) & (
+                    candidate_spans > tolerance
+                )
+                if not np.any(candidate_measurable):
+                    raise ValueError(
+                        "The generated door body has no measurable lateral "
+                        "silhouette."
+                    )
+                repair_envelopes = (
+                    candidate_coordinates[candidate_measurable],
+                    candidate_left_limits[candidate_measurable],
+                    candidate_right_limits[candidate_measurable],
+                )
+            (
+                repair_coordinates,
+                repair_left_limits,
+                repair_right_limits,
+            ) = repair_envelopes
+            collapsed_coordinates = world_vertices[~measurable, 2]
+            left_limits[~measurable] = np.interp(
+                collapsed_coordinates,
+                repair_coordinates,
+                repair_left_limits,
+            )
+            right_limits[~measurable] = np.interp(
+                collapsed_coordinates,
+                repair_coordinates,
+                repair_right_limits,
+            )
+            spans = right_limits - left_limits
         if np.any(~np.isfinite(spans)) or np.any(spans <= tolerance):
             raise ValueError(
                 "The generated door body has no measurable lateral silhouette."
@@ -13671,6 +14397,7 @@ def _get_object_operation_undo_stack(
             OBJECT_OPERATION_GENERATE_TEXTURE,
             OBJECT_OPERATION_CREATE_FACE,
             OBJECT_OPERATION_DELETE_FACES,
+            OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
             OBJECT_OPERATION_COLOR_BALANCE,
         }:
             continue
@@ -13719,6 +14446,7 @@ def _push_object_operation_undo_snapshot(
         OBJECT_OPERATION_GENERATE_TEXTURE,
         OBJECT_OPERATION_CREATE_FACE,
         OBJECT_OPERATION_DELETE_FACES,
+        OBJECT_OPERATION_CONVERT_FACES_TO_GLASS,
         OBJECT_OPERATION_COLOR_BALANCE,
     }:
         raise ValueError("Unknown undoable object operation.")

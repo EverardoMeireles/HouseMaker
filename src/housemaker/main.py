@@ -155,6 +155,7 @@ from housemaker.door_geometry import (
     build_default_door_slot_models,
     build_default_window_slot_models,
     build_door_body_source_outline,
+    mirror_door_model_depthwise,
     mirror_door_model_horizontally,
 )
 from housemaker.door_state import (
@@ -311,6 +312,9 @@ from housemaker.models import (
     create_default_doorway_presets,
     create_default_levels,
     create_fallback_doorway_preset,
+)
+from housemaker.object_symmetry import (
+    SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
 )
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
@@ -2325,8 +2329,20 @@ class BlueprintWorkspace(QWidget):
         self.doors_workspace.asset_slot_axis_scales_changed.connect(
             self._handle_opening_asset_slot_axis_scales_changed
         )
+        self.doors_workspace.asset_slot_horizontal_flip_requested.connect(
+            self._handle_opening_asset_slot_horizontal_flip_requested
+        )
         self.doors_workspace.glass_area_creation_requested.connect(
             self._handle_opening_glass_area_creation_requested
+        )
+        self.doors_workspace.face_creation_requested.connect(
+            self._handle_opening_component_face_creation_requested
+        )
+        self.doors_workspace.face_deletion_requested.connect(
+            self._handle_opening_component_face_deletion_requested
+        )
+        self.doors_workspace.face_glass_conversion_requested.connect(
+            self._handle_opening_component_face_glass_conversion_requested
         )
         self.doors_workspace.asset_slot_mesh_paste_requested.connect(
             self._handle_opening_asset_slot_mesh_paste_requested
@@ -2594,6 +2610,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_opening_selection_changed.connect(
             self._handle_canvas_opening_selection_changed
+        )
+        self.viewer.canvas_opening_fixture_deletion_requested.connect(
+            self._handle_canvas_opening_fixture_deletion_requested
         )
         self.viewer.canvas_opening_edit_started.connect(
             self._handle_canvas_opening_edit_started
@@ -3793,7 +3812,9 @@ class BlueprintWorkspace(QWidget):
         self.place_selected_window_button.setMinimumHeight(40)
         self.place_selected_window_button.setEnabled(False)
         self.place_selected_window_button.setToolTip(
-            "Place the selected reusable window into a window frame."
+            "Place the selected reusable window into a window frame. Use the "
+            "mouse wheel before clicking to cycle horizontal mirroring and "
+            "the side of the wall."
         )
         self.place_selected_window_button.clicked.connect(
             self._handle_place_selected_window_clicked
@@ -3823,7 +3844,8 @@ class BlueprintWorkspace(QWidget):
         self.place_selected_door_button.setEnabled(False)
         self.place_selected_door_button.setToolTip(
             "Place this reusable door into a doorway. Use the mouse wheel "
-            "before clicking to mirror it horizontally."
+            "before clicking to cycle horizontal mirroring and the side of "
+            "the wall."
         )
         self.place_selected_door_button.clicked.connect(
             self._handle_place_selected_door_clicked
@@ -4293,6 +4315,9 @@ class BlueprintWorkspace(QWidget):
         self.canvas.canvas_opening_selection_requested.connect(
             self._handle_blueprint_canvas_opening_selection_requested
         )
+        self.canvas.canvas_opening_fixture_deletion_requested.connect(
+            self._handle_canvas_opening_fixture_deletion_requested
+        )
         self.canvas.canvas_opening_edit_started.connect(
             self._handle_canvas_opening_edit_started
         )
@@ -4685,6 +4710,73 @@ class BlueprintWorkspace(QWidget):
         self.canvas._set_selected_doorway_index(doorway_index)
         self.canvas._set_selected_window_id(window_id, notify=False)
         self.canvas.update()
+
+    def _handle_canvas_opening_fixture_deletion_requested(
+        self,
+        raw_reference: object,
+    ) -> None:
+        """Remove an installed fixture while preserving its structural opening."""
+
+        if not isinstance(raw_reference, CanvasOpeningReference):
+            return
+        library = self.doors_workspace.data()
+        selected_door_id: str | None = None
+        selected_window_id: str | None = None
+        if raw_reference.kind == CANVAS_OPENING_DOORWAY:
+            resolved = self._resolve_doorway_reference(raw_reference)
+            if resolved is None:
+                return
+            level, doorway = resolved
+            removed = tuple(
+                placement
+                for placement in library.placements
+                if placement.level_index == level.index
+                and placement.doorway_id == doorway.doorway_id
+            )
+            if not removed:
+                return
+            selected_door_id = removed[-1].door_id
+            placements = [
+                placement
+                for placement in library.placements
+                if placement not in removed
+            ]
+            window_placements = list(library.window_placements)
+        else:
+            resolved_window = self._resolve_window_frame_reference(raw_reference)
+            if resolved_window is None:
+                return
+            level, frame, _target = resolved_window
+            removed_windows = tuple(
+                placement
+                for placement in library.window_placements
+                if placement.level_index == level.index
+                and placement.window_frame_id == frame.window_id
+            )
+            if not removed_windows:
+                return
+            selected_window_id = removed_windows[-1].window_id
+            placements = list(library.placements)
+            window_placements = [
+                placement
+                for placement in library.window_placements
+                if placement not in removed_windows
+            ]
+
+        self.doors_workspace.set_data(
+            DoorLibraryData(
+                doors=list(library.doors),
+                placements=placements,
+                windows=list(library.windows),
+                window_placements=window_placements,
+            )
+        )
+        self._refresh_canvas_door_list(selected_door_id=selected_door_id)
+        self._refresh_canvas_window_asset_list(
+            selected_window_id=selected_window_id
+        )
+        self._sync_viewer_scene_levels()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_canvas_opening_edit_started(
         self,
@@ -16720,6 +16812,28 @@ class BlueprintWorkspace(QWidget):
             placed_object_levels=placed_object_levels,
             reset_visibility=reset_visibility,
         )
+        self._sync_canvas_opening_fixture_keys()
+
+    def _sync_canvas_opening_fixture_keys(self) -> None:
+        """Tell the 2D canvas which openings own removable fixtures."""
+
+        library = self.doors_workspace.data()
+        doorway_bindings = {
+            (placement.level_index, placement.doorway_id)
+            for placement in library.placements
+        }
+        opening_keys: list[str] = []
+        for level in self.levels:
+            opening_keys.extend(
+                f"doorway:{level.index}:{doorway_index}"
+                for doorway_index, doorway in enumerate(level.doorways)
+                if (level.index, doorway.doorway_id) in doorway_bindings
+            )
+        opening_keys.extend(
+            f"window:{placement.window_frame_id}"
+            for placement in library.window_placements
+        )
+        self.canvas.set_fixture_opening_keys(opening_keys)
 
     def _set_mesh_edit_update_delay_seconds(
         self,
@@ -18194,6 +18308,8 @@ class BlueprintWorkspace(QWidget):
                 )
                 if placement.mirrored_horizontally:
                     model = mirror_door_model_horizontally(model)
+                if placement.mirrored_depthwise:
+                    model = mirror_door_model_depthwise(model)
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
             placed_model = self._build_door_placement_model(
@@ -18243,6 +18359,8 @@ class BlueprintWorkspace(QWidget):
                 )
                 if placement.mirrored_horizontally:
                     model = mirror_door_model_horizontally(model)
+                if placement.mirrored_depthwise:
+                    model = mirror_door_model_depthwise(model)
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
             placed = self._build_window_placement_model(
@@ -18255,6 +18373,48 @@ class BlueprintWorkspace(QWidget):
             if placed is not None:
                 placed_models.append(placed)
         return tuple(placed_models)
+
+    @staticmethod
+    def _build_opening_fixture_world_position(
+        model: GeneratedModel,
+        anchor_world: Sequence[float],
+        *,
+        yaw_radians: float,
+        axis_scales: Sequence[float],
+    ) -> tuple[float, float, float] | None:
+        """Offset the model pivot while keeping its local origin on the opening."""
+
+        bounds = np.asarray(model.mesh.bounds, dtype=float)
+        anchor = np.asarray(anchor_world, dtype=float)
+        scales = np.asarray(axis_scales, dtype=float)
+        if (
+            bounds.shape != (2, 3)
+            or anchor.shape != (3,)
+            or scales.shape != (3,)
+            or not np.all(np.isfinite(bounds))
+            or not np.all(np.isfinite(anchor))
+            or not np.all(np.isfinite(scales))
+        ):
+            return None
+        minimum, maximum = bounds
+        local_bottom_center = np.asarray(
+            (
+                (minimum[0] + maximum[0]) * 0.5,
+                (minimum[1] + maximum[1]) * 0.5,
+                minimum[2],
+            ),
+            dtype=float,
+        )
+        rotation = np.asarray(
+            (
+                (math.cos(yaw_radians), -math.sin(yaw_radians), 0.0),
+                (math.sin(yaw_radians), math.cos(yaw_radians), 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            dtype=float,
+        )
+        world_position = anchor + rotation @ (scales * local_bottom_center)
+        return tuple(float(value) for value in world_position)
 
     @staticmethod
     def _build_door_placement_model(
@@ -18285,34 +18445,27 @@ class BlueprintWorkspace(QWidget):
             return None
         yaw_degrees = math.degrees(math.atan2(width_dy, width_dx))
         yaw_radians = math.radians(yaw_degrees)
-        # Door hardware may extend beyond the body and move the bounds pivot.
-        # Offset that pivot so local origin remains at the doorway bottom-center.
-        minimum, maximum = model.mesh.bounds
-        local_pivot_x = float((minimum[0] + maximum[0]) / 2.0)
-        local_pivot_y = float((minimum[1] + maximum[1]) / 2.0)
-        local_pivot_z = float(minimum[2])
-        scaled_pivot_x = local_pivot_x * level.scale
-        scaled_pivot_y = local_pivot_y * level.scale
-        rotated_pivot_x = (
-            math.cos(yaw_radians) * scaled_pivot_x
-            - math.sin(yaw_radians) * scaled_pivot_y
+        axis_scales = (level.scale, level.scale, 1.0)
+        world_position = BlueprintWorkspace._build_opening_fixture_world_position(
+            model,
+            (
+                center_x,
+                center_y,
+                base_z + doorway.bottom_height_meters,
+            ),
+            yaw_radians=yaw_radians,
+            axis_scales=axis_scales,
         )
-        rotated_pivot_y = (
-            math.sin(yaw_radians) * scaled_pivot_x
-            + math.cos(yaw_radians) * scaled_pivot_y
-        )
+        if world_position is None:
+            return None
         return PlacedGeneratedModel(
             object_id=scene_object_id,
             source_object_id=scene_object_id,
             object_name=door.name,
             model=model,
-            world_position=(
-                center_x + rotated_pivot_x,
-                center_y + rotated_pivot_y,
-                base_z + doorway.bottom_height_meters + local_pivot_z,
-            ),
+            world_position=world_position,
             rotation_degrees=(0.0, 0.0, yaw_degrees),
-            axis_scales=(level.scale, level.scale, 1.0),
+            axis_scales=axis_scales,
         )
 
     @staticmethod
@@ -18336,32 +18489,23 @@ class BlueprintWorkspace(QWidget):
             return None
         yaw_degrees = math.degrees(math.atan2(tangent[1], tangent[0]))
         yaw_radians = math.radians(yaw_degrees)
-        minimum, maximum = model.mesh.bounds
-        local_pivot_x = float((minimum[0] + maximum[0]) * 0.5)
-        local_pivot_y = float((minimum[1] + maximum[1]) * 0.5)
-        local_pivot_z = float(minimum[2])
-        scaled_pivot_x = local_pivot_x * level.scale
-        scaled_pivot_y = local_pivot_y * level.scale
-        rotated_pivot_x = (
-            math.cos(yaw_radians) * scaled_pivot_x
-            - math.sin(yaw_radians) * scaled_pivot_y
+        axis_scales = (level.scale, level.scale, 1.0)
+        world_position = BlueprintWorkspace._build_opening_fixture_world_position(
+            model,
+            bottom_world,
+            yaw_radians=yaw_radians,
+            axis_scales=axis_scales,
         )
-        rotated_pivot_y = (
-            math.sin(yaw_radians) * scaled_pivot_x
-            + math.cos(yaw_radians) * scaled_pivot_y
-        )
+        if world_position is None:
+            return None
         return PlacedGeneratedModel(
             object_id=scene_object_id,
             source_object_id=scene_object_id,
             object_name=window.name,
             model=model,
-            world_position=(
-                float(bottom_world[0]) + rotated_pivot_x,
-                float(bottom_world[1]) + rotated_pivot_y,
-                float(bottom_world[2]) + local_pivot_z,
-            ),
+            world_position=world_position,
             rotation_degrees=(0.0, 0.0, yaw_degrees),
-            axis_scales=(level.scale, level.scale, 1.0),
+            axis_scales=axis_scales,
         )
 
     @staticmethod
@@ -18380,11 +18524,37 @@ class BlueprintWorkspace(QWidget):
             DOOR_SLOT_KNOB: [],
         }
         for preview in model.preview_placed_objects:
-            source_id = preview.source_object_id or preview.object_id
-            component_kind = component_by_source_id.get(source_id)
+            candidate_ids = tuple(
+                candidate_id
+                for candidate_id in (
+                    preview.source_object_id,
+                    preview.object_id,
+                )
+                if candidate_id
+            )
+            component_kind = next(
+                (
+                    component_by_source_id[candidate_id]
+                    for candidate_id in candidate_ids
+                    if candidate_id in component_by_source_id
+                ),
+                None,
+            )
             if component_kind not in meshes_by_component:
-                source_id = preview.object_id
-                component_kind = component_by_source_id.get(preview.object_id)
+                matched_source_id = next(
+                    (
+                        source_id
+                        for source_id in component_by_source_id
+                        if any(
+                            candidate_id.startswith(f"{source_id}:")
+                            for candidate_id in candidate_ids
+                        )
+                    ),
+                    None,
+                )
+                component_kind = component_by_source_id.get(
+                    matched_source_id or ""
+                )
             if component_kind not in meshes_by_component:
                 continue
             for mesh in preview.meshes:
@@ -18407,10 +18577,9 @@ class BlueprintWorkspace(QWidget):
                 ),
                 None,
             )
-            component_kind = component_by_source_id.get(
-                matched_source or "",
-                DOOR_SLOT_BODY,
-            )
+            component_kind = component_by_source_id.get(matched_source or "")
+            if component_kind not in meshes_by_component:
+                continue
             meshes_by_component[component_kind].extend(
                 copy.deepcopy(mesh)
                 for mesh in symmetric_preview.mirrored_meshes
@@ -18431,8 +18600,13 @@ class BlueprintWorkspace(QWidget):
     @staticmethod
     def _mirror_door_placement_preview_parts(
         parts: Sequence[DoorPlacementPreviewPart],
+        *,
+        axis: int = 0,
     ) -> tuple[DoorPlacementPreviewPart, ...]:
-        """Reflect a complete colored door profile across its local X axis."""
+        """Reflect a complete colored fixture profile across one local axis."""
+
+        if axis not in {0, 1}:
+            raise ValueError("Placement preview reflection requires X or Y.")
 
         mirrored_parts: list[DoorPlacementPreviewPart] = []
         for part in parts:
@@ -18440,7 +18614,7 @@ class BlueprintWorkspace(QWidget):
             for mesh in part.meshes:
                 mirrored = copy.deepcopy(mesh)
                 vertices = np.asarray(mirrored.vertices, dtype=float).copy()
-                vertices[:, 0] *= -1.0
+                vertices[:, axis] *= -1.0
                 mirrored.vertices = vertices
                 mirrored.faces = np.ascontiguousarray(
                     np.asarray(mirrored.faces, dtype=np.int64)[:, (0, 2, 1)]
@@ -18459,8 +18633,9 @@ class BlueprintWorkspace(QWidget):
         door: DoorDefinition,
         targets: Sequence[CanvasOpeningTarget],
     ) -> tuple[DoorPlacementPreviewCandidate, ...]:
-        """Build exact normal and wheel-mirrored previews for doorways."""
+        """Build four exact wheel orientations for compatible doorways."""
         base_z_by_level_index = build_level_base_z_lookup(self.levels)
+        require_handle_preview = self._opening_asset_has_resolvable_handle(door)
 
         candidates: list[DoorPlacementPreviewCandidate] = []
         for target in targets:
@@ -18475,6 +18650,7 @@ class BlueprintWorkspace(QWidget):
                 door,
                 doorway,
                 include_unjoined=False,
+                preview_only=True,
             )
             normal_parts = self._build_door_placement_preview_parts(
                 fitted_door,
@@ -18484,9 +18660,25 @@ class BlueprintWorkspace(QWidget):
                 raise ValueError(
                     "The selected door has no visible placement profile."
                 )
-            mirrored_model = mirror_door_model_horizontally(normal_model)
+            if require_handle_preview and not any(
+                part.component_kind == DOOR_SLOT_KNOB for part in normal_parts
+            ):
+                raise ValueError(
+                    "The selected door's Handle could not be represented in "
+                    "the placement preview."
+                )
             mirrored_parts = self._mirror_door_placement_preview_parts(
                 normal_parts
+            )
+            depth_mirrored_parts = self._mirror_door_placement_preview_parts(
+                normal_parts,
+                axis=1,
+            )
+            depth_and_horizontal_parts = (
+                self._mirror_door_placement_preview_parts(
+                    mirrored_parts,
+                    axis=1,
+                )
             )
             normal_placement = self._build_door_placement_model(
                 fitted_door,
@@ -18496,27 +18688,24 @@ class BlueprintWorkspace(QWidget):
                 scene_object_id=f"door-preview:{target.key}:normal",
                 model=normal_model,
             )
-            mirrored_placement = self._build_door_placement_model(
-                fitted_door,
-                level,
-                doorway,
-                base_z=float(base_z),
-                scene_object_id=f"door-preview:{target.key}:mirrored",
-                model=mirrored_model,
-            )
-            if normal_placement is None or mirrored_placement is None:
+            if normal_placement is None:
                 continue
+            anchor_transform = build_placed_generated_model_transform(
+                normal_placement
+            )
             candidates.append(
                 DoorPlacementPreviewCandidate(
                     opening_key=target.key,
                     normal_parts=normal_parts,
-                    normal_transform=build_placed_generated_model_transform(
-                        normal_placement
-                    ),
+                    normal_transform=anchor_transform,
                     mirrored_parts=mirrored_parts,
-                    mirrored_transform=build_placed_generated_model_transform(
-                        mirrored_placement
+                    mirrored_transform=anchor_transform,
+                    depth_mirrored_parts=depth_mirrored_parts,
+                    depth_mirrored_transform=anchor_transform,
+                    depth_and_horizontally_mirrored_parts=(
+                        depth_and_horizontal_parts
                     ),
+                    depth_and_horizontally_mirrored_transform=anchor_transform,
                 )
             )
         return tuple(candidates)
@@ -18526,9 +18715,10 @@ class BlueprintWorkspace(QWidget):
         window: WindowDefinition,
         targets: Sequence[CanvasOpeningTarget],
     ) -> tuple[DoorPlacementPreviewCandidate, ...]:
-        """Build exact normal and wheel-mirrored previews for window frames."""
+        """Build four exact wheel orientations for window frames."""
 
         candidates: list[DoorPlacementPreviewCandidate] = []
+        require_handle_preview = self._opening_asset_has_resolvable_handle(window)
         for target in targets:
             resolved = self._resolve_window_frame_reference(target.reference)
             if resolved is None:
@@ -18539,6 +18729,7 @@ class BlueprintWorkspace(QWidget):
                 resolved_target,
                 level,
                 include_unjoined=False,
+                preview_only=True,
             )
             normal_parts = self._build_door_placement_preview_parts(
                 fitted_window,
@@ -18548,7 +18739,26 @@ class BlueprintWorkspace(QWidget):
                 raise ValueError(
                     "The selected window has no visible placement profile."
                 )
-            mirrored_model = mirror_door_model_horizontally(normal_model)
+            if require_handle_preview and not any(
+                part.component_kind == DOOR_SLOT_KNOB for part in normal_parts
+            ):
+                raise ValueError(
+                    "The selected window's Handle could not be represented in "
+                    "the placement preview."
+                )
+            mirrored_parts = self._mirror_door_placement_preview_parts(
+                normal_parts
+            )
+            depth_mirrored_parts = self._mirror_door_placement_preview_parts(
+                normal_parts,
+                axis=1,
+            )
+            depth_and_horizontal_parts = (
+                self._mirror_door_placement_preview_parts(
+                    mirrored_parts,
+                    axis=1,
+                )
+            )
             normal_placement = self._build_window_placement_model(
                 fitted_window,
                 level,
@@ -18556,31 +18766,42 @@ class BlueprintWorkspace(QWidget):
                 scene_object_id=f"window-preview:{target.key}:normal",
                 model=normal_model,
             )
-            mirrored_placement = self._build_window_placement_model(
-                fitted_window,
-                level,
-                resolved_target,
-                scene_object_id=f"window-preview:{target.key}:mirrored",
-                model=mirrored_model,
-            )
-            if normal_placement is None or mirrored_placement is None:
+            if normal_placement is None:
                 continue
+            anchor_transform = build_placed_generated_model_transform(
+                normal_placement
+            )
             candidates.append(
                 DoorPlacementPreviewCandidate(
                     opening_key=target.key,
                     normal_parts=normal_parts,
-                    normal_transform=build_placed_generated_model_transform(
-                        normal_placement
+                    normal_transform=anchor_transform,
+                    mirrored_parts=mirrored_parts,
+                    mirrored_transform=anchor_transform,
+                    depth_mirrored_parts=depth_mirrored_parts,
+                    depth_mirrored_transform=anchor_transform,
+                    depth_and_horizontally_mirrored_parts=(
+                        depth_and_horizontal_parts
                     ),
-                    mirrored_parts=self._mirror_door_placement_preview_parts(
-                        normal_parts
-                    ),
-                    mirrored_transform=build_placed_generated_model_transform(
-                        mirrored_placement
-                    ),
+                    depth_and_horizontally_mirrored_transform=anchor_transform,
                 )
             )
         return tuple(candidates)
+
+    def _opening_asset_has_resolvable_handle(
+        self,
+        asset: DoorDefinition | WindowDefinition,
+    ) -> bool:
+        """Return whether a joined Handle has a model that preview must show."""
+
+        return any(
+            slot.joined
+            and door_slot_component(slot.slot_id) == DOOR_SLOT_KNOB
+            and self.generation.is_generated_object_asset_available(
+                slot.source_object_id
+            )
+            for slot in asset.slots
+        )
 
     def _resolve_placed_generated_model(
         self,
@@ -21524,6 +21745,8 @@ class BlueprintWorkspace(QWidget):
             )
             if model is None:
                 continue
+            if preview_only and not model.preview_only:
+                model = replace(model, preview_only=True)
             models[slot.source_object_id] = model
         procedural_models: dict[str, GeneratedModel] | None = None
         for slot in door.slots:
@@ -21534,7 +21757,12 @@ class BlueprintWorkspace(QWidget):
                 continue
             if procedural_models is None:
                 procedural_models = build_default_door_slot_models(door)
-            models[slot.source_object_id] = procedural_models[slot.slot_id]
+            procedural_model = procedural_models[slot.slot_id]
+            models[slot.source_object_id] = (
+                replace(procedural_model, preview_only=True)
+                if preview_only and not procedural_model.preview_only
+                else procedural_model
+            )
         return models
 
     def _get_window_slot_models(
@@ -21556,6 +21784,8 @@ class BlueprintWorkspace(QWidget):
                 preview_only=preview_only,
             )
             if model is not None:
+                if preview_only and not model.preview_only:
+                    model = replace(model, preview_only=True)
                 models[slot.source_object_id] = model
         procedural_models: dict[str, GeneratedModel] | None = None
         for slot in window.slots:
@@ -21566,7 +21796,12 @@ class BlueprintWorkspace(QWidget):
                 continue
             if procedural_models is None:
                 procedural_models = build_default_window_slot_models(window)
-            models[slot.source_object_id] = procedural_models[slot.slot_id]
+            procedural_model = procedural_models[slot.slot_id]
+            models[slot.source_object_id] = (
+                replace(procedural_model, preview_only=True)
+                if preview_only and not procedural_model.preview_only
+                else procedural_model
+            )
         return models
 
     def _build_door_assembly_preview(
@@ -21692,16 +21927,61 @@ class BlueprintWorkspace(QWidget):
                     )
                 )
                 continue
+            fitted_x = slot.position_meters[0] * body_width_scale
+            fitted_z = _fit_door_component_height_to_doorway(
+                door,
+                doorway,
+                source_x=slot.position_meters[0],
+                source_z=slot.position_meters[2],
+                target_x=fitted_x,
+            )
             fitted_slots.append(
                 slot.with_transform(
                     position_meters=(
-                        slot.position_meters[0] * body_width_scale,
+                        fitted_x,
                         slot.position_meters[1],
-                        slot.position_meters[2] * body_height_scale,
+                        fitted_z,
                     )
                 )
             )
         return replace(door, slots=tuple(fitted_slots))
+
+    @staticmethod
+    def _build_door_destination_profile_overrides(
+        door: DoorDefinition,
+        doorway: DoorwayData,
+    ) -> dict[str, tuple[tuple[float, float], ...]]:
+        """Express destination leaf profiles in the source door's bounds."""
+
+        if door.shape != doorway.shape:
+            raise ValueError("A door cannot be fitted to another profile type.")
+        if door.shape != DOORWAY_SHAPE_ARCH:
+            return {}
+        destination = replace(
+            door,
+            width_meters=doorway.width_meters,
+            height_meters=doorway.height_meters,
+            shape=doorway.shape,
+            arch_amount=doorway.arch_amount,
+        )
+        width_scale = door.width_meters / doorway.width_meters
+        height_scale = door.height_meters / doorway.height_meters
+        overrides: dict[str, tuple[tuple[float, float], ...]] = {}
+        for slot in destination.slots:
+            if not is_door_body_slot(slot.slot_id):
+                continue
+            destination_outline = build_door_body_source_outline(
+                destination,
+                slot,
+            )
+            overrides[slot.slot_id] = tuple(
+                (
+                    float(x_coordinate) * width_scale,
+                    float(z_coordinate) * height_scale,
+                )
+                for x_coordinate, z_coordinate in destination_outline
+            )
+        return overrides
 
     def _assemble_door_for_doorway(
         self,
@@ -21717,6 +21997,31 @@ class BlueprintWorkspace(QWidget):
             door,
             doorway,
         )
+        body_mirrors = self._resolve_door_body_mirror_configurations(door)
+        body_profile_overrides = self._build_door_destination_profile_overrides(
+            door,
+            doorway,
+        )
+        for slot in door.slots:
+            configuration = body_mirrors.get(slot.slot_id)
+            profile_override = body_profile_overrides.get(slot.slot_id)
+            if (
+                configuration is not None
+                and configuration.symmetric_orientation
+                == SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL
+                and profile_override is not None
+                and not np.allclose(
+                    profile_override,
+                    build_door_body_source_outline(door, slot),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "Arched doorway refitting does not support legacy "
+                    "horizontal half-door geometry. Regenerate the body with "
+                    "vertical Symmetric division."
+                )
         return (
             fitted_door,
             assemble_door_model(
@@ -21726,9 +22031,8 @@ class BlueprintWorkspace(QWidget):
                     preview_only=preview_only,
                 ),
                 include_unjoined=include_unjoined,
-                body_mirrors=(
-                    self._resolve_door_body_mirror_configurations(door)
-                ),
+                body_mirrors=body_mirrors,
+                body_profile_overrides=body_profile_overrides,
             ),
         )
 
@@ -22874,6 +23178,63 @@ class BlueprintWorkspace(QWidget):
         if body_selected and self._window_has_placements(window.window_id):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    def _handle_opening_asset_slot_horizontal_flip_requested(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        slot_id: str,
+    ) -> None:
+        """Flip one slot and its proportional left/right counterpart."""
+
+        library = self.doors_workspace.data()
+        if asset_kind == ASSET_KIND_DOOR:
+            asset = library.get_door(asset_id)
+        elif asset_kind == ASSET_KIND_WINDOW:
+            asset = library.get_window(asset_id)
+        else:
+            return
+        slot = None if asset is None else asset.get_slot(slot_id)
+        if asset is None or slot is None:
+            return
+
+        updated_slot = slot.with_transform(
+            mirrored_horizontally=not slot.mirrored_horizontally
+        )
+        counterpart = self._get_proportional_opening_slot(asset, slot)
+        updated_counterpart = (
+            None
+            if counterpart is None
+            else counterpart.with_transform(
+                mirrored_horizontally=(
+                    not counterpart.mirrored_horizontally
+                )
+            )
+        )
+        if updated_counterpart is None:
+            self._record_opening_asset_slot_undo_state(
+                asset_kind,
+                asset_id,
+                slot,
+            )
+            updated_asset = asset.replace_slot(updated_slot)
+        else:
+            self._record_opening_asset_definition_undo_state(
+                asset_kind,
+                asset,
+            )
+            updated_asset = asset.replace_slot(updated_slot).replace_slot(
+                updated_counterpart
+            )
+        if isinstance(updated_asset, DoorDefinition):
+            self.doors_workspace.upsert_door(updated_asset)
+            has_placements = self._door_has_placements(asset_id)
+        else:
+            self.doors_workspace.upsert_window(updated_asset)
+            has_placements = self._window_has_placements(asset_id)
+        self._sync_selected_opening_asset_preview()
+        if has_placements:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
     def _handle_opening_asset_slot_confirmation_requested(
         self,
         asset_kind: str,
@@ -23310,6 +23671,10 @@ class BlueprintWorkspace(QWidget):
         if selected_glass_area is not None or slot is None:
             self.generation.clear_door_slot_editing_target()
             return
+        self._sync_selected_opening_slot_face_edit_geometry(
+            preview_model,
+            slot,
+        )
         slot_display_name = door_slot_display_name(
             slot.slot_id,
             make_double=asset.make_double,
@@ -23378,6 +23743,147 @@ class BlueprintWorkspace(QWidget):
             accepted = False
         if not accepted:
             self.generation.clear_door_slot_editing_target()
+
+    def _sync_selected_opening_slot_face_edit_geometry(
+        self,
+        preview_model: GeneratedModel,
+        slot: DoorSlotData,
+    ) -> None:
+        """Map one assembled preview part to its canonical source face IDs."""
+
+        source_geometry = self.generation.get_object_face_geometry(
+            slot.source_object_id
+        )
+        preview = next(
+            (
+                candidate
+                for candidate in preview_model.preview_placed_objects
+                if candidate.object_id == slot.source_object_id
+            ),
+            None,
+        )
+        if source_geometry is None or preview is None:
+            self.doors_workspace.clear_preview_face_edit_geometry()
+            return
+        preview_face_count = sum(len(mesh.faces) for mesh in preview.meshes)
+        if preview_face_count != source_geometry.face_count:
+            # Profile fitting and rectangular glass cuts may change topology.
+            # Never guess a source face after such an assembled-only rewrite.
+            self.doors_workspace.clear_preview_face_edit_geometry()
+            return
+        vertices: list[np.ndarray] = []
+        faces: list[np.ndarray] = []
+        vertex_offset = 0
+        for mesh in preview.meshes:
+            mesh_vertices = np.asarray(mesh.vertices, dtype=float)
+            mesh_faces = np.asarray(mesh.faces, dtype=np.int64)
+            vertices.append(
+                trimesh.transform_points(
+                    mesh_vertices,
+                    preview.placement_transform,
+                )
+            )
+            faces.append(mesh_faces + vertex_offset)
+            vertex_offset += len(mesh_vertices)
+        if not vertices or not faces:
+            self.doors_workspace.clear_preview_face_edit_geometry()
+            return
+        self.doors_workspace.set_preview_face_edit_geometry(
+            slot.source_object_id,
+            np.ascontiguousarray(np.vstack(vertices), dtype=float),
+            np.ascontiguousarray(np.vstack(faces), dtype=np.int64),
+        )
+
+    def _selected_opening_slot_matches_face_request(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        source_object_id: str,
+    ) -> bool:
+        """Reject stale face actions after an asset or slot selection change."""
+
+        slot = self.doors_workspace.selected_asset_slot()
+        return bool(
+            asset_kind == self.doors_workspace.selected_asset_kind()
+            and str(asset_id).strip()
+            == (self.doors_workspace.selected_asset_id() or "")
+            and slot is not None
+            and slot.source_object_id == str(source_object_id).strip()
+        )
+
+    def _handle_opening_component_face_creation_requested(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        source_object_id: str,
+        raw_vertex_indices: object,
+    ) -> None:
+        """Create one persistent face on the selected door/window component."""
+
+        if not self._selected_opening_slot_matches_face_request(
+            asset_kind,
+            asset_id,
+            source_object_id,
+        ):
+            return
+        try:
+            vertex_indices = tuple(int(index) for index in raw_vertex_indices)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return
+        self.generation.create_object_face(source_object_id, vertex_indices)
+
+    def _handle_opening_component_face_deletion_requested(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        source_object_id: str,
+        raw_face_indices: object,
+    ) -> None:
+        """Delete persistent faces from the selected door/window component."""
+
+        if not self._selected_opening_slot_matches_face_request(
+            asset_kind,
+            asset_id,
+            source_object_id,
+        ):
+            return
+        try:
+            face_indices = tuple(int(index) for index in raw_face_indices)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return
+        self.generation.delete_object_faces(source_object_id, face_indices)
+
+    def _handle_opening_component_face_glass_conversion_requested(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        source_object_id: str,
+        raw_face_indices: object,
+    ) -> None:
+        """Convert selected component faces with the shared glass material."""
+
+        if not self._selected_opening_slot_matches_face_request(
+            asset_kind,
+            asset_id,
+            source_object_id,
+        ):
+            return
+        try:
+            face_indices = tuple(int(index) for index in raw_face_indices)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return
+        if self.generation.convert_object_faces_to_glass(
+            source_object_id,
+            face_indices,
+        ):
+            return
+        failure_message = self.generation.status_label.text().strip()
+        QMessageBox.warning(
+            self,
+            "Convert faces to glass",
+            failure_message
+            or "The selected faces could not be converted to glass.",
+        )
 
     def _handle_opening_asset_delete_requested(
         self,
@@ -24314,6 +24820,8 @@ class BlueprintWorkspace(QWidget):
     def _prepare_door_for_placement(
         self,
         door_id: str,
+        *,
+        refresh_preview: bool = True,
     ) -> DoorDefinition | None:
         """Commit every available hardware slot before placing one door.
 
@@ -24339,9 +24847,8 @@ class BlueprintWorkspace(QWidget):
             )
             if slot.joined and not is_pending:
                 continue
-            if (
-                self.generation.get_generated_object_model(slot.source_object_id)
-                is None
+            if not self.generation.is_generated_object_asset_available(
+                slot.source_object_id
             ):
                 continue
             if is_pending:
@@ -24359,7 +24866,7 @@ class BlueprintWorkspace(QWidget):
                 slot_id,
                 False,
             )
-        if updated_door != door:
+        if updated_door != door and refresh_preview:
             selected_door = self.doors_workspace.selected_door()
             if (
                 selected_door is not None
@@ -24371,6 +24878,8 @@ class BlueprintWorkspace(QWidget):
     def _prepare_window_for_placement(
         self,
         window_id: str,
+        *,
+        refresh_preview: bool = True,
     ) -> WindowDefinition | None:
         """Confirm every available window hardware part before placement."""
 
@@ -24382,9 +24891,8 @@ class BlueprintWorkspace(QWidget):
         for slot in window.slots:
             if is_door_body_slot(slot.slot_id) or slot.joined:
                 continue
-            if (
-                self.generation.get_generated_object_model(slot.source_object_id)
-                is None
+            if not self.generation.is_generated_object_asset_available(
+                slot.source_object_id
             ):
                 continue
             updated = updated.replace_slot(slot.with_transform(joined=True))
@@ -24396,7 +24904,8 @@ class BlueprintWorkspace(QWidget):
             )
         if updated != window:
             self.doors_workspace.upsert_window(updated)
-            self._sync_selected_opening_asset_preview()
+            if refresh_preview:
+                self._sync_selected_opening_asset_preview()
         return self.doors_workspace.data().get_window(normalized_window_id)
 
     def _handle_door_component_model_deleted(self, object_id: str) -> None:
@@ -24557,7 +25066,10 @@ class BlueprintWorkspace(QWidget):
                 "silhouette. Door width and height are fitted automatically.",
             )
             return
-        door = self._prepare_door_for_placement(door.door_id)
+        door = self._prepare_door_for_placement(
+            door.door_id,
+            refresh_preview=False,
+        )
         if door is None:
             return
         try:
@@ -24621,7 +25133,10 @@ class BlueprintWorkspace(QWidget):
                 "Add at least one window frame before placing a window.",
             )
             return
-        window = self._prepare_window_for_placement(window.window_id)
+        window = self._prepare_window_for_placement(
+            window.window_id,
+            refresh_preview=False,
+        )
         if window is None:
             return
         try:
@@ -24657,6 +25172,7 @@ class BlueprintWorkspace(QWidget):
         door_id: str,
         raw_reference: object,
         mirrored_horizontally: bool,
+        mirrored_depthwise: bool = False,
     ) -> None:
         """Bind one reusable door to a matching stable doorway."""
 
@@ -24664,6 +25180,7 @@ class BlueprintWorkspace(QWidget):
             door_id,
             raw_reference,
             mirrored_horizontally=mirrored_horizontally,
+            mirrored_depthwise=mirrored_depthwise,
         )
 
     def _commit_door_placement(
@@ -24672,6 +25189,7 @@ class BlueprintWorkspace(QWidget):
         raw_reference: object,
         *,
         mirrored_horizontally: bool,
+        mirrored_depthwise: bool = False,
     ) -> None:
         """Commit one complete door assembly to a doorway binding."""
 
@@ -24699,6 +25217,7 @@ class BlueprintWorkspace(QWidget):
                 level_index=level.index,
                 doorway_id=doorway.doorway_id,
                 mirrored_horizontally=bool(mirrored_horizontally),
+                mirrored_depthwise=bool(mirrored_depthwise),
             )
         )
         self.doors_workspace.set_data(
@@ -24718,6 +25237,7 @@ class BlueprintWorkspace(QWidget):
         window_id: str,
         raw_reference: object,
         mirrored_horizontally: bool,
+        mirrored_depthwise: bool = False,
     ) -> None:
         """Bind one reusable window to one stable wall opening frame."""
 
@@ -24745,6 +25265,7 @@ class BlueprintWorkspace(QWidget):
                 level_index=level.index,
                 window_frame_id=frame.window_id,
                 mirrored_horizontally=bool(mirrored_horizontally),
+                mirrored_depthwise=bool(mirrored_depthwise),
             )
         )
         self.doors_workspace.set_data(
@@ -26578,6 +27099,7 @@ class BlueprintWorkspace(QWidget):
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_opening_fixture_keys()
         # Project restore has not installed the incoming Generation data yet.
         # Publishing footprints here would rebuild the outgoing objects, only
         # to repeat the same work after ``generation.set_data`` below.
@@ -26706,6 +27228,53 @@ class MainWindow(QMainWindow):
         self._finish_scheduled_last_project_restore()
         self.blueprint_workspace.shutdown()
         super().closeEvent(event)
+
+
+# ### Door fitting helpers ###
+def _fit_door_component_height_to_doorway(
+    door: DoorDefinition,
+    doorway: DoorwayData,
+    *,
+    source_x: float,
+    source_z: float,
+    target_x: float,
+) -> float:
+    """Preserve a component's relative height below an opening profile."""
+
+    if door.shape != DOORWAY_SHAPE_ARCH:
+        return source_z * doorway.height_meters / door.height_meters
+    source_profile_height = _door_profile_height_at_x(
+        door.width_meters,
+        door.height_meters,
+        door.arch_amount,
+        source_x,
+    )
+    target_profile_height = _door_profile_height_at_x(
+        doorway.width_meters,
+        doorway.height_meters,
+        doorway.arch_amount,
+        target_x,
+    )
+    if source_profile_height <= 1e-9:
+        return source_z * doorway.height_meters / door.height_meters
+    return source_z * target_profile_height / source_profile_height
+
+
+def _door_profile_height_at_x(
+    width_meters: float,
+    height_meters: float,
+    arch_amount: float,
+    x_coordinate: float,
+) -> float:
+    """Return the upper edge of one semi-elliptical doorway profile."""
+
+    half_width = width_meters / 2.0
+    arch_rise = min(half_width, height_meters) * arch_amount
+    spring_height = height_meters - arch_rise
+    normalized_x = min(1.0, abs(x_coordinate) / half_width)
+    return spring_height + arch_rise * math.sqrt(
+        max(0.0, 1.0 - normalized_x * normalized_x)
+    )
 
 
 # ### Palette helpers ###

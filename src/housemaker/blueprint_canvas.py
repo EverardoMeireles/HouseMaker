@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import combinations, pairwise
 from pathlib import Path
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QWidget
 
 from housemaker.camera_models import CameraPose
 from housemaker.canvas_openings import (
+    CANVAS_OPENING_DOORWAY,
     CANVAS_OPENING_WINDOW,
     CanvasOpeningBounds,
     CanvasOpeningEdit,
@@ -557,6 +558,7 @@ class BlueprintCanvas(QWidget):
     doorway_bridge_edges_added = Signal()
     selected_doorway_changed = Signal(int)
     canvas_opening_selection_requested = Signal(object)
+    canvas_opening_fixture_deletion_requested = Signal(object)
     canvas_opening_edit_started = Signal(object)
     canvas_opening_edit_preview_changed = Signal(object)
     canvas_opening_edit_finished = Signal(object, bool)
@@ -649,6 +651,7 @@ class BlueprintCanvas(QWidget):
         self.window_drag_width_side_sign = 0.0
         self.window_drag_start_edit: CanvasOpeningEdit | None = None
         self.selected_doorway_index: int | None = None
+        self._fixture_opening_keys: frozenset[str] = frozenset()
         self.pressed_doorway_index: int | None = None
         self.drag_doorway_index: int | None = None
         self.doorway_drag_press_position: QPointF | None = None
@@ -2378,6 +2381,13 @@ class BlueprintCanvas(QWidget):
         if (
             event.key() == Qt.Key.Key_Delete
             and self._request_selected_stair_deletion()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self._request_selected_opening_fixture_deletion()
         ):
             event.accept()
             return
@@ -4966,6 +4976,48 @@ class BlueprintCanvas(QWidget):
         return replaced
 
     # ### Window helpers ###
+    def set_fixture_opening_keys(self, opening_keys: Sequence[str]) -> None:
+        """Publish openings that currently own an installed door or window."""
+
+        self._fixture_opening_keys = frozenset(
+            normalized_key
+            for key in opening_keys
+            if (normalized_key := str(key).strip())
+        )
+
+    def _selected_opening_reference(self) -> CanvasOpeningReference | None:
+        """Return the selected doorway or window-frame identity."""
+
+        level = self.level_context
+        if level is None:
+            return None
+        window_index = self._find_window_index_by_id(self.selected_window_id)
+        if window_index is not None and self.selected_window_id is not None:
+            return CanvasOpeningReference(
+                kind=CANVAS_OPENING_WINDOW,
+                level_index=level.index,
+                item_index=window_index,
+                stable_id=self.selected_window_id,
+            )
+        doorway_index = self.selected_doorway_index
+        if doorway_index is None or not (0 <= doorway_index < len(self.doorways)):
+            return None
+        return CanvasOpeningReference(
+            kind=CANVAS_OPENING_DOORWAY,
+            level_index=level.index,
+            item_index=doorway_index,
+            stable_id=self.doorways[doorway_index].doorway_id,
+        )
+
+    def _request_selected_opening_fixture_deletion(self) -> bool:
+        """Request fixture removal before Delete can alter its opening."""
+
+        reference = self._selected_opening_reference()
+        if reference is None or reference.key not in self._fixture_opening_keys:
+            return False
+        self.canvas_opening_fixture_deletion_requested.emit(reference)
+        return True
+
     def _set_selected_window_id(
         self,
         window_id: str | None,

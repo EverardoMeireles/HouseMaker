@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 
+import numpy as np
+import pyqtgraph.opengl as gl
 from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -90,6 +92,75 @@ DOOR_FACE_DISPLAY_NAMES = {
     "front": "Front",
     "back": "Back",
 }
+OPENING_PREVIEW_FRONT_ARROW_COLOR = (0.12, 0.88, 1.0, 1.0)
+OPENING_PREVIEW_FRONT_ARROW_WIDTH_PIXELS = 5.0
+OPENING_PREVIEW_FRONT_ARROW_LENGTH_RATIO = 0.4
+OPENING_PREVIEW_FRONT_ARROW_MINIMUM_LENGTH_METERS = 0.35
+OPENING_PREVIEW_FRONT_ARROW_MAXIMUM_LENGTH_METERS = 1.25
+OPENING_PREVIEW_FRONT_ARROW_CLEARANCE_RATIO = 0.04
+OPENING_PREVIEW_FRONT_ARROW_MINIMUM_CLEARANCE_METERS = 0.04
+OPENING_PREVIEW_FRONT_ARROW_HEAD_LENGTH_RATIO = 0.3
+OPENING_PREVIEW_FRONT_ARROW_HEAD_WIDTH_RATIO = 0.18
+OPENING_PREVIEW_FRONT_ARROW_ROLE = "front_direction"
+
+
+# ### Preview arrow geometry ###
+def _build_preview_front_direction_arrow_positions(
+    model: GeneratedModel,
+) -> np.ndarray | None:
+    """Build a floor-level arrow pointing toward canonical local front, -Y."""
+
+    bounds = np.asarray(model.mesh.bounds, dtype=float)
+    if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+        return None
+    minimum, maximum = bounds
+    extents = maximum - minimum
+    if np.any(extents < 0.0):
+        return None
+    model_scale = float(np.max(extents))
+    if not math.isfinite(model_scale) or model_scale <= 0.0:
+        return None
+
+    arrow_length = float(
+        np.clip(
+            model_scale * OPENING_PREVIEW_FRONT_ARROW_LENGTH_RATIO,
+            OPENING_PREVIEW_FRONT_ARROW_MINIMUM_LENGTH_METERS,
+            OPENING_PREVIEW_FRONT_ARROW_MAXIMUM_LENGTH_METERS,
+        )
+    )
+    clearance = max(
+        model_scale * OPENING_PREVIEW_FRONT_ARROW_CLEARANCE_RATIO,
+        OPENING_PREVIEW_FRONT_ARROW_MINIMUM_CLEARANCE_METERS,
+    )
+    center_x = float((minimum[0] + maximum[0]) * 0.5)
+    height = max(model_scale * 0.01, 0.01)
+    origin = np.asarray(
+        (center_x, float(minimum[1] - clearance), float(minimum[2] + height)),
+        dtype=float,
+    )
+    tip = origin + np.asarray((0.0, -arrow_length, 0.0), dtype=float)
+    head_center = tip + np.asarray(
+        (
+            0.0,
+            arrow_length * OPENING_PREVIEW_FRONT_ARROW_HEAD_LENGTH_RATIO,
+            0.0,
+        ),
+        dtype=float,
+    )
+    head_half_width = (
+        arrow_length * OPENING_PREVIEW_FRONT_ARROW_HEAD_WIDTH_RATIO
+    )
+    return np.ascontiguousarray(
+        (
+            origin,
+            tip,
+            tip,
+            head_center + np.asarray((-head_half_width, 0.0, 0.0)),
+            tip,
+            head_center + np.asarray((head_half_width, 0.0, 0.0)),
+        ),
+        dtype=np.float32,
+    )
 
 
 # ### Doors workspace ###
@@ -115,8 +186,12 @@ class DoorsWorkspace(QWidget):
     asset_make_double_changed = Signal(str, str, bool)
     asset_make_double_sided_changed = Signal(str, str, bool)
     asset_slot_mesh_paste_requested = Signal(str, str, str, str)
+    asset_slot_horizontal_flip_requested = Signal(str, str, str)
     asset_delete_requested = Signal(str, str)
     glass_area_creation_requested = Signal(str, str, str)
+    face_creation_requested = Signal(str, str, str, object)
+    face_deletion_requested = Signal(str, str, str, object)
+    face_glass_conversion_requested = Signal(str, str, str, object)
     undo_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -127,6 +202,8 @@ class DoorsWorkspace(QWidget):
         self._previewed_door_id: str | None = None
         self._previewed_asset_kind: str | None = None
         self._previewed_asset_id: str | None = None
+        self._preview_face_edit_object_id: str | None = None
+        self._preview_front_direction_arrow_item: gl.GLLinePlotItem | None = None
         self._copied_asset_slot: tuple[str, str, str] | None = None
         self._refreshing = False
         self._build_ui()
@@ -540,9 +617,11 @@ class DoorsWorkspace(QWidget):
     def set_preview_model(self, model: GeneratedModel | None) -> None:
         """Display the assembled door/window and selected editable part."""
 
+        self.clear_preview_face_edit_geometry()
         if model is None:
             self.preview_viewer.set_selected_placed_object_ids(())
             self.preview_viewer.clear_model()
+            self._refresh_preview_front_direction_arrow()
             self._previewed_door_id = None
             self._previewed_asset_kind = None
             self._previewed_asset_id = None
@@ -560,6 +639,7 @@ class DoorsWorkspace(QWidget):
                 and selected_asset_id == self._previewed_asset_id
             ),
         )
+        self._refresh_preview_front_direction_arrow()
         self._previewed_asset_kind = selected_asset_kind
         self._previewed_asset_id = selected_asset_id
         self._previewed_door_id = (
@@ -568,6 +648,82 @@ class DoorsWorkspace(QWidget):
             else None
         )
         self._sync_preview_slot_gizmo_selection(preserve_mode=True)
+
+    def _refresh_preview_front_direction_arrow(self) -> None:
+        """Rebuild the non-interactive local-front marker for this viewer only."""
+
+        previous_item = self._preview_front_direction_arrow_item
+        self._preview_front_direction_arrow_item = None
+        if (
+            previous_item is not None
+            and previous_item in self.preview_viewer.view.items
+        ):
+            self.preview_viewer.view.removeItem(previous_item)
+
+        model = self.preview_viewer.model
+        if model is None:
+            self.preview_viewer.view.update()
+            return
+        positions = _build_preview_front_direction_arrow_positions(model)
+        if positions is None:
+            self.preview_viewer.view.update()
+            return
+
+        arrow_item = gl.GLLinePlotItem(
+            pos=positions,
+            color=OPENING_PREVIEW_FRONT_ARROW_COLOR,
+            width=OPENING_PREVIEW_FRONT_ARROW_WIDTH_PIXELS,
+            antialias=True,
+            mode="lines",
+        )
+        arrow_item.setGLOptions("translucent")
+        arrow_item._housemaker_doors_preview_role = (
+            OPENING_PREVIEW_FRONT_ARROW_ROLE
+        )
+        self.preview_viewer.view.addItem(arrow_item)
+        self._preview_front_direction_arrow_item = arrow_item
+        self.preview_viewer.view.update()
+
+    def set_preview_face_edit_geometry(
+        self,
+        object_id: str,
+        vertices: object,
+        faces: object,
+    ) -> bool:
+        """Enable source-indexed face editing for the selected preview slot."""
+
+        normalized_object_id = str(object_id).strip()
+        slot = self.selected_asset_slot()
+        model = self.preview_viewer.model
+        if (
+            not normalized_object_id
+            or slot is None
+            or slot.source_object_id != normalized_object_id
+            or model is None
+            or not any(
+                preview.object_id == normalized_object_id
+                for preview in model.preview_placed_objects
+            )
+        ):
+            self.clear_preview_face_edit_geometry()
+            return False
+        try:
+            self.preview_viewer.set_face_edit_geometry(vertices, faces)
+        except (TypeError, ValueError):
+            self.clear_preview_face_edit_geometry()
+            return False
+        self._preview_face_edit_object_id = normalized_object_id
+        self.preview_viewer.set_face_editing_enabled(True)
+        self._sync_glass_action_button()
+        return True
+
+    def clear_preview_face_edit_geometry(self) -> None:
+        """Disable face editing without changing the selected component slot."""
+
+        self._preview_face_edit_object_id = None
+        self.preview_viewer.clear_face_edit_geometry()
+        self.preview_viewer.set_face_editing_enabled(False)
+        self._sync_glass_action_button()
 
     def _sync_preview_slot_gizmo_selection(
         self,
@@ -595,6 +751,8 @@ class DoorsWorkspace(QWidget):
             )
             if has_glass_preview:
                 selected_object_id = glass_area.source_object_id
+        if editable_object_id != self._preview_face_edit_object_id:
+            self.clear_preview_face_edit_geometry()
         body_selected = bool(
             editable_object_id is not None
             and slot is not None
@@ -682,6 +840,18 @@ class DoorsWorkspace(QWidget):
         )
         self.add_glass_area_button.setEnabled(False)
 
+        self.flip_mesh_horizontally_button = QPushButton(
+            "Flip mesh horizontally",
+            self,
+        )
+        self.flip_mesh_horizontally_button.setObjectName(
+            "flip_opening_slot_mesh_horizontally_button"
+        )
+        self.flip_mesh_horizontally_button.setToolTip(
+            "Flip the selected Body or Handle across its local horizontal axis."
+        )
+        self.flip_mesh_horizontally_button.setEnabled(False)
+
         self.confirm_slot_position_button = QPushButton(
             "Confirm slot transform",
             self,
@@ -695,6 +865,7 @@ class DoorsWorkspace(QWidget):
         controls_layout.addWidget(self.rotation_status_label)
         controls_layout.addWidget(door_options_widget)
         controls_layout.addWidget(self.delete_asset_button)
+        controls_layout.addWidget(self.flip_mesh_horizontally_button)
         controls_layout.addWidget(self.add_glass_area_button)
         controls_layout.addWidget(self.confirm_slot_position_button)
 
@@ -809,6 +980,9 @@ class DoorsWorkspace(QWidget):
         self.delete_asset_button.clicked.connect(
             self._handle_delete_asset_clicked
         )
+        self.flip_mesh_horizontally_button.clicked.connect(
+            self._handle_flip_mesh_horizontally_clicked
+        )
         self.confirm_slot_position_button.clicked.connect(
             self._handle_confirm_slot_position_clicked
         )
@@ -835,6 +1009,15 @@ class DoorsWorkspace(QWidget):
         )
         self.preview_viewer.placed_object_double_clicked.connect(
             self._handle_preview_object_double_clicked
+        )
+        self.preview_viewer.face_selection_changed.connect(
+            self._handle_preview_face_selection_changed
+        )
+        self.preview_viewer.object_face_creation_requested.connect(
+            self._handle_preview_face_creation_requested
+        )
+        self.preview_viewer.delete_requested.connect(
+            self._handle_preview_face_delete_requested
         )
         self.undo_shortcut.activated.connect(self._emit_undo_requested)
         self.copy_slot_shortcut.activated.connect(
@@ -1423,7 +1606,7 @@ class DoorsWorkspace(QWidget):
             self.slot_edit_requested.emit(asset_id, slot_id)
 
     def _handle_add_glass_area_clicked(self) -> None:
-        """Request rectangle placement against the selected asset body."""
+        """Convert selected faces or request a rectangular glass cutout."""
 
         asset_kind = self.selected_asset_kind()
         asset_id = self.selected_asset_id()
@@ -1431,6 +1614,20 @@ class DoorsWorkspace(QWidget):
         if asset_kind is None or asset_id is None or asset is None:
             return
         selected_slot = self.selected_asset_slot()
+        selected_faces = self.preview_viewer.get_selected_face_indices()
+        if (
+            selected_slot is not None
+            and selected_faces
+            and self._preview_face_edit_object_id
+            == selected_slot.source_object_id
+        ):
+            self.face_glass_conversion_requested.emit(
+                asset_kind,
+                asset_id,
+                selected_slot.source_object_id,
+                selected_faces,
+            )
+            return
         body = (
             selected_slot
             if selected_slot is not None
@@ -1445,6 +1642,67 @@ class DoorsWorkspace(QWidget):
             body.source_object_id,
         )
 
+    @Slot(object)
+    def _handle_preview_face_selection_changed(
+        self,
+        _face_indices: object,
+    ) -> None:
+        """Keep the shared glass button synchronized with face selection."""
+
+        self._sync_glass_action_button()
+
+    @Slot()
+    def _handle_preview_face_delete_requested(self) -> None:
+        """Request deletion only for faces owned by the selected source slot."""
+
+        asset_kind = self.selected_asset_kind()
+        asset_id = self.selected_asset_id()
+        slot = self.selected_asset_slot()
+        selected_faces = self.preview_viewer.get_selected_face_indices()
+        if (
+            asset_kind is None
+            or asset_id is None
+            or slot is None
+            or not selected_faces
+            or self._preview_face_edit_object_id != slot.source_object_id
+        ):
+            return
+        self.face_deletion_requested.emit(
+            asset_kind,
+            asset_id,
+            slot.source_object_id,
+            selected_faces,
+        )
+
+    @Slot(object)
+    def _handle_preview_face_creation_requested(
+        self,
+        raw_vertex_indices: object,
+    ) -> None:
+        """Request a face fill only in the selected source slot's index space."""
+
+        asset_kind = self.selected_asset_kind()
+        asset_id = self.selected_asset_id()
+        slot = self.selected_asset_slot()
+        try:
+            vertex_indices = tuple(int(index) for index in raw_vertex_indices)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (
+            asset_kind is None
+            or asset_id is None
+            or slot is None
+            or len(vertex_indices) < 3
+            or self._preview_face_edit_object_id != slot.source_object_id
+        ):
+            return
+        self.face_creation_requested.emit(
+            asset_kind,
+            asset_id,
+            slot.source_object_id,
+            vertex_indices,
+        )
+
     def _handle_delete_asset_clicked(self) -> None:
         """Request deletion of the selected door or window owner."""
 
@@ -1453,6 +1711,20 @@ class DoorsWorkspace(QWidget):
         if asset_kind is None or asset_id is None:
             return
         self.asset_delete_requested.emit(asset_kind, asset_id)
+
+    def _handle_flip_mesh_horizontally_clicked(self) -> None:
+        """Request a persistent horizontal flip for one concrete slot."""
+
+        asset_kind = self.selected_asset_kind()
+        asset_id = self.selected_asset_id()
+        slot = self.selected_asset_slot()
+        if asset_kind is None or asset_id is None or slot is None:
+            return
+        self.asset_slot_horizontal_flip_requested.emit(
+            asset_kind,
+            asset_id,
+            slot.slot_id,
+        )
 
     def _handle_make_double_changed(self, checked: bool) -> None:
         """Request one model-owned single/double-leaf transition."""
@@ -1593,7 +1865,8 @@ class DoorsWorkspace(QWidget):
             bool(asset is not None and asset.make_double)
         )
         self.delete_asset_button.setEnabled(asset is not None)
-        self.add_glass_area_button.setEnabled(asset is not None)
+        self.flip_mesh_horizontally_button.setEnabled(slot is not None)
+        self._sync_glass_action_button()
         if asset is None or asset_kind is None or asset_id is None:
             self.confirm_slot_position_button.setEnabled(False)
             return
@@ -1613,6 +1886,34 @@ class DoorsWorkspace(QWidget):
         self.confirm_slot_position_button.setEnabled(
             not is_door_body_slot(slot.slot_id) and pending
         )
+
+    def _sync_glass_action_button(self) -> None:
+        """Present one unambiguous glass action for the current selection."""
+
+        asset = self.selected_asset()
+        slot = self.selected_asset_slot()
+        selected_faces = self.preview_viewer.get_selected_face_indices()
+        converts_faces = bool(
+            asset is not None
+            and slot is not None
+            and selected_faces
+            and self._preview_face_edit_object_id == slot.source_object_id
+        )
+        self.add_glass_area_button.setText(
+            "Convert faces to glass" if converts_faces else "Add glass area"
+        )
+        self.add_glass_area_button.setToolTip(
+            (
+                "Convert the selected component faces to the shared glass "
+                "material."
+            )
+            if converts_faces
+            else (
+                "Drag a rectangle through the selected door or window body "
+                "and fill the cutout with the shared glass material."
+            )
+        )
+        self.add_glass_area_button.setEnabled(asset is not None)
 
     def _sync_make_double_checkbox(
         self,

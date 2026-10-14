@@ -146,11 +146,13 @@ def _bounds_values(bounds: CanvasOpeningBounds) -> tuple[float, ...]:
 def _build_door_preview_candidate(
     target: CanvasOpeningTarget,
 ) -> DoorPlacementPreviewCandidate:
-    """Build visibly distinct normal and wheel-mirrored preview profiles."""
+    """Build visibly distinct profiles for all four wheel orientations."""
 
     roles = (DOOR_SLOT_BODY, DOOR_SLOT_KNOB)
     normal_parts: list[DoorPlacementPreviewPart] = []
     mirrored_parts: list[DoorPlacementPreviewPart] = []
+    depth_mirrored_parts: list[DoorPlacementPreviewPart] = []
+    depth_and_horizontal_parts: list[DoorPlacementPreviewPart] = []
     for index, role in enumerate(roles):
         normal_mesh = trimesh.creation.box(
             extents=(0.25 + index * 0.05, 0.1, 0.5),
@@ -158,18 +160,40 @@ def _build_door_preview_candidate(
         normal_mesh.apply_translation((float(index), 0.0, 0.25))
         mirrored_mesh = normal_mesh.copy()
         mirrored_mesh.apply_translation((10.0, 0.0, 0.0))
+        depth_mirrored_mesh = normal_mesh.copy()
+        depth_mirrored_mesh.apply_translation((20.0, 0.0, 0.0))
+        depth_and_horizontal_mesh = normal_mesh.copy()
+        depth_and_horizontal_mesh.apply_translation((30.0, 0.0, 0.0))
         normal_parts.append(DoorPlacementPreviewPart(role, (normal_mesh,)))
         mirrored_parts.append(DoorPlacementPreviewPart(role, (mirrored_mesh,)))
+        depth_mirrored_parts.append(
+            DoorPlacementPreviewPart(role, (depth_mirrored_mesh,))
+        )
+        depth_and_horizontal_parts.append(
+            DoorPlacementPreviewPart(role, (depth_and_horizontal_mesh,))
+        )
     normal_transform = np.eye(4, dtype=float)
     normal_transform[:3, 3] = (2.0, 3.0, 4.0)
     mirrored_transform = np.eye(4, dtype=float)
     mirrored_transform[:3, 3] = (5.0, 6.0, 7.0)
+    depth_mirrored_transform = np.eye(4, dtype=float)
+    depth_mirrored_transform[:3, 3] = (8.0, 9.0, 10.0)
+    depth_and_horizontal_transform = np.eye(4, dtype=float)
+    depth_and_horizontal_transform[:3, 3] = (11.0, 12.0, 13.0)
     return DoorPlacementPreviewCandidate(
         opening_key=target.key,
         normal_parts=tuple(normal_parts),
         normal_transform=normal_transform,
         mirrored_parts=tuple(mirrored_parts),
         mirrored_transform=mirrored_transform,
+        depth_mirrored_parts=tuple(depth_mirrored_parts),
+        depth_mirrored_transform=depth_mirrored_transform,
+        depth_and_horizontally_mirrored_parts=tuple(
+            depth_and_horizontal_parts
+        ),
+        depth_and_horizontally_mirrored_transform=(
+            depth_and_horizontal_transform
+        ),
     )
 
 
@@ -445,11 +469,11 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
     def test_door_placement_click_emits_without_cancellation(self) -> None:
         target = _build_target(CANVAS_OPENING_DOORWAY)
         viewer = self._build_viewer(target)
-        placements: list[tuple[str, object, bool]] = []
+        placements: list[tuple[str, object, bool, bool]] = []
         cancellations: list[str] = []
         viewer.door_placement_requested.connect(
-            lambda door_id, reference, mirrored: placements.append(
-                (door_id, reference, mirrored)
+            lambda door_id, reference, horizontal, depth: placements.append(
+                (door_id, reference, horizontal, depth)
             )
         )
         viewer.door_placement_cancelled.connect(cancellations.append)
@@ -466,7 +490,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             self.assertTrue(viewer.view.is_primary_pointer_drag_reserved)
             viewer._handle_canvas_gizmo_pointer_released(QPointF(20.0, 20.0))
 
-        self.assertEqual(placements, [("door-a", target.reference, False)])
+        self.assertEqual(
+            placements,
+            [("door-a", target.reference, False, False)],
+        )
         self.assertEqual(cancellations, [])
         self.assertFalse(viewer.is_door_placement_active)
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
@@ -476,10 +503,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         target = _build_target(CANVAS_OPENING_DOORWAY)
         viewer = self._build_viewer(target)
         candidate = _build_door_preview_candidate(target)
-        placements: list[tuple[str, object, bool]] = []
+        placements: list[tuple[str, object, bool, bool]] = []
         viewer.door_placement_requested.connect(
-            lambda door_id, reference, mirrored: placements.append(
-                (door_id, reference, mirrored)
+            lambda door_id, reference, horizontal, depth: placements.append(
+                (door_id, reference, horizontal, depth)
             )
         )
 
@@ -501,7 +528,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             viewer._handle_placed_object_pointer_pressed(QPointF())
             viewer._handle_canvas_gizmo_pointer_released(QPointF())
 
-        self.assertEqual(placements, [("door-a", target.reference, False)])
+        self.assertEqual(
+            placements,
+            [("door-a", target.reference, False, False)],
+        )
         self.assertFalse(viewer.is_door_placement_active)
 
     def test_ctrl_door_placement_does_not_block_an_arched_doorway(self) -> None:
@@ -510,10 +540,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             arch_amount=0.6,
         )
         viewer = self._build_viewer(target)
-        placements: list[tuple[str, object, bool]] = []
+        placements: list[tuple[str, object, bool, bool]] = []
         viewer.door_placement_requested.connect(
-            lambda door_id, reference, mirrored: placements.append(
-                (door_id, reference, mirrored)
+            lambda door_id, reference, horizontal, depth: placements.append(
+                (door_id, reference, horizontal, depth)
             )
         )
 
@@ -528,7 +558,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             viewer._handle_placed_object_pointer_pressed(QPointF())
             viewer._handle_canvas_gizmo_pointer_released(QPointF())
 
-        self.assertEqual(placements, [("door-a", target.reference, False)])
+        self.assertEqual(
+            placements,
+            [("door-a", target.reference, False, False)],
+        )
         self.assertFalse(viewer.is_door_placement_active)
 
     def test_window_fixture_placement_reuses_preview_and_mirror_pipeline(
@@ -537,10 +570,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         target = _build_target(CANVAS_OPENING_WINDOW)
         viewer = self._build_viewer(target)
         candidate = _build_door_preview_candidate(target)
-        placements: list[tuple[str, object, bool]] = []
+        placements: list[tuple[str, object, bool, bool]] = []
         viewer.window_fixture_placement_requested.connect(
-            lambda window_id, reference, mirrored: placements.append(
-                (window_id, reference, mirrored)
+            lambda window_id, reference, horizontal, depth: placements.append(
+                (window_id, reference, horizontal, depth)
             )
         )
 
@@ -566,7 +599,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
 
         self.assertEqual(
             placements,
-            [("window-a", target.reference, True)],
+            [("window-a", target.reference, True, False)],
         )
         self.assertFalse(viewer.is_opening_fixture_placement_active)
 
@@ -660,10 +693,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         target = _build_target(CANVAS_OPENING_DOORWAY)
         viewer = self._build_viewer(target)
         viewer.set_model(_build_model(), preserve_camera=True)
-        placements: list[tuple[str, object, bool]] = []
+        placements: list[tuple[str, object, bool, bool]] = []
         viewer.door_placement_requested.connect(
-            lambda door_id, reference, mirrored: placements.append(
-                (door_id, reference, mirrored)
+            lambda door_id, reference, horizontal, depth: placements.append(
+                (door_id, reference, horizontal, depth)
             )
         )
         self.assertTrue(
@@ -736,10 +769,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         target = _build_target(CANVAS_OPENING_DOORWAY)
         viewer = self._build_viewer(target)
         candidate = _build_door_preview_candidate(target)
-        placements: list[tuple[str, object, bool]] = []
+        placements: list[tuple[str, object, bool, bool]] = []
         viewer.door_placement_requested.connect(
-            lambda door_id, reference, mirrored: placements.append(
-                (door_id, reference, mirrored)
+            lambda door_id, reference, horizontal, depth: placements.append(
+                (door_id, reference, horizontal, depth)
             )
         )
         self.assertTrue(
@@ -770,7 +803,10 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             viewer._handle_canvas_gizmo_pointer_released(QPointF())
 
         self.assertGreater(mirrored_minimum_x, normal_minimum_x + 5.0)
-        self.assertEqual(placements, [("door-a", target.reference, True)])
+        self.assertEqual(
+            placements,
+            [("door-a", target.reference, True, False)],
+        )
         self.assertFalse(viewer.is_door_placement_active)
 
     def test_door_placement_rejects_incompatible_openings_and_stays_armed(
@@ -808,7 +844,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         self.assertTrue(viewer.is_door_placement_active)
         self.assertIsNone(viewer.window_tools_status_label)
 
-    def test_door_placement_wheel_toggles_mirror_without_editing_camera(
+    def test_door_placement_wheel_cycles_four_orientations_without_camera_edit(
         self,
     ) -> None:
         target = _build_target(CANVAS_OPENING_DOORWAY)
@@ -820,12 +856,21 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         viewer._selected_projection_camera_id = "+x"
         self.assertTrue(viewer.begin_door_placement("door-a", (target.key,)))
 
-        viewer._handle_projection_camera_wheel_steps_requested(2)
-        self.assertFalse(viewer._door_placement_mirrored_horizontally)
         viewer._handle_projection_camera_wheel_steps_requested(1)
         self.assertTrue(viewer._door_placement_mirrored_horizontally)
-        viewer._handle_projection_camera_wheel_steps_requested(-3)
+        self.assertFalse(viewer._door_placement_mirrored_depthwise)
+        viewer._handle_projection_camera_wheel_steps_requested(1)
+        self.assertTrue(viewer._door_placement_mirrored_horizontally)
+        self.assertTrue(viewer._door_placement_mirrored_depthwise)
+        viewer._handle_projection_camera_wheel_steps_requested(1)
         self.assertFalse(viewer._door_placement_mirrored_horizontally)
+        self.assertTrue(viewer._door_placement_mirrored_depthwise)
+        viewer._handle_projection_camera_wheel_steps_requested(1)
+        self.assertFalse(viewer._door_placement_mirrored_horizontally)
+        self.assertFalse(viewer._door_placement_mirrored_depthwise)
+        viewer._handle_projection_camera_wheel_steps_requested(-1)
+        self.assertFalse(viewer._door_placement_mirrored_horizontally)
+        self.assertTrue(viewer._door_placement_mirrored_depthwise)
         self.assertEqual(camera_steps, [])
 
         viewer.cancel_door_placement()

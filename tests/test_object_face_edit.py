@@ -16,11 +16,11 @@ from housemaker.glass_material import (
 )
 from housemaker.object_face_edit import (
     _filter_face_materials,
+    convert_object_faces_to_glass_preserving_uvs,
     delete_object_faces_preserving_uvs,
     load_object_face_geometry,
     load_object_face_geometry_from_scene,
 )
-
 
 # ### Fixture constants ###
 _REPEATING_UVS = np.asarray(
@@ -418,6 +418,86 @@ class ObjectFaceDeletionTests(unittest.TestCase):
         )
         self.assertFalse(output_glass.doubleSided)
         self.assertIsNone(output_glass.baseColorTexture)
+
+
+# ### Local glass-conversion tests ###
+class ObjectFaceGlassConversionTests(unittest.TestCase):
+    def test_conversion_preserves_opaque_uvs_textures_and_source_geometry(
+        self,
+    ) -> None:
+        source = _two_node_glb(
+            metadata={"housemaker": {"asset_id": "local-glass-regression"}}
+        )
+        source_scene = _load_scene(source)
+        selected_faces = {0, 2, 16}
+
+        result = convert_object_faces_to_glass_preserving_uvs(
+            source,
+            selected_faces,
+        )
+
+        output_scene = _load_scene(result.glb_bytes)
+        self.assertEqual(result.face_count, 24)
+        self.assertEqual(result.converted_face_count, 3)
+        self.assertEqual(result.glass_face_count, 3)
+        self.assertTrue(result.preserved_textured_uvs)
+        self.assertEqual(output_scene.metadata, source_scene.metadata)
+        self.assertEqual(
+            load_object_face_geometry(result.glb_bytes).face_count,
+            24,
+        )
+
+        face_offset = 0
+        for node_name in sorted(source_scene.graph.nodes_geometry, key=str):
+            source_transform, source_mesh = _node_mesh(source_scene, node_name)
+            opaque_transform, opaque_mesh = _node_mesh(output_scene, node_name)
+            glass_transform, glass_mesh = _node_mesh(
+                output_scene,
+                node_name + "__housemaker_glass",
+            )
+            source_faces = np.asarray(source_mesh.faces, dtype=np.int64)
+            local_glass = np.asarray(
+                [
+                    face_offset + local_index in selected_faces
+                    for local_index in range(len(source_faces))
+                ],
+                dtype=bool,
+            )
+            local_opaque = np.logical_not(local_glass)
+
+            np.testing.assert_array_equal(opaque_transform, source_transform)
+            np.testing.assert_array_equal(glass_transform, source_transform)
+            self.assertEqual(opaque_mesh.metadata, source_mesh.metadata)
+            self.assertEqual(glass_mesh.metadata, source_mesh.metadata)
+            np.testing.assert_array_equal(
+                np.asarray(opaque_mesh.vertices)[opaque_mesh.faces],
+                np.asarray(source_mesh.vertices)[source_faces[local_opaque]],
+            )
+            np.testing.assert_array_equal(
+                np.asarray(glass_mesh.vertices)[glass_mesh.faces],
+                np.asarray(source_mesh.vertices)[source_faces[local_glass]],
+            )
+            np.testing.assert_array_equal(
+                np.asarray(opaque_mesh.visual.uv)[opaque_mesh.faces],
+                np.asarray(source_mesh.visual.uv)[source_faces[local_opaque]],
+            )
+            np.testing.assert_array_equal(
+                _texture_pixels(opaque_mesh),
+                _texture_pixels(source_mesh),
+            )
+            self.assertEqual(
+                opaque_mesh.visual.material.name,
+                source_mesh.visual.material.name,
+            )
+
+            glass_material = glass_mesh.visual.material
+            self.assertTrue(is_housemaker_glass_material(glass_material))
+            self.assertEqual(glass_material.alphaMode, "BLEND")
+            self.assertFalse(glass_material.doubleSided)
+            self.assertIsNone(glass_material.baseColorTexture)
+            self.assertIsNone(glass_material.normalTexture)
+            self.assertIsNone(glass_material.metallicRoughnessTexture)
+            face_offset += len(source_faces)
 
 
 # ### Multi-material filtering tests ###

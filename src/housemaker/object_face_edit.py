@@ -10,8 +10,12 @@ import numpy as np
 import shapely
 import trimesh
 from shapely import Polygon
+from trimesh.visual.texture import TextureVisuals
 
-from housemaker.glass_material import is_housemaker_glass_material
+from housemaker.glass_material import (
+    build_housemaker_glass_material,
+    is_housemaker_glass_material,
+)
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     _serialize_scene_glb_with_half_mesh_extras,
@@ -60,6 +64,17 @@ class ObjectFaceAdditionResult:
     added_face_indices: tuple[int, ...]
     selected_vertex_indices: tuple[int, ...]
     resolved_vertex_indices: tuple[int, ...]
+    preserved_textured_uvs: bool
+
+
+@dataclass(frozen=True)
+class ObjectFaceGlassConversionResult:
+    """One material-only glass conversion retaining source topology and UVs."""
+
+    glb_bytes: bytes
+    face_count: int
+    converted_face_count: int
+    glass_face_count: int
     preserved_textured_uvs: bool
 
 
@@ -130,6 +145,75 @@ def add_object_face_preserving_uvs(
         validate_export=True,
     )
     return result
+
+
+def convert_object_faces_to_glass_preserving_uvs(
+    glb_bytes: bytes,
+    selected_face_indices: Iterable[int],
+    *,
+    double_sided: bool = False,
+) -> ObjectFaceGlassConversionResult:
+    """Assign selected faces to HouseMaker's atlas-independent glass primitive."""
+
+    result, _geometry = _convert_object_faces_to_glass_with_geometry(
+        glb_bytes,
+        selected_face_indices,
+        double_sided=double_sided,
+        validate_export=True,
+    )
+    return result
+
+
+def _convert_object_faces_to_glass_with_geometry(
+    glb_bytes: bytes,
+    selected_face_indices: Iterable[int],
+    *,
+    double_sided: bool,
+    validate_export: bool,
+) -> tuple[ObjectFaceGlassConversionResult, ObjectFaceGeometry]:
+    """Convert selected faces while returning their canonical source geometry."""
+
+    if not isinstance(double_sided, bool):
+        raise TypeError("Glass sidedness must be a boolean.")
+    scene = _load_glb_scene(glb_bytes)
+    instances, geometry = _collect_scene_geometry(scene)
+    face_count = geometry.face_count
+    if face_count == 0:
+        raise ValueError("The object GLB contains no triangle faces.")
+    selected = _normalize_selected_face_indices(
+        selected_face_indices,
+        face_count=face_count,
+    )
+    converted_instances = _convert_instances_faces_to_glass(
+        instances,
+        selected,
+        double_sided=double_sided,
+    )
+    edited_glb = _export_instances(
+        converted_instances,
+        scene_metadata=scene.metadata,
+    )
+    if validate_export:
+        _validate_exported_face_count(edited_glb, face_count)
+    glass_face_count = sum(
+        instance.face_count
+        for instance in converted_instances
+        if is_housemaker_glass_material(
+            getattr(instance.mesh.visual, "material", None)
+        )
+    )
+    return (
+        ObjectFaceGlassConversionResult(
+            glb_bytes=edited_glb,
+            face_count=face_count,
+            converted_face_count=len(selected),
+            glass_face_count=glass_face_count,
+            preserved_textured_uvs=_instances_have_textured_uvs(
+                converted_instances
+            ),
+        ),
+        geometry,
+    )
 
 
 def _add_object_face_preserving_uvs_with_geometry(
@@ -1296,6 +1380,114 @@ def _filter_face_materials(mesh: trimesh.Trimesh, keep_faces: np.ndarray) -> Non
     if face_materials.shape != (len(mesh.faces),):
         raise ValueError("The object GLB contains invalid face material indices.")
     mesh.visual.face_materials = face_materials[keep_faces].copy()
+
+
+# ### Glass material conversion ###
+def _convert_instances_faces_to_glass(
+    instances: Sequence[_MeshInstance],
+    selected_faces: frozenset[int],
+    *,
+    double_sided: bool,
+) -> list[_MeshInstance]:
+    """Split selected faces into dedicated prefab-glass primitives."""
+
+    converted: list[_MeshInstance] = []
+    for instance in instances:
+        first_face = instance.first_face_index
+        local_selected = np.asarray(
+            [
+                first_face + local_index in selected_faces
+                for local_index in range(instance.face_count)
+            ],
+            dtype=bool,
+        )
+        if not np.any(local_selected):
+            converted.append(_copy_mesh_instance(instance))
+            continue
+
+        local_retained = np.logical_not(local_selected)
+        if np.any(local_retained):
+            converted.append(
+                _subset_mesh_instance(
+                    instance,
+                    local_retained,
+                )
+            )
+        glass_instance = _subset_mesh_instance(
+            instance,
+            local_selected,
+            name_suffix="__housemaker_glass",
+        )
+        glass_mesh = glass_instance.mesh
+        source_uvs = np.asarray(
+            getattr(glass_mesh.visual, "uv", None),
+            dtype=float,
+        )
+        if (
+            source_uvs.shape != (len(glass_mesh.vertices), 2)
+            or not np.all(np.isfinite(source_uvs))
+        ):
+            source_uvs = np.zeros((len(glass_mesh.vertices), 2), dtype=float)
+        glass_mesh.visual = TextureVisuals(
+            uv=np.ascontiguousarray(source_uvs, dtype=float),
+            material=build_housemaker_glass_material(double_sided),
+        )
+        converted.append(glass_instance)
+    if not converted:
+        raise ValueError("Glass conversion produced an empty object scene.")
+    return converted
+
+
+def _copy_mesh_instance(instance: _MeshInstance) -> _MeshInstance:
+    """Copy one source primitive without sharing mutable mesh state."""
+
+    return _MeshInstance(
+        node_name=instance.node_name,
+        geometry_name=instance.geometry_name,
+        mesh=instance.mesh.copy(),
+        transform=instance.transform.copy(),
+        first_vertex_index=0,
+        first_face_index=0,
+        vertex_normals=instance.vertex_normals.copy(),
+        node_metadata=copy.deepcopy(instance.node_metadata),
+    )
+
+
+def _subset_mesh_instance(
+    instance: _MeshInstance,
+    keep_faces: np.ndarray,
+    *,
+    name_suffix: str = "",
+) -> _MeshInstance:
+    """Build one compact primitive while retaining its exact source visuals."""
+
+    normalized_keep = np.asarray(keep_faces, dtype=bool)
+    if normalized_keep.shape != (instance.face_count,) or not np.any(
+        normalized_keep
+    ):
+        raise ValueError("Glass conversion requires retained primitive faces.")
+    mesh = instance.mesh.copy()
+    _filter_face_materials(mesh, normalized_keep)
+    mesh.update_faces(normalized_keep)
+    retained_vertex_indices = np.unique(
+        np.asarray(mesh.faces, dtype=np.int64).reshape(-1)
+    )
+    mesh.remove_unreferenced_vertices()
+    if len(mesh.vertices) != len(retained_vertex_indices):
+        raise ValueError("Glass conversion produced invalid retained vertices.")
+    mesh.vertex_normals = instance.vertex_normals[
+        retained_vertex_indices
+    ].copy()
+    return _MeshInstance(
+        node_name=instance.node_name + name_suffix,
+        geometry_name=instance.geometry_name + name_suffix,
+        mesh=mesh,
+        transform=instance.transform.copy(),
+        first_vertex_index=0,
+        first_face_index=0,
+        vertex_normals=np.asarray(mesh.vertex_normals, dtype=float).copy(),
+        node_metadata=copy.deepcopy(instance.node_metadata),
+    )
 
 
 def _get_vertex_normals(mesh: trimesh.Trimesh) -> np.ndarray:

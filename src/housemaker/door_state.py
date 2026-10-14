@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from housemaker.models import (
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_DOORWAY_SHAPE,
+    DOORWAY_SHAPE_ARCH,
     DoorwayData,
     normalize_doorway_arch_amount,
     normalize_doorway_shape,
@@ -786,6 +787,7 @@ class DoorPlacement:
     level_index: int
     doorway_id: str
     mirrored_horizontally: bool = False
+    mirrored_depthwise: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -795,7 +797,9 @@ class DoorPlacement:
         ):
             raise ValueError("Door placement level index must be non-negative.")
         if not isinstance(self.mirrored_horizontally, bool):
-            raise TypeError("Door placement mirror state must be boolean.")
+            raise TypeError("Door placement horizontal mirror state must be boolean.")
+        if not isinstance(self.mirrored_depthwise, bool):
+            raise TypeError("Door placement depth mirror state must be boolean.")
         object.__setattr__(
             self,
             "placement_id",
@@ -819,6 +823,7 @@ class DoorPlacement:
             "level_index": self.level_index,
             "doorway_id": self.doorway_id,
             "mirrored_horizontally": self.mirrored_horizontally,
+            "mirrored_depthwise": self.mirrored_depthwise,
         }
 
     @classmethod
@@ -830,6 +835,7 @@ class DoorPlacement:
             level_index=raw["level_index"],
             doorway_id=str(raw["doorway_id"]),
             mirrored_horizontally=raw.get("mirrored_horizontally", False),
+            mirrored_depthwise=raw.get("mirrored_depthwise", False),
         )
 
 
@@ -842,6 +848,7 @@ class WindowPlacement:
     level_index: int
     window_frame_id: str
     mirrored_horizontally: bool = False
+    mirrored_depthwise: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -851,7 +858,11 @@ class WindowPlacement:
         ):
             raise ValueError("Window placement level index must be non-negative.")
         if not isinstance(self.mirrored_horizontally, bool):
-            raise TypeError("Window placement mirror state must be boolean.")
+            raise TypeError(
+                "Window placement horizontal mirror state must be boolean."
+            )
+        if not isinstance(self.mirrored_depthwise, bool):
+            raise TypeError("Window placement depth mirror state must be boolean.")
         object.__setattr__(
             self,
             "placement_id",
@@ -875,6 +886,7 @@ class WindowPlacement:
             "level_index": self.level_index,
             "window_frame_id": self.window_frame_id,
             "mirrored_horizontally": self.mirrored_horizontally,
+            "mirrored_depthwise": self.mirrored_depthwise,
         }
 
     @classmethod
@@ -886,6 +898,7 @@ class WindowPlacement:
             level_index=raw["level_index"],
             window_frame_id=str(raw["window_frame_id"]),
             mirrored_horizontally=raw.get("mirrored_horizontally", False),
+            mirrored_depthwise=raw.get("mirrored_depthwise", False),
         )
 
 
@@ -1160,6 +1173,7 @@ def create_door_definition_for_doorway(
         thickness_meters=thickness,
         shape=doorway.shape,
         arch_amount=doorway.arch_amount,
+        preserve_profile=doorway.shape == DOORWAY_SHAPE_ARCH,
         slots=slots,
     )
 
@@ -1613,19 +1627,15 @@ def door_fits_doorway(
     door: DoorDefinition,
     doorway: DoorwayData,
 ) -> bool:
-    """Return whether scaling can preserve the destination silhouette."""
+    """Return whether the door can be conformed to the opening profile.
 
-    return (
-        door.shape == doorway.shape
-        and (
-            door.shape == DEFAULT_DOORWAY_SHAPE
-            or math.isclose(
-                door.arch_amount,
-                doorway.arch_amount,
-                abs_tol=1e-6,
-            )
-        )
-    )
+    Width, height, and arch amount are destination-specific fitting inputs.
+    A rectangular body deliberately remains incompatible with an arched
+    opening because changing that topology would alter the authored asset's
+    design rather than resize the same kind of door.
+    """
+
+    return door.shape == doorway.shape
 
 
 # ### Door slot helpers ###
