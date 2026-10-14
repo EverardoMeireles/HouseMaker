@@ -31,6 +31,7 @@ from housemaker.glb import (
 )
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
+    DOORWAY_SHAPE_ARCH,
     DoorwayData,
     LevelData,
     RoomData,
@@ -106,6 +107,20 @@ def _build_one_room_level() -> tuple[LevelData, RoomData]:
             rooms=[room],
         ),
         room,
+    )
+
+
+def _oriented_triangle_key(
+    triangle: object,
+) -> tuple[tuple[float, ...], ...]:
+    points = tuple(
+        tuple(float(value) for value in point)
+        for point in np.round(np.asarray(triangle, dtype=float), 8)
+    )
+    return min(
+        points,
+        (points[1], points[2], points[0]),
+        (points[2], points[0], points[1]),
     )
 
 
@@ -498,6 +513,91 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             model.mesh.area,
         )
         self.assertEqual(model.glb_bytes, b"")
+
+    def test_untextured_doorway_retains_the_selectable_reveal_faces(self) -> None:
+        level, room = _build_one_room_level()
+        level.doorways = [
+            DoorwayData(
+                center_x=50.0,
+                center_y=0.0,
+                width_meters=0.8,
+                height_meters=2.0,
+                depth_meters=0.2,
+                rotation_degrees=90.0,
+            )
+        ]
+        doorway_wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_id
+            == f"level:2/room:{room.center_vertex_id}/wall:1:2"
+        )
+        reveal_triangles = [
+            triangle
+            for triangle, normal in zip(
+                doorway_wall.mesh.triangles,
+                doorway_wall.mesh.face_normals,
+                strict=True,
+            )
+            if abs(float(normal[1])) < 0.9
+        ]
+        self.assertEqual(len(reveal_triangles), 6)
+
+        model = convert_to_export_scene_model((level,))
+        exported_triangles = {
+            _oriented_triangle_key(triangle)
+            for triangle in model.mesh.triangles
+        }
+
+        self.assertTrue(
+            all(
+                _oriented_triangle_key(triangle) in exported_triangles
+                for triangle in reveal_triangles
+            )
+        )
+
+    def test_untextured_arch_doorway_retains_wall_face_orientation(self) -> None:
+        level, room = _build_one_room_level()
+        level.doorways = [
+            DoorwayData(
+                center_x=50.0,
+                center_y=0.0,
+                width_meters=0.8,
+                height_meters=2.0,
+                depth_meters=0.2,
+                rotation_degrees=90.0,
+                shape=DOORWAY_SHAPE_ARCH,
+            )
+        ]
+        doorway_wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_id
+            == f"level:2/room:{room.center_vertex_id}/wall:1:2"
+        )
+        semantic_wall_triangles = [
+            triangle
+            for triangle, normal in zip(
+                doorway_wall.mesh.triangles,
+                doorway_wall.mesh.face_normals,
+                strict=True,
+            )
+            if abs(float(normal[1])) > 0.9
+        ]
+        self.assertGreater(len(semantic_wall_triangles), 2)
+
+        model = convert_to_export_scene_model((level,))
+        exported_triangles = {
+            _oriented_triangle_key(triangle)
+            for triangle in model.mesh.triangles
+        }
+
+        self.assertTrue(
+            all(
+                _oriented_triangle_key(triangle) in exported_triangles
+                for triangle in semantic_wall_triangles
+            )
+        )
 
     def test_untextured_floor_and_ceiling_double_sided_options_are_independent(
         self,
@@ -1097,7 +1197,8 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         assert model.preview_untextured_mesh is not None
         self.assertEqual(
             len(model.preview_untextured_mesh.faces),
-            len(legacy_model.mesh.faces) - 12,
+            len(legacy_model.mesh.faces)
+            - sum(len(overlay.faces) for overlay in overlays.values()),
         )
         oriented_faces = [
             tuple(

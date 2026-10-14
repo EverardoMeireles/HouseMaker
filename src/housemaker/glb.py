@@ -8532,6 +8532,13 @@ def _triangulate_visible_wall_geometry(visible_geometry: object) -> list[WallPie
                 for point_x, point_y in list(triangle.exterior.coords)[:-1]
             )
             if len(points) == 3:
+                signed_area = sum(
+                    points[index][0] * points[(index + 1) % 3][1]
+                    - points[(index + 1) % 3][0] * points[index][1]
+                    for index in range(3)
+                )
+                if signed_area < 0.0:
+                    points = (points[0], points[2], points[1])
                 wall_pieces.append(WallPiece(points=points))
     wall_pieces.sort(
         key=lambda piece: (
@@ -8644,6 +8651,7 @@ def _build_level_doorway_reveal_mesh(
     doorway_reveals = _build_level_doorway_reveals(
         level=level,
         room_vertex_sets=room_vertex_sets,
+        include_single_wall_fallback=True,
     )
     if not doorway_reveals:
         return None
@@ -8790,7 +8798,15 @@ def _build_level_doorway_reveals(
     for opening in doorway_openings:
         contacts = _build_doorway_reveal_contacts(wall_sources, opening)
         reveal_pair = _get_doorway_reveal_pair(contacts)
-        if reveal_pair is None and include_single_wall_fallback:
+        if (
+            reveal_pair is None
+            and include_single_wall_fallback
+            and _can_build_single_wall_doorway_reveal(
+                wall_sources,
+                contacts,
+                opening,
+            )
+        ):
             reveal_pair = _build_single_wall_doorway_reveal_pair(
                 contacts,
                 opening,
@@ -8812,6 +8828,39 @@ def _build_level_doorway_reveals(
             )
         )
     return reveals
+
+
+def _can_build_single_wall_doorway_reveal(
+    wall_sources: Sequence[WallSource],
+    contacts: Sequence[WallOpeningContact],
+    opening: WallOpening,
+) -> bool:
+    """Allow a synthetic tunnel only through one coplanar wall plane."""
+
+    if not contacts:
+        return False
+    contact_source_keys = {contact.source_key for contact in contacts}
+    intersecting_sources = tuple(
+        wall_source
+        for wall_source in wall_sources
+        if _clip_wall_segment_to_opening(
+            start_point=wall_source.start_point,
+            end_point=wall_source.end_point,
+            doorway_opening=opening,
+        )
+        is not None
+    )
+    if not intersecting_sources or any(
+        wall_source.key not in contact_source_keys
+        for wall_source in intersecting_sources
+    ):
+        return False
+
+    depth_positions = tuple(contact.depth_position for contact in contacts)
+    return (
+        max(depth_positions) - min(depth_positions)
+        <= WALL_OPENING_EPSILON
+    )
 
 
 def _build_single_wall_doorway_reveal_pair(
