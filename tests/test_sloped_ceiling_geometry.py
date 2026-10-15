@@ -6,6 +6,7 @@ import unittest
 from dataclasses import replace
 from io import BytesIO
 from itertools import combinations
+from unittest.mock import patch
 
 import numpy as np
 import shapely
@@ -19,6 +20,7 @@ from housemaker.models import (
     DEFAULT_SLOPED_CEILING_WALL_DROP_METERS,
     DoorwayData,
     LevelData,
+    OpenSpaceData,
     RoomData,
     SlopedCeilingData,
     VertexData,
@@ -39,9 +41,9 @@ from housemaker.sloped_ceiling import (
     SlopedCeilingWindowPlacement,
     add_sloped_ceiling_window,
     apply_sloped_ceiling_edit,
-    build_sloped_ceiling_surface_id,
     build_sloped_ceiling_edit_targets,
     build_sloped_ceiling_preview_meshes,
+    build_sloped_ceiling_surface_id,
     build_sloped_ceiling_window_hosts,
     build_sloped_ceiling_window_opening_targets,
     build_sloped_ceiling_window_placement,
@@ -50,6 +52,7 @@ from housemaker.sloped_ceiling import (
 from housemaker.surface_geometry import (
     FixedSurface,
     build_base_fixed_surfaces,
+    build_fixed_surface_scene_snapshot,
     build_fixed_surfaces,
 )
 
@@ -2868,6 +2871,208 @@ class SlopedCeilingWindowTests(unittest.TestCase):
 
 # ### GLB replacement tests ###
 class SlopedCeilingExportTests(unittest.TestCase):
+    def test_surface_snapshot_preserves_rounded_final_and_flat_host_geometry(
+        self,
+    ) -> None:
+        level = _build_room_level()
+        flat_unclipped_surfaces = tuple(
+            build_base_fixed_surfaces(
+                [level],
+                clip_open_spaces=False,
+                apply_sloped_ceilings=False,
+            )
+        )
+        host_wall = _host_wall(list(flat_unclipped_surfaces))
+        level.sloped_ceilings.append(
+            SlopedCeilingData(
+                slope_id=SLOPE_ID,
+                wall_surface_id=host_wall.surface_id,
+                depth_meters=1.0,
+                angle_degrees=30.0,
+                transition_radius_meters=0.2,
+                wall_transition_radius_meters=0.15,
+                side_transition_radius_meters=0.1,
+                start_ratio=0.2,
+                end_ratio=0.8,
+            )
+        )
+
+        snapshot = build_fixed_surface_scene_snapshot([level])
+        expected_final_surfaces = tuple(build_fixed_surfaces([level]))
+        expected_host_surfaces = tuple(
+            build_fixed_surfaces(
+                [level],
+                base_surfaces=flat_unclipped_surfaces,
+            )
+        )
+
+        self._assert_surface_geometry_equal(
+            snapshot.fixed_surfaces,
+            expected_final_surfaces,
+        )
+        self._assert_surface_geometry_equal(
+            snapshot.sloped_ceiling_host_surfaces,
+            expected_host_surfaces,
+        )
+        self.assertTrue(
+            any(
+                surface.sloped_ceiling_id == SLOPE_ID
+                for surface in snapshot.fixed_surfaces
+            )
+        )
+        self.assertFalse(
+            any(
+                surface.sloped_ceiling_id is not None
+                for surface in snapshot.sloped_ceiling_host_surfaces
+            )
+        )
+        rounded_surface = _sloped_ceiling_surface(snapshot.fixed_surfaces)
+        self.assertGreater(len(rounded_surface.mesh.faces), 2)
+
+    def test_prepared_preview_skips_surface_rebuilds_without_changing_geometry(
+        self,
+    ) -> None:
+        level = _build_room_level()
+        flat_surfaces = build_base_fixed_surfaces(
+            [level],
+            apply_sloped_ceilings=False,
+        )
+        host_wall = _host_wall(flat_surfaces)
+        _add_slope(level, host_wall.surface_id)
+        expected_model = convert_to_preview_model([level])
+        snapshot = build_fixed_surface_scene_snapshot([level])
+
+        with (
+            patch(
+                "housemaker.surface_geometry.build_base_fixed_surfaces",
+                side_effect=AssertionError("base surfaces were rebuilt"),
+            ),
+            patch(
+                "housemaker.sloped_ceiling.apply_sloped_ceiling_geometry",
+                side_effect=AssertionError("sloped surfaces were rebuilt"),
+            ),
+            patch(
+                "housemaker.surface_geometry.build_fixed_surfaces",
+                side_effect=AssertionError("fixed surfaces were rebuilt"),
+            ),
+        ):
+            actual_model = convert_to_preview_model(
+                [level],
+                prepared_flat_base_surfaces=snapshot.flat_base_surfaces,
+                prepared_sloped_base_surfaces=snapshot.sloped_base_surfaces,
+                prepared_fixed_surfaces=snapshot.fixed_surfaces,
+            )
+
+        self._assert_preview_geometry_equal(actual_model, expected_model)
+
+    def test_surface_snapshot_preserves_a_slope_crossed_by_an_open_space(
+        self,
+    ) -> None:
+        lower = _build_room_level()
+        upper = _build_room_level()
+        upper.index = lower.index + 1
+        upper.name = "Story 1"
+        flat_surfaces = build_base_fixed_surfaces(
+            [lower, upper],
+            apply_sloped_ceilings=False,
+        )
+        host_wall = next(
+            surface
+            for surface in flat_surfaces
+            if surface.level_index == lower.index
+            and surface.surface_type == "wall"
+            and np.allclose(surface.wall_start_world[1], 0.0)
+            and np.allclose(surface.wall_end_world[1], 0.0)
+        )
+        _add_slope(lower, host_wall.surface_id)
+        full_slope = _sloped_ceiling_surface(
+            tuple(build_fixed_surfaces([lower, upper]))
+        )
+        upper.open_spaces.append(
+            OpenSpaceData(
+                "slope-opening",
+                45.0,
+                5.0,
+                55.0,
+                15.0,
+            )
+        )
+
+        expected_surfaces = tuple(build_fixed_surfaces([lower, upper]))
+        expected_model = convert_to_preview_model([lower, upper])
+        snapshot = build_fixed_surface_scene_snapshot([lower, upper])
+        actual_model = convert_to_preview_model(
+            [lower, upper],
+            prepared_flat_base_surfaces=snapshot.flat_base_surfaces,
+            prepared_sloped_base_surfaces=snapshot.sloped_base_surfaces,
+            prepared_fixed_surfaces=snapshot.fixed_surfaces,
+        )
+
+        clipped_slope = _sloped_ceiling_surface(snapshot.fixed_surfaces)
+        self.assertLess(clipped_slope.mesh.area, full_slope.mesh.area)
+        self._assert_surface_geometry_equal(
+            snapshot.fixed_surfaces,
+            expected_surfaces,
+        )
+        self._assert_preview_geometry_equal(actual_model, expected_model)
+
+    def _assert_preview_geometry_equal(
+        self,
+        actual_model,
+        expected_model,
+    ) -> None:
+        """Assert aggregate and named preview geometry are unchanged."""
+
+        np.testing.assert_allclose(
+            actual_model.mesh.triangles,
+            expected_model.mesh.triangles,
+            atol=1e-9,
+        )
+        self.assertEqual(
+            tuple(actual_model.scene.geometry),
+            tuple(expected_model.scene.geometry),
+        )
+        for geometry_name in expected_model.scene.geometry:
+            np.testing.assert_allclose(
+                actual_model.scene.geometry[geometry_name].triangles,
+                expected_model.scene.geometry[geometry_name].triangles,
+                atol=1e-9,
+            )
+
+    def _assert_surface_geometry_equal(
+        self,
+        actual_surfaces: tuple[FixedSurface, ...],
+        expected_surfaces: tuple[FixedSurface, ...],
+    ) -> None:
+        """Assert stable semantic identity and exact generated geometry."""
+
+        actual_by_id = {
+            surface.surface_id: surface for surface in actual_surfaces
+        }
+        expected_by_id = {
+            surface.surface_id: surface for surface in expected_surfaces
+        }
+        self.assertEqual(set(actual_by_id), set(expected_by_id))
+        for surface_id, expected_surface in expected_by_id.items():
+            actual_surface = actual_by_id[surface_id]
+            self.assertEqual(
+                actual_surface.surface_type,
+                expected_surface.surface_type,
+            )
+            self.assertEqual(
+                actual_surface.sloped_ceiling_id,
+                expected_surface.sloped_ceiling_id,
+            )
+            self.assertEqual(
+                actual_surface.sloped_ceiling_part,
+                expected_surface.sloped_ceiling_part,
+            )
+            np.testing.assert_allclose(
+                actual_surface.mesh.triangles,
+                expected_surface.mesh.triangles,
+                atol=1e-9,
+            )
+
     def test_preview_export_and_textured_surface_use_semantic_slope(self) -> None:
         level = _build_room_level()
         flat_surfaces = build_base_fixed_surfaces(

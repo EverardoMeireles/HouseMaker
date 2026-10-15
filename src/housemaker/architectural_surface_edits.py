@@ -405,13 +405,19 @@ def resolve_surface_vertex_preview(
 
 def build_surface_drawing_overlay(
     levels: Sequence[LevelData],
+    *,
+    base_surfaces: Sequence[FixedSurface] | None = None,
 ) -> SurfaceDrawingOverlay:
-    """Build snap targets, manual markers, and unfinished chain edges."""
+    """Build drawing overlays, optionally reusing structural surfaces."""
 
     level_sequence = _normalize_levels(levels)
     base_by_id = {
         surface.surface_id: surface
-        for surface in build_base_fixed_surfaces(level_sequence)
+        for surface in (
+            build_base_fixed_surfaces(level_sequence)
+            if base_surfaces is None
+            else base_surfaces
+        )
     }
     vertex_targets: list[SurfaceDrawingVertexTarget] = []
     edge_targets: list[SurfaceDrawingEdgeTarget] = []

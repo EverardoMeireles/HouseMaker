@@ -17,12 +17,15 @@ import trimesh
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
+import housemaker.main as main_module
+import housemaker.sloped_ceiling as sloped_ceiling_module
+import housemaker.surface_geometry as surface_geometry_module
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import GeneratedObjectPlacement
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import create_default_levels
+from housemaker.models import LevelData, create_default_levels
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -37,6 +40,26 @@ def _preview_model(name: str) -> GeneratedModel:
         scene=trimesh.Scene({name: mesh.copy()}),
         glb_bytes=b"",
     )
+
+
+def _add_square_level_geometry(level: LevelData) -> None:
+    """Add one closed wall loop to an otherwise empty level."""
+
+    vertex_ids = tuple(
+        level.vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (200.0, 0.0),
+            (200.0, 200.0),
+            (0.0, 200.0),
+        )
+    )
+    for start_id, end_id in zip(
+        vertex_ids,
+        (*vertex_ids[1:], vertex_ids[0]),
+        strict=True,
+    ):
+        level.vertex_data.add_edge(start_id, end_id)
 
 
 # ### Preview-cache integration tests ###
@@ -438,6 +461,175 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             self.workspace._refresh_viewer_preview(preserve_camera=True)
 
         build_levels.assert_called_once_with()
+
+    def test_one_refresh_reuses_one_structural_surface_snapshot(self) -> None:
+        level = self.workspace.current_level
+        _add_square_level_geometry(level)
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        _qt_application.processEvents()
+        self.workspace._mark_viewer_preview_dirty()
+
+        with (
+            patch(
+                "housemaker.main.build_fixed_surface_scene_snapshot",
+                wraps=main_module.build_fixed_surface_scene_snapshot,
+            ) as build_snapshot,
+            patch(
+                "housemaker.main.convert_to_preview_model",
+                wraps=main_module.convert_to_preview_model,
+            ) as convert_preview,
+            patch(
+                "housemaker.surface_geometry.build_base_fixed_surfaces",
+                wraps=surface_geometry_module.build_base_fixed_surfaces,
+            ) as build_underlying_base_surfaces,
+            patch(
+                "housemaker.sloped_ceiling.apply_sloped_ceiling_geometry",
+                wraps=sloped_ceiling_module.apply_sloped_ceiling_geometry,
+            ) as apply_underlying_slopes,
+            patch(
+                "housemaker.surface_geometry.build_fixed_surfaces",
+                wraps=surface_geometry_module.build_fixed_surfaces,
+            ) as build_underlying_fixed_surfaces,
+            patch(
+                "housemaker.main.build_fixed_surfaces",
+                side_effect=AssertionError("fixed surfaces were rebuilt"),
+            ) as rebuild_fixed_surfaces,
+            patch(
+                "housemaker.main.build_base_fixed_surfaces",
+                side_effect=AssertionError("base surfaces were rebuilt"),
+            ) as rebuild_base_surfaces,
+        ):
+            self.workspace._refresh_viewer_preview(preserve_camera=True)
+
+        build_snapshot.assert_called_once()
+        convert_preview.assert_called_once()
+        # The snapshot owns one wall build plus separate clipped-preview and
+        # unclipped-semantic slope passes. Conversion must add no more work.
+        self.assertEqual(build_underlying_base_surfaces.call_count, 1)
+        self.assertEqual(apply_underlying_slopes.call_count, 2)
+        self.assertEqual(build_underlying_fixed_surfaces.call_count, 2)
+        rebuild_fixed_surfaces.assert_not_called()
+        rebuild_base_surfaces.assert_not_called()
+        self.assertEqual(
+            self.workspace._viewer_surface_snapshot_revision,
+            self.workspace._viewer_preview_revision,
+        )
+        snapshot = self.workspace._viewer_surface_snapshot
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        preview_kwargs = convert_preview.call_args.kwargs
+        self.assertIs(
+            preview_kwargs["prepared_flat_base_surfaces"],
+            snapshot.flat_base_surfaces,
+        )
+        self.assertIs(
+            preview_kwargs["prepared_sloped_base_surfaces"],
+            snapshot.sloped_base_surfaces,
+        )
+        self.assertEqual(
+            tuple(preview_kwargs["prepared_fixed_surfaces"]),
+            snapshot.fixed_surfaces,
+        )
+
+    def test_surface_snapshot_cache_is_owned_by_one_viewer_revision(self) -> None:
+        preview_levels = self.workspace._build_viewer_preview_levels()
+        first_revision = self.workspace._viewer_preview_revision + 10
+
+        with patch(
+            "housemaker.main.build_fixed_surface_scene_snapshot",
+            wraps=main_module.build_fixed_surface_scene_snapshot,
+        ) as build_snapshot:
+            first_snapshot = self.workspace._get_viewer_surface_snapshot(
+                preview_levels,
+                first_revision,
+            )
+            repeated_snapshot = self.workspace._get_viewer_surface_snapshot(
+                preview_levels,
+                first_revision,
+            )
+            next_snapshot = self.workspace._get_viewer_surface_snapshot(
+                preview_levels,
+                first_revision + 1,
+            )
+
+        self.assertIs(repeated_snapshot, first_snapshot)
+        self.assertIsNot(next_snapshot, first_snapshot)
+        self.assertEqual(build_snapshot.call_count, 2)
+
+    def test_viewer_snapshot_does_not_contaminate_export_surface_cache(
+        self,
+    ) -> None:
+        excluded_level = self.workspace.current_level
+        _add_square_level_geometry(excluded_level)
+        excluded_level.include_in_export = False
+        revision = self.workspace._mark_viewer_preview_dirty()
+        export_surfaces = self.workspace._get_base_fixed_surface_snapshot(
+            self.workspace.levels
+        )
+        export_surfaces_by_id = self.workspace._base_fixed_surfaces_cache_by_id
+
+        preview_levels = self.workspace._build_viewer_preview_levels()
+        viewer_snapshot = self.workspace._get_viewer_surface_snapshot(
+            preview_levels,
+            revision,
+        )
+
+        self.assertTrue(
+            any(
+                surface.level_index == excluded_level.index
+                for surface in viewer_snapshot.sloped_base_surfaces
+            )
+        )
+        self.assertFalse(
+            any(
+                surface.level_index == excluded_level.index
+                for surface in export_surfaces
+            )
+        )
+        self.assertIs(
+            self.workspace._base_fixed_surfaces_cache,
+            export_surfaces,
+        )
+        self.assertIs(
+            self.workspace._base_fixed_surfaces_cache_by_id,
+            export_surfaces_by_id,
+        )
+        self.assertEqual(
+            self.workspace._base_fixed_surfaces_cache_revision,
+            revision,
+        )
+
+    def test_refresh_ignores_malformed_surface_snapshot(self) -> None:
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        _qt_application.processEvents()
+
+        for error_type in (TypeError, ValueError):
+            with self.subTest(error_type=error_type.__name__):
+                revision = self.workspace._mark_viewer_preview_dirty()
+                with (
+                    patch(
+                        "housemaker.main.build_fixed_surface_scene_snapshot",
+                        side_effect=error_type("invalid intermediate geometry"),
+                    ) as build_snapshot,
+                    patch.object(
+                        self.workspace,
+                        "_build_viewer_preview_model",
+                    ) as build_preview,
+                ):
+                    self.workspace._refresh_viewer_preview(
+                        preserve_camera=True
+                    )
+
+                build_snapshot.assert_called_once()
+                build_preview.assert_not_called()
+                self.assertNotEqual(
+                    self.workspace._viewer_preview_model_revision,
+                    revision,
+                )
 
     def test_tab_dependency_fingerprint_is_reused_by_the_refresh(self) -> None:
         self.workspace.workspace_tabs.setCurrentWidget(

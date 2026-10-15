@@ -374,9 +374,11 @@ from housemaker.sloped_ceiling import (
 from housemaker.surface_geometry import (
     SURFACE_TYPE_WALL,
     FixedSurface,
+    FixedSurfaceSceneSnapshot,
     WallWindowPlacement,
     add_wall_window,
     build_base_fixed_surfaces,
+    build_fixed_surface_scene_snapshot,
     build_fixed_surfaces,
 )
 from housemaker.surface_materials import (
@@ -1636,8 +1638,10 @@ class BlueprintWorkspace(QWidget):
         self._scheduled_viewer_refresh_preserve_camera = True
         self._viewer_preview_revision = 0
         self._viewer_preview_model_revision = -1
+        self._viewer_surface_snapshot_revision = -1
         self._canvas_viewer_preview_revision = -1
         self._viewer_preview_model: GeneratedModel | None = None
+        self._viewer_surface_snapshot: FixedSurfaceSceneSnapshot | None = None
         self._viewer_preview_dependency_signature: tuple[object, ...] | None = None
         self._viewer_preview_dependency_signature_revision = -1
         self._is_applying_project_state = False
@@ -1845,6 +1849,9 @@ class BlueprintWorkspace(QWidget):
         ) = None
         self._pending_viewer_preview_dependency_signature_revision = -1
         self._viewer_preview_levels_for_model_build: list[LevelData] | None = None
+        self._viewer_surface_snapshot_for_model_build: (
+            FixedSurfaceSceneSnapshot | None
+        ) = None
         self._tour_point_request_revision = 0
         self._tour_draft_overlay: dict[str, object] | None = None
         self._suppress_tour_preview_camera_updates = False
@@ -5110,6 +5117,7 @@ class BlueprintWorkspace(QWidget):
         surfaces: Sequence[FixedSurface],
         *,
         preview_levels: Sequence[LevelData] | None = None,
+        surface_snapshot: FixedSurfaceSceneSnapshot | None = None,
     ) -> None:
         """Install semantic surfaces and their selectable opening overlays."""
 
@@ -5128,28 +5136,35 @@ class BlueprintWorkspace(QWidget):
         self._canvas_surface_targets_by_id = {
             surface.surface_id: surface for surface in surface_targets
         }
-        try:
-            slope_free_base_surfaces = tuple(
-                build_base_fixed_surfaces(
-                    semantic_levels,
-                    stairs=self.stairs,
-                    clip_open_spaces=False,
-                    apply_sloped_ceilings=False,
-                )
-            )
+        if surface_snapshot is not None:
             self._sloped_ceiling_host_surfaces = tuple(
                 surface
-                for surface in build_fixed_surfaces(
-                    semantic_levels,
-                    stairs=self.stairs,
-                    base_surfaces=slope_free_base_surfaces,
-                )
+                for surface in surface_snapshot.sloped_ceiling_host_surfaces
                 if not is_architectural_trim_surface_id(surface.surface_id)
             )
-        except (TypeError, ValueError):
-            # Keep older or partially edited projects interactive. The next
-            # successful scene rebuild will replace this fallback snapshot.
-            self._sloped_ceiling_host_surfaces = surface_targets
+        else:
+            try:
+                slope_free_base_surfaces = tuple(
+                    build_base_fixed_surfaces(
+                        semantic_levels,
+                        stairs=self.stairs,
+                        clip_open_spaces=False,
+                        apply_sloped_ceilings=False,
+                    )
+                )
+                self._sloped_ceiling_host_surfaces = tuple(
+                    surface
+                    for surface in build_fixed_surfaces(
+                        semantic_levels,
+                        stairs=self.stairs,
+                        base_surfaces=slope_free_base_surfaces,
+                    )
+                    if not is_architectural_trim_surface_id(surface.surface_id)
+                )
+            except (TypeError, ValueError):
+                # Keep older or partially edited projects interactive. The next
+                # successful scene rebuild will replace this fallback snapshot.
+                self._sloped_ceiling_host_surfaces = surface_targets
         self._desired_canvas_surface_ids = tuple(
             surface_id
             for surface_id in self._desired_canvas_surface_ids
@@ -5197,7 +5212,14 @@ class BlueprintWorkspace(QWidget):
             except (TypeError, ValueError):
                 sloped_window_hosts = ()
             self.viewer.set_sloped_ceiling_window_hosts(sloped_window_hosts)
-            self._sync_canvas_surface_drawing_overlay(semantic_levels)
+            self._sync_canvas_surface_drawing_overlay(
+                semantic_levels,
+                base_surfaces=(
+                    None
+                    if surface_snapshot is None
+                    else surface_snapshot.sloped_base_surfaces
+                ),
+            )
             if self._desired_canvas_surface_ids:
                 self.viewer.set_selected_canvas_surface_ids(
                     self._desired_canvas_surface_ids
@@ -5237,7 +5259,12 @@ class BlueprintWorkspace(QWidget):
             semantic_levels
         )
         trim_part_targets = self._sync_canvas_architectural_trim_semantic_targets(
-            semantic_levels
+            semantic_levels,
+            structural_surfaces=(
+                None
+                if surface_snapshot is None
+                else surface_snapshot.sloped_base_surfaces
+            ),
         )
         assignable_surface_ids = (
             installed_surface_ids
@@ -5405,18 +5432,24 @@ class BlueprintWorkspace(QWidget):
     def _sync_canvas_architectural_trim_semantic_targets(
         self,
         levels: Sequence[LevelData],
+        *,
+        structural_surfaces: Sequence[FixedSurface] | None = None,
     ) -> tuple[ArchitecturalTrimPart, ...]:
         """Publish trim parts, independent texture targets, and edit handles."""
 
         try:
-            structural_surfaces = self._get_base_fixed_surface_snapshot(levels)
+            effective_surfaces = (
+                self._get_base_fixed_surface_snapshot(levels)
+                if structural_surfaces is None
+                else tuple(structural_surfaces)
+            )
             geometry = build_architectural_trim_geometry(
                 levels,
-                structural_surfaces,
+                effective_surfaces,
             )
             edit_targets = build_architectural_trim_edit_targets(
                 levels,
-                structural_surfaces,
+                effective_surfaces,
             )
         except (TypeError, ValueError):
             geometry_parts: tuple[ArchitecturalTrimPart, ...] = ()
@@ -5802,7 +5835,15 @@ class BlueprintWorkspace(QWidget):
         """Resolve exactly the host walls needed by a generated trim frame."""
 
         wall_surface_ids = tuple(getattr(trim, "wall_surface_ids", ()))
-        authoritative_surfaces = self._project_apply_base_surfaces_by_id
+        viewer_snapshot = self._viewer_surface_snapshot_for_model_build
+        authoritative_surfaces = (
+            {
+                surface.surface_id: surface
+                for surface in viewer_snapshot.sloped_base_surfaces
+            }
+            if viewer_snapshot is not None
+            else self._project_apply_base_surfaces_by_id
+        )
         if authoritative_surfaces is None:
             self._get_base_fixed_surface_snapshot(self.levels)
             authoritative_surfaces = (
@@ -7407,7 +7448,9 @@ class BlueprintWorkspace(QWidget):
         if defer_viewer_refresh:
             self._mark_viewer_preview_dirty(preserve_camera=True)
             return
-        self._refresh_sloped_ceiling_edit_targets(preserve_selection=True)
+        # Release already rebased these lightweight handles against the
+        # committed values. The scene install below replaces them again, so a
+        # third whole-level target pass here only extends the post-delay stall.
         self._reconcile_canvas_surface_edit_and_refresh()
 
     def _cancel_pending_sloped_ceiling_mesh_update(
@@ -8880,6 +8923,8 @@ class BlueprintWorkspace(QWidget):
     def _sync_canvas_surface_drawing_overlay(
         self,
         preview_levels: Sequence[LevelData] | None = None,
+        *,
+        base_surfaces: Sequence[FixedSurface] | None = None,
     ) -> None:
         """Keep persistent drawn vertices and edges aligned with preview levels."""
 
@@ -8888,7 +8933,10 @@ class BlueprintWorkspace(QWidget):
             if preview_levels is not None
             else self._build_viewer_preview_levels()
         )
-        overlay = build_surface_drawing_overlay(effective_levels)
+        overlay = build_surface_drawing_overlay(
+            effective_levels,
+            base_surfaces=base_surfaces,
+        )
         known_vertex_ids = {vertex.vertex_id for vertex in overlay.vertices}
         if self._active_canvas_surface_drawing_vertex_id not in known_vertex_ids:
             self._active_canvas_surface_drawing_vertex_id = None
@@ -10799,13 +10847,15 @@ class BlueprintWorkspace(QWidget):
         )
         if cache_is_current:
             assert cached_model is not None
+            preview_levels = self._build_viewer_preview_levels()
+            surface_snapshot = self._get_viewer_surface_snapshot(
+                preview_levels,
+                revision,
+            )
             self._set_canvas_viewer_targets(
-                tuple(
-                    build_fixed_surfaces(
-                        self._build_viewer_preview_levels(),
-                        stairs=self.stairs,
-                    )
-                )
+                surface_snapshot.fixed_surfaces,
+                preview_levels=preview_levels,
+                surface_snapshot=surface_snapshot,
             )
             self._sync_viewer_architectural_trim_placed_object_bindings(
                 cached_model
@@ -17848,6 +17898,27 @@ class BlueprintWorkspace(QWidget):
             preview_levels.append(preview_level)
         return preview_levels
 
+    def _get_viewer_surface_snapshot(
+        self,
+        preview_levels: Sequence[LevelData],
+        revision: int,
+    ) -> FixedSurfaceSceneSnapshot:
+        """Reuse every structural surface representation for one revision."""
+
+        snapshot = self._viewer_surface_snapshot
+        if (
+            snapshot is None
+            or self._viewer_surface_snapshot_revision != revision
+        ):
+            snapshot = build_fixed_surface_scene_snapshot(
+                preview_levels,
+                stairs=self.stairs,
+            )
+            self._viewer_surface_snapshot = snapshot
+            self._viewer_surface_snapshot_revision = revision
+
+        return snapshot
+
     def _sync_viewer_scene_levels(
         self,
         *,
@@ -18288,6 +18359,7 @@ class BlueprintWorkspace(QWidget):
     ) -> GeneratedModel | None:
         """Build render data without paying the GLB serialization cost."""
 
+        surface_snapshot = self._viewer_surface_snapshot_for_model_build
         trim_models: tuple[PlacedGeneratedModel, ...] = ()
         preview_opening_targets_by_key: dict[str, CanvasOpeningTarget] = {}
         try:
@@ -18305,6 +18377,24 @@ class BlueprintWorkspace(QWidget):
                     preview_levels,
                     generated_trim_keys,
                 )
+                prepared_fixed_surfaces = None
+                if surface_snapshot is not None:
+                    generated_trim_key_set = {
+                        (int(level_index), str(trim_id).strip().lower())
+                        for level_index, trim_id in generated_trim_keys
+                    }
+                    prepared_fixed_surfaces = tuple(
+                        surface
+                        for surface in surface_snapshot.fixed_surfaces
+                        if (
+                            (parsed := parse_architectural_trim_surface_id(
+                                surface.surface_id
+                            ))
+                            is None
+                            or (surface.level_index, parsed[0])
+                            not in generated_trim_key_set
+                        )
+                    )
                 base_model = convert_to_preview_model(
                     preview_levels,
                     stairs=self.stairs,
@@ -18315,11 +18405,23 @@ class BlueprintWorkspace(QWidget):
                     make_ceilings_double_sided=(
                         self._generation_settings.make_ceilings_double_sided
                     ),
+                    prepared_flat_base_surfaces=(
+                        None
+                        if surface_snapshot is None
+                        else surface_snapshot.flat_base_surfaces
+                    ),
+                    prepared_sloped_base_surfaces=(
+                        None
+                        if surface_snapshot is None
+                        else surface_snapshot.sloped_base_surfaces
+                    ),
+                    prepared_fixed_surfaces=prepared_fixed_surfaces,
                 )
                 preview_opening_targets_by_key = (
                     self._build_opening_target_lookup_for_levels(
                         preview_levels,
                         include_excluded_levels=True,
+                        prepared_fixed_surfaces=prepared_fixed_surfaces,
                     )
                 )
             except NoUsableBlueprintGeometryError:
@@ -18351,6 +18453,7 @@ class BlueprintWorkspace(QWidget):
         levels: Sequence[LevelData],
         *,
         include_excluded_levels: bool,
+        prepared_fixed_surfaces: Sequence[FixedSurface] | None = None,
     ) -> dict[str, CanvasOpeningTarget]:
         """Build current opening planes without depending on viewer cache order."""
 
@@ -18360,10 +18463,14 @@ class BlueprintWorkspace(QWidget):
             if include_excluded_levels:
                 opening_level.include_in_export = True
             opening_levels.append(opening_level)
-        surfaces = tuple(
-            build_fixed_surfaces(
-                opening_levels,
-                stairs=self.stairs,
+        surfaces = (
+            tuple(prepared_fixed_surfaces)
+            if prepared_fixed_surfaces is not None
+            else tuple(
+                build_fixed_surfaces(
+                    opening_levels,
+                    stairs=self.stairs,
+                )
             )
         )
         return {
@@ -19084,11 +19191,17 @@ class BlueprintWorkspace(QWidget):
             if (identity := get_architectural_trim_component_identity(record))
             is not None
         }
+        viewer_snapshot = self._viewer_surface_snapshot_for_model_build
+        trim_base_surfaces = (
+            viewer_snapshot.sloped_base_surfaces
+            if include_excluded_levels and viewer_snapshot is not None
+            else self._get_base_fixed_surface_snapshot(self.levels)
+        )
         trim_miters_by_trim_key = {
             (descriptor.level_index, descriptor.trim_id): descriptor
             for descriptor in build_architectural_trim_miter_descriptors(
                 self.levels,
-                self._get_base_fixed_surface_snapshot(self.levels),
+                trim_base_surfaces,
             )
         }
         linked_bindings = (
@@ -20246,6 +20359,16 @@ class BlueprintWorkspace(QWidget):
             return
 
         preview_levels = self._build_viewer_preview_levels()
+        try:
+            surface_snapshot = self._get_viewer_surface_snapshot(
+                preview_levels,
+                revision,
+            )
+        except (TypeError, ValueError):
+            # Surface construction used to live inside the guarded model
+            # builder. Keep malformed intermediate edits from escaping the
+            # scheduled Qt refresh now that the shared snapshot is built here.
+            return
         self._sync_viewer_scene_levels()
         if self._viewer_preview_model_revision != revision:
             if (
@@ -20263,10 +20386,12 @@ class BlueprintWorkspace(QWidget):
             self._pending_viewer_preview_dependency_signature = None
             self._pending_viewer_preview_dependency_signature_revision = -1
             self._viewer_preview_levels_for_model_build = preview_levels
+            self._viewer_surface_snapshot_for_model_build = surface_snapshot
             try:
                 next_model = self._build_viewer_preview_model(None)
             finally:
                 self._viewer_preview_levels_for_model_build = None
+                self._viewer_surface_snapshot_for_model_build = None
             if next_model is None:
                 return
             dependency_signature_after = (
@@ -20286,6 +20411,7 @@ class BlueprintWorkspace(QWidget):
                 self._set_canvas_viewer_targets(
                     (),
                     preview_levels=preview_levels,
+                    surface_snapshot=surface_snapshot,
                 )
                 self._sync_viewer_architectural_trim_placed_object_bindings(None)
                 self._is_syncing_canvas_scene_selection = True
@@ -20295,13 +20421,9 @@ class BlueprintWorkspace(QWidget):
                     self._is_syncing_canvas_scene_selection = False
             else:
                 self._set_canvas_viewer_targets(
-                    tuple(
-                        build_fixed_surfaces(
-                            preview_levels,
-                            stairs=self.stairs,
-                        )
-                    ),
+                    surface_snapshot.fixed_surfaces,
                     preview_levels=preview_levels,
+                    surface_snapshot=surface_snapshot,
                 )
                 self._sync_viewer_architectural_trim_placed_object_bindings(
                     generated_model

@@ -828,8 +828,12 @@ def convert_to_preview_model(
     stairs: Sequence[StairData] = (),
     make_floors_double_sided: bool = False,
     make_ceilings_double_sided: bool = False,
+    *,
+    prepared_flat_base_surfaces: Sequence[object] | None = None,
+    prepared_sloped_base_surfaces: Sequence[object] | None = None,
+    prepared_fixed_surfaces: Sequence[object] | None = None,
 ) -> GeneratedModel:
-    """Build the complete interactive house model without GLB serialization."""
+    """Build the interactive model, optionally reusing one scene snapshot."""
 
     return _build_blueprint_model(
         level_source=level_source,
@@ -842,6 +846,9 @@ def convert_to_preview_model(
         export_untextured_surfaces=True,
         make_floors_double_sided=make_floors_double_sided,
         make_ceilings_double_sided=make_ceilings_double_sided,
+        prepared_flat_base_surfaces=prepared_flat_base_surfaces,
+        prepared_sloped_base_surfaces=prepared_sloped_base_surfaces,
+        prepared_fixed_surfaces=prepared_fixed_surfaces,
     )
 
 
@@ -887,6 +894,9 @@ def _build_blueprint_model(
     export_untextured_surfaces: bool,
     make_floors_double_sided: bool,
     make_ceilings_double_sided: bool,
+    prepared_flat_base_surfaces: Sequence[object] | None = None,
+    prepared_sloped_base_surfaces: Sequence[object] | None = None,
+    prepared_fixed_surfaces: Sequence[object] | None = None,
 ) -> GeneratedModel:
     if not isinstance(make_floors_double_sided, bool):
         raise TypeError("The floor double-sided option must be boolean.")
@@ -896,6 +906,17 @@ def _build_blueprint_model(
     preview_stair_parts: list[PreviewStairPart] = []
     preview_architectural_trim_parts: list[object] = []
     if isinstance(level_source, VertexData):
+        if any(
+            prepared is not None
+            for prepared in (
+                prepared_flat_base_surfaces,
+                prepared_sloped_base_surfaces,
+                prepared_fixed_surfaces,
+            )
+        ):
+            raise ValueError(
+                "Prepared surfaces require level-based blueprint data."
+            )
         if stairs:
             raise ValueError("Stairs require level data with endpoint levels.")
         preview_textured_walls: list[PreviewTexturedWall] = []
@@ -928,14 +949,22 @@ def _build_blueprint_model(
             level_source,
             exportable_stairs,
         )
-        flat_base_fixed_surfaces = build_base_fixed_surfaces(
-            level_source,
-            stairs=exportable_stairs,
-            apply_sloped_ceilings=False,
+        flat_base_fixed_surfaces = (
+            tuple(prepared_flat_base_surfaces)
+            if prepared_flat_base_surfaces is not None
+            else build_base_fixed_surfaces(
+                level_source,
+                stairs=exportable_stairs,
+                apply_sloped_ceilings=False,
+            )
         )
-        base_fixed_surfaces = apply_sloped_ceiling_geometry(
-            level_source,
-            flat_base_fixed_surfaces,
+        base_fixed_surfaces = (
+            tuple(prepared_sloped_base_surfaces)
+            if prepared_sloped_base_surfaces is not None
+            else apply_sloped_ceiling_geometry(
+                level_source,
+                flat_base_fixed_surfaces,
+            )
         )
         trim_geometry = build_architectural_trim_geometry(
             level_source,
@@ -950,9 +979,13 @@ def _build_blueprint_model(
             )
             for run in trim_geometry.runs
         )
-        fixed_surfaces = build_fixed_surfaces(
-            level_source,
-            stairs=exportable_stairs,
+        fixed_surfaces = (
+            tuple(prepared_fixed_surfaces)
+            if prepared_fixed_surfaces is not None
+            else build_fixed_surfaces(
+                level_source,
+                stairs=exportable_stairs,
+            )
         )
         structural_fixed_surfaces = tuple(
             surface

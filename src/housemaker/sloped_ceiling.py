@@ -2458,28 +2458,31 @@ def _rebuild_ceiling_surfaces(
             cell.representative_point().coords[0],
             dtype=float,
         )
+        buffered_cell = cell.buffer(SLOPED_CEILING_GEOMETRY_EPSILON)
         triangles = shapely.constrained_delaunay_triangles(cell)
+        drop_by_xy: dict[tuple[float, float], float] = {}
         for triangle in shapely.get_parts(triangles):
             if not isinstance(triangle, Polygon) or triangle.is_empty:
                 continue
-            if not cell.buffer(SLOPED_CEILING_GEOMETRY_EPSILON).covers(triangle):
+            if not buffered_cell.covers(triangle):
                 continue
             points = list(triangle.exterior.coords)[:-1]
             if len(points) != 3:
                 continue
-            world_points = [
-                (
-                    float(point[0]),
-                    float(point[1]),
-                    ceiling_z
-                    - _ceiling_drop_at_xy(
+            world_points: list[tuple[float, float, float]] = []
+            for point in points:
+                point_xy = (float(point[0]), float(point[1]))
+                drop = drop_by_xy.get(point_xy)
+                if drop is None:
+                    drop = _ceiling_drop_at_xy(
                         point,
                         frames,
                         lateral_reference_xy=representative,
-                    ),
+                    )
+                    drop_by_xy[point_xy] = drop
+                world_points.append(
+                    (point_xy[0], point_xy[1], ceiling_z - drop)
                 )
-                for point in points
-            ]
             indices = [
                 _append_indexed_vertex(vertices, vertex_index, point)
                 for point in world_points
@@ -3505,13 +3508,14 @@ def _append_joined_side_return_groups(
         for polygon in _iter_polygon_parts(united):
             if polygon.area <= SLOPED_CEILING_GEOMETRY_EPSILON:
                 continue
+            buffered_polygon = polygon.buffer(
+                SLOPED_CEILING_GEOMETRY_EPSILON
+            )
             triangulation = shapely.constrained_delaunay_triangles(polygon)
             for triangle in shapely.get_parts(triangulation):
                 if (
                     not isinstance(triangle, Polygon)
-                    or not polygon.buffer(
-                        SLOPED_CEILING_GEOMETRY_EPSILON
-                    ).covers(triangle)
+                    or not buffered_polygon.covers(triangle)
                 ):
                     continue
                 projected_coordinates = tuple(triangle.exterior.coords)[:-1]
@@ -3807,10 +3811,11 @@ def _rebuild_wall_surface(
     for part in shapely.get_parts(clipped):
         if not isinstance(part, Polygon) or part.is_empty:
             continue
+        buffered_part = part.buffer(SLOPED_CEILING_GEOMETRY_EPSILON)
         for triangle in shapely.get_parts(shapely.constrained_delaunay_triangles(part)):
             if not isinstance(triangle, Polygon) or triangle.is_empty:
                 continue
-            if not part.buffer(SLOPED_CEILING_GEOMETRY_EPSILON).covers(triangle):
+            if not buffered_part.covers(triangle):
                 continue
             points = list(triangle.exterior.coords)[:-1]
             if len(points) != 3:

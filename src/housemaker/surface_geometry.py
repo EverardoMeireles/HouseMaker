@@ -172,6 +172,16 @@ class FixedSurface:
 
 
 @dataclass(frozen=True)
+class FixedSurfaceSceneSnapshot:
+    """Reusable structural geometry for one immutable level-state revision."""
+
+    flat_base_surfaces: tuple[FixedSurface, ...]
+    sloped_base_surfaces: tuple[FixedSurface, ...]
+    fixed_surfaces: tuple[FixedSurface, ...]
+    sloped_ceiling_host_surfaces: tuple[FixedSurface, ...]
+
+
+@dataclass(frozen=True)
 class WallWindowPlacement:
     """A validated rectangle in one stable wall's normalized local frame."""
 
@@ -258,6 +268,69 @@ def build_fixed_surfaces(
     return sorted(
         (*resolved_surfaces, *trim_surfaces),
         key=_get_surface_sort_key,
+    )
+
+
+def build_fixed_surface_scene_snapshot(
+    levels: Sequence[LevelData],
+    *,
+    stairs: Sequence[StairData] = (),
+) -> FixedSurfaceSceneSnapshot:
+    """Build every live-scene surface view from one wall reconstruction.
+
+    Sloped-ceiling tessellation is the expensive part of a structural scene
+    refresh. Final semantic surfaces and slope-edit hosts therefore reuse one
+    unclipped base each. The preview's sloped base remains a separate pass:
+    slab openings must be clipped before sloping so their boundary returns do
+    not become extra geometry.
+    """
+
+    from housemaker.sloped_ceiling import apply_sloped_ceiling_geometry
+
+    flat_unclipped_surfaces = tuple(
+        build_base_fixed_surfaces(
+            levels,
+            stairs=stairs,
+            clip_open_spaces=False,
+            apply_sloped_ceilings=False,
+        )
+    )
+    flat_base_surfaces = tuple(
+        _clip_horizontal_surfaces_for_slab_openings(
+            levels,
+            flat_unclipped_surfaces,
+            stairs,
+        )
+    )
+    sloped_base_surfaces = tuple(
+        apply_sloped_ceiling_geometry(
+            levels,
+            flat_base_surfaces,
+        )
+    )
+    sloped_unclipped_surfaces = tuple(
+        apply_sloped_ceiling_geometry(
+            levels,
+            flat_unclipped_surfaces,
+        )
+    )
+    return FixedSurfaceSceneSnapshot(
+        flat_base_surfaces=flat_base_surfaces,
+        sloped_base_surfaces=sloped_base_surfaces,
+        fixed_surfaces=tuple(
+            build_fixed_surfaces(
+                levels,
+                stairs=stairs,
+                base_surfaces=sloped_unclipped_surfaces,
+            )
+        ),
+        sloped_ceiling_host_surfaces=tuple(
+            build_fixed_surfaces(
+                levels,
+                stairs=stairs,
+                base_surfaces=flat_unclipped_surfaces,
+            )
+        ),
     )
 
 
