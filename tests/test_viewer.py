@@ -25,6 +25,7 @@ from trimesh.visual.texture import TextureVisuals
 from housemaker.camera_indicators import INDICATOR_SELECTED_COLOR
 from housemaker.camera_models import CameraPose
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
@@ -2642,6 +2643,31 @@ class FirstPersonNavigationTests(unittest.TestCase):
         self.assertAlmostEqual(moved_pose.x, 2.0)
         self.assertAlmostEqual(moved_pose.y, 2.0)
         self.assertAlmostEqual(moved_pose.z, 1.7)
+
+    def test_configurable_speed_scales_first_person_movement(self) -> None:
+        self.assertEqual(
+            self.view.get_first_person_speed(),
+            DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+        )
+        self.view.set_first_person_speed(5.0)
+        self.view.set_first_person_camera_pose(CameraPose(z=1.7))
+        self.view.enter_first_person_mode()
+        self.view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Z,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.view.step_first_person_movement(0.4)
+
+        self.assertAlmostEqual(
+            self.view.get_first_person_camera_pose().x,
+            2.0,
+        )
+        with self.assertRaisesRegex(ValueError, "First-person speed"):
+            self.view.set_first_person_speed(0.0)
 
     def test_noclip_forward_movement_follows_camera_pitch(self) -> None:
         self.view.set_first_person_movement_mode(

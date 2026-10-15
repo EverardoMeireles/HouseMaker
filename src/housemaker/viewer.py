@@ -95,9 +95,11 @@ from housemaker.directional_light_projection import (
 from housemaker.directional_light_state import DirectionalLightData
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     build_first_person_forward_vector,
     normalize_first_person_navigation_mode,
+    normalize_first_person_speed_meters_per_second,
 )
 from housemaker.glass_material import (
     get_housemaker_glass_double_sided,
@@ -117,6 +119,7 @@ from housemaker.models import (
     DOORWAY_SHAPE_ARCH,
     MAX_ARCHITECTURAL_TRIM_DIMENSION_METERS,
     MIN_ARCHITECTURAL_TRIM_DIMENSION_METERS,
+    MIN_SLOPED_CEILING_RATIO_SPAN,
     TRIM_KIND_CORNICE,
     TRIM_KIND_EDGING_STRIP,
     TRIM_KIND_SKIRTING_BOARD,
@@ -126,6 +129,23 @@ from housemaker.object_texture_variants import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
     PBR_MAP_TYPES,
+)
+from housemaker.sloped_ceiling import (
+    SLOPED_CEILING_HANDLE_CEILING_TRANSITION_RADIUS,
+    SLOPED_CEILING_HANDLE_CREATE_DEPTH,
+    SLOPED_CEILING_HANDLE_DEPTH,
+    SLOPED_CEILING_HANDLE_END,
+    SLOPED_CEILING_HANDLE_SIDE_TRANSITION_RADIUS,
+    SLOPED_CEILING_HANDLE_START,
+    SLOPED_CEILING_HANDLE_WALL_DROP,
+    SLOPED_CEILING_HANDLE_WALL_TRANSITION_RADIUS,
+    SlopedCeilingEdit,
+    SlopedCeilingEditHandle,
+    SlopedCeilingEditTarget,
+    SlopedCeilingWindowHost,
+    SlopedCeilingWindowPlacement,
+    build_sloped_ceiling_window_placement,
+    get_sloped_ceiling_window_world_corners,
 )
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
@@ -206,7 +226,6 @@ VIEWER_NAVIGATION_MODES = frozenset(
     (NAVIGATION_MODE_ORBIT, NAVIGATION_MODE_FIRST_PERSON)
 )
 DEFAULT_FIRST_PERSON_HEIGHT_METERS = 1.65
-DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 2.5
 DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
@@ -431,14 +450,6 @@ ARCHITECTURAL_TRIM_GIZMO_HIT_RATIO = 0.14
 ARCHITECTURAL_TRIM_GIZMO_MIN_HIT_RADIUS_METERS = 0.035
 ARCHITECTURAL_TRIM_SNAP_DISTANCE_PIXELS = 18.0
 ARCHITECTURAL_TRIM_SNAP_MIN_DISTANCE_METERS = 0.025
-ARCHITECTURAL_TRIM_HOVER_ACTION_OFFSET_PIXELS = 14
-ARCHITECTURAL_TRIM_HOVER_ACTION_MARGIN_PIXELS = 8
-ARCHITECTURAL_TRIM_PASSIVE_HOVER_INTERVAL_MILLISECONDS = 33
-ARCHITECTURAL_TRIM_HOVER_KIND_ORDER = (
-    TRIM_KIND_SKIRTING_BOARD,
-    TRIM_KIND_EDGING_STRIP,
-    TRIM_KIND_CORNICE,
-)
 CANVAS_SURFACE_EDIT_PREVIEW_COLOR = (0.20, 0.86, 0.38, 1.0)
 CANVAS_SURFACE_EDIT_OUTLINE_WIDTH = 5.0
 CANVAS_SURFACE_EDIT_GIZMO_SCREEN_SIZE_PIXELS = 86.0
@@ -447,6 +458,28 @@ CANVAS_SURFACE_EDIT_GIZMO_LINE_WIDTH = 5.0
 CANVAS_SURFACE_EDIT_GIZMO_ENDPOINT_SIZE_PIXELS = 16.0
 CANVAS_SURFACE_EDIT_GIZMO_HIT_RATIO = 0.14
 CANVAS_SURFACE_EDIT_GIZMO_MIN_HIT_RADIUS_METERS = 0.05
+SLOPED_CEILING_EDGE_COLOR = (0.28, 0.78, 1.0, 1.0)
+SLOPED_CEILING_EDGE_WIDTH = 6.0
+SLOPED_CEILING_GIZMO_SCREEN_SIZE_PIXELS = 82.0
+SLOPED_CEILING_GIZMO_MIN_SIZE_METERS = 0.25
+SLOPED_CEILING_GIZMO_LINE_WIDTH = 5.0
+SLOPED_CEILING_GIZMO_ENDPOINT_SIZE_PIXELS = 18.0
+SLOPED_CEILING_GIZMO_HIT_RATIO = 0.14
+SLOPED_CEILING_GIZMO_MIN_HIT_RADIUS_METERS = 0.04
+SLOPED_CEILING_PARALLEL_DOT_TOLERANCE = 1e-6
+SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS = 1e-6
+SLOPED_CEILING_PREVIEW_COLOR = (1.0, 0.76, 0.12, 0.42)
+SLOPED_CEILING_PREVIEW_EDGE_COLOR = (1.0, 0.88, 0.26, 0.96)
+SLOPED_CEILING_HANDLE_COLORS = {
+    SLOPED_CEILING_HANDLE_CREATE_DEPTH: (0.22, 0.90, 0.46, 1.0),
+    SLOPED_CEILING_HANDLE_DEPTH: (1.0, 0.54, 0.12, 1.0),
+    SLOPED_CEILING_HANDLE_WALL_DROP: (1.0, 0.54, 0.12, 1.0),
+    SLOPED_CEILING_HANDLE_CEILING_TRANSITION_RADIUS: (0.76, 0.36, 1.0, 1.0),
+    SLOPED_CEILING_HANDLE_WALL_TRANSITION_RADIUS: (0.76, 0.36, 1.0, 1.0),
+    SLOPED_CEILING_HANDLE_SIDE_TRANSITION_RADIUS: (0.76, 0.36, 1.0, 1.0),
+    SLOPED_CEILING_HANDLE_START: (0.20, 0.72, 1.0, 1.0),
+    SLOPED_CEILING_HANDLE_END: (0.20, 0.72, 1.0, 1.0),
+}
 CANVAS_SURFACE_DRAWING_EDGE_COLOR = (1.0, 0.76, 0.16, 1.0)
 CANVAS_SURFACE_DRAWING_EDGE_WIDTH = 3.0
 CANVAS_SURFACE_DRAWING_VERTEX_COLOR = (0.16, 0.82, 1.0, 1.0)
@@ -979,8 +1012,6 @@ class _CanvasOpeningEditDrag:
     preview_target: CanvasOpeningTarget
     handle: _CanvasOpeningGizmoHandle
     pointer_offset_local: tuple[float, float]
-    last_emitted_bounds: CanvasOpeningBounds
-    last_emitted_arch_amount: float | None
 
 
 @dataclass
@@ -997,6 +1028,23 @@ class _CanvasSurfaceEditDrag:
     )
     preview_delta_meters: float = 0.0
     last_emitted_delta_meters: float = 0.0
+
+
+@dataclass
+class _SlopedCeilingEditDrag:
+    """Stable handle frame and live absolute value for one slope edit."""
+
+    target: SlopedCeilingEditTarget
+    handle: SlopedCeilingEditHandle
+    affected_target_handles: tuple[
+        tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle],
+        ...,
+    ]
+    axis: np.ndarray
+    drag_plane_normal: np.ndarray
+    start_axis_parameter: float
+    preview_value: float
+    last_emitted_value: float
 
 
 @dataclass(frozen=True)
@@ -1715,6 +1763,18 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         self._first_person_movement_mode = normalize_first_person_navigation_mode(mode)
 
+    def get_first_person_speed(self) -> float:
+        """Return first-person movement speed in meters per second."""
+
+        return self._move_speed
+
+    def set_first_person_speed(self, speed_meters_per_second: float) -> None:
+        """Set first-person movement speed in meters per second."""
+
+        self._move_speed = normalize_first_person_speed_meters_per_second(
+            speed_meters_per_second
+        )
+
     def set_first_person_camera_pose(self, pose: CameraPose) -> None:
         """Set a persistent first-person pose, for example from the Canvas camera."""
 
@@ -2232,10 +2292,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self.delete_requested.emit()
             event.accept()
             return
-        if (
-            self._primary_pointer_finish_enabled
-            and event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
-        ):
+        if self._primary_pointer_finish_enabled and event.key() in {
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        }:
             self.primary_pointer_finish_requested.emit()
             event.accept()
             return
@@ -2668,21 +2728,13 @@ class TexturedMeshItem(GLGraphicsItem):
         )
         self._texture_bundle_signature = _build_texture_bundle_content_signature(
             self._texture_rgba,
-            (
-                self._normal_texture_rgba
-                if self._normal_texture_available
-                else None
-            ),
+            (self._normal_texture_rgba if self._normal_texture_available else None),
             (
                 self._roughness_texture_rgba
                 if self._roughness_texture_available
                 else None
             ),
-            (
-                self._metallic_texture_rgba
-                if self._metallic_texture_available
-                else None
-            ),
+            (self._metallic_texture_rgba if self._metallic_texture_available else None),
         )
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
         self._point_light_world_position = _normalize_optional_world_position(
@@ -3071,9 +3123,7 @@ class TexturedMeshItem(GLGraphicsItem):
 
     def _reset_gl_resource_handles(self) -> None:
         if self._shared_shader_program_lease is not None:
-            _SHARED_GL_SHADER_PROGRAM_CACHE.discard(
-                self._shared_shader_program_lease
-            )
+            _SHARED_GL_SHADER_PROGRAM_CACHE.discard(self._shared_shader_program_lease)
             self._shared_shader_program_lease = None
         for lease in self._shared_texture_leases.values():
             _SHARED_GL_TEXTURE_CACHE.discard(lease)
@@ -3491,9 +3541,7 @@ class TexturedMeshItem(GLGraphicsItem):
                 self._edit_mask_dirty = False
             return
         self._gl_context = current_context
-        shader_program_lease = _SHARED_GL_SHADER_PROGRAM_CACHE.acquire(
-            current_context
-        )
+        shader_program_lease = _SHARED_GL_SHADER_PROGRAM_CACHE.acquire(current_context)
         if shader_program_lease is None:
             self._shader_program = _compile_textured_mesh_shader_program()
         else:
@@ -4201,9 +4249,7 @@ def _get_directional_light_marker_size_pixels(
     except (TypeError, ValueError, OverflowError) as error:
         raise TypeError("Directional-light intensity must be numeric.") from error
     if not math.isfinite(normalized_intensity) or normalized_intensity < 0.0:
-        raise ValueError(
-            "Directional-light intensity must be finite and non-negative."
-        )
+        raise ValueError("Directional-light intensity must be finite and non-negative.")
     base_size = (
         DIRECTIONAL_LIGHT_MARKER_SIZE_PIXELS
         + DIRECTIONAL_LIGHT_MARKER_INTENSITY_GAIN_PIXELS
@@ -4251,10 +4297,7 @@ def _build_tour_direction_arrow_positions(
     """Build a shaft and four-sided arrowhead pointing at the camera target."""
 
     normalized_length_scale = float(length_scale)
-    if (
-        not math.isfinite(normalized_length_scale)
-        or normalized_length_scale <= 0.0
-    ):
+    if not math.isfinite(normalized_length_scale) or normalized_length_scale <= 0.0:
         raise ValueError("Direction-arrow length scale must be finite and positive.")
 
     origin = _normalize_tour_point(camera_position)
@@ -4383,10 +4426,8 @@ class DoorPlacementPreviewCandidate:
         depth_mirrored_transform = _normalize_door_placement_preview_transform(
             self.depth_mirrored_transform
         )
-        depth_and_horizontal_transform = (
-            _normalize_door_placement_preview_transform(
-                self.depth_and_horizontally_mirrored_transform
-            )
+        depth_and_horizontal_transform = _normalize_door_placement_preview_transform(
+            self.depth_and_horizontally_mirrored_transform
         )
         object.__setattr__(self, "opening_key", normalized_key)
         object.__setattr__(self, "normal_transform", normal_transform)
@@ -4456,9 +4497,7 @@ def _normalize_glass_area_axis_bounds(
         or maximum > 1.0
         or maximum - minimum < GLASS_AREA_MINIMUM_NORMALIZED_SPAN
     ):
-        raise ValueError(
-            f"Glass-area {axis_name} bounds must be ordered inside 0..1."
-        )
+        raise ValueError(f"Glass-area {axis_name} bounds must be ordered inside 0..1.")
     return minimum, maximum
 
 
@@ -4478,9 +4517,7 @@ def _normalize_glass_area_profile_bounds(
             "Glass-area profile bounds must contain four finite numbers."
         ) from error
     if len(values) != 4 or not all(math.isfinite(value) for value in values):
-        raise ValueError(
-            "Glass-area profile bounds must contain four finite numbers."
-        )
+        raise ValueError("Glass-area profile bounds must contain four finite numbers.")
     minimum_x, maximum_x, minimum_z, maximum_z = values
     if maximum_x <= minimum_x or maximum_z <= minimum_z:
         raise ValueError("Glass-area profile bounds must have positive spans.")
@@ -4543,6 +4580,11 @@ class GlbViewerWidget(QWidget):
     canvas_surface_edit_preview_changed = Signal(object)
     canvas_surface_edit_finished = Signal(object, bool)
     canvas_surface_edit_cancelled = Signal(object)
+    sloped_ceiling_edge_selection_changed = Signal(object)
+    sloped_ceiling_edit_started = Signal(object)
+    sloped_ceiling_edit_preview_changed = Signal(object)
+    sloped_ceiling_edit_finished = Signal(object, bool)
+    sloped_ceiling_edit_cancelled = Signal(object)
     canvas_surface_vertex_insertion_requested = Signal(object)
     canvas_surface_vertex_chain_reset_requested = Signal()
     canvas_surface_face_extrusion_requested = Signal(object)
@@ -4672,17 +4714,12 @@ class GlbViewerWidget(QWidget):
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
-        self._orbiting_point_light_with_pbr = bool(
-            orbiting_point_light_with_pbr
-        )
+        self._orbiting_point_light_with_pbr = bool(orbiting_point_light_with_pbr)
         self._orbiting_point_light_enabled = bool(
-            self._orbiting_point_light_with_pbr
-            and any(self._pbr_maps_enabled.values())
+            self._orbiting_point_light_with_pbr and any(self._pbr_maps_enabled.values())
         )
         self._orbiting_point_light_phase = 0.0
-        self._orbiting_point_light_position: tuple[float, float, float] | None = (
-            None
-        )
+        self._orbiting_point_light_position: tuple[float, float, float] | None = None
         self._hover_point_light_enabled = bool(hover_point_light_enabled)
         self._hover_point_light_input_connected = False
         self._hover_point_light_position: tuple[float, float, float] | None = None
@@ -4713,9 +4750,7 @@ class GlbViewerWidget(QWidget):
         self._face_editing_enabled = bool(face_editing_enabled)
         self._tour_direction_arrow_enabled = bool(tour_direction_arrow_enabled)
         self._tour_html_tooltips_enabled = bool(tour_html_tooltips_enabled)
-        self._symmetric_preview_fade_enabled = bool(
-            symmetric_preview_fade_enabled
-        )
+        self._symmetric_preview_fade_enabled = bool(symmetric_preview_fade_enabled)
         self._face_edit_vertices: np.ndarray | None = None
         self._face_edit_faces: np.ndarray | None = None
         self._face_edit_vertex_representatives: np.ndarray | None = None
@@ -4841,16 +4876,12 @@ class GlbViewerWidget(QWidget):
         self._directional_light_projection_grid_item: (
             _DepthTestedOverlayLineItem | None
         ) = None
-        self._directional_light_projection_collision_mesh: (
-            trimesh.Trimesh | None
-        ) = None
+        self._directional_light_projection_collision_mesh: trimesh.Trimesh | None = None
         self._directional_light_projection_cached_collision_key: (
             tuple[object, ...] | None
         ) = None
         self._directional_light_projection_render_key: tuple[object, ...] | None = None
-        self._directional_light_gizmo_size = (
-            DIRECTIONAL_LIGHT_GIZMO_MIN_SIZE_METERS
-        )
+        self._directional_light_gizmo_size = DIRECTIONAL_LIGHT_GIZMO_MIN_SIZE_METERS
         self._directional_light_drag: (
             _DirectionalLightDrag | _DirectionalLightRotationDrag | None
         ) = None
@@ -4860,9 +4891,7 @@ class GlbViewerWidget(QWidget):
             tuple[float, float, float] | None
         ) = None
         self._directional_light_placement_pointer_pressed = False
-        self._directional_light_placement_hover_item: (
-            gl.GLScatterPlotItem | None
-        ) = None
+        self._directional_light_placement_hover_item: gl.GLScatterPlotItem | None = None
         self._tour_curve_overlay_items: dict[str, gl.GLLinePlotItem] = {}
         self._tour_trigger_overlay_items: dict[str, gl.GLMeshItem] = {}
         self._tour_step_overlay_items: dict[str, gl.GLScatterPlotItem] = {}
@@ -4910,6 +4939,19 @@ class GlbViewerWidget(QWidget):
         ] = {}
         self._canvas_surface_edit_gizmo_items: list[GLGraphicsItem] = []
         self._canvas_surface_edit_gizmo_sizes: dict[tuple[str, str], float] = {}
+        self._sloped_ceiling_edit_targets: dict[
+            tuple[str, str],
+            SlopedCeilingEditTarget,
+        ] = {}
+        self._selected_sloped_ceiling_wall_surface_id: str | None = None
+        self._sloped_ceiling_edit_drag: _SlopedCeilingEditDrag | None = None
+        self._sloped_ceiling_gizmo_items: list[GLGraphicsItem] = []
+        self._sloped_ceiling_gizmo_sizes: dict[
+            tuple[str, str, str],
+            float,
+        ] = {}
+        self._sloped_ceiling_preview_meshes: tuple[trimesh.Trimesh, ...] = ()
+        self._sloped_ceiling_preview_items: list[GLGraphicsItem] = []
         self._surface_vertex_placement_active = False
         self._canvas_surface_drawing_vertices: dict[
             str,
@@ -4936,6 +4978,10 @@ class GlbViewerWidget(QWidget):
         self.scene_wireframe_checkbox: QCheckBox | None = None
         self._surface_tools_status_override: str | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
+        self._sloped_ceiling_window_hosts: dict[
+            str,
+            SlopedCeilingWindowHost,
+        ] = {}
         self._canvas_surface_targets: dict[str, FixedSurface] = {}
         self._selected_canvas_surface_ids: tuple[str, ...] = ()
         self._canvas_surface_selection_items: list[gl.GLLinePlotItem] = []
@@ -4967,9 +5013,7 @@ class GlbViewerWidget(QWidget):
         self._selected_canvas_stair_part_ids: tuple[str, ...] = ()
         self._canvas_stair_part_selection_items: list[gl.GLLinePlotItem] = []
         self._selected_canvas_stair_face_refs: tuple[tuple[str, int], ...] = ()
-        self._canvas_stair_face_selection_item: _WireframeOverlayMeshItem | None = (
-            None
-        )
+        self._canvas_stair_face_selection_item: _WireframeOverlayMeshItem | None = None
         self._highlighted_canvas_stair_part_ids: tuple[str, ...] = ()
         self._atlas_stair_part_highlight_items: list[gl.GLLinePlotItem] = []
         self._canvas_stair_preview_stair_index: int | None = None
@@ -4992,22 +5036,6 @@ class GlbViewerWidget(QWidget):
         self._architectural_trim_hover_candidate: (
             _ArchitecturalTrimHoverCandidate | None
         ) = None
-        self._architectural_trim_passive_hover_candidates: dict[
-            str,
-            _ArchitecturalTrimHoverCandidate,
-        ] = {}
-        self._architectural_trim_passive_hover_position: QPointF | None = None
-        self._architectural_trim_passive_hover_timer = QTimer(self)
-        self._architectural_trim_passive_hover_timer.setSingleShot(True)
-        self._architectural_trim_passive_hover_timer.setTimerType(
-            Qt.TimerType.PreciseTimer
-        )
-        self._architectural_trim_passive_hover_timer.setInterval(
-            ARCHITECTURAL_TRIM_PASSIVE_HOVER_INTERVAL_MILLISECONDS
-        )
-        self._architectural_trim_passive_hover_timer.timeout.connect(
-            self._flush_architectural_trim_passive_hover
-        )
         self._architectural_trim_pointer_pressed = False
         self._architectural_trim_preview_items: list[gl.GLMeshItem] = []
         self._architectural_trim_edit_targets: dict[
@@ -5023,27 +5051,29 @@ class GlbViewerWidget(QWidget):
         self._architectural_trim_gizmo_items: list[GLGraphicsItem] = []
         self._architectural_trim_gizmo_sizes: dict[str, float] = {}
         self._selected_window_wall_surface_id: str | None = None
+        self._selected_sloped_ceiling_window_host_id: str | None = None
+        self._window_drag_placement_host: (
+            FixedSurface | SlopedCeilingWindowHost | None
+        ) = None
         self._window_drag_first_world: tuple[float, float, float] | None = None
-        self._window_preview_placement: WallWindowPlacement | None = None
+        self._window_preview_placement: (
+            WallWindowPlacement | SlopedCeilingWindowPlacement | None
+        ) = None
         self._window_preview_is_valid = False
         self._window_preview_item: gl.GLMeshItem | None = None
         self.canvas_tools_panel: QWidget | None = None
-        # Compatibility aliases remain temporarily while Main drops the old
-        # Window-tools wiring. No window controls are rendered in this panel.
+        # Compatibility aliases remain while the Canvas and detached scene
+        # share the same window-placement controller.
         self.window_tools_panel: QWidget | None = None
         self.window_tools_status_label: QLabel | None = None
         self.undo_window_button: QPushButton | None = None
+        self.add_window_frame_button: QPushButton | None = None
         self.add_surface_vertex_button: QPushButton | None = None
         self.canvas_level_visibility_list: QListWidget | None = None
         self.highlight_floor_button: QPushButton | None = None
         self.hide_ceiling_button: QPushButton | None = None
         self.architectural_trim_mode_buttons: dict[str, QPushButton] = {}
         self.architectural_trim_status_label: QLabel | None = None
-        self.architectural_trim_hover_action_widget: QWidget | None = None
-        self.architectural_trim_hover_action_buttons: dict[
-            str,
-            QPushButton,
-        ] = {}
         self._texture_edit_mask: np.ndarray | None = None
         self._symmetric_preview_orientation: str | None = None
         self._symmetric_preview_plane_coordinate: float | None = None
@@ -5076,9 +5106,7 @@ class GlbViewerWidget(QWidget):
             self._tick_canvas_stair_preview_animation
         )
         self._orbiting_point_light_timer = QTimer(self)
-        self._orbiting_point_light_timer.setTimerType(
-            Qt.TimerType.PreciseTimer
-        )
+        self._orbiting_point_light_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._orbiting_point_light_timer.setInterval(
             ORBITING_POINT_LIGHT_UPDATE_INTERVAL_MILLISECONDS
         )
@@ -5089,9 +5117,7 @@ class GlbViewerWidget(QWidget):
         self._ambient_shader = _build_ambient_shader(self._ambient_light_intensity)
         application = QApplication.instance()
         if application is not None:
-            application.focusChanged.connect(
-                self._handle_application_focus_changed
-            )
+            application.focusChanged.connect(self._handle_application_focus_changed)
             application.applicationStateChanged.connect(
                 self._handle_application_state_changed
             )
@@ -5496,9 +5522,7 @@ class GlbViewerWidget(QWidget):
             self._tour_selected_step_id = normalized_step_id
             self._tour_selected_step = normalized_step_id
         self._tour_selected_action_id = (
-            str(reference)
-            if normalized_kind == TOUR_EDIT_TARGET_ACTION
-            else None
+            str(reference) if normalized_kind == TOUR_EDIT_TARGET_ACTION else None
         )
         self._refresh_tour_static_overlay_items()
         self._refresh_tour_text_overlay_items()
@@ -5586,14 +5610,12 @@ class GlbViewerWidget(QWidget):
         if target is None or self._get_tour_edit_target_rotation(target) is None:
             return False
         try:
-            normalized_rotation = _normalize_tour_rotation_degrees(
-                rotation_degrees
-            )
+            normalized_rotation = _normalize_tour_rotation_degrees(rotation_degrees)
         except (TypeError, ValueError):
             return False
-        self._tour_rotation_overrides[
-            (normalized_tour_id, normalized_action_id)
-        ] = normalized_rotation
+        self._tour_rotation_overrides[(normalized_tour_id, normalized_action_id)] = (
+            normalized_rotation
+        )
         self._refresh_tour_text_overlay_items()
         self._refresh_tour_edit_gizmo_items()
         return True
@@ -5747,9 +5769,7 @@ class GlbViewerWidget(QWidget):
         self._tour_preview_position = (
             None
             if camera_position is None
-            else tuple(
-                float(value) for value in _normalize_tour_point(camera_position)
-            )
+            else tuple(float(value) for value in _normalize_tour_point(camera_position))
         )
         self._tour_preview_target = (
             None
@@ -5969,8 +5989,7 @@ class GlbViewerWidget(QWidget):
         self.view.setBackgroundColor((24, 24, 28))
         self.view.set_item_click_selection_enabled(False)
         self.view.set_viewport_click_selection_enabled(
-            self._window_editing_enabled
-            or self._placed_object_click_selection_enabled
+            self._window_editing_enabled or self._placed_object_click_selection_enabled
         )
         self.view.set_first_person_ctrl_interaction_enabled(
             self._window_editing_enabled
@@ -6003,8 +6022,6 @@ class GlbViewerWidget(QWidget):
         self.view.directional_light_wheel_steps_requested.connect(
             self._handle_directional_light_wheel_steps_requested
         )
-        if self._window_editing_enabled:
-            self._build_architectural_trim_hover_action_widget()
         layout.addWidget(self.view)
 
         if self._tour_html_tooltips_enabled:
@@ -6036,48 +6053,11 @@ class GlbViewerWidget(QWidget):
         )
         layout.addWidget(self.first_person_crosshair_label)
 
-    def _build_architectural_trim_hover_action_widget(self) -> None:
-        """Build the hover-first insertion chooser over the 3D viewport."""
-
-        widget = QWidget(self.view)
-        widget.setObjectName("canvas-architectural-trim-hover-actions")
-        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        widget.setStyleSheet(
-            "#canvas-architectural-trim-hover-actions {"
-            "background: rgba(28, 31, 38, 232);"
-            "border: 1px solid rgba(90, 230, 135, 220);"
-            "border-radius: 5px;"
-            "}"
-        )
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-        for kind, label in (
-            (TRIM_KIND_SKIRTING_BOARD, "Add skirting board"),
-            (TRIM_KIND_EDGING_STRIP, "Add edging strip"),
-            (TRIM_KIND_CORNICE, "Add cornice"),
-        ):
-            button = QPushButton(label, widget)
-            button.setObjectName(f"canvas-{kind.replace('_', '-')}-hover-action")
-            button.clicked.connect(
-                lambda _checked=False, trim_kind=kind: (
-                    self._commit_architectural_trim_hover_action(trim_kind)
-                )
-            )
-            button.hide()
-            layout.addWidget(button)
-            self.architectural_trim_hover_action_buttons[kind] = button
-        widget.hide()
-        self.architectural_trim_hover_action_widget = widget
-
     # ### Continuous preview animation lifecycle ###
     def _continuous_preview_animation_allowed(self) -> bool:
         """Return whether this viewer can currently present animation frames."""
 
-        if (
-            not is_valid_qt_object(self)
-            or self._continuous_preview_animation_closed
-        ):
+        if not is_valid_qt_object(self) or self._continuous_preview_animation_closed:
             return False
         if not self.isVisible():
             return False
@@ -6087,10 +6067,8 @@ class GlbViewerWidget(QWidget):
         application = QApplication.instance()
         if (
             application is not None
-            and application.platformName().casefold()
-            not in HEADLESS_QT_PLATFORM_NAMES
-            and application.applicationState()
-            != Qt.ApplicationState.ApplicationActive
+            and application.platformName().casefold() not in HEADLESS_QT_PLATFORM_NAMES
+            and application.applicationState() != Qt.ApplicationState.ApplicationActive
         ):
             return False
         active_window = QApplication.activeWindow()
@@ -6225,7 +6203,7 @@ class GlbViewerWidget(QWidget):
             panel_layout.addWidget(button)
 
         self.architectural_trim_status_label = QLabel(
-            "Choose a trim type, then hover over a compatible wall edge."
+            "Click an Add trim button, then hover over a compatible wall edge."
         )
         self.architectural_trim_status_label.setObjectName(
             "canvas-architectural-trim-status"
@@ -6253,16 +6231,12 @@ class GlbViewerWidget(QWidget):
         panel_layout.addWidget(self.canvas_level_visibility_list)
 
         self.scene_wireframe_checkbox = QCheckBox("Wireframe")
-        self.scene_wireframe_checkbox.setObjectName(
-            "canvas-scene-wireframe-checkbox"
-        )
+        self.scene_wireframe_checkbox.setObjectName("canvas-scene-wireframe-checkbox")
         self.scene_wireframe_checkbox.setToolTip(
             "Show or hide wireframe edges on the 3D scene meshes."
         )
         self.scene_wireframe_checkbox.setChecked(self._wireframe_enabled)
-        self.scene_wireframe_checkbox.toggled.connect(
-            self.set_wireframe_enabled
-        )
+        self.scene_wireframe_checkbox.toggled.connect(self.set_wireframe_enabled)
         panel_layout.addWidget(self.scene_wireframe_checkbox)
 
         self.highlight_floor_button = QPushButton("Highlight floor")
@@ -6284,6 +6258,25 @@ class GlbViewerWidget(QWidget):
         )
         self.hide_ceiling_button.toggled.connect(self._handle_hide_ceiling_toggled)
         panel_layout.addWidget(self.hide_ceiling_button)
+
+        window_title_label = QLabel("Window frames")
+        window_title_label.setObjectName("canvas-window-frames-title")
+        panel_layout.addWidget(window_title_label)
+
+        self.add_window_frame_button = QPushButton("Add window frame")
+        self.add_window_frame_button.setObjectName(
+            "canvas-scene-add-window-frame-button"
+        )
+        self.add_window_frame_button.setCheckable(True)
+        self.add_window_frame_button.setEnabled(False)
+        self.add_window_frame_button.setToolTip(
+            "Drag directly on a visible wall or straight sloped-ceiling "
+            "surface to create a window frame."
+        )
+        self.add_window_frame_button.toggled.connect(
+            self._handle_add_window_frame_button_toggled
+        )
+        panel_layout.addWidget(self.add_window_frame_button)
 
         surface_title_label = QLabel("Surface tools")
         surface_title_label.setObjectName("canvas-surface-tools-title")
@@ -6650,9 +6643,15 @@ class GlbViewerWidget(QWidget):
             button.blockSignals(previous_blocked)
 
     def _canvas_surface_is_visible(self, surface: FixedSurface) -> bool:
-        return self._canvas_level_is_visible(
-            surface.level_index
-        ) and self._canvas_surface_type_is_visible(surface.surface_type)
+        if not self._canvas_level_is_visible(surface.level_index):
+            return False
+        if getattr(surface, "sloped_ceiling_id", None) is None:
+            return self._canvas_surface_type_is_visible(surface.surface_type)
+        focus_type = self._canvas_surface_focus_type
+        return bool(
+            (focus_type is None or focus_type == SURFACE_TYPE_CEILING)
+            and not self._canvas_ceiling_hidden
+        )
 
     def _canvas_surface_type_is_visible(self, surface_type: str) -> bool:
         """Apply focus-first precedence to one semantic surface type."""
@@ -6796,7 +6795,6 @@ class GlbViewerWidget(QWidget):
     def _prepare_canvas_scene_visibility_change(self) -> None:
         """Cancel pointer-owned edits before their geometry becomes hidden."""
 
-        self._clear_architectural_trim_passive_hover()
         self._cancel_canvas_rectangle_selection()
         if self.is_window_placement_active():
             self.cancel_window_placement(status_message=None)
@@ -6843,9 +6841,7 @@ class GlbViewerWidget(QWidget):
                 and self._canvas_stair_part_is_visible(part)
             )
         )
-        self.set_selected_canvas_stair_face_refs(
-            self._selected_canvas_stair_face_refs
-        )
+        self.set_selected_canvas_stair_face_refs(self._selected_canvas_stair_face_refs)
         self.set_selected_architectural_trim_part_ids(
             semantic_id
             for semantic_id in self._selected_architectural_trim_part_ids
@@ -6954,12 +6950,8 @@ class GlbViewerWidget(QWidget):
             if (
                 semantic_id in previous_targets
                 and semantic_id in normalized_targets
-                and previous_targets[
-                    semantic_id
-                ].source_topology_fingerprint
-                == normalized_targets[
-                    semantic_id
-                ].source_topology_fingerprint
+                and previous_targets[semantic_id].source_topology_fingerprint
+                == normalized_targets[semantic_id].source_topology_fingerprint
             )
         )
         self._canvas_stair_part_targets = normalized_targets
@@ -7285,9 +7277,7 @@ class GlbViewerWidget(QWidget):
                 dict.fromkeys(
                     semantic_id
                     for value in raw_semantic_ids
-                    if (
-                        semantic_id := str(value).strip()
-                    )
+                    if (semantic_id := str(value).strip())
                 )
             )
             if semantic_ids:
@@ -7740,11 +7730,15 @@ class GlbViewerWidget(QWidget):
             targets[surface.surface_id] = surface
 
         self._cancel_canvas_surface_edit_drag()
+        self._cancel_sloped_ceiling_edit_drag()
         self._cancel_canvas_face_extrusion_drag()
         self._cancel_surface_vertex_pointer_interaction()
-        self._clear_architectural_trim_passive_hover()
         self._architectural_trim_hover_candidate = None
         self._remove_architectural_trim_preview_items()
+        preserve_armed_window_placement = bool(
+            self.is_window_placement_active()
+            and self._window_drag_first_world is None
+        )
         selected_id = self._selected_window_wall_surface_id
         self._canvas_surface_targets = all_targets
         previous_canvas_surface_ids = self._selected_canvas_surface_ids
@@ -7770,14 +7764,19 @@ class GlbViewerWidget(QWidget):
         self._selected_window_wall_surface_id = (
             selected_id if selected_id in targets else None
         )
+        if self._selected_sloped_ceiling_wall_surface_id not in all_targets:
+            self._set_selected_sloped_ceiling_wall_surface_id(None)
         self._set_active_canvas_surface_id(next_active_surface_id)
-        self.cancel_window_placement(status_message=None)
+        if not preserve_armed_window_placement:
+            self.cancel_window_placement(status_message=None)
         self._refresh_canvas_surface_selection_outlines()
         self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
         self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
+        self._refresh_sloped_ceiling_gizmo_items()
+        self._refresh_sloped_ceiling_preview_items()
         self._refresh_canvas_face_extrusion_gizmo_items()
         self._rebuild_level_transform_preview_source_positions()
         if self._selected_canvas_surface_ids != previous_canvas_surface_ids:
@@ -7792,10 +7791,56 @@ class GlbViewerWidget(QWidget):
         ):
             self._repopulate_canvas_scene_preserving_camera()
 
+    def set_sloped_ceiling_window_hosts(
+        self,
+        hosts: tuple[SlopedCeilingWindowHost, ...],
+    ) -> None:
+        """Replace the straight sloped planes that can receive window frames."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(hosts, tuple):
+            raise TypeError("Sloped-ceiling window hosts must be supplied as a tuple.")
+        normalized: dict[str, SlopedCeilingWindowHost] = {}
+        for host in hosts:
+            if not isinstance(host, SlopedCeilingWindowHost):
+                raise TypeError(
+                    "Sloped-ceiling window hosts must contain "
+                    "SlopedCeilingWindowHost values."
+                )
+            if host.target_id in normalized:
+                raise ValueError(
+                    f"Duplicate sloped-ceiling window host: {host.target_id!r}."
+                )
+            normalized[host.target_id] = host
+
+        selected_id = self._selected_sloped_ceiling_window_host_id
+        self._sloped_ceiling_window_hosts = normalized
+        if selected_id not in normalized:
+            if (
+                self.is_window_placement_active()
+                and self._window_drag_first_world is None
+            ):
+                self._selected_sloped_ceiling_window_host_id = None
+            else:
+                self._set_sloped_ceiling_window_host_selection(None)
+        if (
+            self.is_window_placement_active()
+            and self._window_drag_first_world is None
+            and not self._get_available_window_placement_hosts()
+        ):
+            self.cancel_window_placement(status_message=None)
+        self._sync_window_tools_controls()
+
     def get_selected_wall_surface_id(self) -> str | None:
         """Return the one selected semantic wall, if any."""
 
         return self._selected_window_wall_surface_id
+
+    def get_selected_sloped_ceiling_window_host_id(self) -> str | None:
+        """Return the slope selected for window-frame placement, if any."""
+
+        return self._selected_sloped_ceiling_window_host_id
 
     def get_selected_canvas_surface_ids(self) -> tuple[str, ...]:
         """Return semantic surfaces selected for Canvas editing."""
@@ -7843,6 +7888,8 @@ class GlbViewerWidget(QWidget):
             self._refresh_canvas_extrudable_face_outlines()
             self._refresh_canvas_surface_drawing_items()
             self._refresh_canvas_surface_edit_gizmo_items()
+            self._refresh_sloped_ceiling_gizmo_items()
+            self._refresh_sloped_ceiling_preview_items()
             self._refresh_canvas_face_extrusion_gizmo_items()
             self.canvas_surface_selection_changed.emit(normalized_ids)
         elif active_changed:
@@ -7900,6 +7947,12 @@ class GlbViewerWidget(QWidget):
             return False
         if normalized_id is None and additive:
             return False
+        # A slope host is selected from the exact 3D hit point below. Generic
+        # semantic selection has no such point, so it must not retain a stale
+        # sloped placement plane.
+        slope_window_selection_changed = (
+            self._set_sloped_ceiling_window_host_selection(None)
+        )
         selected_ids = list(self._selected_canvas_surface_ids)
         selected_surface = surface
         if normalized_id is None:
@@ -7953,6 +8006,7 @@ class GlbViewerWidget(QWidget):
             canvas_selection_changed
             or active_selection_changed
             or wall_selection_changed
+            or slope_window_selection_changed
         )
 
     def select_wall_target(self, surface_id: str | None) -> bool:
@@ -7965,6 +8019,9 @@ class GlbViewerWidget(QWidget):
             surface = self._window_wall_targets.get(normalized_id)
             if surface is None or not self._canvas_surface_is_visible(surface):
                 return False
+        slope_window_selection_changed = (
+            self._set_sloped_ceiling_window_host_selection(None)
+        )
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
@@ -7972,7 +8029,11 @@ class GlbViewerWidget(QWidget):
             () if normalized_id is None else (normalized_id,)
         )
         wall_selection_changed = self._set_window_wall_selection(normalized_id)
-        return canvas_selection_changed or wall_selection_changed
+        return (
+            canvas_selection_changed
+            or wall_selection_changed
+            or slope_window_selection_changed
+        )
 
     def _set_window_wall_selection(self, surface_id: str | None) -> bool:
         """Update only the singular wall used by the window-placement tools."""
@@ -7981,10 +8042,42 @@ class GlbViewerWidget(QWidget):
             surface = self._window_wall_targets.get(surface_id)
             if surface is None or not self._canvas_surface_is_visible(surface):
                 surface_id = None
+        slope_changed = False
+        if surface_id is not None:
+            slope_changed = self._set_sloped_ceiling_window_host_selection(
+                None,
+                clear_wall=False,
+            )
         if surface_id == self._selected_window_wall_surface_id:
-            return False
+            return slope_changed
         self.cancel_window_placement(status_message=None)
         self._selected_window_wall_surface_id = surface_id
+        self._sync_window_tools_controls()
+        return True
+
+    def _set_sloped_ceiling_window_host_selection(
+        self,
+        target_id: str | None,
+        *,
+        clear_wall: bool = True,
+    ) -> bool:
+        """Select one exact planar slope for the window-frame drawing tool."""
+
+        normalized_id = None if target_id is None else str(target_id).strip()
+        if normalized_id not in self._sloped_ceiling_window_hosts:
+            normalized_id = None
+        wall_changed = False
+        if clear_wall and normalized_id is not None:
+            if self._selected_window_wall_surface_id is not None:
+                self._selected_window_wall_surface_id = None
+                wall_changed = True
+        if normalized_id == self._selected_sloped_ceiling_window_host_id:
+            if wall_changed:
+                self.cancel_window_placement(status_message=None)
+                self._sync_window_tools_controls()
+            return wall_changed
+        self.cancel_window_placement(status_message=None)
+        self._selected_sloped_ceiling_window_host_id = normalized_id
         self._sync_window_tools_controls()
         return True
 
@@ -8028,7 +8121,6 @@ class GlbViewerWidget(QWidget):
             self._set_surface_tools_status("Select a surface to add vertices.")
             self._set_add_surface_vertex_button_checked(False)
             return False
-        self._clear_architectural_trim_passive_hover()
         self.cancel_directional_light_placement()
         self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
@@ -8115,6 +8207,233 @@ class GlbViewerWidget(QWidget):
         self._surface_tools_status_override = message
         self._set_surface_tools_status(message)
 
+    # ### Sloped-ceiling edit API ###
+    def set_sloped_ceiling_edit_targets(
+        self,
+        targets: tuple[SlopedCeilingEditTarget, ...],
+        *,
+        preserve_selection: bool = False,
+    ) -> None:
+        """Replace selectable wall targets and their slope handles."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(targets, tuple):
+            raise TypeError("Sloped-ceiling edit targets must be supplied as a tuple.")
+        normalized_targets: dict[
+            tuple[str, str],
+            SlopedCeilingEditTarget,
+        ] = {}
+        for target in targets:
+            if not isinstance(target, SlopedCeilingEditTarget):
+                raise TypeError(
+                    "Sloped-ceiling edit targets must contain "
+                    "SlopedCeilingEditTarget values."
+                )
+            surface_id = str(target.wall_surface_id).strip()
+            if not surface_id:
+                raise ValueError("A sloped-ceiling target needs a wall surface ID.")
+            target_key = _get_sloped_ceiling_target_key(target)
+            if target_key in normalized_targets:
+                raise ValueError(
+                    "Duplicate sloped-ceiling edit target: "
+                    f"{target_key[1]!r} on {surface_id!r}."
+                )
+            normalized_targets[target_key] = target
+
+        self._cancel_sloped_ceiling_edit_drag()
+        self._sloped_ceiling_edit_targets = normalized_targets
+        selected_id = self._selected_sloped_ceiling_wall_surface_id
+        desired_id = self._get_active_sloped_ceiling_wall_surface_id()
+        if (
+            preserve_selection
+            and self._has_sloped_ceiling_wall_target(selected_id)
+            and selected_id == desired_id
+        ):
+            desired_id = selected_id
+        self._set_selected_sloped_ceiling_wall_surface_id(desired_id)
+        self._refresh_sloped_ceiling_gizmo_items()
+
+    def select_sloped_ceiling_edge(self, wall_surface_id: str | None) -> bool:
+        """Select the wall surface that owns one set of slope controls."""
+
+        normalized_id = (
+            None if wall_surface_id is None else str(wall_surface_id).strip()
+        )
+        surface_changed = False
+        if normalized_id is not None:
+            surface = self._canvas_surface_targets.get(normalized_id)
+            if (
+                not self._has_sloped_ceiling_wall_target(normalized_id)
+                or surface is None
+                or not self._canvas_surface_is_visible(surface)
+            ):
+                return False
+            surface_changed = self.select_canvas_surface_target(
+                normalized_id,
+                additive=False,
+            )
+        slope_changed = self._set_selected_sloped_ceiling_wall_surface_id(normalized_id)
+        return surface_changed or slope_changed
+
+    def get_selected_sloped_ceiling_wall_surface_id(self) -> str | None:
+        """Return the active selected wall that owns slope controls."""
+
+        return self._selected_sloped_ceiling_wall_surface_id
+
+    def get_selected_sloped_ceiling_wall_surface_ids(self) -> tuple[str, ...]:
+        """Return every selected root wall with available slope controls."""
+
+        if self._selected_sloped_ceiling_wall_surface_id is None:
+            return ()
+        selected_wall_ids: list[str] = []
+        for surface_id in self._selected_canvas_surface_ids:
+            surface = self._canvas_surface_targets.get(surface_id)
+            if surface is None or not self._canvas_surface_is_visible(surface):
+                continue
+            slope_wall_id = getattr(
+                surface,
+                "sloped_ceiling_wall_surface_id",
+                None,
+            )
+            if slope_wall_id is not None:
+                wall_surface_id = str(slope_wall_id)
+            elif surface.surface_type == SURFACE_TYPE_WALL:
+                wall_surface_id = (
+                    _get_fixed_surface_source_id(surface) or surface.surface_id
+                )
+            else:
+                continue
+            if (
+                wall_surface_id not in selected_wall_ids
+                and self._has_sloped_ceiling_wall_target(wall_surface_id)
+            ):
+                selected_wall_ids.append(wall_surface_id)
+        selected_group_ids = {
+            target.joined_group_id
+            for target in self._get_selected_sloped_ceiling_targets()
+            if target.joined_group_id is not None
+        }
+        for target in self._sloped_ceiling_edit_targets.values():
+            if (
+                target.joined_group_id in selected_group_ids
+                and target.wall_surface_id not in selected_wall_ids
+            ):
+                selected_wall_ids.append(target.wall_surface_id)
+        return tuple(selected_wall_ids)
+
+    def set_sloped_ceiling_preview_meshes(
+        self,
+        meshes: tuple[trimesh.Trimesh, ...],
+    ) -> None:
+        """Show lightweight candidate slope skins without rebuilding the scene."""
+
+        if not isinstance(meshes, tuple):
+            raise TypeError(
+                "Sloped-ceiling preview meshes must be supplied as a tuple."
+            )
+        normalized: list[trimesh.Trimesh] = []
+        for mesh in meshes:
+            if not isinstance(mesh, trimesh.Trimesh):
+                raise TypeError(
+                    "Sloped-ceiling preview meshes must contain trimesh values."
+                )
+            vertices = np.asarray(mesh.vertices, dtype=float)
+            faces = np.asarray(mesh.faces, dtype=np.int64)
+            if (
+                vertices.ndim != 2
+                or vertices.shape[1:] != (3,)
+                or faces.ndim != 2
+                or faces.shape[1:] != (3,)
+                or not len(vertices)
+                or not len(faces)
+                or not np.all(np.isfinite(vertices))
+            ):
+                raise ValueError(
+                    "A sloped-ceiling preview mesh needs finite triangle geometry."
+                )
+            normalized.append(mesh.copy())
+        self._sloped_ceiling_preview_meshes = tuple(normalized)
+        self._refresh_sloped_ceiling_preview_items()
+
+    def clear_sloped_ceiling_preview(self) -> None:
+        """Remove transient slope skins while retaining wall selection."""
+
+        self._sloped_ceiling_preview_meshes = ()
+        self._remove_sloped_ceiling_preview_items()
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def cancel_sloped_ceiling_edit(self) -> bool:
+        """Cancel a live slope-handle drag and restore its baseline value."""
+
+        return self._cancel_sloped_ceiling_edit_drag()
+
+    def _set_selected_sloped_ceiling_wall_surface_id(
+        self,
+        wall_surface_id: str | None,
+    ) -> bool:
+        """Update slope-control ownership without recursively selecting a wall."""
+
+        normalized_id = (
+            None if wall_surface_id is None else str(wall_surface_id).strip()
+        )
+        if not self._has_sloped_ceiling_wall_target(normalized_id):
+            normalized_id = None
+        if normalized_id == self._selected_sloped_ceiling_wall_surface_id:
+            return False
+        self._cancel_sloped_ceiling_edit_drag()
+        self._selected_sloped_ceiling_wall_surface_id = normalized_id
+        self._refresh_canvas_surface_edit_gizmo_items()
+        self._refresh_sloped_ceiling_gizmo_items()
+        self.sloped_ceiling_edge_selection_changed.emit(normalized_id)
+        return True
+
+    def _get_active_sloped_ceiling_wall_surface_id(self) -> str | None:
+        """Resolve the active wall or semantic slope to its owning wall."""
+
+        active_surface_id = self._active_canvas_surface_id
+        surface = self._canvas_surface_targets.get(active_surface_id or "")
+        if surface is None or not self._canvas_surface_is_visible(surface):
+            return None
+        slope_wall_id = getattr(
+            surface,
+            "sloped_ceiling_wall_surface_id",
+            None,
+        )
+        if slope_wall_id is not None:
+            wall_surface_id = str(slope_wall_id)
+        elif surface.surface_type == SURFACE_TYPE_WALL:
+            wall_surface_id = (
+                _get_fixed_surface_source_id(surface) or surface.surface_id
+            )
+        else:
+            return None
+        if not self._has_sloped_ceiling_wall_target(wall_surface_id):
+            return None
+        return wall_surface_id
+
+    def _has_sloped_ceiling_wall_target(
+        self,
+        wall_surface_id: str | None,
+    ) -> bool:
+        """Return whether one root wall owns at least one slope target."""
+
+        return bool(
+            wall_surface_id is not None
+            and any(
+                target_key[0] == wall_surface_id
+                for target_key in self._sloped_ceiling_edit_targets
+            )
+        )
+
+    def _sync_sloped_ceiling_selection_to_active_surface(self) -> bool:
+        """Show slope controls whenever an eligible wall surface is active."""
+
+        return self._set_selected_sloped_ceiling_wall_surface_id(
+            self._get_active_sloped_ceiling_wall_surface_id()
+        )
+
     # ### Canvas structural edit API ###
     def set_canvas_surface_edit_targets(
         self,
@@ -8193,6 +8512,8 @@ class GlbViewerWidget(QWidget):
             self._cancel_surface_vertex_pointer_interaction()
         if self._canvas_face_extrusion_drag is not None:
             return self._cancel_canvas_face_extrusion_drag()
+        if self._sloped_ceiling_edit_drag is not None:
+            return self._cancel_sloped_ceiling_edit_drag()
         if self._placed_object_transform_drag is not None:
             self._cancel_placed_object_gizmo_drag()
             return True
@@ -8267,9 +8588,10 @@ class GlbViewerWidget(QWidget):
         ):
             normalized_id = None
         if normalized_id == self._active_canvas_surface_id:
-            return False
+            return self._sync_sloped_ceiling_selection_to_active_surface()
         self._cancel_canvas_surface_edit_drag()
         self._active_canvas_surface_id = normalized_id
+        self._sync_sloped_ceiling_selection_to_active_surface()
         self._refresh_canvas_surface_edit_gizmo_items()
         self._refresh_canvas_face_extrusion_gizmo_items()
         self._sync_surface_tools_controls()
@@ -8353,9 +8675,7 @@ class GlbViewerWidget(QWidget):
             if not retained_keys or preview_target_changed:
                 self.cancel_door_placement()
             else:
-                self._door_placement_compatible_opening_keys = frozenset(
-                    retained_keys
-                )
+                self._door_placement_compatible_opening_keys = frozenset(retained_keys)
                 self._door_placement_preview_candidates = {
                     key: candidate
                     for key, candidate in (
@@ -8457,6 +8777,7 @@ class GlbViewerWidget(QWidget):
             self.set_selected_architectural_trim_part_ids(())
             self._set_selected_placed_object(None)
             self._selected_window_wall_surface_id = None
+            self._selected_sloped_ceiling_window_host_id = None
             self.set_selected_canvas_surface_ids(())
         self._sync_window_tools_controls()
         if normalized_key is not None:
@@ -8925,8 +9246,7 @@ class GlbViewerWidget(QWidget):
                     )
                 )
                 or any(
-                    value < PLACED_OBJECT_MIN_SCALE
-                    or value > PLACED_OBJECT_MAX_SCALE
+                    value < PLACED_OBJECT_MIN_SCALE or value > PLACED_OBJECT_MAX_SCALE
                     for value in normalized_axis_scales
                 )
             ):
@@ -9042,8 +9362,7 @@ class GlbViewerWidget(QWidget):
 
         self._invalidate_external_canvas_rectangle_selection()
         if self._face_editing_enabled and (
-            self.get_selected_face_indices()
-            or self.get_selected_vertex_indices()
+            self.get_selected_face_indices() or self.get_selected_vertex_indices()
         ):
             # A selected preview part is also represented as a placed object.
             # Face deletion must win without clearing or removing that part.
@@ -9057,9 +9376,7 @@ class GlbViewerWidget(QWidget):
         selected_stair_face_refs = self._selected_canvas_stair_face_refs
         if self._window_editing_enabled and selected_stair_face_refs:
             self.set_selected_canvas_stair_face_refs(())
-            self.canvas_stair_face_deletion_requested.emit(
-                selected_stair_face_refs
-            )
+            self.canvas_stair_face_deletion_requested.emit(selected_stair_face_refs)
             return
         selected_stair_ids = tuple(
             dict.fromkeys(
@@ -9265,7 +9582,6 @@ class GlbViewerWidget(QWidget):
         except (TypeError, ValueError):
             return False
 
-        self._clear_architectural_trim_passive_hover()
         self.cancel_directional_light_placement()
         self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
@@ -9483,7 +9799,6 @@ class GlbViewerWidget(QWidget):
             )
             return False
 
-        self._clear_architectural_trim_passive_hover()
         self.cancel_directional_light_placement()
         self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
@@ -9530,7 +9845,7 @@ class GlbViewerWidget(QWidget):
             self._set_architectural_trim_mode_button_checked(active_kind, False)
         if had_state:
             self._set_architectural_trim_status(
-                "Choose a trim type, then hover over a compatible wall edge."
+                "Click an Add trim button, then hover over a compatible wall edge."
             )
         return had_state
 
@@ -9574,8 +9889,6 @@ class GlbViewerWidget(QWidget):
         )
         for button in self.architectural_trim_mode_buttons.values():
             button.setEnabled(enabled)
-        if not enabled:
-            self._clear_architectural_trim_passive_hover()
         if not enabled and self.is_architectural_trim_placement_active:
             self.cancel_architectural_trim_placement()
 
@@ -9628,160 +9941,6 @@ class GlbViewerWidget(QWidget):
             else "Hover close to a compatible wall edge."
         )
         return changed
-
-    def _schedule_architectural_trim_passive_hover(
-        self,
-        position: QPointF,
-    ) -> bool:
-        """Retain the latest passive pointer and resolve it at a bounded rate."""
-
-        if not self._architectural_trim_passive_hover_is_available():
-            return self._clear_architectural_trim_passive_hover()
-        self._architectural_trim_passive_hover_position = QPointF(position)
-        if not self._architectural_trim_passive_hover_timer.isActive():
-            self._architectural_trim_passive_hover_timer.start()
-        return False
-
-    def _flush_architectural_trim_passive_hover(self) -> bool:
-        """Resolve the newest queued pointer once, including a burst's final move."""
-
-        self._architectural_trim_passive_hover_timer.stop()
-        position = self._architectural_trim_passive_hover_position
-        self._architectural_trim_passive_hover_position = None
-        if position is None:
-            return False
-        return self._update_architectural_trim_passive_hover(position)
-
-    def _update_architectural_trim_passive_hover(
-        self,
-        position: QPointF,
-    ) -> bool:
-        """Expose applicable insertion actions before a persistent mode is armed."""
-
-        self._architectural_trim_passive_hover_timer.stop()
-        self._architectural_trim_passive_hover_position = None
-        if not self._architectural_trim_passive_hover_is_available():
-            return self._clear_architectural_trim_passive_hover()
-        camera_ray = self.view.build_camera_ray(position)
-        candidates = (
-            {}
-            if camera_ray is None
-            else self._resolve_architectural_trim_hover_candidates(
-                *camera_ray,
-                kinds=ARCHITECTURAL_TRIM_HOVER_KIND_ORDER,
-            )
-        )
-        previous = self._architectural_trim_passive_hover_candidates
-        retained_candidates: dict[str, _ArchitecturalTrimHoverCandidate] = {}
-        for kind, candidate in candidates.items():
-            previous_candidate = previous.get(kind)
-            if previous_candidate is not None and _architectural_trim_requests_match(
-                previous_candidate.request,
-                candidate.request,
-            ):
-                candidate = _ArchitecturalTrimHoverCandidate(
-                    request=replace(
-                        candidate.request,
-                        trim_id=previous_candidate.request.trim_id,
-                    ),
-                    preview_meshes=candidate.preview_meshes,
-                )
-            retained_candidates[kind] = candidate
-        changed = not _architectural_trim_hover_candidate_maps_match(
-            previous,
-            retained_candidates,
-        )
-        self._architectural_trim_passive_hover_candidates = retained_candidates
-        self._sync_architectural_trim_hover_action_widget(position)
-        if changed:
-            self._refresh_architectural_trim_hover_preview_items()
-        return changed
-
-    def _architectural_trim_passive_hover_is_available(self) -> bool:
-        """Keep contextual actions out of the way of every explicit pointer tool."""
-
-        return bool(
-            self._window_editing_enabled
-            and not self.is_architectural_trim_placement_active
-            and not self.is_object_placement_active
-            and not self.is_window_placement_active()
-            and not self.is_surface_vertex_placement_active()
-            and self._level_transform_preview_level_index is None
-            and not self._canvas_face_orientation_visible
-            and self._architectural_trim_edit_drag is None
-            and self._canvas_opening_edit_drag is None
-            and self._canvas_surface_edit_drag is None
-            and self._canvas_face_extrusion_drag is None
-            and self._placed_object_transform_drag is None
-        )
-
-    def _sync_architectural_trim_hover_action_widget(
-        self,
-        position: QPointF,
-    ) -> None:
-        """Show valid actions beside the hovered snap without covering it."""
-
-        widget = self.architectural_trim_hover_action_widget
-        if widget is None:
-            return
-        candidates = self._architectural_trim_passive_hover_candidates
-        for kind, button in self.architectural_trim_hover_action_buttons.items():
-            available = kind in candidates
-            button.setEnabled(available)
-            button.setVisible(available)
-        if not candidates:
-            widget.hide()
-            return
-
-        widget.adjustSize()
-        width = max(widget.width(), widget.sizeHint().width())
-        height = max(widget.height(), widget.sizeHint().height())
-        offset = ARCHITECTURAL_TRIM_HOVER_ACTION_OFFSET_PIXELS
-        margin = ARCHITECTURAL_TRIM_HOVER_ACTION_MARGIN_PIXELS
-        target_x = int(round(position.x())) + offset
-        target_y = int(round(position.y())) + offset
-        if target_x + width + margin > self.view.width():
-            target_x = int(round(position.x())) - width - offset
-        if target_y + height + margin > self.view.height():
-            target_y = int(round(position.y())) - height - offset
-        maximum_x = max(margin, self.view.width() - width - margin)
-        maximum_y = max(margin, self.view.height() - height - margin)
-        widget.move(
-            min(max(margin, target_x), maximum_x),
-            min(max(margin, target_y), maximum_y),
-        )
-        widget.show()
-        widget.raise_()
-
-    def _clear_architectural_trim_passive_hover(self) -> bool:
-        """Remove contextual insertion actions and their shared 3D preview."""
-
-        self._architectural_trim_passive_hover_timer.stop()
-        self._architectural_trim_passive_hover_position = None
-        widget = self.architectural_trim_hover_action_widget
-        had_state = bool(
-            self._architectural_trim_passive_hover_candidates
-            or (widget is not None and not widget.isHidden())
-        )
-        self._architectural_trim_passive_hover_candidates = {}
-        if widget is not None:
-            widget.hide()
-        for button in self.architectural_trim_hover_action_buttons.values():
-            button.hide()
-        if not self.is_architectural_trim_placement_active:
-            self._remove_architectural_trim_preview_items()
-        return had_state
-
-    def _commit_architectural_trim_hover_action(self, kind: str) -> bool:
-        """Insert one retained contextual candidate without arming a mode."""
-
-        candidate = self._architectural_trim_passive_hover_candidates.get(kind)
-        if candidate is None:
-            return False
-        request = candidate.request
-        self._clear_architectural_trim_passive_hover()
-        self.architectural_trim_placement_requested.emit(request)
-        return True
 
     def _resolve_architectural_trim_hover_candidate(
         self,
@@ -9967,18 +10126,20 @@ class GlbViewerWidget(QWidget):
         return True
 
     def begin_window_placement(self) -> bool:
-        """Arm rectangle drawing when exactly one wall is selected."""
+        """Arm rectangle drawing on any visible wall or planar ceiling slope."""
 
         if (
             not self._window_editing_enabled
-            or self._selected_window_wall_surface_id not in self._window_wall_targets
+            or not self._get_available_window_placement_hosts()
         ):
-            self._set_window_tools_status("Select one wall.")
+            self._set_window_tools_status(
+                "Show at least one wall or straight sloped surface."
+            )
+            self._set_add_window_frame_button_checked(False)
             return False
 
         was_active = self.is_window_placement_active()
         self.cancel_glass_area_placement(notify=False)
-        self._clear_architectural_trim_passive_hover()
         self.cancel_directional_light_placement()
         self.set_selected_directional_light_id(None)
         self.cancel_tour_point_placement()
@@ -9988,14 +10149,17 @@ class GlbViewerWidget(QWidget):
         self.cancel_architectural_trim_placement()
         self._set_selected_placed_object(None)
         self._set_selected_canvas_opening_key(None)
+        self._window_drag_placement_host = None
         self._window_drag_first_world = None
         self._window_preview_placement = None
         self._window_preview_is_valid = False
         self._remove_window_preview_item()
         self.view.set_rectangle_drawing_enabled(True)
+        self._set_add_window_frame_button_checked(True)
         self._sync_window_undo_button()
         self._set_window_tools_status(
-            "Drag on the selected wall. Escape or right-click cancels."
+            "Drag on a wall or straight sloped surface. Escape or right-click "
+            "cancels."
         )
         if not was_active:
             self.window_placement_changed.emit(True)
@@ -10012,10 +10176,12 @@ class GlbViewerWidget(QWidget):
             return
         was_active = self.is_window_placement_active()
         self.view.set_rectangle_drawing_enabled(False)
+        self._window_drag_placement_host = None
         self._window_drag_first_world = None
         self._window_preview_placement = None
         self._window_preview_is_valid = False
         self._remove_window_preview_item()
+        self._set_add_window_frame_button_checked(False)
         self._sync_window_undo_button()
         if status_message is not None:
             self._set_window_tools_status(status_message)
@@ -10233,15 +10399,11 @@ class GlbViewerWidget(QWidget):
             if camera_ray is None
             else self._pick_scene_world_point(
                 *camera_ray,
-                fallback_plane_z=(
-                    self._directional_light_placement_fallback_plane_z
-                ),
+                fallback_plane_z=(self._directional_light_placement_fallback_plane_z),
             )
         )
         next_position = (
-            None
-            if point is None
-            else tuple(float(value) for value in point)
+            None if point is None else tuple(float(value) for value in point)
         )
         if next_position == self._directional_light_placement_hover_position:
             return False
@@ -10281,9 +10443,7 @@ class GlbViewerWidget(QWidget):
             else:
                 point = self._pick_tour_world_point(*camera_ray)
         self._tour_point_hover_position = (
-            None
-            if point is None
-            else tuple(float(value) for value in point)
+            None if point is None else tuple(float(value) for value in point)
         )
         self._refresh_tour_point_hover_item()
 
@@ -10537,10 +10697,7 @@ class GlbViewerWidget(QWidget):
         """Cache the currently visible world-space geometry used for ray hits."""
 
         collision_key = self._get_directional_light_projection_collision_key()
-        if (
-            self._directional_light_projection_cached_collision_key
-            == collision_key
-        ):
+        if self._directional_light_projection_cached_collision_key == collision_key:
             return self._directional_light_projection_collision_mesh
 
         collision_meshes: list[trimesh.Trimesh] = []
@@ -10590,9 +10747,7 @@ class GlbViewerWidget(QWidget):
                 collision_meshes.append(world_mesh)
 
         collision_mesh = (
-            None
-            if not collision_meshes
-            else trimesh.util.concatenate(collision_meshes)
+            None if not collision_meshes else trimesh.util.concatenate(collision_meshes)
         )
         if not _mesh_has_projectable_triangles(collision_mesh):
             collision_mesh = None
@@ -10696,8 +10851,7 @@ class GlbViewerWidget(QWidget):
         viewport = (0, 0, width, height)
         try:
             view_projection = (
-                self.view.projectionMatrix(viewport, viewport)
-                * self.view.viewMatrix()
+                self.view.projectionMatrix(viewport, viewport) * self.view.viewMatrix()
             )
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return None
@@ -10725,7 +10879,9 @@ class GlbViewerWidget(QWidget):
                 marker_size / 2.0 + 6.0,
             )
             if distance <= selection_tolerance:
-                candidates.append((distance, float(projected[2]), index, light.light_id))
+                candidates.append(
+                    (distance, float(projected[2]), index, light.light_id)
+                )
         return None if not candidates else min(candidates)[3]
 
     def _refresh_directional_light_gizmo_items(self) -> None:
@@ -10828,8 +10984,7 @@ class GlbViewerWidget(QWidget):
         position, _target = self._get_directional_light_display_endpoints(light)
         pivot = np.asarray(position, dtype=float)
         tolerance = (
-            self._directional_light_gizmo_size
-            * DIRECTIONAL_LIGHT_GIZMO_AXIS_HIT_RATIO
+            self._directional_light_gizmo_size * DIRECTIONAL_LIGHT_GIZMO_AXIS_HIT_RATIO
         )
         candidates: list[tuple[float, _TransformGizmoHandle]] = []
         for axis_index, axis in enumerate(np.eye(3, dtype=float)):
@@ -10910,8 +11065,7 @@ class GlbViewerWidget(QWidget):
         camera_ray = self.view.build_camera_ray(position)
         if (
             light is None
-            or handle.kind
-            not in {TRANSFORM_GIZMO_TRANSLATE, TRANSFORM_GIZMO_ROTATE}
+            or handle.kind not in {TRANSFORM_GIZMO_TRANSLATE, TRANSFORM_GIZMO_ROTATE}
             or camera_ray is None
         ):
             return False
@@ -10925,9 +11079,7 @@ class GlbViewerWidget(QWidget):
                 axis,
             )
             initial_vector = (
-                None
-                if hit is None
-                else _normalize_vector(hit - start_position)
+                None if hit is None else _normalize_vector(hit - start_position)
             )
             if initial_vector is None:
                 return False
@@ -11000,8 +11152,7 @@ class GlbViewerWidget(QWidget):
             target_offset = drag.start_target - drag.start_position
             next_position = tuple(float(value) for value in drag.start_position)
             next_target = tuple(
-                float(value)
-                for value in drag.start_position + rotation @ target_offset
+                float(value) for value in drag.start_position + rotation @ target_offset
             )
             if np.allclose(
                 next_target,
@@ -11251,12 +11402,10 @@ class GlbViewerWidget(QWidget):
                 for step_index, target_color, target_timing in target_contexts:
                     step = overlay.steps[step_index]
                     step_id = _get_tour_step_id(step, step_index)
-                    camera_target = (
-                        self._get_tour_step_camera_target_display_position(
-                            overlay,
-                            step,
-                            step_index,
-                        )
+                    camera_target = self._get_tour_step_camera_target_display_position(
+                        overlay,
+                        step,
+                        step_index,
                     )
                     if camera_target is None:
                         continue
@@ -11273,9 +11422,9 @@ class GlbViewerWidget(QWidget):
                         )
                         target_item._housemaker_step_id = step_id
                         target_item._housemaker_tour_target_timing = target_timing
-                        self._tour_camera_target_overlay_items[
-                            (tour_id, step_id)
-                        ] = target_item
+                        self._tour_camera_target_overlay_items[(tour_id, step_id)] = (
+                            target_item
+                        )
             if len(display_points) < 2:
                 continue
             samples = sample_open_catmull_rom_curve(
@@ -11402,9 +11551,7 @@ class GlbViewerWidget(QWidget):
             self.view.addItem(text_item)
             self._tour_text_overlay_items.append(text_item)
             self._tour_text_item_targets[text_item] = target
-            self._tour_text_hit_boxes[target] = _build_tour_text_hit_box(
-                world_vertices
-            )
+            self._tour_text_hit_boxes[target] = _build_tour_text_hit_box(world_vertices)
         step = overlay.steps[step_index]
         step_id = _get_tour_step_id(step, step_index)
         for action_index, action in enumerate(_read_tour_actions(step)):
@@ -11569,9 +11716,7 @@ class GlbViewerWidget(QWidget):
         if projected is None:
             tooltip_overlay.hide_tooltip()
             return
-        html_body = str(
-            _read_tour_field(action, "html_body", "htmlBody") or ""
-        ).strip()
+        html_body = str(_read_tour_field(action, "html_body", "htmlBody") or "").strip()
         if not html_body:
             tooltip_overlay.hide_tooltip()
             return
@@ -11628,8 +11773,7 @@ class GlbViewerWidget(QWidget):
         viewport = (0, 0, width, height)
         try:
             view_projection = (
-                self.view.projectionMatrix(viewport, viewport)
-                * self.view.viewMatrix()
+                self.view.projectionMatrix(viewport, viewport) * self.view.viewMatrix()
             )
             projected = _project_vertices_to_view(
                 np.asarray((_normalize_tour_point(point),), dtype=float),
@@ -11641,9 +11785,7 @@ class GlbViewerWidget(QWidget):
             return None
         if not _is_usable_projected_point(projected):
             return None
-        return QPointF(float(projected[0]), float(projected[1])), float(
-            projected[2]
-        )
+        return QPointF(float(projected[0]), float(projected[1])), float(projected[2])
 
     def _refresh_tour_preview_overlay_items(self) -> None:
         """Rebuild the red playhead and its camera-look direction arrow."""
@@ -11970,9 +12112,7 @@ class GlbViewerWidget(QWidget):
     ) -> tuple[float, float, float]:
         """Return retained or temporary world-space XYZ text rotation."""
 
-        override = self._tour_rotation_overrides.get(
-            (overlay.tour_id, action_id)
-        )
+        override = self._tour_rotation_overrides.get((overlay.tour_id, action_id))
         if override is not None:
             return override
         declared = _read_tour_field(
@@ -12083,18 +12223,15 @@ class GlbViewerWidget(QWidget):
             overlay.steps,
             self._tour_selected_step_id,
         )
-        is_authoring_selected_step = (
-            selected_step_index == active_step_index
-            and (
-                self._tour_preview_progress is None
-                or math.isclose(
-                    _read_tour_progress(
-                        overlay.steps[active_step_index],
-                        default=-1.0,
-                    ),
-                    self._tour_preview_progress,
-                    abs_tol=1e-12,
-                )
+        is_authoring_selected_step = selected_step_index == active_step_index and (
+            self._tour_preview_progress is None
+            or math.isclose(
+                _read_tour_progress(
+                    overlay.steps[active_step_index],
+                    default=-1.0,
+                ),
+                self._tour_preview_progress,
+                abs_tol=1e-12,
             )
         )
         if is_authoring_selected_step:
@@ -12109,9 +12246,7 @@ class GlbViewerWidget(QWidget):
         duration_ms = overlay.duration_seconds * 1000.0
         timeline_ms = self._tour_preview_progress * duration_ms
         active_step = overlay.steps[active_step_index]
-        active_start_ms = (
-            _read_tour_progress(active_step, default=0.0) * duration_ms
-        )
+        active_start_ms = _read_tour_progress(active_step, default=0.0) * duration_ms
         elapsed_ms = max(timeline_ms - active_start_ms, 0.0)
         visible: list[tuple[int, int, object, float]] = []
 
@@ -12399,11 +12534,7 @@ class GlbViewerWidget(QWidget):
         )
         camera_ray = (
             _build_tour_drag_camera_ray(drag.camera_snapshot, position)
-            if (
-                drag is not None
-                and pointer_moved
-                and drag.camera_snapshot is not None
-            )
+            if (drag is not None and pointer_moved and drag.camera_snapshot is not None)
             else self.view.build_camera_ray(position)
         )
         if drag is None or camera_ray is None:
@@ -12594,8 +12725,7 @@ class GlbViewerWidget(QWidget):
         viewport = (0, 0, width, height)
         try:
             view_projection = (
-                self.view.projectionMatrix(viewport, viewport)
-                * self.view.viewMatrix()
+                self.view.projectionMatrix(viewport, viewport) * self.view.viewMatrix()
             )
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return None
@@ -12699,12 +12829,10 @@ class GlbViewerWidget(QWidget):
                 for step_index in visible_target_indexes:
                     step = selected_overlay.steps[step_index]
                     step_id = _get_tour_step_id(step, step_index)
-                    camera_target = (
-                        self._get_tour_step_camera_target_display_position(
-                            selected_overlay,
-                            step,
-                            step_index,
-                        )
+                    camera_target = self._get_tour_step_camera_target_display_position(
+                        selected_overlay,
+                        step,
+                        step_index,
                     )
                     if camera_target is None:
                         continue
@@ -12729,7 +12857,7 @@ class GlbViewerWidget(QWidget):
                                     TOUR_EDIT_TARGET_CAMERA_TARGET,
                                     step_id,
                                     step_id,
-                                )
+                                ),
                             )
                         )
                         order += 1
@@ -12844,10 +12972,7 @@ class GlbViewerWidget(QWidget):
         return None if not candidates else min(candidates)[4]
 
     def _apply_tour_overlay_pick(self, picked: _TourOverlayPick) -> None:
-        if (
-            picked.kind == "curve"
-            and picked.tour_id == self._tour_selected_tour_id
-        ):
+        if picked.kind == "curve" and picked.tour_id == self._tour_selected_tour_id:
             self._tour_selected_tour_id = None
             self._tour_selected_step_id = None
             self._tour_selected_action_id = None
@@ -12995,6 +13120,16 @@ class GlbViewerWidget(QWidget):
         if self.is_surface_vertex_placement_active():
             self.cancel_surface_vertex_placement()
 
+    def _handle_add_window_frame_button_toggled(self, checked: bool) -> None:
+        """Arm or cancel the shared 3D window-frame rectangle tool."""
+
+        if checked:
+            if not self.begin_window_placement():
+                self._set_add_window_frame_button_checked(False)
+            return
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+
     def _handle_undo_window_button_clicked(self) -> None:
         self.cancel_window_placement(status_message=None)
         self.window_undo_requested.emit()
@@ -13084,6 +13219,15 @@ class GlbViewerWidget(QWidget):
             ray_origin,
             ray_direction,
         )
+        slope_window_host_hit = _get_nearest_sloped_ceiling_window_host_ray_hit(
+            tuple(
+                host
+                for host in self._sloped_ceiling_window_hosts.values()
+                if self._sloped_ceiling_window_host_is_visible(host)
+            ),
+            ray_origin,
+            ray_direction,
+        )
         stair_hit = _get_nearest_preview_stair_part_ray_hit(
             tuple(
                 part
@@ -13109,6 +13253,7 @@ class GlbViewerWidget(QWidget):
                 ("object", object_hit),
                 ("architectural_trim_part", trim_hit),
                 ("stair_part", stair_hit),
+                ("sloped_window_host", slope_window_host_hit),
                 ("surface", surface_hit),
             )
             if hit is not None
@@ -13193,6 +13338,48 @@ class GlbViewerWidget(QWidget):
                 additive=additive,
             )
             return
+        if winning_kind == "sloped_window_host":
+            assert slope_window_host_hit is not None
+            host = slope_window_host_hit[0]
+            host_surface = self._get_sloped_ceiling_window_host_surface(host)
+            if host_surface is not None:
+                self.set_selected_directional_light_id(None)
+                self._set_selected_canvas_opening_key(None)
+                self._set_selected_placed_object(None)
+                self.select_architectural_trim_part(None)
+                self.select_canvas_stair_part_target(None)
+                if self._canvas_surface_is_visible(host_surface):
+                    self.select_canvas_surface_target(
+                        host_surface.surface_id,
+                        additive=additive,
+                    )
+                    active_surface = self._canvas_surface_targets.get(
+                        self._active_canvas_surface_id or ""
+                    )
+                    active_slope_host = (
+                        None
+                        if active_surface is None
+                        else self._get_sloped_ceiling_window_host_for_surface(
+                            active_surface
+                        )
+                    )
+                else:
+                    self.select_canvas_surface_target(None, additive=False)
+                    active_slope_host = host
+                if active_slope_host is not None:
+                    self._set_sloped_ceiling_window_host_selection(
+                        active_slope_host.target_id
+                    )
+                else:
+                    active_wall_id = (
+                        self._active_canvas_surface_id
+                        if self._active_canvas_surface_id
+                        in self._window_wall_targets
+                        else None
+                    )
+                    self._set_sloped_ceiling_window_host_selection(None)
+                    self._set_window_wall_selection(active_wall_id)
+            return
         if winning_kind is None and additive:
             return
         self.set_selected_directional_light_id(None)
@@ -13213,9 +13400,7 @@ class GlbViewerWidget(QWidget):
         hit = self._get_door_placement_opening_hit_at(position)
         opening_kind = self._door_placement_opening_kind
         opening_label = (
-            "window frame"
-            if opening_kind == CANVAS_OPENING_WINDOW
-            else "doorway"
+            "window frame" if opening_kind == CANVAS_OPENING_WINDOW else "doorway"
         )
         if hit is None:
             self._set_door_placement_status(
@@ -13229,8 +13414,7 @@ class GlbViewerWidget(QWidget):
             or target.key not in self._door_placement_compatible_opening_keys
         ):
             self._set_door_placement_status(
-                f"That opening is not compatible. Choose a matching "
-                f"{opening_label}."
+                f"That opening is not compatible. Choose a matching {opening_label}."
             )
             return
         self._commit_door_placement(target)
@@ -13440,6 +13624,11 @@ class GlbViewerWidget(QWidget):
         if opening_handle is not None:
             self._begin_canvas_opening_gizmo_drag(opening_handle, position)
             return
+        sloped_ceiling_handle = self._pick_sloped_ceiling_gizmo_handle(*camera_ray)
+        if sloped_ceiling_handle is not None:
+            target, handle = sloped_ceiling_handle
+            self._begin_sloped_ceiling_edit_drag(target, handle, position)
+            return
         extrusion_target = self._pick_canvas_face_extrusion_handle(*camera_ray)
         if extrusion_target is not None:
             self._begin_canvas_face_extrusion_drag(
@@ -13451,10 +13640,9 @@ class GlbViewerWidget(QWidget):
         if surface_edit_target is not None:
             self._begin_canvas_surface_edit_drag(surface_edit_target, position)
             return
-        if (
-            self._pick_placed_object_instance_gizmo_handle(*camera_ray)
-            and self._begin_placed_object_instance_drag(position)
-        ):
+        if self._pick_placed_object_instance_gizmo_handle(
+            *camera_ray
+        ) and self._begin_placed_object_instance_drag(position):
             return
         handle = self._pick_transform_gizmo_handle(*camera_ray)
         if handle is not None:
@@ -13489,6 +13677,9 @@ class GlbViewerWidget(QWidget):
             return
         if self._architectural_trim_edit_drag is not None:
             self._update_architectural_trim_edit_drag(position)
+            return
+        if self._sloped_ceiling_edit_drag is not None:
+            self._update_sloped_ceiling_edit_drag(position)
             return
         if self._canvas_surface_edit_drag is not None:
             self._update_canvas_surface_edit_drag(position)
@@ -13548,6 +13739,9 @@ class GlbViewerWidget(QWidget):
         if self._architectural_trim_edit_drag is not None:
             self._finish_architectural_trim_edit_drag(position)
             return
+        if self._sloped_ceiling_edit_drag is not None:
+            self._finish_sloped_ceiling_edit_drag(position)
+            return
         if self._canvas_surface_edit_drag is not None:
             self._finish_canvas_surface_edit_drag(position)
             return
@@ -13587,6 +13781,9 @@ class GlbViewerWidget(QWidget):
             return
         if self._architectural_trim_edit_drag is not None:
             self._cancel_architectural_trim_edit_drag()
+            return
+        if self._sloped_ceiling_edit_drag is not None:
+            self._cancel_sloped_ceiling_edit_drag()
             return
         if self._canvas_surface_edit_drag is not None:
             self._cancel_canvas_surface_edit_drag()
@@ -13969,9 +14166,7 @@ class GlbViewerWidget(QWidget):
                 if semantic_id in visible_trim_part_ids
             )
         )
-        trim_part_ids = tuple(
-            dict.fromkeys((*trim_part_ids, *mapped_trim_part_ids))
-        )
+        trim_part_ids = tuple(dict.fromkeys((*trim_part_ids, *mapped_trim_part_ids)))
         stair_part_ids = tuple(
             dict.fromkeys(
                 semantic_id
@@ -14042,11 +14237,7 @@ class GlbViewerWidget(QWidget):
                 self._selected_canvas_stair_face_refs if result.additive else ()
             )
             self.set_selected_canvas_stair_face_refs(
-                tuple(
-                    dict.fromkeys(
-                        (*current_stair_face_refs, *stair_face_refs)
-                    )
-                )
+                tuple(dict.fromkeys((*current_stair_face_refs, *stair_face_refs)))
             )
             return
         if stair_part_ids:
@@ -14175,7 +14366,7 @@ class GlbViewerWidget(QWidget):
         self,
         position: QPointF,
     ) -> bool:
-        """Show contextual insertion or the currently armed pointer preview."""
+        """Show a preview only for the currently armed pointer tool."""
 
         if self.is_directional_light_placement_active:
             return self._update_directional_light_placement_hover(position)
@@ -14187,8 +14378,7 @@ class GlbViewerWidget(QWidget):
         if self.is_architectural_trim_placement_active:
             return self._update_architectural_trim_hover(position)
         if not self.is_surface_vertex_placement_active():
-            return self._schedule_architectural_trim_passive_hover(position)
-        self._clear_architectural_trim_passive_hover()
+            return False
         preview, _is_occluded = self._resolve_surface_vertex_pointer_preview(position)
         if preview is None:
             changed = self._surface_vertex_hover_preview is not None
@@ -14204,8 +14394,6 @@ class GlbViewerWidget(QWidget):
     def _handle_surface_vertex_pointer_left(self) -> None:
         """Hide only the transient hover candidate outside the viewport."""
 
-        self._architectural_trim_passive_hover_timer.stop()
-        self._architectural_trim_passive_hover_position = None
         if self.is_directional_light_placement_active:
             if not self._directional_light_placement_pointer_pressed:
                 self._directional_light_placement_hover_position = None
@@ -14222,15 +14410,6 @@ class GlbViewerWidget(QWidget):
         if self.is_architectural_trim_placement_active:
             self._architectural_trim_hover_candidate = None
             self._remove_architectural_trim_preview_items()
-        else:
-            widget = self.architectural_trim_hover_action_widget
-            cursor_over_actions = bool(
-                widget is not None
-                and not widget.isHidden()
-                and widget.rect().contains(widget.mapFromGlobal(QCursor.pos()))
-            )
-            if not cursor_over_actions:
-                self._clear_architectural_trim_passive_hover()
         self._surface_vertex_hover_preview = None
         self._remove_surface_vertex_preview_items()
 
@@ -14262,6 +14441,7 @@ class GlbViewerWidget(QWidget):
             surface
             for surface in self._canvas_surface_targets.values()
             if self._canvas_surface_is_visible(surface)
+            and getattr(surface, "sloped_ceiling_id", None) is None
         )
         hit = _get_nearest_fixed_surface_ray_hit(
             visible_surfaces,
@@ -14447,21 +14627,21 @@ class GlbViewerWidget(QWidget):
         if self.is_glass_area_placement_active:
             self._handle_glass_area_pointer_pressed(position)
             return
-        surface = self._get_selected_window_wall()
         camera_ray = self.view.build_camera_ray(position)
-        if surface is None or camera_ray is None:
-            self._set_window_tools_status("Start the drag on the selected wall.")
+        if camera_ray is None:
+            self._set_window_tools_status("Start the drag on a window surface.")
             return
         ray_origin, ray_direction = camera_ray
-        hit = _get_nearest_fixed_surface_ray_hit(
-            (surface,),
+        host_hit = self._get_nearest_window_placement_host_ray_hit(
             ray_origin,
             ray_direction,
         )
-        if hit is None:
-            self._set_window_tools_status("Start the drag on the selected wall.")
+        if host_hit is None:
+            self._set_window_tools_status("Start the drag on a window surface.")
             return
-        self._window_drag_first_world = _world_point_tuple(hit[1])
+        placement_host, hit_point, _distance = host_hit
+        self._window_drag_placement_host = placement_host
+        self._window_drag_first_world = _world_point_tuple(hit_point)
         self._window_preview_placement = None
         self._window_preview_is_valid = False
 
@@ -14477,7 +14657,7 @@ class GlbViewerWidget(QWidget):
             return
         if self._window_drag_first_world is None:
             self.cancel_window_placement(
-                status_message="Start the drag on the selected wall."
+                status_message="Start the drag on a window surface."
             )
             return
 
@@ -14637,20 +14817,16 @@ class GlbViewerWidget(QWidget):
             self._remove_glass_area_preview_item()
             return
         x_min = local_bounds[0, 0] + (
-            request.normalized_x_bounds[0]
-            * (local_bounds[1, 0] - local_bounds[0, 0])
+            request.normalized_x_bounds[0] * (local_bounds[1, 0] - local_bounds[0, 0])
         )
         x_max = local_bounds[0, 0] + (
-            request.normalized_x_bounds[1]
-            * (local_bounds[1, 0] - local_bounds[0, 0])
+            request.normalized_x_bounds[1] * (local_bounds[1, 0] - local_bounds[0, 0])
         )
         z_min = local_bounds[0, 2] + (
-            request.normalized_z_bounds[0]
-            * (local_bounds[1, 2] - local_bounds[0, 2])
+            request.normalized_z_bounds[0] * (local_bounds[1, 2] - local_bounds[0, 2])
         )
         z_max = local_bounds[0, 2] + (
-            request.normalized_z_bounds[1]
-            * (local_bounds[1, 2] - local_bounds[0, 2])
+            request.normalized_z_bounds[1] * (local_bounds[1, 2] - local_bounds[0, 2])
         )
         plane_y = float(
             self._glass_area_preview_plane_y
@@ -14709,18 +14885,18 @@ class GlbViewerWidget(QWidget):
             self.view.update()
 
     def _update_window_drag_preview(self, position: QPointF) -> None:
-        surface = self._get_selected_window_wall()
+        placement_host = self._window_drag_placement_host
         first_world = self._window_drag_first_world
         camera_ray = self.view.build_camera_ray(position)
-        if surface is None or first_world is None:
-            self._invalidate_window_preview("Start the drag on the selected wall.")
+        if placement_host is None or first_world is None:
+            self._invalidate_window_preview("Start the drag on a window surface.")
             return
         if camera_ray is None:
             self._invalidate_window_preview("Keep the pointer over the wall plane.")
             return
         ray_origin, ray_direction = camera_ray
-        second_world = _intersect_ray_with_fixed_surface_plane(
-            surface,
+        second_world = _intersect_ray_with_window_placement_host_plane(
+            placement_host,
             ray_origin,
             ray_direction,
         )
@@ -14728,21 +14904,21 @@ class GlbViewerWidget(QWidget):
             self._invalidate_window_preview("Keep the pointer over the wall plane.")
             return
 
-        raw_corners = _build_wall_rectangle_corners(
-            surface,
+        raw_corners = _build_window_placement_rectangle_corners(
+            placement_host,
             first_world,
             second_world,
         )
         placement: object | None = None
         error_message: str | None = None
         try:
-            placement = _build_validated_wall_window_placement(
-                surface,
+            placement = _build_validated_window_placement(
+                placement_host,
                 first_world,
                 second_world,
             )
-            corners = _get_validated_wall_window_world_corners(
-                surface,
+            corners = _get_validated_window_placement_world_corners(
+                placement_host,
                 placement,
             )
         except (TypeError, ValueError) as error:
@@ -14753,7 +14929,7 @@ class GlbViewerWidget(QWidget):
         self._window_preview_is_valid = placement is not None
         if corners is not None:
             self._set_window_preview_item(
-                surface,
+                placement_host,
                 corners,
                 ray_origin,
                 is_valid=self._window_preview_is_valid,
@@ -14781,6 +14957,180 @@ class GlbViewerWidget(QWidget):
         if not isinstance(surface, FixedSurface):
             return None
         return surface if self._canvas_surface_is_visible(surface) else None
+
+    def _get_selected_sloped_ceiling_window_host(
+        self,
+    ) -> SlopedCeilingWindowHost | None:
+        """Return the selected slope while its independent band is visible."""
+
+        host = self._sloped_ceiling_window_hosts.get(
+            self._selected_sloped_ceiling_window_host_id or ""
+        )
+        if not isinstance(host, SlopedCeilingWindowHost):
+            return None
+        if not self._sloped_ceiling_window_host_is_visible(host):
+            return None
+        return host
+
+    def _sloped_ceiling_window_host_is_visible(
+        self,
+        host: SlopedCeilingWindowHost,
+    ) -> bool:
+        """Keep inclined bands interactive when only top-down ceilings are ignored."""
+
+        host_surface = self._get_sloped_ceiling_window_host_surface(host)
+        if host_surface is None or not self._canvas_level_is_visible(host.level_index):
+            return False
+        focus_type = self._canvas_surface_focus_type
+        if focus_type is not None and focus_type != SURFACE_TYPE_CEILING:
+            return False
+        return not self._canvas_ceiling_hidden
+
+    def _get_selected_window_placement_host(
+        self,
+    ) -> FixedSurface | SlopedCeilingWindowHost | None:
+        """Return the currently selected rectangular window placement plane."""
+
+        sloped_host = self._get_selected_sloped_ceiling_window_host()
+        return (
+            sloped_host
+            if sloped_host is not None
+            else self._get_selected_window_wall()
+        )
+
+    def _get_available_window_placement_hosts(
+        self,
+    ) -> tuple[FixedSurface | SlopedCeilingWindowHost, ...]:
+        """Return every visible finite plane that may receive a window frame."""
+
+        walls = tuple(
+            surface
+            for surface in self._window_wall_targets.values()
+            if self._canvas_surface_is_visible(surface)
+        )
+        slopes = tuple(
+            host
+            for host in self._sloped_ceiling_window_hosts.values()
+            if self._sloped_ceiling_window_host_is_visible(host)
+        )
+        return (*walls, *slopes)
+
+    def _get_nearest_window_placement_host_ray_hit(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+        *,
+        level_index: int | None = None,
+        use_logical_wall_rectangles: bool = False,
+    ) -> tuple[
+        FixedSurface | SlopedCeilingWindowHost,
+        tuple[float, float, float],
+        float,
+    ] | None:
+        """Pick the closest finite wall or straight slope under one scene ray."""
+
+        origin = np.asarray(ray_origin, dtype=float)
+        if origin.shape != (3,) or not np.all(np.isfinite(origin)):
+            return None
+        candidates: list[
+            tuple[
+                FixedSurface | SlopedCeilingWindowHost,
+                tuple[float, float, float],
+                float,
+            ]
+        ] = []
+        for host in self._get_available_window_placement_hosts():
+            if level_index is not None and host.level_index != int(level_index):
+                continue
+            hit_point = (
+                _get_fixed_surface_wall_rectangle_ray_hit_point(
+                    host,
+                    ray_origin,
+                    ray_direction,
+                )
+                if use_logical_wall_rectangles and isinstance(host, FixedSurface)
+                else _get_window_placement_host_ray_hit_point(
+                    host,
+                    ray_origin,
+                    ray_direction,
+                )
+            )
+            if hit_point is None:
+                continue
+            normalized_hit_point = _world_point_tuple(hit_point)
+            distance = float(
+                np.linalg.norm(
+                    np.asarray(normalized_hit_point, dtype=float) - origin
+                )
+            )
+            if math.isfinite(distance):
+                candidates.append((host, normalized_hit_point, distance))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: candidate[2])
+
+    def _get_sloped_ceiling_window_host_surface(
+        self,
+        host: SlopedCeilingWindowHost,
+    ) -> FixedSurface | None:
+        """Resolve the exact semantic slope that owns one window host."""
+
+        semantic_surfaces = tuple(
+            surface
+            for surface in self._canvas_surface_targets.values()
+            if getattr(surface, "sloped_ceiling_id", None) == host.slope_id
+            and surface.level_index == host.level_index
+        )
+        if semantic_surfaces:
+            return min(
+                semantic_surfaces,
+                key=lambda surface: (
+                    0
+                    if getattr(surface, "sloped_ceiling_part", None) == "main"
+                    else 1,
+                    surface.surface_id,
+                ),
+            )
+        # Older saved scenes exposed only the parent ceiling surface. Keep that
+        # representation usable while new geometry supplies exact slope IDs.
+        return next(
+            (
+                surface
+                for surface in self._canvas_surface_targets.values()
+                if surface.surface_type == SURFACE_TYPE_CEILING
+                and surface.level_index == host.level_index
+                and getattr(surface, "sloped_ceiling_id", None) is None
+            ),
+            None,
+        )
+
+    def _get_sloped_ceiling_window_host_for_surface(
+        self,
+        surface: FixedSurface,
+    ) -> SlopedCeilingWindowHost | None:
+        """Resolve the placement host owned by one semantic slope surface."""
+
+        slope_id = getattr(surface, "sloped_ceiling_id", None)
+        if slope_id is None:
+            return None
+        wall_surface_id = getattr(
+            surface,
+            "sloped_ceiling_wall_surface_id",
+            None,
+        )
+        return next(
+            (
+                host
+                for host in self._sloped_ceiling_window_hosts.values()
+                if host.slope_id == str(slope_id)
+                and host.level_index == surface.level_index
+                and (
+                    wall_surface_id is None
+                    or host.wall_surface_id == str(wall_surface_id)
+                )
+            ),
+            None,
+        )
 
     # ### Architectural-trim semantic rendering ###
     def _refresh_architectural_trim_selection_outlines(self) -> None:
@@ -14864,7 +15214,7 @@ class GlbViewerWidget(QWidget):
         candidates = (
             (self._architectural_trim_hover_candidate,)
             if self._architectural_trim_hover_candidate is not None
-            else tuple(self._architectural_trim_passive_hover_candidates.values())
+            else ()
         )
         if not candidates or not hasattr(self, "view"):
             if hasattr(self, "view"):
@@ -15639,11 +15989,7 @@ class GlbViewerWidget(QWidget):
                     (),
                 )
                 if level_mesh.is_floor
-                if (
-                    positions := _build_mesh_feature_line_positions(
-                        level_mesh.mesh
-                    )
-                )
+                if (positions := _build_mesh_feature_line_positions(level_mesh.mesh))
                 is not None
             )
             if self._canvas_level_is_visible(level_index)
@@ -15795,7 +16141,7 @@ class GlbViewerWidget(QWidget):
     # ### Canvas window preview rendering ###
     def _set_window_preview_item(
         self,
-        surface: FixedSurface,
+        placement_host: FixedSurface | SlopedCeilingWindowHost,
         corners: object,
         camera_position: object,
         *,
@@ -15805,7 +16151,11 @@ class GlbViewerWidget(QWidget):
         if raw_corners.shape != (4, 3) or not np.isfinite(raw_corners).all():
             self._remove_window_preview_item()
             return
-        normal = _get_fixed_surface_plane_normal(surface)
+        normal = (
+            np.asarray(placement_host.wall_normal_world, dtype=float)
+            if isinstance(placement_host, SlopedCeilingWindowHost)
+            else _get_fixed_surface_plane_normal(placement_host)
+        )
         offset_corners = _offset_points_toward_camera(
             raw_corners,
             normal,
@@ -15873,13 +16223,24 @@ class GlbViewerWidget(QWidget):
 
     # ### Canvas window editor controls ###
     def _sync_window_tools_controls(self) -> None:
+        button = self.add_window_frame_button
+        has_available_host = bool(self._get_available_window_placement_hosts())
+        can_place = bool(
+            has_available_host
+            and self._level_transform_preview_level_index is None
+            and not self._canvas_face_orientation_visible
+        )
+        if button is not None:
+            button.setEnabled(can_place or self.is_window_placement_active())
+        self._set_add_window_frame_button_checked(
+            self.is_window_placement_active()
+        )
         if self._level_transform_preview_level_index is not None:
             self._sync_window_undo_button()
             self._set_window_tools_status(
                 "Window editing resumes after the level transform is applied."
             )
             return
-        selected = self._get_selected_window_wall() is not None
         self._sync_window_undo_button()
         if self.is_window_placement_active():
             return
@@ -15889,10 +16250,21 @@ class GlbViewerWidget(QWidget):
             )
             return
         self._set_window_tools_status(
-            "Wall selected. Use Add window frame in the Canvas tab."
-            if selected
-            else "Select one wall."
+            "Drag on a wall or straight sloped surface after choosing Add "
+            "window frame."
+            if has_available_host
+            else "Show at least one wall or straight sloped surface."
         )
+
+    def _set_add_window_frame_button_checked(self, checked: bool) -> None:
+        """Synchronize the scene button without recursively toggling the tool."""
+
+        button = self.add_window_frame_button
+        if button is None or button.isChecked() == bool(checked):
+            return
+        was_blocked = button.blockSignals(True)
+        button.setChecked(bool(checked))
+        button.blockSignals(was_blocked)
 
     def _sync_window_undo_button(self) -> None:
         """Compatibility no-op after removal of the dedicated Undo button."""
@@ -16084,6 +16456,16 @@ class GlbViewerWidget(QWidget):
 
         self.view.set_first_person_movement_mode(mode)
 
+    def get_first_person_speed(self) -> float:
+        """Return first-person movement speed in meters per second."""
+
+        return self.view.get_first_person_speed()
+
+    def set_first_person_speed(self, speed_meters_per_second: float) -> None:
+        """Set first-person movement speed in meters per second."""
+
+        self.view.set_first_person_speed(speed_meters_per_second)
+
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self._invalidate_progressive_texture_updates()
         self._hover_point_light_position = None
@@ -16098,7 +16480,6 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_face_extrusion_drag()
         self._cancel_surface_vertex_pointer_interaction()
         self._cancel_placed_object_gizmo_drag()
-        self._clear_architectural_trim_passive_hover()
         self.cancel_architectural_trim_placement()
         self.clear_architectural_trim_edit_preview()
         self.clear_face_edit_geometry()
@@ -16146,7 +16527,6 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_face_extrusion_drag()
         self.cancel_surface_vertex_placement()
         self._cancel_placed_object_gizmo_drag()
-        self._clear_architectural_trim_passive_hover()
         self.cancel_architectural_trim_placement()
         self.clear_architectural_trim_edit_preview()
         self.clear_face_edit_geometry()
@@ -17042,8 +17422,7 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             return
         placed_previews_by_id = {
-            preview.object_id: preview
-            for preview in self.model.preview_placed_objects
+            preview.object_id: preview for preview in self.model.preview_placed_objects
         }
         top_level_mirror_ids = {
             preview.object_id
@@ -17650,9 +18029,7 @@ class GlbViewerWidget(QWidget):
         partially_targeted_surface_items = tuple(
             item
             for item in self.textured_surface_items
-            if (
-                surface_ids := self._get_textured_surface_item_surface_ids(item)
-            )
+            if (surface_ids := self._get_textured_surface_item_surface_ids(item))
             and bool(surface_ids & token.surface_ids)
             and not surface_ids.issubset(token.surface_ids)
             and item._texture_bundle_signature != bundle.content_signature
@@ -17674,24 +18051,15 @@ class GlbViewerWidget(QWidget):
                 )
             )
         for item in self.textured_surface_items:
-            if (
-                self._get_textured_surface_item_surface_ids(item)
-                & token.surface_ids
-            ):
+            if self._get_textured_surface_item_surface_ids(item) & token.surface_ids:
                 candidates.append(item)
         for object_id in token.placed_object_ids:
-            candidates.extend(
-                self._iter_placed_object_textured_mesh_items(object_id)
-            )
+            candidates.extend(self._iter_placed_object_textured_mesh_items(object_id))
 
         changed_count = len(partially_targeted_surface_items)
         seen_item_ids: set[int] = set()
         for item in candidates:
-            if (
-                item is None
-                or item._is_prefab_glass
-                or id(item) in seen_item_ids
-            ):
+            if item is None or item._is_prefab_glass or id(item) in seen_item_ids:
                 continue
             seen_item_ids.add(id(item))
             changed_count += int(item.set_texture_bundle(bundle))
@@ -17817,9 +18185,7 @@ class GlbViewerWidget(QWidget):
             return
         camera_ray = self.view.build_camera_ray(position)
         hit_point = (
-            None
-            if camera_ray is None
-            else self._get_hover_point_light_hit(*camera_ray)
+            None if camera_ray is None else self._get_hover_point_light_hit(*camera_ray)
         )
         if hit_point is None:
             self._set_hover_point_light_position(None)
@@ -17915,8 +18281,7 @@ class GlbViewerWidget(QWidget):
         """Give hover priority, then match orbit state to active PBR maps."""
 
         self._orbiting_point_light_enabled = bool(
-            self._orbiting_point_light_with_pbr
-            and any(self._pbr_maps_enabled.values())
+            self._orbiting_point_light_with_pbr and any(self._pbr_maps_enabled.values())
         )
         textured_items = self._iter_textured_mesh_items()
         if (
@@ -17955,10 +18320,7 @@ class GlbViewerWidget(QWidget):
         if self.is_hover_point_light_active():
             self._sync_orbiting_point_light()
             return
-        if (
-            not self._orbiting_point_light_enabled
-            or self.model is None
-        ):
+        if not self._orbiting_point_light_enabled or self.model is None:
             self._sync_orbiting_point_light()
             return
         phase_step = (
@@ -17969,9 +18331,7 @@ class GlbViewerWidget(QWidget):
         self._orbiting_point_light_phase = (
             self._orbiting_point_light_phase + phase_step
         ) % math.tau
-        self._update_orbiting_point_light_position(
-            self._iter_textured_mesh_items()
-        )
+        self._update_orbiting_point_light_position(self._iter_textured_mesh_items())
 
     def _update_orbiting_point_light_position(
         self,
@@ -18042,9 +18402,7 @@ class GlbViewerWidget(QWidget):
                 normalized,
                 request_update=False,
             )
-        marker_requested_update = self._move_orbiting_point_light_marker(
-            normalized
-        )
+        marker_requested_update = self._move_orbiting_point_light_marker(normalized)
         if hasattr(self, "view") and not marker_requested_update:
             self.view.update()
 
@@ -18069,9 +18427,7 @@ class GlbViewerWidget(QWidget):
                 abs_tol=1e-9,
             )
         ):
-            self._move_orbiting_point_light_marker(
-                self._orbiting_point_light_position
-            )
+            self._move_orbiting_point_light_marker(self._orbiting_point_light_position)
             return
 
         self._remove_orbiting_point_light_marker()
@@ -18092,9 +18448,7 @@ class GlbViewerWidget(QWidget):
         self.view.addItem(marker)
         self._orbiting_point_light_marker_item = marker
         self._orbiting_point_light_marker_radius = marker_radius
-        self._move_orbiting_point_light_marker(
-            self._orbiting_point_light_position
-        )
+        self._move_orbiting_point_light_marker(self._orbiting_point_light_position)
 
     def _move_orbiting_point_light_marker(
         self,
@@ -18115,11 +18469,7 @@ class GlbViewerWidget(QWidget):
         """Remove the marker independently from the actual shader light."""
 
         marker = self._orbiting_point_light_marker_item
-        if (
-            marker is not None
-            and hasattr(self, "view")
-            and marker in self.view.items
-        ):
+        if marker is not None and hasattr(self, "view") and marker in self.view.items:
             self.view.removeItem(marker)
         self._orbiting_point_light_marker_item = None
         self._orbiting_point_light_marker_radius = None
@@ -18589,6 +18939,8 @@ class GlbViewerWidget(QWidget):
             self._refresh_canvas_opening_gizmo_items()
             self._refresh_canvas_surface_drawing_items()
             self._refresh_canvas_surface_edit_gizmo_items()
+            self._refresh_sloped_ceiling_gizmo_items()
+            self._refresh_sloped_ceiling_preview_items()
             self._refresh_canvas_face_extrusion_gizmo_items()
             self._refresh_architectural_trim_gizmo_items()
             self._refresh_level_transform_preview_outline_item()
@@ -18639,9 +18991,7 @@ class GlbViewerWidget(QWidget):
                     self._ambient_light_intensity,
                     double_sided=texture_mesh_data.double_sided,
                     pbr_maps_enabled=self._pbr_maps_enabled,
-                    point_light_world_position=(
-                        self._orbiting_point_light_position
-                    ),
+                    point_light_world_position=(self._orbiting_point_light_position),
                     point_light_intensity=self._point_light_intensity,
                 )
                 if (
@@ -18658,9 +19008,7 @@ class GlbViewerWidget(QWidget):
                 tuple[object, ...],
                 list[TextureMeshData],
             ] = {}
-            for material_index, material_mesh in enumerate(
-                material_preview_meshes
-            ):
+            for material_index, material_mesh in enumerate(material_preview_meshes):
                 material_texture_data = _build_texture_mesh_data(material_mesh)
                 if material_texture_data is None:
                     continue
@@ -18673,17 +19021,13 @@ class GlbViewerWidget(QWidget):
                 ).append(material_texture_data)
 
             for material_batch in material_texture_batches.values():
-                material_texture_data = _combine_texture_mesh_data(
-                    material_batch
-                )
+                material_texture_data = _combine_texture_mesh_data(material_batch)
                 material_item = TexturedMeshItem(
                     material_texture_data,
                     self._ambient_light_intensity,
                     double_sided=material_texture_data.double_sided,
                     pbr_maps_enabled=self._pbr_maps_enabled,
-                    point_light_world_position=(
-                        self._orbiting_point_light_position
-                    ),
+                    point_light_world_position=(self._orbiting_point_light_position),
                     point_light_intensity=self._point_light_intensity,
                 )
                 if (
@@ -18753,6 +19097,8 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_opening_gizmo_items()
         self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
+        self._refresh_sloped_ceiling_gizmo_items()
+        self._refresh_sloped_ceiling_preview_items()
         self._refresh_canvas_face_extrusion_gizmo_items()
         self._refresh_architectural_trim_gizmo_items()
         self._sync_placed_object_selection_rendering()
@@ -18969,9 +19315,7 @@ class GlbViewerWidget(QWidget):
                 batch_parts,
                 key=_surface_texture_culling_sort_key,
             )
-            texture_data, draw_ranges = _build_surface_texture_batch(
-                sorted_parts
-            )
+            texture_data, draw_ranges = _build_surface_texture_batch(sorted_parts)
             representative = sorted_parts[0]
             texture_item = TexturedMeshItem(
                 texture_data,
@@ -19027,14 +19371,8 @@ class GlbViewerWidget(QWidget):
             )
             if progressive_bundle is not None:
                 for item in (
-                    *(
-                        part.textured_item
-                        for part in retained_parts
-                    ),
-                    *(
-                        group.textured_item
-                        for group in symmetric_groups
-                    ),
+                    *(part.textured_item for part in retained_parts),
+                    *(group.textured_item for group in symmetric_groups),
                 ):
                     if item is not None and not item._is_prefab_glass:
                         item.set_texture_bundle(progressive_bundle)
@@ -19143,9 +19481,7 @@ class GlbViewerWidget(QWidget):
 
         vertices = np.ascontiguousarray(np.concatenate(vertex_parts, axis=0))
         faces = np.ascontiguousarray(np.concatenate(face_parts, axis=0))
-        face_colors = np.ascontiguousarray(
-            np.concatenate(face_color_parts, axis=0)
-        )
+        face_colors = np.ascontiguousarray(np.concatenate(face_color_parts, axis=0))
         texture_data = (
             _combine_texture_mesh_data(texture_parts)
             if len(texture_parts) == len(batch)
@@ -19636,8 +19972,6 @@ class GlbViewerWidget(QWidget):
             preview_target=target,
             handle=handle,
             pointer_offset_local=pointer_offset,
-            last_emitted_bounds=target.bounds,
-            last_emitted_arch_amount=target.arch_amount,
         )
         self.view.reserve_primary_pointer_drag()
         self._refresh_canvas_opening_gizmo_items()
@@ -19651,35 +19985,53 @@ class GlbViewerWidget(QWidget):
         camera_ray = self.view.build_camera_ray(position)
         if drag is None or camera_ray is None:
             return False
-        target = drag.start_target
         ray_origin, ray_direction = camera_ray
-        hit = _intersect_ray_with_plane(
-            ray_origin,
-            ray_direction,
-            target.plane_start_world,
-            target.wall_normal_world,
-        )
-        if hit is None:
+        target = drag.start_target
+        if (
+            drag.handle.kind == CANVAS_OPENING_GIZMO_ANCHOR
+            and target.reference.kind == CANVAS_OPENING_WINDOW
+        ):
+            host_hit = self._get_nearest_window_placement_host_ray_hit(
+                ray_origin,
+                ray_direction,
+                level_index=target.reference.level_index,
+                use_logical_wall_rectangles=True,
+            )
+            if host_hit is None:
+                return False
+            host, hit, _distance = host_hit
+            preview_target = _build_rehosted_canvas_window_target(
+                target,
+                host,
+                hit,
+                drag.pointer_offset_local,
+            )
+            if preview_target is None:
+                return False
+        else:
+            hit = _intersect_ray_with_plane(
+                ray_origin,
+                ray_direction,
+                target.plane_start_world,
+                target.wall_normal_world,
+            )
+            if hit is None:
+                return False
+            pointer_local = target.world_to_local(hit)
+            requested_local = (
+                pointer_local[0] + drag.pointer_offset_local[0],
+                pointer_local[1] + drag.pointer_offset_local[1],
+            )
+            preview_target = _build_dragged_canvas_opening_target(
+                target,
+                drag.handle,
+                requested_local,
+            )
+        previous_target = drag.preview_target
+        if preview_target == previous_target:
             return False
-        pointer_local = target.world_to_local(hit)
-        requested_local = (
-            pointer_local[0] + drag.pointer_offset_local[0],
-            pointer_local[1] + drag.pointer_offset_local[1],
-        )
-        preview_target = _build_dragged_canvas_opening_target(
-            target,
-            drag.handle,
-            requested_local,
-        )
         drag.preview_target = preview_target
         self._refresh_canvas_opening_gizmo_items()
-        if (
-            preview_target.bounds == drag.last_emitted_bounds
-            and preview_target.arch_amount == drag.last_emitted_arch_amount
-        ):
-            return False
-        drag.last_emitted_bounds = preview_target.bounds
-        drag.last_emitted_arch_amount = preview_target.arch_amount
         self.canvas_opening_edit_preview_changed.emit(
             _build_canvas_opening_edit(drag.preview_target)
         )
@@ -19693,10 +20045,7 @@ class GlbViewerWidget(QWidget):
             return False
         self._update_canvas_opening_gizmo_drag(position)
         final_target = drag.preview_target
-        changed = (
-            final_target.bounds != drag.start_target.bounds
-            or final_target.arch_amount != drag.start_target.arch_amount
-        )
+        changed = final_target != drag.start_target
         if changed:
             self._canvas_opening_targets[final_target.key] = final_target
         else:
@@ -20174,6 +20523,661 @@ class GlbViewerWidget(QWidget):
             _build_canvas_surface_edit(drag.target, 0.0)
         )
         return True
+
+    # ### Sloped-ceiling selection and gizmo rendering ###
+    def _get_selected_sloped_ceiling_target(
+        self,
+    ) -> SlopedCeilingEditTarget | None:
+        """Prefer the exact active semantic slope, then its owning wall."""
+
+        active_wall_id = self._selected_sloped_ceiling_wall_surface_id
+        active_surface = self._canvas_surface_targets.get(
+            self._active_canvas_surface_id or ""
+        )
+        active_slope_id = (
+            None
+            if active_surface is None
+            else getattr(active_surface, "sloped_ceiling_id", None)
+        )
+        selected_targets = self._get_selected_sloped_ceiling_targets()
+        if active_slope_id is not None:
+            exact_target = next(
+                (
+                    target
+                    for target in selected_targets
+                    if target.wall_surface_id == active_wall_id
+                    and target.slope_id == str(active_slope_id)
+                ),
+                None,
+            )
+            if exact_target is not None:
+                return exact_target
+        return next(
+            (
+                target
+                for target in selected_targets
+                if target.wall_surface_id == active_wall_id
+            ),
+            None,
+        )
+
+    def _get_selected_sloped_ceiling_scope(
+        self,
+    ) -> tuple[set[str], dict[str, set[str]]]:
+        """Separate whole-wall selection from exact semantic slope selection."""
+
+        root_wall_ids: set[str] = set()
+        explicit_slope_ids_by_wall: dict[str, set[str]] = {}
+        for surface_id in self._selected_canvas_surface_ids:
+            surface = self._canvas_surface_targets.get(surface_id)
+            if surface is None or not self._canvas_surface_is_visible(surface):
+                continue
+            slope_id = getattr(surface, "sloped_ceiling_id", None)
+            slope_wall_id = getattr(
+                surface,
+                "sloped_ceiling_wall_surface_id",
+                None,
+            )
+            if slope_id is not None and slope_wall_id is not None:
+                explicit_slope_ids_by_wall.setdefault(
+                    str(slope_wall_id),
+                    set(),
+                ).add(str(slope_id))
+                continue
+            if surface.surface_type != SURFACE_TYPE_WALL:
+                continue
+            root_wall_ids.add(
+                _get_fixed_surface_source_id(surface) or surface.surface_id
+            )
+        return root_wall_ids, explicit_slope_ids_by_wall
+
+    def _get_selected_sloped_ceiling_targets(
+        self,
+    ) -> tuple[SlopedCeilingEditTarget, ...]:
+        """Return selected walls, slopes, and every member of a joined slope."""
+
+        if self._selected_sloped_ceiling_wall_surface_id is None:
+            return ()
+        root_wall_ids, explicit_slope_ids_by_wall = (
+            self._get_selected_sloped_ceiling_scope()
+        )
+        if not root_wall_ids and not explicit_slope_ids_by_wall:
+            return ()
+        explicit_slope_ids = {
+            slope_id
+            for slope_ids in explicit_slope_ids_by_wall.values()
+            for slope_id in slope_ids
+        }
+        selected_group_ids = {
+            target.joined_group_id
+            for target in self._sloped_ceiling_edit_targets.values()
+            if target.slope_id in explicit_slope_ids
+            and target.joined_group_id is not None
+        }
+        return tuple(
+            target
+            for target in self._sloped_ceiling_edit_targets.values()
+            if (
+                target.wall_surface_id in root_wall_ids
+                or target.slope_id
+                in explicit_slope_ids_by_wall.get(target.wall_surface_id, set())
+                or target.joined_group_id in selected_group_ids
+            )
+        )
+
+    def _get_displayed_sloped_ceiling_targets(
+        self,
+    ) -> tuple[SlopedCeilingEditTarget, ...]:
+        """Collapse compatible parallel-wall targets to active-wall controls."""
+
+        targets = self._get_selected_sloped_ceiling_targets()
+        selected_wall_ids = self.get_selected_sloped_ceiling_wall_surface_ids()
+        active_wall_id = self._selected_sloped_ceiling_wall_surface_id
+        if (
+            len(selected_wall_ids) < 2
+            or active_wall_id not in selected_wall_ids
+            or not self._selected_sloped_ceiling_walls_are_parallel(
+                targets,
+                selected_wall_ids,
+                active_wall_id,
+            )
+        ):
+            return targets
+
+        hidden_target_keys: set[tuple[str, str]] = set()
+        for active_target in targets:
+            if active_target.wall_surface_id != active_wall_id:
+                continue
+            group = self._get_parallel_sloped_ceiling_target_group(
+                active_target,
+                targets,
+                selected_wall_ids,
+            )
+            if len(group) != len(selected_wall_ids):
+                continue
+            hidden_target_keys.update(
+                _get_sloped_ceiling_target_key(target)
+                for target in group
+                if target is not active_target
+            )
+        return tuple(
+            target
+            for target in targets
+            if _get_sloped_ceiling_target_key(target) not in hidden_target_keys
+        )
+
+    @staticmethod
+    def _selected_sloped_ceiling_walls_are_parallel(
+        targets: Sequence[SlopedCeilingEditTarget],
+        selected_wall_ids: Sequence[str],
+        active_wall_id: str,
+    ) -> bool:
+        """Return whether every selected slope wall shares one axial direction."""
+
+        directions_by_wall_id: dict[str, np.ndarray] = {}
+        for target in targets:
+            if target.wall_surface_id in directions_by_wall_id:
+                continue
+            direction = _normalize_vector(
+                np.asarray(target.wall_end_world, dtype=float)
+                - np.asarray(target.wall_start_world, dtype=float)
+            )
+            if direction is not None:
+                directions_by_wall_id[target.wall_surface_id] = direction
+        reference = directions_by_wall_id.get(active_wall_id)
+        if reference is None or any(
+            wall_surface_id not in directions_by_wall_id
+            for wall_surface_id in selected_wall_ids
+        ):
+            return False
+        return all(
+            abs(float(np.dot(reference, directions_by_wall_id[wall_surface_id])))
+            >= 1.0 - SLOPED_CEILING_PARALLEL_DOT_TOLERANCE
+            for wall_surface_id in selected_wall_ids
+        )
+
+    @staticmethod
+    def _get_parallel_sloped_ceiling_target_group(
+        target: SlopedCeilingEditTarget,
+        targets: Sequence[SlopedCeilingEditTarget],
+        selected_wall_ids: Sequence[str],
+    ) -> tuple[SlopedCeilingEditTarget, ...]:
+        """Resolve one structurally equivalent target from every parallel wall."""
+
+        group = [target]
+        for wall_surface_id in selected_wall_ids:
+            if wall_surface_id == target.wall_surface_id:
+                continue
+            candidate = _get_corresponding_parallel_sloped_ceiling_target(
+                target,
+                targets,
+                wall_surface_id,
+            )
+            if candidate is None:
+                return (target,)
+            group.append(candidate)
+        if not _sloped_ceiling_target_group_has_common_handle_ranges(group):
+            return (target,)
+        return tuple(group)
+
+    def _refresh_sloped_ceiling_gizmo_items(self) -> None:
+        """Draw the active slope boundary and its screen-sized controls."""
+
+        self._remove_sloped_ceiling_gizmo_items()
+        if self._level_transform_preview_level_index is not None:
+            if hasattr(self, "view"):
+                self.view.update()
+            return
+        targets = self._get_displayed_sloped_ceiling_targets()
+        if not targets or not hasattr(self, "view"):
+            return
+        drag = self._sloped_ceiling_edit_drag
+        for target in targets:
+            edge_start = np.asarray(
+                target.selection_edge_start_world,
+                dtype=float,
+            )
+            edge_end = np.asarray(target.selection_edge_end_world, dtype=float)
+            edge_item = gl.GLLinePlotItem(
+                pos=np.asarray((edge_start, edge_end), dtype=float),
+                color=SLOPED_CEILING_EDGE_COLOR,
+                width=SLOPED_CEILING_EDGE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_sloped_ceiling_overlay_item(edge_item)
+
+            for handle in target.handles:
+                origin = _get_sloped_ceiling_handle_display_origin(
+                    handle,
+                    drag,
+                )
+                gizmo_size = self._get_sloped_ceiling_gizmo_size(origin)
+                handle_key = _get_sloped_ceiling_handle_key(target, handle)
+                self._sloped_ceiling_gizmo_sizes[handle_key] = gizmo_size
+                axis = np.asarray(handle.axis_world, dtype=float)
+                endpoint = origin + axis * gizmo_size
+                color = SLOPED_CEILING_HANDLE_COLORS.get(
+                    handle.handle_kind,
+                    (1.0, 1.0, 1.0, 1.0),
+                )
+                axis_item = gl.GLLinePlotItem(
+                    pos=np.asarray((origin, endpoint), dtype=float),
+                    color=color,
+                    width=SLOPED_CEILING_GIZMO_LINE_WIDTH,
+                    antialias=True,
+                    mode="lines",
+                )
+                self._add_sloped_ceiling_overlay_item(axis_item)
+                endpoint_item = gl.GLScatterPlotItem(
+                    pos=np.asarray((endpoint,), dtype=float),
+                    color=color,
+                    size=SLOPED_CEILING_GIZMO_ENDPOINT_SIZE_PIXELS,
+                    pxMode=True,
+                )
+                self._add_sloped_ceiling_overlay_item(endpoint_item)
+        self.view.update()
+
+    def _get_sloped_ceiling_gizmo_size(self, origin: np.ndarray) -> float:
+        """Resolve a stable screen-sized slope handle length."""
+
+        try:
+            pixel_size = float(
+                self.view.pixelSize(QVector3D(*[float(value) for value in origin]))
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if math.isfinite(pixel_size) and pixel_size > 0.0:
+            return max(
+                SLOPED_CEILING_GIZMO_MIN_SIZE_METERS,
+                pixel_size * SLOPED_CEILING_GIZMO_SCREEN_SIZE_PIXELS,
+            )
+        return SLOPED_CEILING_GIZMO_MIN_SIZE_METERS
+
+    def _add_sloped_ceiling_overlay_item(self, item: GLGraphicsItem) -> None:
+        """Render one slope control through scene geometry."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 1.0)
+        self.view.addItem(item)
+        self._sloped_ceiling_gizmo_items.append(item)
+
+    def _remove_sloped_ceiling_gizmo_items(self) -> None:
+        if not hasattr(self, "view"):
+            self._sloped_ceiling_gizmo_items = []
+            self._sloped_ceiling_gizmo_sizes = {}
+            return
+        for item in self._sloped_ceiling_gizmo_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._sloped_ceiling_gizmo_items = []
+        self._sloped_ceiling_gizmo_sizes = {}
+
+    def _pick_sloped_ceiling_gizmo_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle] | None:
+        """CPU-pick the endpoint or shaft of one active slope handle."""
+
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        targets = self._get_displayed_sloped_ceiling_targets()
+        if origin is None or direction is None or not targets:
+            return None
+        candidates: list[
+            tuple[
+                float,
+                float,
+                str,
+                str,
+                str,
+                SlopedCeilingEditTarget,
+                SlopedCeilingEditHandle,
+            ]
+        ] = []
+        for target in targets:
+            target_key = _get_sloped_ceiling_target_key(target)
+            for handle in target.handles:
+                handle_origin = _get_sloped_ceiling_handle_display_origin(
+                    handle,
+                    None,
+                )
+                gizmo_size = self._sloped_ceiling_gizmo_sizes.get(
+                    _get_sloped_ceiling_handle_key(target, handle),
+                    self._get_sloped_ceiling_gizmo_size(handle_origin),
+                )
+                handle_end = (
+                    handle_origin
+                    + np.asarray(handle.axis_world, dtype=float) * gizmo_size
+                )
+                marker_hit = _get_ray_point_distance(
+                    origin,
+                    direction,
+                    handle_end,
+                )
+                marker_tolerance = max(
+                    SLOPED_CEILING_GIZMO_MIN_HIT_RADIUS_METERS,
+                    gizmo_size
+                    * SLOPED_CEILING_GIZMO_ENDPOINT_SIZE_PIXELS
+                    / (SLOPED_CEILING_GIZMO_SCREEN_SIZE_PIXELS * 2.0),
+                )
+                if marker_hit is not None and marker_hit[0] <= marker_tolerance:
+                    candidates.append(
+                        (
+                            marker_hit[0] / marker_tolerance,
+                            marker_hit[1],
+                            target_key[0],
+                            target_key[1],
+                            handle.handle_kind,
+                            target,
+                            handle,
+                        )
+                    )
+                    continue
+                segment_distance = _get_ray_segment_distance(
+                    origin,
+                    direction,
+                    handle_origin,
+                    handle_end,
+                )
+                tolerance = max(
+                    SLOPED_CEILING_GIZMO_MIN_HIT_RADIUS_METERS,
+                    gizmo_size * SLOPED_CEILING_GIZMO_HIT_RATIO,
+                )
+                if segment_distance is None or segment_distance > tolerance:
+                    continue
+                midpoint_hit = _get_ray_point_distance(
+                    origin,
+                    direction,
+                    (handle_origin + handle_end) * 0.5,
+                )
+                candidates.append(
+                    (
+                        segment_distance / tolerance,
+                        midpoint_hit[1] if midpoint_hit is not None else math.inf,
+                        target_key[0],
+                        target_key[1],
+                        handle.handle_kind,
+                        target,
+                        handle,
+                    )
+                )
+        if not candidates:
+            return None
+        selected = min(candidates, key=lambda item: item[:5])
+        return selected[5], selected[6]
+
+    # ### Sloped-ceiling gizmo dragging ###
+    def _get_compatible_sloped_ceiling_target_handles(
+        self,
+        target: SlopedCeilingEditTarget,
+        handle: SlopedCeilingEditHandle,
+    ) -> tuple[
+        tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle],
+        ...,
+    ]:
+        """Pair one equivalent slope handle from each selected wall."""
+
+        selected_targets = self._get_selected_sloped_ceiling_targets()
+        if target not in selected_targets:
+            return ()
+        primary_is_creation = target.slope_id is None
+        primary_center = _get_sloped_ceiling_target_wall_ratio(target)
+        selected_wall_ids = self.get_selected_sloped_ceiling_wall_surface_ids()
+        if self._selected_sloped_ceiling_walls_are_parallel(
+            selected_targets,
+            selected_wall_ids,
+            target.wall_surface_id,
+        ):
+            parallel_group = self._get_parallel_sloped_ceiling_target_group(
+                target,
+                selected_targets,
+                selected_wall_ids,
+            )
+            if len(parallel_group) != len(selected_wall_ids):
+                return ((target, handle),)
+            target_handles: list[
+                tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle]
+            ] = [(target, handle)]
+            for candidate in parallel_group[1:]:
+                candidate_handle = _get_parallel_sloped_ceiling_peer_handle(
+                    target,
+                    handle,
+                    candidate,
+                )
+                if candidate_handle is None:
+                    return ((target, handle),)
+                target_handles.append((candidate, candidate_handle))
+            return tuple(target_handles)
+        target_handles: list[
+            tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle]
+        ] = [(target, handle)]
+        for wall_surface_id in selected_wall_ids:
+            if wall_surface_id == target.wall_surface_id:
+                continue
+            candidates: list[
+                tuple[
+                    float,
+                    tuple[str, str],
+                    SlopedCeilingEditTarget,
+                    SlopedCeilingEditHandle,
+                ]
+            ] = []
+            for candidate in selected_targets:
+                if (
+                    candidate.wall_surface_id != wall_surface_id
+                    or (candidate.slope_id is None) != primary_is_creation
+                ):
+                    continue
+                candidate_handle = next(
+                    (
+                        item
+                        for item in candidate.handles
+                        if item.handle_kind == handle.handle_kind
+                    ),
+                    None,
+                )
+                if candidate_handle is None:
+                    continue
+                candidates.append(
+                    (
+                        abs(
+                            _get_sloped_ceiling_target_wall_ratio(candidate)
+                            - primary_center
+                        ),
+                        _get_sloped_ceiling_target_key(candidate),
+                        candidate,
+                        candidate_handle,
+                    )
+                )
+            if candidates:
+                selected = min(candidates, key=lambda item: item[:2])
+                target_handles.append((selected[2], selected[3]))
+        if max(
+            candidate_handle.minimum_value
+            for _candidate_target, candidate_handle in target_handles
+        ) > min(
+            candidate_handle.maximum_value
+            for _candidate_target, candidate_handle in target_handles
+        ):
+            return ((target, handle),)
+        return tuple(target_handles)
+
+    def _begin_sloped_ceiling_edit_drag(
+        self,
+        target: SlopedCeilingEditTarget,
+        handle: SlopedCeilingEditHandle,
+        position: QPointF,
+    ) -> bool:
+        """Reserve pointer input and snapshot an absolute slope value."""
+
+        affected_target_handles = self._get_compatible_sloped_ceiling_target_handles(
+            target, handle
+        )
+        if not affected_target_handles:
+            return False
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        axis = _normalize_vector(handle.axis_world)
+        if axis is None:
+            return False
+        drag_plane_normal = _build_axis_drag_plane_normal(axis, ray_direction)
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            handle.origin_world,
+            drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        handle_origin = np.asarray(handle.origin_world, dtype=float)
+        start_axis_parameter = float(np.dot(hit - handle_origin, axis))
+        value = float(handle.value)
+        self._sloped_ceiling_edit_drag = _SlopedCeilingEditDrag(
+            target=target,
+            handle=handle,
+            affected_target_handles=affected_target_handles,
+            axis=axis,
+            drag_plane_normal=drag_plane_normal,
+            start_axis_parameter=start_axis_parameter,
+            preview_value=value,
+            last_emitted_value=value,
+        )
+        self.view.reserve_primary_pointer_drag()
+        self._refresh_sloped_ceiling_gizmo_items()
+        self.sloped_ceiling_edit_started.emit(
+            _build_sloped_ceiling_edit_batch(
+                affected_target_handles,
+                shared_value=None,
+            )
+        )
+        return True
+
+    def _update_sloped_ceiling_edit_drag(self, position: QPointF) -> bool:
+        """Emit a clamped absolute slope value and move its active handle."""
+
+        drag = self._sloped_ceiling_edit_drag
+        camera_ray = self.view.build_camera_ray(position)
+        if drag is None or camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        handle_origin = np.asarray(drag.handle.origin_world, dtype=float)
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            handle_origin,
+            drag.drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        axis_parameter = float(np.dot(hit - handle_origin, drag.axis))
+        minimum_value, maximum_value = _get_sloped_ceiling_shared_value_bounds(
+            drag.affected_target_handles
+        )
+        value = float(
+            np.clip(
+                drag.handle.value
+                + (axis_parameter - drag.start_axis_parameter)
+                * drag.handle.value_per_meter,
+                minimum_value,
+                maximum_value,
+            )
+        )
+        if math.isclose(value, drag.preview_value, abs_tol=1e-9, rel_tol=0.0):
+            return False
+        drag.preview_value = value
+        self._refresh_sloped_ceiling_gizmo_items()
+        if math.isclose(value, drag.last_emitted_value, abs_tol=1e-9, rel_tol=0.0):
+            return False
+        drag.last_emitted_value = value
+        self.sloped_ceiling_edit_preview_changed.emit(
+            _build_sloped_ceiling_edit_batch(
+                drag.affected_target_handles,
+                shared_value=value,
+            )
+        )
+        return True
+
+    def _finish_sloped_ceiling_edit_drag(self, position: QPointF) -> bool:
+        """Finish one slope edit without rebuilding the displayed model."""
+
+        if self._sloped_ceiling_edit_drag is None:
+            return False
+        self._update_sloped_ceiling_edit_drag(position)
+        drag = self._sloped_ceiling_edit_drag
+        if drag is None:
+            return False
+        edits = _build_sloped_ceiling_edit_batch(
+            drag.affected_target_handles,
+            shared_value=drag.preview_value,
+        )
+        changed = not math.isclose(
+            drag.preview_value,
+            drag.handle.value,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        )
+        self._sloped_ceiling_edit_drag = None
+        self.view.release_primary_pointer_drag()
+        self.sloped_ceiling_edit_finished.emit(edits, changed)
+        self._refresh_sloped_ceiling_gizmo_items()
+        return changed
+
+    def _cancel_sloped_ceiling_edit_drag(self, *_args: object) -> bool:
+        """Restore the handle's initial value and release pointer input."""
+
+        drag = self._sloped_ceiling_edit_drag
+        if drag is None:
+            return False
+        self._sloped_ceiling_edit_drag = None
+        self.view.cancel_primary_pointer_drag()
+        self._refresh_sloped_ceiling_gizmo_items()
+        self.sloped_ceiling_edit_cancelled.emit(
+            _build_sloped_ceiling_edit_batch(
+                drag.affected_target_handles,
+                shared_value=None,
+            )
+        )
+        return True
+
+    # ### Sloped-ceiling lightweight preview ###
+    def _refresh_sloped_ceiling_preview_items(self) -> None:
+        """Render retained candidate slope skins as translucent geometry."""
+
+        self._remove_sloped_ceiling_preview_items()
+        if not hasattr(self, "view"):
+            return
+        for mesh in self._sloped_ceiling_preview_meshes:
+            vertices = np.asarray(mesh.vertices, dtype=np.float32)
+            faces = np.asarray(mesh.faces, dtype=np.int32)
+            if not len(vertices) or not len(faces):
+                continue
+            item = gl.GLMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                color=SLOPED_CEILING_PREVIEW_COLOR,
+                smooth=False,
+                drawFaces=True,
+                drawEdges=True,
+                edgeColor=SLOPED_CEILING_PREVIEW_EDGE_COLOR,
+                shader="shaded",
+            )
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 1.0)
+            self.view.addItem(item)
+            self._sloped_ceiling_preview_items.append(item)
+        self.view.update()
+
+    def _remove_sloped_ceiling_preview_items(self) -> None:
+        if not hasattr(self, "view"):
+            self._sloped_ceiling_preview_items = []
+            return
+        for item in self._sloped_ceiling_preview_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._sloped_ceiling_preview_items = []
 
     # ### Canvas surface drawing overlay ###
     def _refresh_canvas_surface_drawing_items(self) -> None:
@@ -20941,12 +21945,8 @@ class GlbViewerWidget(QWidget):
         if group is None:
             return None
         scale_mode = self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE
-        if (
-            scale_mode
-            and not self._placed_object_axis_scale_gizmos_enabled
-        ) or (
-            not scale_mode
-            and not self._placed_object_transform_gizmos_enabled
+        if (scale_mode and not self._placed_object_axis_scale_gizmos_enabled) or (
+            not scale_mode and not self._placed_object_transform_gizmos_enabled
         ):
             return None
         origin, direction = _normalize_ray(ray_origin, ray_direction)
@@ -21372,16 +22372,13 @@ class GlbViewerWidget(QWidget):
             drag.preview_rotation_degrees,
             drag.preview_axis_scales,
         )
-        if (
-            drag.handle.kind == TRANSFORM_GIZMO_ROTATE
-            and (
-                previous_preview_rotation is None
-                or not np.allclose(
-                    drag.preview_rotation_degrees,
-                    previous_preview_rotation,
-                    atol=1e-9,
-                    rtol=0.0,
-                )
+        if drag.handle.kind == TRANSFORM_GIZMO_ROTATE and (
+            previous_preview_rotation is None
+            or not np.allclose(
+                drag.preview_rotation_degrees,
+                previous_preview_rotation,
+                atol=1e-9,
+                rtol=0.0,
             )
         ):
             self.placed_object_rotation_preview_changed.emit(
@@ -21571,9 +22568,7 @@ class GlbViewerWidget(QWidget):
                 for surface_id in self._get_textured_surface_item_surface_ids(
                     textured_surface_item
                 )
-                if (
-                    stair_part := self._canvas_stair_part_targets.get(surface_id)
-                )
+                if (stair_part := self._canvas_stair_part_targets.get(surface_id))
                 is not None
             )
             textured_surface_item.setVisible(
@@ -21598,9 +22593,7 @@ class GlbViewerWidget(QWidget):
                             or not self._textures_enabled
                         )
                     ),
-                    draw_edges=(
-                        self._wireframe_enabled or self._wireframe_only
-                    ),
+                    draw_edges=(self._wireframe_enabled or self._wireframe_only),
                 )
 
         if self.mesh_item is not None:
@@ -21618,10 +22611,7 @@ class GlbViewerWidget(QWidget):
             group.mesh_item.set_draw_modes(
                 draw_faces=(
                     not self._wireframe_only
-                    and (
-                        group.textured_item is None
-                        or not self._textures_enabled
-                    )
+                    and (group.textured_item is None or not self._textures_enabled)
                 ),
                 draw_edges=(self._wireframe_enabled or self._wireframe_only),
             )
@@ -21698,6 +22688,9 @@ class GlbViewerWidget(QWidget):
         self._canvas_opening_creation_items = []
         self._canvas_surface_edit_gizmo_items = []
         self._canvas_surface_edit_gizmo_sizes = {}
+        self._sloped_ceiling_gizmo_items = []
+        self._sloped_ceiling_gizmo_sizes = {}
+        self._sloped_ceiling_preview_items = []
         self._canvas_surface_drawing_items = []
         self._canvas_face_extrusion_gizmo_items = []
         self._surface_vertex_preview_item = None
@@ -21861,10 +22854,26 @@ def _build_tour_trigger_area_geometry(
     z_position = normalized_center[2] + TOUR_TRIGGER_AREA_PICK_THICKNESS_METERS * 0.5
     vertices = np.asarray(
         (
-            (normalized_center[0] - half_width, normalized_center[1] - half_depth, z_position),
-            (normalized_center[0] + half_width, normalized_center[1] - half_depth, z_position),
-            (normalized_center[0] + half_width, normalized_center[1] + half_depth, z_position),
-            (normalized_center[0] - half_width, normalized_center[1] + half_depth, z_position),
+            (
+                normalized_center[0] - half_width,
+                normalized_center[1] - half_depth,
+                z_position,
+            ),
+            (
+                normalized_center[0] + half_width,
+                normalized_center[1] - half_depth,
+                z_position,
+            ),
+            (
+                normalized_center[0] + half_width,
+                normalized_center[1] + half_depth,
+                z_position,
+            ),
+            (
+                normalized_center[0] - half_width,
+                normalized_center[1] + half_depth,
+                z_position,
+            ),
         ),
         dtype=np.float32,
     )
@@ -21914,7 +22923,9 @@ def _normalize_tour_points(points: object) -> tuple[np.ndarray, ...]:
         try:
             points = tuple(points)  # type: ignore[arg-type]
         except TypeError as error:
-            raise TypeError("Tour points must be one sequence of XYZ coordinates.") from error
+            raise TypeError(
+                "Tour points must be one sequence of XYZ coordinates."
+            ) from error
     return tuple(_normalize_tour_point(point) for point in points)
 
 
@@ -21936,10 +22947,7 @@ def _normalize_tour_overlay_collection(
         return ()
     sources: tuple[tuple[object, str | None], ...]
     if isinstance(tours, Mapping):
-        if any(
-            field in tours
-            for field in ("tour_id", "id", "curve", "curve_points")
-        ):
+        if any(field in tours for field in ("tour_id", "id", "curve", "curve_points")):
             sources = ((tours, None),)
         else:
             sources = tuple((value, str(key)) for key, value in tours.items())
@@ -21952,7 +22960,9 @@ def _normalize_tour_overlay_collection(
         try:
             sources = tuple((value, None) for value in tours)  # type: ignore[union-attr]
         except TypeError as error:
-            raise TypeError("Tour overlays must be supplied as a sequence or mapping.") from error
+            raise TypeError(
+                "Tour overlays must be supplied as a sequence or mapping."
+            ) from error
 
     overlays = tuple(
         _normalize_tour_overlay_data(source, fallback_tour_id=fallback_id)
@@ -22004,9 +23014,7 @@ def _normalize_tour_overlay_data(
         for point in _normalize_tour_points(raw_points)
     )
     raw_tension = (
-        _read_tour_field(curve_source, "tension")
-        if curve_source is not None
-        else None
+        _read_tour_field(curve_source, "tension") if curve_source is not None else None
     )
     if raw_tension is None:
         raw_tension = _read_tour_field(source, "tension")
@@ -22016,9 +23024,7 @@ def _normalize_tour_overlay_data(
     steps = _normalize_tour_steps(_read_tour_field(source, "steps"))
     raw_duration = _read_tour_field(source, "duration_seconds", "duration")
     duration_seconds = (
-        TOUR_DEFAULT_DURATION_SECONDS
-        if raw_duration is None
-        else float(raw_duration)
+        TOUR_DEFAULT_DURATION_SECONDS if raw_duration is None else float(raw_duration)
     )
     if not math.isfinite(duration_seconds) or duration_seconds <= 0.0:
         raise ValueError("A tour duration must be finite and positive.")
@@ -22164,7 +23170,9 @@ def _read_positive_tour_number(
         normalized = float(value)
     except (TypeError, ValueError):
         return float(default)
-    return normalized if math.isfinite(normalized) and normalized > 0.0 else float(default)
+    return (
+        normalized if math.isfinite(normalized) and normalized > 0.0 else float(default)
+    )
 
 
 def _read_nonnegative_tour_number(
@@ -22237,7 +23245,11 @@ def _resolve_selected_tour_step_index(
         if step is selected_step or step == selected_step:
             return index
         step_id = _read_tour_field(step, "step_id", "id")
-        if selected_id is not None and step_id is not None and str(step_id) == str(selected_id):
+        if (
+            selected_id is not None
+            and step_id is not None
+            and str(step_id) == str(selected_id)
+        ):
             return index
     return None
 
@@ -22314,7 +23326,11 @@ def _build_tour_text_local_mesh(
 
     normalized_text = str(text).replace("\t", "    ").strip()
     normalized_size = float(size_points)
-    if not normalized_text or not math.isfinite(normalized_size) or normalized_size <= 0.0:
+    if (
+        not normalized_text
+        or not math.isfinite(normalized_size)
+        or normalized_size <= 0.0
+    ):
         return (
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.int32),
@@ -22406,8 +23422,7 @@ def _build_tour_text_local_mesh(
             if triangle.geom_type != "Polygon" or triangle.is_empty:
                 continue
             coordinates = tuple(
-                (float(x), float(y))
-                for x, y in tuple(triangle.exterior.coords)[:-1]
+                (float(x), float(y)) for x, y in tuple(triangle.exterior.coords)[:-1]
             )
             if len(coordinates) != 3:
                 continue
@@ -22568,7 +23583,9 @@ def _derive_tour_camera_target(
 
 def _get_tour_placement_instruction(kind: str) -> str:
     if kind == TOUR_POINT_KIND_CURVE:
-        return "Click curve points. Press Enter or double-click to finish; Escape cancels."
+        return (
+            "Click curve points. Press Enter or double-click to finish; Escape cancels."
+        )
     if kind == TOUR_POINT_KIND_TRIGGER:
         return "Click and drag to define the rectangular tour trigger area."
     return "Click a visible surface to place the tour point."
@@ -22815,10 +23832,13 @@ def _bounds_intersect_clip_frustum(
     )
     if not np.all(np.isfinite(clip_corners)):
         return True
-    plane_distances = clip_corners @ np.asarray(
-        SELECTION_HOMOGENEOUS_CLIP_PLANES,
-        dtype=np.float32,
-    ).T
+    plane_distances = (
+        clip_corners
+        @ np.asarray(
+            SELECTION_HOMOGENEOUS_CLIP_PLANES,
+            dtype=np.float32,
+        ).T
+    )
     return not bool(
         np.any(
             np.all(
@@ -23542,9 +24562,7 @@ def _rasterize_canvas_target_selection_with_stair_faces(
         if target_type == CANVAS_SELECTION_TARGET_STAIR_PART:
             logical_index_by_source_face: dict[int, int] = {}
             logical_indices = np.empty(face_count, dtype=np.int64)
-            for clipped_face_index, source_face_index in enumerate(
-                source_face_indices
-            ):
+            for clipped_face_index, source_face_index in enumerate(source_face_indices):
                 normalized_source_index = int(source_face_index)
                 logical_index = logical_index_by_source_face.get(
                     normalized_source_index
@@ -23552,9 +24570,9 @@ def _rasterize_canvas_target_selection_with_stair_faces(
                 if logical_index is None:
                     logical_index = next_logical_index
                     next_logical_index += 1
-                    logical_index_by_source_face[
-                        normalized_source_index
-                    ] = logical_index
+                    logical_index_by_source_face[normalized_source_index] = (
+                        logical_index
+                    )
                     logical_targets[logical_index] = (
                         target_type,
                         target_id,
@@ -23946,6 +24964,9 @@ def _build_canvas_opening_edit(target: CanvasOpeningTarget) -> CanvasOpeningEdit
         wall_surface_id=target.wall_surface_id,
         bounds=target.bounds,
         arch_amount=target.arch_amount,
+        destination_target=(
+            target if target.reference.kind == CANVAS_OPENING_WINDOW else None
+        ),
     )
 
 
@@ -24040,6 +25061,654 @@ def _build_canvas_surface_edit_outline_positions(
     )
     preview_positions[endpoint_mask] += offset
     return preview_positions
+
+
+# ### Sloped-ceiling edit helpers ###
+def _get_sloped_ceiling_target_key(
+    target: SlopedCeilingEditTarget,
+) -> tuple[str, str]:
+    """Return a stable key that permits several targets on one wall."""
+
+    wall_surface_id = str(target.wall_surface_id).strip()
+    explicit_key = getattr(target, "target_id", None)
+    if explicit_key is not None and str(explicit_key).strip():
+        identity = str(explicit_key).strip()
+    elif target.slope_id is not None:
+        identity = f"slope:{target.slope_id}"
+    else:
+        coordinates = (
+            *target.selection_edge_start_world,
+            *target.selection_edge_end_world,
+        )
+        identity = "create:" + ":".join(float(value).hex() for value in coordinates)
+    return wall_surface_id, identity
+
+
+def _get_sloped_ceiling_handle_key(
+    target: SlopedCeilingEditTarget,
+    handle: SlopedCeilingEditHandle,
+) -> tuple[str, str, str]:
+    """Return one collision-free rendered-handle key."""
+
+    wall_surface_id, target_identity = _get_sloped_ceiling_target_key(target)
+    return wall_surface_id, target_identity, handle.handle_kind
+
+
+def _get_sloped_ceiling_target_wall_ratio(
+    target: SlopedCeilingEditTarget,
+) -> float:
+    """Return a target span's normalized midpoint along its host wall."""
+
+    start_ratio, end_ratio = _get_sloped_ceiling_target_wall_interval(target)
+    return (start_ratio + end_ratio) * 0.5
+
+
+def _get_sloped_ceiling_target_wall_interval(
+    target: SlopedCeilingEditTarget,
+) -> tuple[float, float]:
+    """Return one target span as ordered ratios along its own wall direction."""
+
+    wall_start = np.asarray(target.wall_start_world, dtype=float)
+    wall_end = np.asarray(target.wall_end_world, dtype=float)
+    edge_start = np.asarray(target.selection_edge_start_world, dtype=float)
+    edge_end = np.asarray(target.selection_edge_end_world, dtype=float)
+    wall_delta = wall_end - wall_start
+    length_squared = float(np.dot(wall_delta, wall_delta))
+    if length_squared <= 1e-12:
+        return 0.0, 1.0
+    ratios = sorted(
+        float(
+            np.clip(
+                np.dot(point - wall_start, wall_delta) / length_squared,
+                0.0,
+                1.0,
+            )
+        )
+        for point in (edge_start, edge_end)
+    )
+    return ratios[0], ratios[1]
+
+
+def _get_sloped_ceiling_target_wall_direction(
+    target: SlopedCeilingEditTarget,
+) -> np.ndarray | None:
+    """Return one target wall's normalized local start-to-end direction."""
+
+    return _normalize_vector(
+        np.asarray(target.wall_end_world, dtype=float)
+        - np.asarray(target.wall_start_world, dtype=float)
+    )
+
+
+def _sloped_ceiling_targets_have_opposite_wall_directions(
+    first: SlopedCeilingEditTarget,
+    second: SlopedCeilingEditTarget,
+) -> bool:
+    """Return whether two parallel walls encode their endpoints oppositely."""
+
+    first_direction = _get_sloped_ceiling_target_wall_direction(first)
+    second_direction = _get_sloped_ceiling_target_wall_direction(second)
+    return bool(
+        first_direction is not None
+        and second_direction is not None
+        and float(np.dot(first_direction, second_direction)) < 0.0
+    )
+
+
+def _get_sloped_ceiling_interval_in_reference_direction(
+    reference: SlopedCeilingEditTarget,
+    candidate: SlopedCeilingEditTarget,
+) -> tuple[float, float]:
+    """Express a candidate span along the reference wall's world direction."""
+
+    start_ratio, end_ratio = _get_sloped_ceiling_target_wall_interval(candidate)
+    if _sloped_ceiling_targets_have_opposite_wall_directions(reference, candidate):
+        return 1.0 - end_ratio, 1.0 - start_ratio
+    return start_ratio, end_ratio
+
+
+def _get_sloped_ceiling_interval_metrics_in_reference_direction(
+    reference: SlopedCeilingEditTarget,
+    target: SlopedCeilingEditTarget,
+) -> tuple[float, float, float]:
+    """Return physical start inset, end inset, and width in one direction."""
+
+    start_ratio, end_ratio = _get_sloped_ceiling_interval_in_reference_direction(
+        reference,
+        target,
+    )
+    wall_length = float(
+        np.linalg.norm(
+            np.asarray(target.wall_end_world, dtype=float)
+            - np.asarray(target.wall_start_world, dtype=float)
+        )
+    )
+    return (
+        start_ratio * wall_length,
+        (1.0 - end_ratio) * wall_length,
+        (end_ratio - start_ratio) * wall_length,
+    )
+
+
+def _sloped_ceiling_handle_is_lateral(
+    handle: SlopedCeilingEditHandle,
+) -> bool:
+    """Return whether a blue handle moves one lateral slope boundary."""
+
+    return handle.handle_kind in {
+        SLOPED_CEILING_HANDLE_START,
+        SLOPED_CEILING_HANDLE_END,
+    }
+
+
+def _get_parallel_sloped_ceiling_peer_handle(
+    primary_target: SlopedCeilingEditTarget,
+    primary_handle: SlopedCeilingEditHandle,
+    candidate_target: SlopedCeilingEditTarget,
+) -> SlopedCeilingEditHandle | None:
+    """Match a peer control by world-side direction instead of local naming."""
+
+    if not _sloped_ceiling_handle_is_lateral(primary_handle):
+        return next(
+            (
+                handle
+                for handle in candidate_target.handles
+                if handle.handle_kind == primary_handle.handle_kind
+            ),
+            None,
+        )
+    candidates = tuple(
+        handle
+        for handle in candidate_target.handles
+        if _sloped_ceiling_handle_is_lateral(handle)
+    )
+    if not candidates:
+        return None
+    primary_axis = np.asarray(primary_handle.axis_world, dtype=float)
+    selected = max(
+        candidates,
+        key=lambda handle: float(
+            np.dot(primary_axis, np.asarray(handle.axis_world, dtype=float))
+        ),
+    )
+    alignment = float(
+        np.dot(primary_axis, np.asarray(selected.axis_world, dtype=float))
+    )
+    if alignment < 1.0 - SLOPED_CEILING_PARALLEL_DOT_TOLERANCE:
+        return None
+    return selected
+
+
+def _resolve_sloped_ceiling_shared_handle_value(
+    primary_target: SlopedCeilingEditTarget,
+    primary_handle: SlopedCeilingEditHandle,
+    candidate_target: SlopedCeilingEditTarget,
+    candidate_handle: SlopedCeilingEditHandle,
+    shared_value: float,
+) -> float:
+    """Map one active value to the same physical displacement on a peer."""
+
+    if not _sloped_ceiling_targets_are_parallel(
+        primary_target,
+        candidate_target,
+    ):
+        return float(shared_value)
+    displacement_meters = (
+        float(shared_value) - primary_handle.value
+    ) / primary_handle.value_per_meter
+    return float(
+        candidate_handle.value
+        + displacement_meters * candidate_handle.value_per_meter
+    )
+
+
+def _get_sloped_ceiling_shared_handle_value_range(
+    primary_target: SlopedCeilingEditTarget,
+    primary_handle: SlopedCeilingEditHandle,
+    candidate_target: SlopedCeilingEditTarget,
+    candidate_handle: SlopedCeilingEditHandle,
+) -> tuple[float, float]:
+    """Map a peer handle's limits into the active handle's value space."""
+
+    if not _sloped_ceiling_targets_are_parallel(
+        primary_target,
+        candidate_target,
+    ):
+        return candidate_handle.minimum_value, candidate_handle.maximum_value
+    mapped = tuple(
+        primary_handle.value
+        + (
+            (candidate_value - candidate_handle.value)
+            / candidate_handle.value_per_meter
+        )
+        * primary_handle.value_per_meter
+        for candidate_value in (
+            candidate_handle.minimum_value,
+            candidate_handle.maximum_value,
+        )
+    )
+    return min(mapped), max(mapped)
+
+
+def _get_sloped_ceiling_shared_value_bounds(
+    target_handles: Sequence[
+        tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle]
+    ],
+) -> tuple[float, float]:
+    """Intersect every peer limit in the active handle's value space."""
+
+    if not target_handles:
+        raise ValueError("A shared slope edit requires at least one handle.")
+    primary_target, primary_handle = target_handles[0]
+    ranges = tuple(
+        _get_sloped_ceiling_shared_handle_value_range(
+            primary_target,
+            primary_handle,
+            candidate_target,
+            candidate_handle,
+        )
+        for candidate_target, candidate_handle in target_handles
+    )
+    return (
+        max(value_range[0] for value_range in ranges),
+        min(value_range[1] for value_range in ranges),
+    )
+
+
+def _sloped_ceiling_targets_are_parallel(
+    first: SlopedCeilingEditTarget,
+    second: SlopedCeilingEditTarget,
+) -> bool:
+    """Return whether two target walls are parallel in either direction."""
+
+    first_direction = _get_sloped_ceiling_target_wall_direction(first)
+    second_direction = _get_sloped_ceiling_target_wall_direction(second)
+    return bool(
+        first_direction is not None
+        and second_direction is not None
+        and abs(float(np.dot(first_direction, second_direction)))
+        >= 1.0 - SLOPED_CEILING_PARALLEL_DOT_TOLERANCE
+    )
+
+
+def _get_corresponding_parallel_sloped_ceiling_target(
+    reference: SlopedCeilingEditTarget,
+    targets: Sequence[SlopedCeilingEditTarget],
+    candidate_wall_surface_id: str,
+) -> SlopedCeilingEditTarget | None:
+    """Match one peer by exact geometry or its ordered wall-layout position."""
+
+    exact_matches = tuple(
+        candidate
+        for candidate in targets
+        if candidate.wall_surface_id == candidate_wall_surface_id
+        and _sloped_ceiling_targets_are_group_compatible(reference, candidate)
+    )
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    reference_targets = _get_ordered_sloped_ceiling_wall_targets(
+        reference,
+        targets,
+        reference.wall_surface_id,
+    )
+    candidate_targets = _get_ordered_sloped_ceiling_wall_targets(
+        reference,
+        targets,
+        candidate_wall_surface_id,
+    )
+    if (
+        len(reference_targets) <= 1
+        or len(reference_targets) != len(candidate_targets)
+        or tuple(map(_get_sloped_ceiling_target_layout_kind, reference_targets))
+        != tuple(map(_get_sloped_ceiling_target_layout_kind, candidate_targets))
+    ):
+        return None
+    try:
+        target_index = reference_targets.index(reference)
+    except ValueError:
+        return None
+    ordered_match = candidate_targets[target_index]
+    if exact_matches and ordered_match not in exact_matches:
+        return None
+    return ordered_match
+
+
+def _get_ordered_sloped_ceiling_wall_targets(
+    reference: SlopedCeilingEditTarget,
+    targets: Sequence[SlopedCeilingEditTarget],
+    wall_surface_id: str,
+) -> tuple[SlopedCeilingEditTarget, ...]:
+    """Order one wall's slopes and free gaps in the reference direction."""
+
+    return tuple(
+        sorted(
+            (
+                target
+                for target in targets
+                if target.wall_surface_id == wall_surface_id
+            ),
+            key=lambda target: (
+                *_get_sloped_ceiling_interval_in_reference_direction(
+                    reference,
+                    target,
+                ),
+                target.slope_id is None,
+                target.target_id,
+            ),
+        )
+    )
+
+
+def _get_sloped_ceiling_target_layout_kind(
+    target: SlopedCeilingEditTarget,
+) -> tuple[bool, frozenset[str]]:
+    """Return the structural traits used to align rebuilt wall layouts."""
+
+    return (
+        target.slope_id is None,
+        frozenset(handle.handle_kind for handle in target.handles),
+    )
+
+
+def _sloped_ceiling_targets_are_group_compatible(
+    first: SlopedCeilingEditTarget,
+    second: SlopedCeilingEditTarget,
+) -> bool:
+    """Return whether two parallel-wall targets can share one control set."""
+
+    if first.level_index != second.level_index:
+        return False
+    if (first.slope_id is None) != (second.slope_id is None):
+        return False
+    if first.slope_id is None and not _sloped_ceiling_creation_spans_overlap(
+        first,
+        second,
+    ):
+        return False
+    if first.joined_group_id is not None or second.joined_group_id is not None:
+        if first.joined_group_id != second.joined_group_id:
+            return False
+        return {
+            handle.handle_kind for handle in first.handles
+        } == {handle.handle_kind for handle in second.handles}
+    first_metrics = _get_sloped_ceiling_interval_metrics_in_reference_direction(
+        first,
+        first,
+    )
+    second_metrics = _get_sloped_ceiling_interval_metrics_in_reference_direction(
+        first,
+        second,
+    )
+    if first.slope_id is None:
+        first_start, first_end, first_width = first_metrics
+        second_start, second_end, second_width = second_metrics
+        tolerance = SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS
+        first_attachments = (
+            first_start <= tolerance,
+            first_end <= tolerance,
+        )
+        second_attachments = (
+            second_start <= tolerance,
+            second_end <= tolerance,
+        )
+        intervals_match = bool(
+            first_attachments == second_attachments
+            and (
+                (first_attachments == (True, True))
+                or math.isclose(
+                    first_width,
+                    second_width,
+                    abs_tol=tolerance,
+                    rel_tol=0.0,
+                )
+            )
+        )
+    else:
+        intervals_match = all(
+            math.isclose(
+                first_value,
+                second_value,
+                abs_tol=SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS,
+                rel_tol=0.0,
+            )
+            for first_value, second_value in zip(
+                first_metrics[:2],
+                second_metrics[:2],
+            )
+        )
+    if not intervals_match:
+        return False
+    return {
+        handle.handle_kind for handle in first.handles
+    } == {handle.handle_kind for handle in second.handles}
+
+
+def _sloped_ceiling_creation_spans_overlap(
+    first: SlopedCeilingEditTarget,
+    second: SlopedCeilingEditTarget,
+) -> bool:
+    """Return whether two parallel creation spans share physical world extent."""
+
+    reference_direction = _get_sloped_ceiling_target_wall_direction(first)
+    if reference_direction is None:
+        return False
+    intervals = []
+    for target in (first, second):
+        projections = tuple(
+            float(np.dot(np.asarray(point, dtype=float), reference_direction))
+            for point in (
+                target.selection_edge_start_world,
+                target.selection_edge_end_world,
+            )
+        )
+        intervals.append((min(projections), max(projections)))
+    overlap = min(interval[1] for interval in intervals) - max(
+        interval[0] for interval in intervals
+    )
+    return overlap > SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS
+
+
+def _sloped_ceiling_target_group_has_common_handle_ranges(
+    targets: Sequence[SlopedCeilingEditTarget],
+) -> bool:
+    """Return whether every shared control permits a common displacement."""
+
+    if not targets:
+        return False
+    primary_target = targets[0]
+    for primary_handle in primary_target.handles:
+        target_handles = [(primary_target, primary_handle)]
+        for candidate_target in targets[1:]:
+            candidate_handle = _get_parallel_sloped_ceiling_peer_handle(
+                primary_target,
+                primary_handle,
+                candidate_target,
+            )
+            if candidate_handle is None:
+                return False
+            target_handles.append((candidate_target, candidate_handle))
+        common_minimum, common_maximum = _get_sloped_ceiling_shared_value_bounds(
+            target_handles
+        )
+        if common_minimum > common_maximum or not (
+            common_minimum <= primary_handle.value <= common_maximum
+        ):
+            return False
+    return True
+
+
+def _build_sloped_ceiling_edit(
+    target: SlopedCeilingEditTarget,
+    handle: SlopedCeilingEditHandle,
+    value: float,
+) -> SlopedCeilingEdit:
+    """Create one immutable absolute-value slope edit payload."""
+
+    return SlopedCeilingEdit(
+        slope_id=target.slope_id,
+        wall_surface_id=target.wall_surface_id,
+        level_index=target.level_index,
+        handle_kind=handle.handle_kind,
+        value=float(value),
+        creation_start_ratio=target.creation_start_ratio,
+        creation_end_ratio=target.creation_end_ratio,
+    )
+
+
+def _build_sloped_ceiling_edit_batch(
+    target_handles: Sequence[tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle]],
+    *,
+    shared_value: float | None,
+) -> tuple[SlopedCeilingEdit, ...]:
+    """Build one absolute edit per selected compatible wall target."""
+
+    if not target_handles:
+        return ()
+    primary_target, primary_handle = target_handles[0]
+    normalized_creation_intervals = (
+        _get_normalized_parallel_creation_intervals(target_handles)
+    )
+    edits: list[SlopedCeilingEdit] = []
+    for target, handle in target_handles:
+        value = (
+            float(handle.value)
+            if shared_value is None
+            else float(
+                np.clip(
+                    _resolve_sloped_ceiling_shared_handle_value(
+                        primary_target,
+                        primary_handle,
+                        target,
+                        handle,
+                        shared_value,
+                    ),
+                    handle.minimum_value,
+                    handle.maximum_value,
+                )
+            )
+        )
+        edit = _build_sloped_ceiling_edit(target, handle, value)
+        creation_interval = normalized_creation_intervals.get(
+            _get_sloped_ceiling_target_key(target)
+        )
+        if creation_interval is not None:
+            edit = replace(
+                edit,
+                creation_start_ratio=creation_interval[0],
+                creation_end_ratio=creation_interval[1],
+            )
+        edits.append(edit)
+    return tuple(edits)
+
+
+def _get_normalized_parallel_creation_intervals(
+    target_handles: Sequence[
+        tuple[SlopedCeilingEditTarget, SlopedCeilingEditHandle]
+    ],
+) -> dict[tuple[str, str], tuple[float, float]]:
+    """Fit a shared creation span to the walls' common physical length."""
+
+    if (
+        len(target_handles) < 2
+        or any(
+            target.slope_id is not None
+            or handle.handle_kind != SLOPED_CEILING_HANDLE_CREATE_DEPTH
+            for target, handle in target_handles
+        )
+    ):
+        return {}
+    targets = tuple(target for target, _handle in target_handles)
+    reference_direction = _get_sloped_ceiling_target_wall_direction(targets[0])
+    if reference_direction is None or any(
+        not _sloped_ceiling_targets_are_parallel(targets[0], target)
+        for target in targets[1:]
+    ):
+        return {}
+
+    projected_intervals: list[tuple[float, float]] = []
+    for target in targets:
+        projections = tuple(
+            float(np.dot(np.asarray(point, dtype=float), reference_direction))
+            for point in (
+                target.selection_edge_start_world,
+                target.selection_edge_end_world,
+            )
+        )
+        projected_intervals.append((min(projections), max(projections)))
+    shared_start = max(interval[0] for interval in projected_intervals)
+    shared_end = min(interval[1] for interval in projected_intervals)
+    if (
+        shared_end - shared_start
+        <= SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS
+    ):
+        return {}
+
+    normalized: dict[tuple[str, str], tuple[float, float]] = {}
+    for target in targets:
+        wall_start = np.asarray(target.wall_start_world, dtype=float)
+        wall_end = np.asarray(target.wall_end_world, dtype=float)
+        wall_start_projection = float(np.dot(wall_start, reference_direction))
+        wall_end_projection = float(np.dot(wall_end, reference_direction))
+        projection_span = wall_end_projection - wall_start_projection
+        if abs(projection_span) <= SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS:
+            return {}
+        ratios = sorted(
+            (
+                (shared_start - wall_start_projection) / projection_span,
+                (shared_end - wall_start_projection) / projection_span,
+            )
+        )
+        start_ratio = max(target.creation_start_ratio, ratios[0])
+        end_ratio = min(target.creation_end_ratio, ratios[1])
+        if end_ratio - start_ratio <= MIN_SLOPED_CEILING_RATIO_SPAN:
+            return {}
+        normalized[_get_sloped_ceiling_target_key(target)] = (
+            float(start_ratio),
+            float(end_ratio),
+        )
+    return normalized
+
+
+def _get_sloped_ceiling_handle_display_origin(
+    handle: SlopedCeilingEditHandle,
+    drag: _SlopedCeilingEditDrag | None,
+) -> np.ndarray:
+    """Move every selected-wall peer with its shared live preview value."""
+
+    origin = np.asarray(handle.origin_world, dtype=float)
+    if drag is None:
+        return origin
+    affected_target_handle = next(
+        (
+            (candidate_target, candidate_handle)
+            for candidate_target, candidate_handle in drag.affected_target_handles
+            if candidate_handle is handle
+        ),
+        None,
+    )
+    if affected_target_handle is None:
+        return origin
+    primary_target, primary_handle = drag.affected_target_handles[0]
+    affected_target, _affected_handle = affected_target_handle
+    value_per_meter = float(handle.value_per_meter)
+    if not math.isfinite(value_per_meter) or abs(value_per_meter) <= 1e-12:
+        return origin
+    preview_value = float(
+        np.clip(
+            _resolve_sloped_ceiling_shared_handle_value(
+                primary_target,
+                primary_handle,
+                affected_target,
+                handle,
+                drag.preview_value,
+            ),
+            handle.minimum_value,
+            handle.maximum_value,
+        )
+    )
+    axis = np.asarray(handle.axis_world, dtype=float)
+    return origin + axis * ((preview_value - handle.value) / value_per_meter)
 
 
 # ### Canvas editable-face helpers ###
@@ -25550,6 +27219,114 @@ def _build_dragged_canvas_opening_target(
     )
 
 
+def _build_rehosted_canvas_window_target(
+    source: CanvasOpeningTarget,
+    host: FixedSurface | SlopedCeilingWindowHost,
+    pointer_world: object,
+    pointer_offset_local: tuple[float, float],
+) -> CanvasOpeningTarget | None:
+    """Move one window between planar hosts without changing its metric size."""
+
+    if source.reference.kind != CANVAS_OPENING_WINDOW:
+        return None
+    try:
+        if isinstance(host, SlopedCeilingWindowHost):
+            plane_start = host.plane_start_world
+            tangent = host.wall_tangent_world
+            normal = host.wall_normal_world
+            vertical_axis = host.vertical_axis_world
+            host_width = float(host.wall_width_meters)
+            host_height = float(host.wall_height_meters)
+            wall_surface_id = host.wall_surface_id
+            sloped_ceiling_id = host.slope_id
+        else:
+            wall_start, tangent_array, normal_array = (
+                _get_fixed_surface_wall_frame(host)
+            )
+            plane_start = _world_point_tuple(wall_start)
+            tangent = _world_point_tuple(tangent_array)
+            normal = _world_point_tuple(normal_array)
+            vertical_axis = (0.0, 0.0, 1.0)
+            host_width = float(
+                np.linalg.norm(
+                    np.asarray(host.wall_end_world, dtype=float) - wall_start
+                )
+            )
+            host_height = float(host.wall_height_meters)
+            wall_surface_id = host.surface_id
+            sloped_ceiling_id = None
+    except (TypeError, ValueError):
+        return None
+
+    window_width = source.bounds.horizontal_span * source.wall_width_meters
+    window_height = source.bounds.vertical_span * source.wall_height_meters
+    if (
+        not math.isfinite(host_width)
+        or not math.isfinite(host_height)
+        or host_width <= 1e-10
+        or host_height <= 1e-10
+        or window_width > host_width + 1e-9
+        or window_height > host_height + 1e-9
+    ):
+        return None
+
+    empty_bounds = CanvasOpeningBounds(
+        start_ratio=0.0,
+        end_ratio=window_width / host_width,
+        bottom_ratio=0.0,
+        top_ratio=window_height / host_height,
+    )
+    destination_frame = replace(
+        source,
+        wall_surface_id=wall_surface_id,
+        plane_start_world=plane_start,
+        wall_tangent_world=tangent,
+        wall_normal_world=normal,
+        vertical_axis_world=vertical_axis,
+        wall_width_meters=host_width,
+        wall_height_meters=host_height,
+        bounds=empty_bounds,
+        sloped_ceiling_id=sloped_ceiling_id,
+    )
+    pointer_horizontal, pointer_vertical = destination_frame.world_to_local(
+        pointer_world
+    )
+    requested_center_horizontal = pointer_horizontal + (
+        float(pointer_offset_local[0])
+        * source.wall_width_meters
+        / host_width
+    )
+    requested_center_vertical = pointer_vertical + (
+        float(pointer_offset_local[1])
+        * source.wall_height_meters
+        / host_height
+    )
+    half_horizontal_span = empty_bounds.horizontal_span * 0.5
+    half_vertical_span = empty_bounds.vertical_span * 0.5
+    center_horizontal = float(
+        np.clip(
+            requested_center_horizontal,
+            half_horizontal_span,
+            1.0 - half_horizontal_span,
+        )
+    )
+    center_vertical = float(
+        np.clip(
+            requested_center_vertical,
+            half_vertical_span,
+            1.0 - half_vertical_span,
+        )
+    )
+    return destination_frame.with_bounds(
+        CanvasOpeningBounds(
+            start_ratio=center_horizontal - half_horizontal_span,
+            end_ratio=center_horizontal + half_horizontal_span,
+            bottom_ratio=center_vertical - half_vertical_span,
+            top_ratio=center_vertical + half_vertical_span,
+        )
+    )
+
+
 def _build_dragged_canvas_opening_bounds(
     target: CanvasOpeningTarget,
     handle: _CanvasOpeningGizmoHandle,
@@ -25725,10 +27502,7 @@ def _canvas_stair_parts_match_geometry(
             or first.part_kind != second.part_kind
             or first.level_indices != second.level_indices
             or first.source_face_indices != second.source_face_indices
-            or (
-                first.source_topology_fingerprint
-                != second.source_topology_fingerprint
-            )
+            or (first.source_topology_fingerprint != second.source_topology_fingerprint)
         ):
             return False
         first_vertices = np.asarray(first.mesh.vertices, dtype=float)
@@ -25928,24 +27702,6 @@ def _architectural_trim_hover_candidates_match(
     if first is None or second is None:
         return first is second
     return _architectural_trim_requests_match(first.request, second.request)
-
-
-def _architectural_trim_hover_candidate_maps_match(
-    first: Mapping[str, _ArchitecturalTrimHoverCandidate],
-    second: Mapping[str, _ArchitecturalTrimHoverCandidate],
-) -> bool:
-    """Compare contextual choices without treating generated IDs as changes."""
-
-    return bool(
-        tuple(first) == tuple(second)
-        and all(
-            _architectural_trim_requests_match(
-                first[kind].request,
-                second[kind].request,
-            )
-            for kind in first
-        )
-    )
 
 
 def _architectural_trim_hit_is_occluded(
@@ -26508,6 +28264,182 @@ def _intersect_ray_with_fixed_surface_plane(
     return _world_point_tuple(origin + direction * distance)
 
 
+def _get_fixed_surface_wall_rectangle_ray_hit_point(
+    surface: FixedSurface,
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[float, float, float] | None:
+    """Hit a wall's finite logical rectangle even where openings cut its mesh."""
+
+    point = _intersect_ray_with_fixed_surface_plane(
+        surface,
+        ray_origin,
+        ray_direction,
+    )
+    if point is None:
+        return None
+    try:
+        wall_start, tangent, _normal = _get_fixed_surface_wall_frame(surface)
+        wall_end = np.asarray(surface.wall_end_world, dtype=float)
+        wall_axis = wall_end - wall_start
+        wall_axis[2] = 0.0
+        wall_width = float(np.linalg.norm(wall_axis))
+        wall_height = float(surface.wall_height_meters)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(wall_width)
+        or not math.isfinite(wall_height)
+        or wall_width <= 1e-10
+        or wall_height <= 1e-10
+    ):
+        return None
+    offset = np.asarray(point, dtype=float) - wall_start
+    horizontal = float(np.dot(offset, tangent))
+    vertical = float(offset[2])
+    tolerance = 1e-7
+    if (
+        horizontal < -tolerance
+        or horizontal > wall_width + tolerance
+        or vertical < -tolerance
+        or vertical > wall_height + tolerance
+    ):
+        return None
+    return point
+
+
+def _intersect_ray_with_sloped_ceiling_window_host_plane(
+    host: SlopedCeilingWindowHost,
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[float, float, float] | None:
+    """Intersect a ray with the infinite plane of one straight slope band."""
+
+    origin = np.asarray(ray_origin, dtype=float)
+    direction = np.asarray(ray_direction, dtype=float)
+    plane_point = np.asarray(host.plane_start_world, dtype=float)
+    plane_normal = np.asarray(host.wall_normal_world, dtype=float)
+    if (
+        origin.shape != (3,)
+        or direction.shape != (3,)
+        or plane_point.shape != (3,)
+        or plane_normal.shape != (3,)
+        or not np.all(np.isfinite((origin, direction, plane_point, plane_normal)))
+    ):
+        return None
+    denominator = float(np.dot(plane_normal, direction))
+    if abs(denominator) <= 1e-10:
+        return None
+    distance = float(np.dot(plane_point - origin, plane_normal) / denominator)
+    if not math.isfinite(distance) or distance < 0.0:
+        return None
+    return _world_point_tuple(origin + direction * distance)
+
+
+def _intersect_ray_with_window_placement_host_plane(
+    host: FixedSurface | SlopedCeilingWindowHost,
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[float, float, float] | None:
+    """Intersect a ray with either supported window placement plane."""
+
+    if isinstance(host, SlopedCeilingWindowHost):
+        return _intersect_ray_with_sloped_ceiling_window_host_plane(
+            host,
+            ray_origin,
+            ray_direction,
+        )
+    return _intersect_ray_with_fixed_surface_plane(host, ray_origin, ray_direction)
+
+
+def _get_window_placement_host_ray_hit_point(
+    host: FixedSurface | SlopedCeilingWindowHost,
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[float, float, float] | None:
+    """Return a hit only when it lands inside the selected finite host."""
+
+    if isinstance(host, FixedSurface):
+        hit = _get_nearest_fixed_surface_ray_hit(
+            (host,),
+            ray_origin,
+            ray_direction,
+        )
+        return None if hit is None else _world_point_tuple(hit[1])
+    point = _intersect_ray_with_sloped_ceiling_window_host_plane(
+        host,
+        ray_origin,
+        ray_direction,
+    )
+    if point is None:
+        return None
+    try:
+        horizontal_ratio, vertical_ratio = host.world_to_local(point)
+    except (TypeError, ValueError):
+        return None
+    tolerance = 1e-7
+    if (
+        horizontal_ratio < -tolerance
+        or horizontal_ratio > 1.0 + tolerance
+        or vertical_ratio < -tolerance
+        or vertical_ratio > 1.0 + tolerance
+    ):
+        return None
+    return point
+
+
+def _get_nearest_sloped_ceiling_window_host_ray_hit(
+    hosts: Sequence[SlopedCeilingWindowHost],
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[SlopedCeilingWindowHost, np.ndarray, float] | None:
+    """Return the nearest finite planar slope band hit by a camera ray."""
+
+    origin = np.asarray(ray_origin, dtype=float)
+    direction = np.asarray(ray_direction, dtype=float)
+    if origin.shape != (3,) or direction.shape != (3,):
+        return None
+    nearest: tuple[SlopedCeilingWindowHost, np.ndarray, float] | None = None
+    for host in hosts:
+        point = _get_window_placement_host_ray_hit_point(
+            host,
+            origin,
+            direction,
+        )
+        if point is None:
+            continue
+        point_array = np.asarray(point, dtype=float)
+        distance = float(np.linalg.norm(point_array - origin))
+        if nearest is None or distance < nearest[2]:
+            nearest = host, point_array, distance
+    return nearest
+
+
+def _build_window_placement_rectangle_corners(
+    host: FixedSurface | SlopedCeilingWindowHost,
+    first_world: object,
+    second_world: object,
+) -> tuple[tuple[float, float, float], ...] | None:
+    """Build raw drag corners on either a vertical wall or a ceiling slope."""
+
+    if isinstance(host, FixedSurface):
+        return _build_wall_rectangle_corners(host, first_world, second_world)
+    try:
+        first_horizontal, first_vertical = host.world_to_local(first_world)
+        second_horizontal, second_vertical = host.world_to_local(second_world)
+        return tuple(
+            host.local_to_world(horizontal, vertical)
+            for horizontal, vertical in (
+                (first_horizontal, first_vertical),
+                (second_horizontal, first_vertical),
+                (second_horizontal, second_vertical),
+                (first_horizontal, second_vertical),
+            )
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_wall_rectangle_corners(
     surface: FixedSurface,
     first_world: object,
@@ -26542,6 +28474,22 @@ def _build_validated_wall_window_placement(
     return build_wall_window_placement(surface, first_world, second_world)
 
 
+def _build_validated_window_placement(
+    host: FixedSurface | SlopedCeilingWindowHost,
+    first_world: object,
+    second_world: object,
+) -> WallWindowPlacement | SlopedCeilingWindowPlacement:
+    """Validate one rectangle against its selected vertical or sloped host."""
+
+    if isinstance(host, SlopedCeilingWindowHost):
+        return build_sloped_ceiling_window_placement(
+            host,
+            first_world,
+            second_world,
+        )
+    return _build_validated_wall_window_placement(host, first_world, second_world)
+
+
 def _get_validated_wall_window_world_corners(
     surface: FixedSurface,
     placement: object,
@@ -26551,6 +28499,21 @@ def _get_validated_wall_window_world_corners(
     if not isinstance(placement, WallWindowPlacement):
         raise TypeError("A Canvas window preview requires a wall placement.")
     return get_wall_window_world_corners(surface, placement)
+
+
+def _get_validated_window_placement_world_corners(
+    host: FixedSurface | SlopedCeilingWindowHost,
+    placement: object,
+) -> tuple[tuple[float, float, float], ...]:
+    """Resolve either validated placement into preview-ready world corners."""
+
+    if isinstance(host, SlopedCeilingWindowHost):
+        if not isinstance(placement, SlopedCeilingWindowPlacement):
+            raise TypeError(
+                "A sloped-ceiling preview requires a sloped placement."
+            )
+        return get_sloped_ceiling_window_world_corners(host, placement)
+    return _get_validated_wall_window_world_corners(host, placement)
 
 
 def _build_fixed_surface_boundary_line_positions(
@@ -27021,12 +28984,12 @@ def _get_ray_axis_aligned_bounds_hit_distance(
             ):
                 return None
             continue
-        first = (
-            bounds_minimum[axis_index] - origin[axis_index]
-        ) / direction[axis_index]
-        second = (
-            bounds_maximum[axis_index] - origin[axis_index]
-        ) / direction[axis_index]
+        first = (bounds_minimum[axis_index] - origin[axis_index]) / direction[
+            axis_index
+        ]
+        second = (bounds_maximum[axis_index] - origin[axis_index]) / direction[
+            axis_index
+        ]
         axis_near, axis_far = sorted((float(first), float(second)))
         near = max(near, axis_near)
         far = min(far, axis_far)
@@ -27110,6 +29073,41 @@ def _get_ray_segment_distance(
     segment_start: np.ndarray,
     segment_end: np.ndarray,
 ) -> float | None:
+    approach = _get_ray_segment_closest_approach(
+        ray_origin,
+        ray_direction,
+        segment_start,
+        segment_end,
+    )
+    return None if approach is None else approach[0]
+
+
+def _get_ray_segment_closest_approach(
+    ray_origin: object,
+    ray_direction: object,
+    segment_start: object,
+    segment_end: object,
+) -> tuple[float, float] | None:
+    """Return distance and ray parameter at a ray/segment closest approach."""
+
+    normalized_origin, normalized_direction = _normalize_ray(
+        ray_origin,
+        ray_direction,
+    )
+    normalized_start = np.asarray(segment_start, dtype=float)
+    normalized_end = np.asarray(segment_end, dtype=float)
+    if (
+        normalized_origin is None
+        or normalized_direction is None
+        or normalized_start.shape != (3,)
+        or normalized_end.shape != (3,)
+        or not np.all(np.isfinite((normalized_start, normalized_end)))
+    ):
+        return None
+    ray_origin = normalized_origin
+    ray_direction = normalized_direction
+    segment_start = normalized_start
+    segment_end = normalized_end
     segment = segment_end - segment_start
     segment_length_squared = float(np.dot(segment, segment))
     if segment_length_squared <= 1e-12:
@@ -27145,7 +29143,7 @@ def _get_ray_segment_distance(
     )
     ray_point = ray_origin + ray_direction * ray_parameter
     segment_point = segment_start + segment * segment_parameter
-    return float(np.linalg.norm(ray_point - segment_point))
+    return float(np.linalg.norm(ray_point - segment_point)), ray_parameter
 
 
 def _get_nearest_preview_placed_object_ray_hit(
@@ -27201,9 +29199,11 @@ def _get_preview_placed_object_local_bounds(
     if not vertices:
         return None
     combined = np.vstack(vertices)
-    if combined.ndim != 2 or combined.shape[1:] != (3,) or not np.isfinite(
-        combined
-    ).all():
+    if (
+        combined.ndim != 2
+        or combined.shape[1:] != (3,)
+        or not np.isfinite(combined).all()
+    ):
         return None
     return np.asarray((np.min(combined, axis=0), np.max(combined, axis=0)))
 
@@ -27504,9 +29504,7 @@ def _normalize_texture_draw_ranges(
         ):
             raise ValueError("Texture draw ranges must contain complete triangles.")
         bounds_corners = np.asarray(draw_range.bounds_corners, dtype=np.float32)
-        if bounds_corners.shape != (8, 3) or not np.all(
-            np.isfinite(bounds_corners)
-        ):
+        if bounds_corners.shape != (8, 3) or not np.all(np.isfinite(bounds_corners)):
             bounds_corners = _build_axis_aligned_bounds_corners(
                 vertices[first_vertex : first_vertex + range_vertex_count]
             )
@@ -27866,9 +29864,7 @@ def _resolve_material_alpha_settings(
         for material, mode in zip(materials, modes)
         if mode == GLTF_ALPHA_MODE_MASK
     )
-    alpha_cutoff = (
-        min(mask_cutoffs) if mask_cutoffs else DEFAULT_GLTF_ALPHA_CUTOFF
-    )
+    alpha_cutoff = min(mask_cutoffs) if mask_cutoffs else DEFAULT_GLTF_ALPHA_CUTOFF
     base_color_alphas = tuple(
         _material_base_color_alpha(material) for material in materials
     )
@@ -28242,10 +30238,9 @@ def _intern_texture_rgba(
     """Share one read-only decoded array while at least one preview retains it."""
 
     normalized = np.ascontiguousarray(texture_rgba, dtype=np.uint8)
-    if (
-        content_key is None
-        or content_key[:2]
-        != (int(normalized.shape[0]), int(normalized.shape[1]))
+    if content_key is None or content_key[:2] != (
+        int(normalized.shape[0]),
+        int(normalized.shape[1]),
     ):
         content_key = _texture_rgba_content_key(normalized)
     with _TEXTURE_CACHE_LOCK:
@@ -28685,8 +30680,7 @@ def _draw_texture_ranges(
         vertex_count = int(draw_range.vertex_count)
         if (
             submitted_ranges
-            and submitted_ranges[-1][0] + submitted_ranges[-1][1]
-            == first_vertex
+            and submitted_ranges[-1][0] + submitted_ranges[-1][1] == first_vertex
         ):
             previous_first, previous_count = submitted_ranges[-1]
             submitted_ranges[-1] = (

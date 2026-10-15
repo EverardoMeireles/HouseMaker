@@ -911,6 +911,7 @@ def _build_blueprint_model(
             build_architectural_trim_geometry,
             is_architectural_trim_surface_id,
         )
+        from housemaker.sloped_ceiling import apply_sloped_ceiling_geometry
         from housemaker.surface_geometry import (
             build_base_fixed_surfaces,
             build_fixed_surfaces,
@@ -927,9 +928,14 @@ def _build_blueprint_model(
             level_source,
             exportable_stairs,
         )
-        base_fixed_surfaces = build_base_fixed_surfaces(
+        flat_base_fixed_surfaces = build_base_fixed_surfaces(
             level_source,
             stairs=exportable_stairs,
+            apply_sloped_ceilings=False,
+        )
+        base_fixed_surfaces = apply_sloped_ceiling_geometry(
+            level_source,
+            flat_base_fixed_surfaces,
         )
         trim_geometry = build_architectural_trim_geometry(
             level_source,
@@ -956,8 +962,14 @@ def _build_blueprint_model(
         named_meshes.extend(
             _build_untextured_ceiling_named_meshes(
                 level_source,
-                base_fixed_surfaces,
+                flat_base_fixed_surfaces,
             )
+        )
+        named_meshes = _apply_sloped_ceiling_surface_geometry(
+            named_meshes,
+            level_source,
+            flat_base_fixed_surfaces,
+            base_fixed_surfaces,
         )
         named_meshes = _apply_editable_surface_geometry(
             named_meshes,
@@ -1127,6 +1139,70 @@ def _build_untextured_surface_backface_named_meshes(
     return backfaces
 
 
+# ### Sloped-ceiling geometry replacement ###
+def _apply_sloped_ceiling_surface_geometry(
+    named_meshes: Sequence[NamedMesh],
+    levels: Sequence[LevelData],
+    flat_surfaces: Sequence[object],
+    sloped_surfaces: Sequence[object],
+) -> list[NamedMesh]:
+    """Replace only semantic skins changed by the shared slope modifier."""
+
+    from housemaker.sloped_ceiling import (
+        get_sloped_ceiling_affected_surface_ids,
+    )
+
+    affected_surface_ids = get_sloped_ceiling_affected_surface_ids(
+        levels,
+        flat_surfaces,
+    )
+    if not affected_surface_ids:
+        return list(named_meshes)
+
+    removal_surfaces = [
+        surface
+        for surface in flat_surfaces
+        if str(getattr(surface, "surface_id", "")) in affected_surface_ids
+    ]
+    retained_named_meshes = _remove_named_mesh_surface_faces(
+        named_meshes,
+        _build_oriented_surface_face_keys(removal_surfaces),
+        _build_surface_plane_coverage(removal_surfaces),
+    )
+    replacement_surfaces = sorted(
+        (
+            surface
+            for surface in sloped_surfaces
+            if (
+                str(getattr(surface, "surface_id", ""))
+                in affected_surface_ids
+                or str(
+                    getattr(
+                        surface,
+                        "sloped_ceiling_host_surface_id",
+                        "",
+                    )
+                )
+                in affected_surface_ids
+            )
+        ),
+        key=lambda surface: str(getattr(surface, "surface_id", "")),
+    )
+    for surface in replacement_surfaces:
+        surface_id = str(getattr(surface, "surface_id"))
+        mesh = getattr(surface, "mesh").copy()
+        mesh.metadata = copy.deepcopy(dict(getattr(mesh, "metadata", {}) or {}))
+        mesh.metadata["housemaker_surface_id"] = surface_id
+        retained_named_meshes.append(
+            NamedMesh(
+                name=f"{_get_surface_object_name(surface_id)}_slope_geometry",
+                mesh=mesh,
+            )
+        )
+    return retained_named_meshes
+
+
+# ### Editable-surface geometry replacement ###
 def _apply_editable_surface_geometry(
     named_meshes: Sequence[NamedMesh],
     levels: Sequence[LevelData],
@@ -5563,7 +5639,10 @@ def _apply_surface_materials(
     replacement_face_keys = _build_oriented_surface_face_keys(removal_surfaces)
     replacement_plane_coverage = _build_surface_plane_coverage(removal_surfaces)
     retained_named_meshes = _remove_named_mesh_surface_faces(
-        named_meshes,
+        _remove_authoritative_surface_named_meshes(
+            named_meshes,
+            replacement_surface_ids,
+        ),
         replacement_face_keys,
         replacement_plane_coverage,
     )
@@ -5664,6 +5743,35 @@ def _apply_surface_materials(
 
 
 # ### Surface material helpers ###
+def _remove_authoritative_surface_named_meshes(
+    named_meshes: Sequence[NamedMesh],
+    surface_ids: Collection[str],
+) -> list[NamedMesh]:
+    """Remove complete source meshes owned by replaced semantic surfaces.
+
+    Rebuilt surfaces such as sloped-ceiling returns are already partitioned
+    into one named mesh per stable surface ID.  Removing those meshes by their
+    authoritative metadata avoids leaving an opposite-wound or differently
+    triangulated source skin behind the textured replacement.  Untagged
+    legacy geometry still falls through to geometric face matching.
+    """
+
+    replaced_ids = {str(surface_id) for surface_id in surface_ids}
+    if not replaced_ids:
+        return list(named_meshes)
+    return [
+        named_mesh
+        for named_mesh in named_meshes
+        if str(
+            getattr(named_mesh.mesh, "metadata", {}).get(
+                "housemaker_surface_id",
+                "",
+            )
+        )
+        not in replaced_ids
+    ]
+
+
 def _build_surface_named_meshes(
     fixed_surfaces: Sequence[object],
     resolved_materials: Mapping[str, object],
@@ -8024,6 +8132,11 @@ def _build_window_openings(
     openings: list[WallOpening] = []
     targets = _build_window_wall_target_lookup(level, wall_orientation)
     for window in getattr(level, "windows", ()):
+        # Sloped-ceiling windows are cut in their own inclined host geometry.
+        # Treating their retained owner wall ID as a vertical opening would
+        # incorrectly punch a second hole through that wall.
+        if getattr(window, "sloped_ceiling_id", None) is not None:
+            continue
         wall_surface_id = str(getattr(window, "wall_surface_id", "")).strip()
         target = targets.get(wall_surface_id)
         if target is None:

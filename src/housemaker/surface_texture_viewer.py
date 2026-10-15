@@ -10,16 +10,18 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph.opengl as gl
 import trimesh
-from PySide6.QtCore import QPointF, QTimer, Qt, Signal
+from PIL import Image
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QVector3D
 from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
-from PIL import Image
 
 from housemaker.camera_models import CameraPose
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     build_first_person_forward_vector,
     normalize_first_person_navigation_mode,
+    normalize_first_person_speed_meters_per_second,
 )
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
 from housemaker.models import LevelData
@@ -38,27 +40,28 @@ from housemaker.surface_geometry import (
     build_fixed_surfaces,
     get_combined_surface_area,
 )
+from housemaker.surface_materials import build_world_planar_face_uvs
 from housemaker.viewer import (
     DEFAULT_AMBIENT_LIGHT_INTENSITY as CANVAS_AMBIENT_LIGHT_INTENSITY,
+)
+from housemaker.viewer import (
     EDGE_COLOR,
     FACE_COLOR,
-    TextureMeshData,
     TexturedMeshItem,
-    _WireframeOverlayMeshItem,
+    TextureMeshData,
     _build_ambient_shader,
     _build_texture_mesh_data,
     _build_textured_wall_transform,
-    _get_reference_grid_height,
     _get_mesh_face_colors,
+    _get_reference_grid_height,
     _limit_optional_texture_preview_size,
     _limit_texture_preview_size,
     _normalize_pbr_maps_enabled,
+    _WireframeOverlayMeshItem,
 )
-
 
 # ### Constants ###
 DEFAULT_FIRST_PERSON_HEIGHT_METERS = 1.65
-DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 2.5
 DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 DEFAULT_TEXTURE_WORLD_SIZE_METERS = 2.0
 DEFAULT_AMBIENT_LIGHT_INTENSITY = CANVAS_AMBIENT_LIGHT_INTENSITY
@@ -211,6 +214,18 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
 
         self._first_person_movement_mode = (
             normalize_first_person_navigation_mode(mode)
+        )
+
+    def get_first_person_speed(self) -> float:
+        """Return first-person movement speed in meters per second."""
+
+        return self._move_speed
+
+    def set_first_person_speed(self, speed_meters_per_second: float) -> None:
+        """Set first-person movement speed in meters per second."""
+
+        self._move_speed = normalize_first_person_speed_meters_per_second(
+            speed_meters_per_second
         )
 
     def set_camera_pose(
@@ -753,6 +768,16 @@ class SurfaceTextureViewer(QWidget):
 
         self.view.set_first_person_movement_mode(mode)
 
+    def get_first_person_speed(self) -> float:
+        """Return first-person movement speed in meters per second."""
+
+        return self.view.get_first_person_speed()
+
+    def set_first_person_speed(self, speed_meters_per_second: float) -> None:
+        """Set first-person movement speed in meters per second."""
+
+        self.view.set_first_person_speed(speed_meters_per_second)
+
     def enter_first_person_mode(self) -> None:
         self.view.enter_first_person_mode()
 
@@ -1288,28 +1313,13 @@ def _build_surface_texture_mesh_data(
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
     face_vertices = vertices[faces]
     face_normals = np.asarray(mesh.face_normals, dtype=np.float32)
-    texture_coordinates = np.empty((len(faces), 3, 2), dtype=np.float32)
     tile_size = max(float(texture_world_size_meters), SURFACE_GEOMETRY_MINIMUM)
-    for face_index, triangle_vertices in enumerate(face_vertices):
-        normal = face_normals[face_index]
-        if surface.surface_type == SURFACE_TYPE_WALL and abs(normal[2]) < 0.7:
-            tangent = np.array((-normal[1], normal[0], 0.0), dtype=np.float32)
-            tangent_length = float(np.linalg.norm(tangent))
-            if tangent_length > SURFACE_GEOMETRY_MINIMUM:
-                tangent /= tangent_length
-            texture_coordinates[face_index, :, 0] = (
-                triangle_vertices @ tangent
-            ) / tile_size
-            texture_coordinates[face_index, :, 1] = (
-                triangle_vertices[:, 2] / tile_size
-            )
-        else:
-            texture_coordinates[face_index, :, 0] = (
-                triangle_vertices[:, 0] / tile_size
-            )
-            texture_coordinates[face_index, :, 1] = (
-                triangle_vertices[:, 1] / tile_size
-            )
+    texture_coordinates = build_world_planar_face_uvs(
+        face_vertices,
+        face_normals,
+        surface.surface_type,
+        texture_world_size_meters=tile_size,
+    )
     normalized_maps = dict(map_textures or {})
     return TextureMeshData(
         vertices=np.ascontiguousarray(face_vertices.reshape(-1, 3)),

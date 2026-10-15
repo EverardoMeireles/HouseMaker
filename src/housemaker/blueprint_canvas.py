@@ -5584,6 +5584,8 @@ class BlueprintCanvas(QWidget):
         window: WindowData | WallWindowPlacement,
         wall_frame: WindowWallFrame | None = None,
     ) -> tuple[QPointF, QPointF] | None:
+        if getattr(window, "sloped_ceiling_id", None) is not None:
+            return None
         frame = wall_frame or self._get_window_wall_frame(window)
         if frame is None:
             return None

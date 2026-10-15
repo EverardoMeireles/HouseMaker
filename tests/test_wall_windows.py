@@ -1,10 +1,10 @@
 # ### Imports ###
 from __future__ import annotations
 
-from io import BytesIO
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -521,6 +521,40 @@ class WallWindowStateTests(unittest.TestCase):
                 top_ratio=0.75,
             )
 
+    def test_window_data_persists_an_optional_sloped_ceiling_binding(
+        self,
+    ) -> None:
+        slope_id = "a" * 32
+        window = WindowData(
+            window_id="sloped-window-1",
+            wall_surface_id="level:2/room:5/wall:1:2",
+            start_ratio=0.2,
+            end_ratio=0.6,
+            bottom_ratio=0.25,
+            top_ratio=0.75,
+            sloped_ceiling_id=slope_id.upper(),
+        )
+
+        self.assertEqual(window.sloped_ceiling_id, slope_id)
+        self.assertEqual(window.to_dict()["sloped_ceiling_id"], slope_id)
+        self.assertEqual(WindowData.from_dict(window.to_dict()), window)
+
+        legacy_payload = window.to_dict()
+        legacy_payload.pop("sloped_ceiling_id")
+        self.assertIsNone(
+            WindowData.from_dict(legacy_payload).sloped_ceiling_id
+        )
+        with self.assertRaises(ValueError):
+            WindowData(
+                window_id="bad-slope",
+                wall_surface_id="level:2/room:5/wall:1:2",
+                start_ratio=0.2,
+                end_ratio=0.6,
+                bottom_ratio=0.25,
+                top_ratio=0.75,
+                sloped_ceiling_id="not-a-stable-slope-id",
+            )
+
     def test_project_round_trip_persists_windows_and_skips_invalid_data(
         self,
     ) -> None:
@@ -568,6 +602,23 @@ class WallWindowStateTests(unittest.TestCase):
 
 # ### Window geometry and export tests ###
 class WallWindowGeometryTests(unittest.TestCase):
+    def test_sloped_ceiling_window_does_not_cut_its_owner_wall(self) -> None:
+        level = _build_square_level()
+        surface_id = "level:2/room:5/wall:1:2"
+        level.windows = [
+            WindowData(
+                window_id="sloped-window-1",
+                wall_surface_id=surface_id,
+                start_ratio=0.2,
+                end_ratio=0.6,
+                bottom_ratio=0.25,
+                top_ratio=0.75,
+                sloped_ceiling_id="a" * 32,
+            )
+        ]
+
+        self.assertEqual(_build_window_openings(level), [])
+
     def test_room_window_depth_follows_paired_wall_orientation(self) -> None:
         level, surface_id = _build_paired_room_window_level()
 

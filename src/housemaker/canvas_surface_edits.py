@@ -388,7 +388,10 @@ def build_canvas_surface_edit_targets(
         # Persistent topology faces have their own normal extrusion control.
         # Structural wall/level handles belong only to their authoritative
         # source surface, never to one of its editable descendants.
-        if getattr(surface, "source_surface_id", None) is not None:
+        if (
+            getattr(surface, "source_surface_id", None) is not None
+            or getattr(surface, "sloped_ceiling_id", None) is not None
+        ):
             continue
         level = level_by_index.get(surface.level_index)
         if level is None:

@@ -11,8 +11,15 @@ from shapely import Point, Polygon
 
 from housemaker.architectural_surface_edits import insert_surface_vertex
 from housemaker.level_coordinates import level_world_to_image_xy
-from housemaker.models import LevelData, OpenSpaceData, VertexData
+from housemaker.models import (
+    LevelData,
+    OpenSpaceData,
+    SlopedCeilingData,
+    StairData,
+    VertexData,
+)
 from housemaker.surface_geometry import (
+    _build_slab_openings_by_level,
     build_base_fixed_surfaces,
     build_fixed_surfaces,
 )
@@ -52,6 +59,85 @@ def _surface_geometry(surface) -> object:
     )
 
 
+def _host_ceiling_surfaces(
+    surfaces,
+    host_surface_id: str,
+) -> tuple:
+    """Return one ceiling host and all semantic slope children it owns."""
+
+    return tuple(
+        surface
+        for surface in surfaces
+        if surface.surface_id == host_surface_id
+        or surface.sloped_ceiling_host_surface_id == host_surface_id
+    )
+
+
+def _combined_host_geometry(
+    surfaces,
+    host_surface_id: str,
+) -> object:
+    """Combine the horizontal projections of one semantic ceiling host."""
+
+    return shapely.union_all(
+        [
+            _surface_geometry(surface)
+            for surface in _host_ceiling_surfaces(
+                surfaces,
+                host_surface_id,
+            )
+        ]
+    )
+
+
+def _combined_host_z_values(
+    surfaces,
+    host_surface_id: str,
+) -> np.ndarray:
+    """Collect Z values across a ceiling host and every slope child."""
+
+    return np.concatenate(
+        [
+            np.asarray(surface.mesh.vertices, dtype=float)[:, 2]
+            for surface in _host_ceiling_surfaces(
+                surfaces,
+                host_surface_id,
+            )
+        ]
+    )
+
+
+def _slope_children_by_id(
+    surfaces,
+    host_surface_id: str,
+) -> dict[str, object]:
+    """Index one host's semantic slope children by their stable IDs."""
+
+    return {
+        surface.surface_id: surface
+        for surface in _host_ceiling_surfaces(surfaces, host_surface_id)
+        if surface.sloped_ceiling_id is not None
+    }
+
+
+def _assert_meshes_equal(
+    test_case: unittest.TestCase,
+    actual,
+    expected,
+) -> None:
+    """Assert exact retained slope geometry, independent of mesh object identity."""
+
+    np.testing.assert_array_equal(
+        np.asarray(actual.vertices, dtype=float),
+        np.asarray(expected.vertices, dtype=float),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual.faces, dtype=np.int64),
+        np.asarray(expected.faces, dtype=np.int64),
+    )
+    test_case.assertAlmostEqual(float(actual.area), float(expected.area))
+
+
 def _open_space_around_world_point(
     level: LevelData,
     world_x: float,
@@ -78,8 +164,233 @@ def _open_space_around_world_point(
     )
 
 
+def _add_test_sloped_ceiling(
+    lower: LevelData,
+    upper: LevelData,
+) -> None:
+    flat_surfaces = build_base_fixed_surfaces(
+        (lower, upper),
+        clip_open_spaces=False,
+        apply_sloped_ceilings=False,
+    )
+    host_wall = next(
+        surface
+        for surface in flat_surfaces
+        if surface.level_index == lower.index
+        and surface.surface_type == "wall"
+        and np.allclose(surface.wall_start_world[1], 0.0)
+        and np.allclose(surface.wall_end_world[1], 0.0)
+    )
+    lower.sloped_ceilings.append(
+        SlopedCeilingData(
+            slope_id="b" * 32,
+            wall_surface_id=host_wall.surface_id,
+            depth_meters=0.4,
+            wall_drop_meters=0.4,
+            start_ratio=0.1,
+            end_ratio=0.9,
+            side_transition_radius_meters=0.1,
+        )
+    )
+
+
 # ### Surface clipping regressions ###
 class OpenSpaceSurfaceClippingTests(unittest.TestCase):
+    def test_upper_open_space_does_not_flatten_lower_sloped_ceiling(
+        self,
+    ) -> None:
+        lower = _build_square_level(1)
+        upper = _build_square_level(2)
+        _add_test_sloped_ceiling(lower, upper)
+        host_surface_id = "level:1/ceiling"
+        before_surfaces = build_fixed_surfaces((lower, upper))
+        before_z = _combined_host_z_values(
+            before_surfaces,
+            host_surface_id,
+        )
+        before_children = _slope_children_by_id(
+            before_surfaces,
+            host_surface_id,
+        )
+        upper.open_spaces.append(OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0))
+
+        after_surfaces = build_fixed_surfaces((lower, upper))
+        after_z = _combined_host_z_values(
+            after_surfaces,
+            host_surface_id,
+        )
+        after_children = _slope_children_by_id(
+            after_surfaces,
+            host_surface_id,
+        )
+
+        self.assertFalse(
+            _combined_host_geometry(
+                after_surfaces,
+                host_surface_id,
+            ).covers(Point(1.0, -1.0))
+        )
+        self.assertAlmostEqual(float(np.min(after_z)), float(np.min(before_z)))
+        self.assertAlmostEqual(float(np.max(after_z)), float(np.max(before_z)))
+        self.assertGreater(float(np.ptp(after_z)), 0.39)
+        self.assertEqual(set(after_children), set(before_children))
+        for surface_id, before_child in before_children.items():
+            _assert_meshes_equal(
+                self,
+                after_children[surface_id].mesh,
+                before_child.mesh,
+            )
+
+    def test_automatic_stair_opening_preserves_crossed_sloped_ceiling(
+        self,
+    ) -> None:
+        lower = _build_square_level(1)
+        upper = _build_square_level(2)
+        _add_test_sloped_ceiling(lower, upper)
+        host_surface_id = "level:1/ceiling"
+        before_surfaces = build_fixed_surfaces((lower, upper))
+        before_z = _combined_host_z_values(
+            before_surfaces,
+            host_surface_id,
+        )
+        before_children = _slope_children_by_id(
+            before_surfaces,
+            host_surface_id,
+        )
+        stair = StairData(
+            start_level_index=1,
+            start_a_x=40.0,
+            start_a_y=0.0,
+            start_b_x=60.0,
+            start_b_y=0.0,
+            end_level_index=2,
+            end_a_x=40.0,
+            end_a_y=60.0,
+            end_b_x=60.0,
+            end_b_y=60.0,
+        )
+
+        after_surfaces = build_fixed_surfaces(
+            (lower, upper),
+            stairs=(stair,),
+        )
+        after_z = _combined_host_z_values(
+            after_surfaces,
+            host_surface_id,
+        )
+        after_children = _slope_children_by_id(
+            after_surfaces,
+            host_surface_id,
+        )
+
+        self.assertFalse(
+            _combined_host_geometry(
+                after_surfaces,
+                host_surface_id,
+            ).covers(Point(1.0, -0.2))
+        )
+        self.assertAlmostEqual(float(np.min(after_z)), float(np.min(before_z)))
+        self.assertAlmostEqual(float(np.max(after_z)), float(np.max(before_z)))
+        self.assertGreater(float(np.ptp(after_z)), 0.39)
+        self.assertEqual(set(after_children), set(before_children))
+        opening_geometry = _build_slab_openings_by_level(
+            (lower, upper),
+            (stair,),
+        )[upper.index]
+        for surface_id, before_child in before_children.items():
+            after_child = after_children[surface_id]
+            if before_child.sloped_ceiling_part != "main":
+                _assert_meshes_equal(
+                    self,
+                    after_child.mesh,
+                    before_child.mesh,
+                )
+                continue
+            expected_geometry = _surface_geometry(before_child).difference(
+                opening_geometry
+            )
+            self.assertLessEqual(
+                _surface_geometry(after_child)
+                .symmetric_difference(expected_geometry)
+                .area,
+                1e-10,
+            )
+
+    def test_supplied_base_surfaces_preserve_opening_and_ceiling_slope(
+        self,
+    ) -> None:
+        lower = _build_square_level(1)
+        upper = _build_square_level(2)
+        _add_test_sloped_ceiling(lower, upper)
+        host_surface_id = "level:1/ceiling"
+        before_surfaces = build_fixed_surfaces((lower, upper))
+        before_z = _combined_host_z_values(
+            before_surfaces,
+            host_surface_id,
+        )
+        before_children = _slope_children_by_id(
+            before_surfaces,
+            host_surface_id,
+        )
+        upper.open_spaces.append(
+            _open_space_around_world_point(
+                upper,
+                world_x=1.0,
+                world_y=-0.2,
+                half_side_meters=0.1,
+            )
+        )
+        project_load_base_surfaces = build_base_fixed_surfaces(
+            (lower, upper),
+            clip_open_spaces=False,
+        )
+
+        after_surfaces = build_fixed_surfaces(
+            (lower, upper),
+            base_surfaces=project_load_base_surfaces,
+        )
+        after_z = _combined_host_z_values(
+            after_surfaces,
+            host_surface_id,
+        )
+        after_children = _slope_children_by_id(
+            after_surfaces,
+            host_surface_id,
+        )
+
+        self.assertFalse(
+            _combined_host_geometry(
+                after_surfaces,
+                host_surface_id,
+            ).covers(Point(1.0, -0.2))
+        )
+        self.assertAlmostEqual(float(np.min(after_z)), float(np.min(before_z)))
+        self.assertAlmostEqual(float(np.max(after_z)), float(np.max(before_z)))
+        self.assertGreater(float(np.ptp(after_z)), 0.39)
+        self.assertEqual(set(after_children), set(before_children))
+        opening_geometry = _build_slab_openings_by_level(
+            (lower, upper),
+            (),
+        )[upper.index]
+        for surface_id, before_child in before_children.items():
+            after_child = after_children[surface_id]
+            if before_child.sloped_ceiling_part != "main":
+                _assert_meshes_equal(
+                    self,
+                    after_child.mesh,
+                    before_child.mesh,
+                )
+                continue
+            expected_geometry = _surface_geometry(before_child).difference(
+                opening_geometry
+            )
+            self.assertLessEqual(
+                _surface_geometry(after_child)
+                .symmetric_difference(expected_geometry)
+                .area,
+                1e-10,
+            )
+
     def test_excluded_upper_level_does_not_cut_included_lower_ceiling(
         self,
     ) -> None:
@@ -105,23 +416,16 @@ class OpenSpaceSurfaceClippingTests(unittest.TestCase):
         expected_ceiling_ids = {
             surface.surface_id
             for surface in build_fixed_surfaces((lower, upper))
-            if surface.level_index == 1
-            and surface.surface_type == "ceiling"
+            if surface.level_index == 1 and surface.surface_type == "ceiling"
         }
         upper.include_in_export = False
-        upper.open_spaces.append(
-            OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0)
-        )
+        upper.open_spaces.append(OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0))
 
-        surfaces = [
-            surface
-            for surface in build_fixed_surfaces((lower, upper))
-        ]
+        surfaces = [surface for surface in build_fixed_surfaces((lower, upper))]
         lower_ceilings = [
             surface
             for surface in surfaces
-            if surface.level_index == 1
-            and surface.surface_type == "ceiling"
+            if surface.level_index == 1 and surface.surface_type == "ceiling"
         ]
 
         self.assertFalse(any(surface.level_index == 2 for surface in surfaces))
@@ -165,9 +469,11 @@ class OpenSpaceSurfaceClippingTests(unittest.TestCase):
         }
         target = max(
             before_by_id.values(),
-            key=lambda surface: _surface_geometry(surface)
-            .representative_point()
-            .distance(_surface_geometry(surface).boundary),
+            key=lambda surface: (
+                _surface_geometry(surface)
+                .representative_point()
+                .distance(_surface_geometry(surface).boundary)
+            ),
         )
         target_geometry = _surface_geometry(target)
         target_point = target_geometry.representative_point()
@@ -195,9 +501,7 @@ class OpenSpaceSurfaceClippingTests(unittest.TestCase):
             target.area_square_meters - hole_area,
         )
         self.assertFalse(
-            _surface_geometry(after_by_id[target.surface_id]).covers(
-                target_point
-            )
+            _surface_geometry(after_by_id[target.surface_id]).covers(target_point)
         )
         for surface_id, before_surface in before_by_id.items():
             if surface_id == target.surface_id:
@@ -211,9 +515,7 @@ class OpenSpaceSurfaceClippingTests(unittest.TestCase):
 
     def test_open_space_builds_base_surfaces_only_once(self) -> None:
         level = _build_square_level(2)
-        level.open_spaces.append(
-            OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0)
-        )
+        level.open_spaces.append(OpenSpaceData("opening-a", 25.0, 25.0, 75.0, 75.0))
 
         with patch(
             "housemaker.surface_geometry.build_base_fixed_surfaces",

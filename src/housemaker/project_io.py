@@ -53,6 +53,7 @@ from housemaker.models import (
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
+    MIN_SLOPED_CEILING_RATIO_SPAN,
     ArchitecturalTrimData,
     DoorwayData,
     DoorwayPreset,
@@ -63,6 +64,7 @@ from housemaker.models import (
     LevelData,
     OpenSpaceData,
     RoomData,
+    SlopedCeilingData,
     StairData,
     VertexData,
     WallTextureData,
@@ -220,6 +222,9 @@ def save_project(
                 "architectural_trims": [
                     trim.to_dict() for trim in level.architectural_trims
                 ],
+                "sloped_ceilings": [
+                    slope.to_dict() for slope in level.sloped_ceilings
+                ],
             }
             for level in levels
         ],
@@ -335,6 +340,10 @@ def load_project(path: str | Path) -> ProjectData:
             valid_vertex_ids={
                 vertex.id for vertex in level.vertex_data.vertices
             },
+        )
+        level.sloped_ceilings = _deserialize_sloped_ceilings(
+            raw_level.get("sloped_ceilings", []),
+            level_index=level.index,
         )
 
     image_library_paths = _deserialize_image_library_paths(
@@ -966,6 +975,53 @@ def _deserialize_architectural_trims(
         trim_ids.add(trim.trim_id)
         trims.append(trim)
     return trims
+
+
+# ### Sloped-ceiling serialization helpers ###
+def _deserialize_sloped_ceilings(
+    raw_slopes: object,
+    *,
+    level_index: int,
+) -> list[SlopedCeilingData]:
+    """Load valid level-local slopes while isolating malformed entries."""
+
+    if not isinstance(raw_slopes, list | tuple):
+        return []
+
+    slopes: list[SlopedCeilingData] = []
+    slope_ids: set[str] = set()
+    level_prefix = f"level:{int(level_index)}/"
+    for raw_slope in raw_slopes:
+        try:
+            slope = SlopedCeilingData.from_dict(raw_slope)
+        except (TypeError, ValueError):
+            continue
+        if slope.slope_id in slope_ids:
+            continue
+        if not slope.wall_surface_id.startswith(level_prefix):
+            continue
+        if any(
+            _sloped_ceiling_intervals_overlap(slope, existing)
+            for existing in slopes
+        ):
+            continue
+        slope_ids.add(slope.slope_id)
+        slopes.append(slope)
+    return slopes
+
+
+def _sloped_ceiling_intervals_overlap(
+    first: SlopedCeilingData,
+    second: SlopedCeilingData,
+) -> bool:
+    """Return whether two same-wall persisted slope interiors overlap."""
+
+    if first.wall_surface_id != second.wall_surface_id:
+        return False
+    return bool(
+        first.start_ratio < second.end_ratio - MIN_SLOPED_CEILING_RATIO_SPAN
+        and second.start_ratio < first.end_ratio - MIN_SLOPED_CEILING_RATIO_SPAN
+    )
 
 
 # ### Open-space serialization helpers ###

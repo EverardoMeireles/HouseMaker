@@ -78,6 +78,11 @@ class FixedSurface:
     wall_height_meters: float | None = None
     source_surface_id: str | None = None
     is_directly_drawn: bool = False
+    sloped_ceiling_id: str | None = None
+    sloped_ceiling_wall_surface_id: str | None = None
+    sloped_ceiling_host_surface_id: str | None = None
+    sloped_ceiling_part: str | None = None
+    surface_alias_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.surface_id:
@@ -98,6 +103,72 @@ class FixedSurface:
             object.__setattr__(self, "source_surface_id", source_surface_id)
         if not isinstance(self.is_directly_drawn, bool):
             raise TypeError("Fixed-surface drawing provenance must be boolean.")
+        slope_metadata = (
+            self.sloped_ceiling_id,
+            self.sloped_ceiling_wall_surface_id,
+            self.sloped_ceiling_host_surface_id,
+        )
+        if any(value is not None for value in slope_metadata):
+            if any(value is None for value in slope_metadata):
+                raise ValueError(
+                    "A sloped-ceiling surface requires complete ownership metadata."
+                )
+            normalized_slope_metadata = tuple(
+                str(value).strip() for value in slope_metadata
+            )
+            if any(not value for value in normalized_slope_metadata):
+                raise ValueError(
+                    "Sloped-ceiling surface ownership metadata cannot be empty."
+                )
+            if self.surface_type != SURFACE_TYPE_CEILING:
+                raise ValueError(
+                    "Only ceiling surfaces can belong to a sloped ceiling."
+                )
+            (
+                sloped_ceiling_id,
+                sloped_ceiling_wall_surface_id,
+                sloped_ceiling_host_surface_id,
+            ) = normalized_slope_metadata
+            object.__setattr__(self, "sloped_ceiling_id", sloped_ceiling_id)
+            object.__setattr__(
+                self,
+                "sloped_ceiling_wall_surface_id",
+                sloped_ceiling_wall_surface_id,
+            )
+            object.__setattr__(
+                self,
+                "sloped_ceiling_host_surface_id",
+                sloped_ceiling_host_surface_id,
+            )
+            slope_part = (
+                "main"
+                if self.sloped_ceiling_part is None
+                else str(self.sloped_ceiling_part).strip().lower()
+            )
+            if not slope_part or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+                for character in slope_part
+            ):
+                raise ValueError(
+                    "A sloped-ceiling surface part must be a stable slug."
+                )
+            object.__setattr__(self, "sloped_ceiling_part", slope_part)
+        elif self.sloped_ceiling_part is not None:
+            raise ValueError(
+                "Only an owned sloped-ceiling surface can declare a part."
+            )
+        alias_ids = tuple(
+            dict.fromkeys(
+                str(value).strip() for value in self.surface_alias_ids
+            )
+        )
+        if any(not value for value in alias_ids):
+            raise ValueError("A fixed-surface alias ID cannot be empty.")
+        if self.surface_id in alias_ids:
+            raise ValueError(
+                "A fixed surface cannot declare its own ID as an alias."
+            )
+        object.__setattr__(self, "surface_alias_ids", alias_ids)
 
 
 @dataclass(frozen=True)
@@ -391,14 +462,21 @@ def _clip_horizontal_surface(
     surface: FixedSurface,
     open_space_geometry: BaseGeometry,
 ) -> FixedSurface | None:
-    """Clip one horizontal face without changing its stable ID."""
+    """Clip one floor or ceiling without changing its stable ID."""
 
     triangles = np.asarray(surface.mesh.triangles, dtype=float)
     if triangles.size == 0:
         return None
-    source_geometry = shapely.union_all(
-        [Polygon(triangle[:, :2]) for triangle in triangles]
+    projected_triangles = tuple(
+        polygon
+        for triangle in triangles
+        if (
+            polygon := Polygon(triangle[:, :2])
+        ).area > SURFACE_GEOMETRY_EPSILON
     )
+    if not projected_triangles:
+        return surface
+    source_geometry = shapely.union_all(projected_triangles)
     clipped_geometry = _subtract_open_space_geometry(
         source_geometry,
         open_space_geometry,
@@ -412,6 +490,11 @@ def _clip_horizontal_surface(
         abs_tol=SURFACE_GEOMETRY_EPSILON,
     ):
         return surface
+    if float(np.ptp(triangles[:, :, 2])) > SURFACE_GEOMETRY_EPSILON:
+        return _clip_sloped_horizontal_surface(
+            surface,
+            open_space_geometry,
+        )
 
     face_normals = np.asarray(surface.mesh.face_normals, dtype=float)
     face_areas = np.asarray(surface.mesh.area_faces, dtype=float)
@@ -434,11 +517,159 @@ def _clip_horizontal_surface(
     )
 
 
+def _clip_sloped_horizontal_surface(
+    surface: FixedSurface,
+    open_space_geometry: BaseGeometry,
+) -> FixedSurface | None:
+    """Cut a plan opening while preserving every retained triangle's plane."""
+
+    source_mesh = surface.mesh
+    source_vertices = np.asarray(source_mesh.vertices, dtype=float)
+    vertices: list[tuple[float, float, float]] = []
+    vertex_index_by_point: dict[tuple[float, float, float], int] = {}
+    faces: list[tuple[int, int, int]] = []
+    for face, source_normal in zip(
+        np.asarray(source_mesh.faces, dtype=np.int64),
+        np.asarray(source_mesh.face_normals, dtype=float),
+        strict=True,
+    ):
+        source_triangle = source_vertices[face]
+        projected_triangle = Polygon(source_triangle[:, :2])
+        if projected_triangle.area <= SURFACE_GEOMETRY_EPSILON:
+            _append_height_preserving_triangle(
+                source_triangle,
+                source_normal,
+                vertices,
+                vertex_index_by_point,
+                faces,
+            )
+            continue
+        if not projected_triangle.intersects(open_space_geometry):
+            _append_height_preserving_triangle(
+                source_triangle,
+                source_normal,
+                vertices,
+                vertex_index_by_point,
+                faces,
+            )
+            continue
+        retained_geometry = projected_triangle.difference(open_space_geometry)
+        for retained_part in shapely.get_parts(retained_geometry):
+            if (
+                not isinstance(retained_part, Polygon)
+                or retained_part.is_empty
+                or retained_part.area <= SURFACE_GEOMETRY_EPSILON
+            ):
+                continue
+            planar_triangles = shapely.constrained_delaunay_triangles(
+                retained_part
+            )
+            for planar_triangle in shapely.get_parts(planar_triangles):
+                if not isinstance(planar_triangle, Polygon):
+                    continue
+                if not retained_part.buffer(
+                    SURFACE_GEOMETRY_EPSILON
+                ).covers(planar_triangle):
+                    continue
+                points_xy = np.asarray(
+                    list(planar_triangle.exterior.coords)[:-1],
+                    dtype=float,
+                )
+                if points_xy.shape != (3, 2):
+                    continue
+                world_triangle = np.asarray(
+                    [
+                        (
+                            float(point[0]),
+                            float(point[1]),
+                            _interpolate_triangle_height(
+                                source_triangle,
+                                point,
+                            ),
+                        )
+                        for point in points_xy
+                    ],
+                    dtype=float,
+                )
+                _append_height_preserving_triangle(
+                    world_triangle,
+                    source_normal,
+                    vertices,
+                    vertex_index_by_point,
+                    faces,
+                )
+    if not vertices or not faces:
+        return None
+    clipped_mesh = trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=float),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
+    return replace(
+        surface,
+        mesh=clipped_mesh,
+        area_square_meters=float(clipped_mesh.area),
+    )
+
+
+def _interpolate_triangle_height(
+    source_triangle: np.ndarray,
+    point_xy: np.ndarray,
+) -> float:
+    """Interpolate one retained XY point on its source triangle plane."""
+
+    matrix = np.column_stack(
+        (
+            source_triangle[1, :2] - source_triangle[0, :2],
+            source_triangle[2, :2] - source_triangle[0, :2],
+        )
+    )
+    first_weight, second_weight = np.linalg.solve(
+        matrix,
+        point_xy - source_triangle[0, :2],
+    )
+    return float(
+        source_triangle[0, 2]
+        + first_weight
+        * (source_triangle[1, 2] - source_triangle[0, 2])
+        + second_weight
+        * (source_triangle[2, 2] - source_triangle[0, 2])
+    )
+
+
+def _append_height_preserving_triangle(
+    triangle: np.ndarray,
+    source_normal: np.ndarray,
+    vertices: list[tuple[float, float, float]],
+    vertex_index_by_point: dict[tuple[float, float, float], int],
+    faces: list[tuple[int, int, int]],
+) -> None:
+    """Append one measurable triangle with the source face's winding."""
+
+    candidate = np.asarray(triangle, dtype=float)
+    normal = np.cross(candidate[1] - candidate[0], candidate[2] - candidate[0])
+    if float(np.linalg.norm(normal)) <= SURFACE_GEOMETRY_EPSILON:
+        return
+    indices: list[int] = []
+    for point in candidate:
+        key = tuple(round(float(value), 10) for value in point)
+        index = vertex_index_by_point.get(key)
+        if index is None:
+            index = len(vertices)
+            vertex_index_by_point[key] = index
+            vertices.append(tuple(float(value) for value in point))
+        indices.append(index)
+    if float(np.dot(normal, source_normal)) < 0.0:
+        indices.reverse()
+    faces.append(tuple(indices))
+
+
 def build_base_fixed_surfaces(
     levels: Sequence[LevelData],
     *,
     stairs: Sequence[StairData] = (),
     clip_open_spaces: bool = True,
+    apply_sloped_ceilings: bool = True,
 ) -> list[FixedSurface]:
     """Build generated semantic surfaces before authored topology edits."""
 
@@ -522,6 +753,11 @@ def build_base_fixed_surfaces(
                 level_floor_footprint,
             )
         )
+
+    if apply_sloped_ceilings:
+        from housemaker.sloped_ceiling import apply_sloped_ceiling_geometry
+
+        surfaces = apply_sloped_ceiling_geometry(levels, surfaces)
 
     return sorted(
         _apply_manual_surface_orientation_overrides(

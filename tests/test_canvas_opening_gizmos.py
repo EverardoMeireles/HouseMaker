@@ -29,7 +29,12 @@ from housemaker.door_state import (
     DOOR_SLOT_KNOB,
 )
 from housemaker.glb import GeneratedModel, PreviewPlacedObject
-from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
+from housemaker.sloped_ceiling import SlopedCeilingWindowHost
+from housemaker.surface_geometry import (
+    SURFACE_TYPE_CEILING,
+    SURFACE_TYPE_WALL,
+    FixedSurface,
+)
 from housemaker.viewer import (
     CANVAS_OPENING_ARCH_SIZE_PIXELS,
     CANVAS_OPENING_CREATE_SIZE_PIXELS,
@@ -119,6 +124,50 @@ def _build_wall(*, y_offset: float = 0.0) -> FixedSurface:
         wall_end_world=(4.0, y_offset, 0.0),
         wall_height_meters=3.0,
     )
+
+
+def _build_sloped_window_host() -> tuple[SlopedCeilingWindowHost, FixedSurface]:
+    """Build one selectable inclined host and its semantic ceiling surface."""
+
+    diagonal = float(np.sqrt(0.5))
+    host = SlopedCeilingWindowHost(
+        slope_id="a" * 32,
+        wall_surface_id="level:0/wall:1:2",
+        level_index=0,
+        room_index=None,
+        plane_start_world=(0.0, 1.0, 1.0),
+        wall_tangent_world=(1.0, 0.0, 0.0),
+        wall_normal_world=(0.0, -diagonal, diagonal),
+        vertical_axis_world=(0.0, diagonal, diagonal),
+        wall_width_meters=4.0,
+        wall_height_meters=3.0,
+    )
+    vertices = np.asarray(
+        tuple(
+            host.local_to_world(horizontal, vertical)
+            for horizontal, vertical in (
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+            )
+        ),
+        dtype=float,
+    )
+    mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64),
+        process=False,
+    )
+    ceiling = FixedSurface(
+        surface_id="level:0/ceiling:slope-a",
+        surface_type=SURFACE_TYPE_CEILING,
+        level_index=0,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=float(mesh.area),
+    )
+    return host, ceiling
 
 
 def _build_model() -> GeneratedModel:
@@ -1240,6 +1289,177 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
                     _bounds_values(expected_bounds),
                     atol=1e-9,
                 )
+
+    def test_window_anchor_rehosts_from_wall_to_sloped_ceiling(self) -> None:
+        target = _build_target()
+        wall = _build_wall()
+        host, ceiling = _build_sloped_window_host()
+        viewer = GlbViewerWidget(window_editing_enabled=True)
+        viewer.set_wall_targets((wall, ceiling))
+        viewer.set_sloped_ceiling_window_hosts((host,))
+        viewer.set_canvas_opening_targets((target,))
+        viewer.select_canvas_opening(target.reference)
+        self.widgets.append(viewer)
+        finished: list[tuple[object, bool]] = []
+        viewer.canvas_opening_edit_finished.connect(
+            lambda edit, changed: finished.append((edit, changed))
+        )
+        handle = _CanvasOpeningGizmoHandle(CANVAS_OPENING_GIZMO_ANCHOR)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            self.assertTrue(viewer._begin_canvas_opening_gizmo_drag(handle, QPointF()))
+        slope_center = np.asarray(host.local_to_world(0.6, 0.5), dtype=float)
+        slope_normal = np.asarray(host.wall_normal_world, dtype=float)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(slope_center + slope_normal, -slope_normal),
+        ):
+            self.assertTrue(viewer._finish_canvas_opening_gizmo_drag(QPointF()))
+
+        self.assertEqual(len(finished), 1)
+        final_edit, changed = finished[0]
+        self.assertTrue(changed)
+        destination = final_edit.destination_target
+        self.assertIsNotNone(destination)
+        assert destination is not None
+        self.assertEqual(destination.sloped_ceiling_id, host.slope_id)
+        self.assertEqual(destination.wall_surface_id, host.wall_surface_id)
+        self.assertAlmostEqual(
+            destination.bounds.horizontal_span * destination.wall_width_meters,
+            target.bounds.horizontal_span * target.wall_width_meters,
+        )
+        self.assertAlmostEqual(
+            destination.bounds.vertical_span * destination.wall_height_meters,
+            target.bounds.vertical_span * target.wall_height_meters,
+        )
+        self.assertEqual(viewer._canvas_opening_targets[target.key], destination)
+
+    def test_window_anchor_rehosts_from_sloped_ceiling_back_to_wall(self) -> None:
+        wall = _build_wall()
+        host, ceiling = _build_sloped_window_host()
+        wall_target = _build_target()
+        source = replace(
+            wall_target,
+            plane_start_world=host.plane_start_world,
+            wall_tangent_world=host.wall_tangent_world,
+            wall_normal_world=host.wall_normal_world,
+            vertical_axis_world=host.vertical_axis_world,
+            wall_width_meters=host.wall_width_meters,
+            wall_height_meters=host.wall_height_meters,
+            sloped_ceiling_id=host.slope_id,
+        )
+        viewer = GlbViewerWidget(window_editing_enabled=True)
+        viewer.set_wall_targets((wall, ceiling))
+        viewer.set_sloped_ceiling_window_hosts((host,))
+        viewer.set_canvas_opening_targets((source,))
+        viewer.select_canvas_opening(source.reference)
+        self.widgets.append(viewer)
+        finished: list[tuple[object, bool]] = []
+        viewer.canvas_opening_edit_finished.connect(
+            lambda edit, changed: finished.append((edit, changed))
+        )
+        handle = _CanvasOpeningGizmoHandle(CANVAS_OPENING_GIZMO_ANCHOR)
+
+        slope_center = np.asarray(source.get_world_center(), dtype=float)
+        slope_normal = np.asarray(source.wall_normal_world, dtype=float)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(slope_center + slope_normal, -slope_normal),
+        ):
+            self.assertTrue(viewer._begin_canvas_opening_gizmo_drag(handle, QPointF()))
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            self.assertTrue(viewer._finish_canvas_opening_gizmo_drag(QPointF()))
+
+        self.assertEqual(len(finished), 1)
+        final_edit, changed = finished[0]
+        self.assertTrue(changed)
+        destination = final_edit.destination_target
+        self.assertIsNotNone(destination)
+        assert destination is not None
+        self.assertIsNone(destination.sloped_ceiling_id)
+        self.assertEqual(destination.wall_surface_id, wall.surface_id)
+        self.assertEqual(destination.plane_start_world, wall_target.plane_start_world)
+        self.assertEqual(destination.vertical_axis_world, (0.0, 0.0, 1.0))
+        self.assertAlmostEqual(
+            destination.bounds.horizontal_span * destination.wall_width_meters,
+            source.bounds.horizontal_span * source.wall_width_meters,
+        )
+        self.assertAlmostEqual(
+            destination.bounds.vertical_span * destination.wall_height_meters,
+            source.bounds.vertical_span * source.wall_height_meters,
+        )
+        self.assertEqual(viewer._canvas_opening_targets[source.key], destination)
+
+    def test_window_anchor_moves_inside_its_existing_wall_hole(self) -> None:
+        target = _build_target()
+        wall = _build_wall()
+        vertices: list[tuple[float, float, float]] = []
+        faces: list[tuple[int, int, int]] = []
+        for minimum_x, maximum_x, minimum_z, maximum_z in (
+            (0.0, 1.0, 0.0, 3.0),
+            (3.0, 4.0, 0.0, 3.0),
+            (1.0, 3.0, 0.0, 0.6),
+            (1.0, 3.0, 2.4, 3.0),
+        ):
+            first_index = len(vertices)
+            vertices.extend(
+                (
+                    (minimum_x, 0.0, minimum_z),
+                    (maximum_x, 0.0, minimum_z),
+                    (maximum_x, 0.0, maximum_z),
+                    (minimum_x, 0.0, maximum_z),
+                )
+            )
+            faces.extend(
+                (
+                    (first_index, first_index + 1, first_index + 2),
+                    (first_index, first_index + 2, first_index + 3),
+                )
+            )
+        holed_wall = replace(
+            wall,
+            mesh=trimesh.Trimesh(
+                vertices=np.asarray(vertices, dtype=float),
+                faces=np.asarray(faces, dtype=np.int64),
+                process=False,
+            ),
+        )
+        viewer = self._build_viewer(target)
+        viewer.set_wall_targets((holed_wall,))
+        viewer.select_canvas_opening(target.reference)
+        handle = _CanvasOpeningGizmoHandle(CANVAS_OPENING_GIZMO_ANCHOR)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.0, 1.5),
+        ):
+            self.assertTrue(viewer._begin_canvas_opening_gizmo_drag(handle, QPointF()))
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.2, 1.6),
+        ):
+            self.assertTrue(viewer._finish_canvas_opening_gizmo_drag(QPointF()))
+
+        moved = viewer._canvas_opening_targets[target.key]
+        self.assertEqual(moved.wall_surface_id, target.wall_surface_id)
+        self.assertIsNone(moved.sloped_ceiling_id)
+        np.testing.assert_allclose(
+            _bounds_values(moved.bounds),
+            (0.3, 0.8, 0.2 + 1.0 / 30.0, 0.8 + 1.0 / 30.0),
+            atol=1e-9,
+        )
 
     def test_side_drags_clamp_to_wall_and_minimum_size(self) -> None:
         cases = (

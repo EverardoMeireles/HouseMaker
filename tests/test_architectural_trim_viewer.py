@@ -227,180 +227,32 @@ class ArchitecturalTrimViewerTests(unittest.TestCase):
         )
         self.assertTrue(all(button.isEnabled() for button in buttons.values()))
 
-        self.assertTrue(
-            self.viewer.begin_architectural_trim_placement(TRIM_KIND_SKIRTING_BOARD)
-        )
+        buttons[TRIM_KIND_SKIRTING_BOARD].click()
         self.assertTrue(buttons[TRIM_KIND_SKIRTING_BOARD].isChecked())
-        self.assertTrue(
-            self.viewer.begin_architectural_trim_placement(TRIM_KIND_CORNICE)
-        )
+        buttons[TRIM_KIND_CORNICE].click()
         self.assertFalse(buttons[TRIM_KIND_SKIRTING_BOARD].isChecked())
         self.assertTrue(buttons[TRIM_KIND_CORNICE].isChecked())
 
-    def test_passive_hover_exposes_only_location_appropriate_trim_actions(
-        self,
-    ) -> None:
-        hover_cases = (
-            (
-                TRIM_KIND_SKIRTING_BOARD,
-                (
-                    np.asarray((0.0, -2.0, 0.03), dtype=float),
-                    np.asarray((0.0, 1.0, 0.0), dtype=float),
-                ),
-            ),
-            (
-                TRIM_KIND_CORNICE,
-                (
-                    np.asarray((0.0, -2.0, 2.97), dtype=float),
-                    np.asarray((0.0, 1.0, 0.0), dtype=float),
-                ),
-            ),
-            (
-                TRIM_KIND_EDGING_STRIP,
-                (
-                    np.asarray((1.99, -2.0, 1.0), dtype=float),
-                    np.asarray((0.0, 1.0, 0.0), dtype=float),
-                ),
-            ),
-        )
-
-        for expected_kind, camera_ray in hover_cases:
-            with (
-                self.subTest(kind=expected_kind),
-                patch.object(
-                    self.viewer.view,
-                    "build_camera_ray",
-                    return_value=camera_ray,
-                ),
-                patch.object(
-                    self.viewer,
-                    "_get_architectural_trim_snap_tolerance",
-                    return_value=0.05,
-                ),
-            ):
-                self.assertFalse(self.viewer.is_architectural_trim_placement_active)
-                self.viewer._update_architectural_trim_passive_hover(QPointF(32, 48))
-
-                action_buttons = self.viewer.architectural_trim_hover_action_buttons
-                self.assertEqual(
-                    set(action_buttons),
-                    {
-                        TRIM_KIND_SKIRTING_BOARD,
-                        TRIM_KIND_EDGING_STRIP,
-                        TRIM_KIND_CORNICE,
-                    },
-                )
-                self.assertTrue(action_buttons[expected_kind].isEnabled())
-                self.assertFalse(action_buttons[expected_kind].isHidden())
-                self.assertTrue(self.viewer._architectural_trim_preview_items)
-                self.assertTrue(
-                    all(
-                        button.isHidden()
-                        for kind, button in action_buttons.items()
-                        if kind != expected_kind
-                    )
-                )
-
-    def test_passive_hover_action_inserts_without_arming_persistent_mode(
-        self,
-    ) -> None:
-        camera_ray = (
-            np.asarray((0.0, -2.0, 0.03), dtype=float),
-            np.asarray((0.0, 1.0, 0.0), dtype=float),
-        )
+    def test_unarmed_hover_does_not_offer_or_preview_trim(self) -> None:
         emitted = QSignalSpy(self.viewer.architectural_trim_placement_requested)
-        with (
-            patch.object(
-                self.viewer.view,
-                "build_camera_ray",
-                return_value=camera_ray,
-            ),
-            patch.object(
-                self.viewer,
-                "_get_architectural_trim_snap_tolerance",
-                return_value=0.05,
-            ),
-        ):
-            self.viewer._update_architectural_trim_passive_hover(QPointF(32, 48))
-            action_button = self.viewer.architectural_trim_hover_action_buttons[
-                TRIM_KIND_SKIRTING_BOARD
-            ]
-            self.assertFalse(action_button.isHidden())
-            action_button.click()
-
-        self.assertEqual(emitted.count(), 1)
-        request = emitted.at(0)[0]
-        self.assertEqual(request.kind, TRIM_KIND_SKIRTING_BOARD)
-        self.assertEqual(request.wall_surface_ids, (self.walls[0].surface_id,))
         self.assertFalse(self.viewer.is_architectural_trim_placement_active)
-        self.assertTrue(
-            all(
-                button.isHidden()
-                for button in (
-                    self.viewer.architectural_trim_hover_action_buttons.values()
-                )
-            )
-        )
-        self.assertFalse(self.viewer._architectural_trim_preview_items)
-
-    def test_passive_hover_coalesces_pointer_burst_to_latest_position(self) -> None:
-        timer = self.viewer._architectural_trim_passive_hover_timer
-        timer.setInterval(1)
-        positions = (
-            QPointF(12.0, 18.0),
-            QPointF(44.0, 52.0),
-            QPointF(73.0, 81.0),
-        )
-
         with patch.object(
             self.viewer,
-            "_update_architectural_trim_passive_hover",
+            "_update_architectural_trim_hover",
             return_value=True,
         ) as update_hover:
-            timeout = QSignalSpy(timer.timeout)
-            for position in positions:
-                self.assertFalse(
-                    self.viewer._handle_surface_vertex_pointer_hovered(position)
-                )
-
-            update_hover.assert_not_called()
-            self.assertTrue(timer.isActive())
-            self.assertTrue(timeout.wait(500))
-
-        update_hover.assert_called_once()
-        resolved_position = update_hover.call_args.args[0]
-        self.assertEqual(resolved_position, positions[-1])
-        self.assertIsNone(self.viewer._architectural_trim_passive_hover_position)
-        self.assertFalse(timer.isActive())
-
-    def test_clearing_passive_hover_discards_queued_pointer(self) -> None:
-        position = QPointF(24.0, 36.0)
-        with patch.object(
-            self.viewer,
-            "_update_architectural_trim_passive_hover",
-            return_value=True,
-        ) as update_hover:
-            self.viewer._handle_surface_vertex_pointer_hovered(position)
-            self.assertTrue(
-                self.viewer._architectural_trim_passive_hover_timer.isActive()
-            )
-
-            self.viewer._handle_surface_vertex_pointer_left()
-
             self.assertFalse(
-                self.viewer._architectural_trim_passive_hover_timer.isActive()
-            )
-            self.assertIsNone(
-                self.viewer._architectural_trim_passive_hover_position
-            )
-            self.assertFalse(
-                self.viewer._flush_architectural_trim_passive_hover()
+                self.viewer._handle_surface_vertex_pointer_hovered(QPointF(32, 48))
             )
 
         update_hover.assert_not_called()
+        self.assertFalse(self.viewer._architectural_trim_preview_items)
+        self.assertEqual(emitted.count(), 0)
 
-    def test_active_trim_hover_bypasses_passive_coalescing(self) -> None:
-        self.viewer.begin_architectural_trim_placement(TRIM_KIND_SKIRTING_BOARD)
+    def test_add_button_arms_active_trim_hover(self) -> None:
+        self.viewer.architectural_trim_mode_buttons[
+            TRIM_KIND_SKIRTING_BOARD
+        ].click()
         position = QPointF(31.0, 47.0)
 
         with patch.object(
@@ -413,9 +265,6 @@ class ArchitecturalTrimViewerTests(unittest.TestCase):
             )
 
         update_hover.assert_called_once_with(position)
-        self.assertFalse(
-            self.viewer._architectural_trim_passive_hover_timer.isActive()
-        )
 
     def test_derived_editable_wall_faces_are_not_trim_hosts(self) -> None:
         source_wall = self.walls[0]
@@ -620,7 +469,9 @@ class ArchitecturalTrimViewerTests(unittest.TestCase):
         self.assertIsNone(candidate)
 
     def test_primary_click_emits_the_retained_hover_request(self) -> None:
-        self.viewer.begin_architectural_trim_placement(TRIM_KIND_SKIRTING_BOARD)
+        self.viewer.architectural_trim_mode_buttons[
+            TRIM_KIND_SKIRTING_BOARD
+        ].click()
         ray = (
             np.asarray((0.0, -2.0, 0.03), dtype=float),
             np.asarray((0.0, 1.0, 0.0), dtype=float),

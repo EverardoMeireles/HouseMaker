@@ -19,10 +19,12 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -30,9 +32,14 @@ from PySide6.QtWidgets import (
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND,
     FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
+    MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+    MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     normalize_first_person_navigation_mode,
+    normalize_first_person_speed_meters_per_second,
 )
 from housemaker.openai_model_pricing import (
     OPENAI_PRICING_MARKDOWN_URL,
@@ -81,6 +88,7 @@ CLEAR_MASK_HOTKEY_SETTING_KEY = "generation/clear_mask_hotkey"
 FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
+FIRST_PERSON_SPEED_SETTING_KEY = "navigation/first_person_speed"
 IGNORE_TOP_DOWN_CEILING_SETTING_KEY = "navigation/ignore_top_down_ceiling"
 MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY = "canvas/make_floors_double_sided"
 MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY = (
@@ -247,6 +255,9 @@ class GenerationServiceSettings:
     )
     make_floors_double_sided: bool = DEFAULT_MAKE_FLOORS_DOUBLE_SIDED
     make_ceilings_double_sided: bool = DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED
+    first_person_speed_meters_per_second: float = (
+        DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
+    )
 
     def __post_init__(self) -> None:
         try:
@@ -255,7 +266,7 @@ class GenerationServiceSettings:
                     self.first_person_navigation_mode
                 )
             )
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             raise ValueError(
                 "First-person navigation mode must be Gravity or Noclip."
             ) from error
@@ -263,6 +274,21 @@ class GenerationServiceSettings:
             self,
             "first_person_navigation_mode",
             normalized_first_person_navigation_mode,
+        )
+        try:
+            normalized_first_person_speed = (
+                normalize_first_person_speed_meters_per_second(
+                    self.first_person_speed_meters_per_second
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "First-person speed must be within the supported range."
+            ) from error
+        object.__setattr__(
+            self,
+            "first_person_speed_meters_per_second",
+            normalized_first_person_speed,
         )
         if not isinstance(self.snap_middle_equal_angle_only, bool):
             raise ValueError(
@@ -574,6 +600,9 @@ class SettingsWidget(QWidget):
             ),
             first_person_navigation_mode=str(
                 self.first_person_navigation_combo.currentData()
+            ),
+            first_person_speed_meters_per_second=(
+                self._first_person_speed_from_slider()
             ),
             ignore_top_down_ceiling=(
                 self.ignore_top_down_ceiling_checkbox.isChecked()
@@ -987,6 +1016,48 @@ class SettingsWidget(QWidget):
             self.first_person_navigation_combo,
         )
 
+        self.first_person_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.first_person_speed_slider.setObjectName(
+            "first_person_speed_slider"
+        )
+        self.first_person_speed_slider.setRange(
+            round(
+                MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
+                / FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND
+            ),
+            round(
+                MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
+                / FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND
+            ),
+        )
+        self.first_person_speed_slider.setSingleStep(1)
+        self.first_person_speed_slider.setPageStep(10)
+        self.first_person_speed_slider.setToolTip(
+            "Set first-person movement speed in meters per second."
+        )
+        self.first_person_speed_value_label = QLabel()
+        self.first_person_speed_value_label.setObjectName(
+            "first_person_speed_value_label"
+        )
+        self.first_person_speed_control = QWidget()
+        self.first_person_speed_control.setObjectName(
+            "first_person_speed_control"
+        )
+        first_person_speed_layout = QHBoxLayout(
+            self.first_person_speed_control
+        )
+        first_person_speed_layout.setContentsMargins(0, 0, 0, 0)
+        first_person_speed_layout.setSpacing(8)
+        first_person_speed_layout.addWidget(self.first_person_speed_slider, 1)
+        first_person_speed_layout.addWidget(self.first_person_speed_value_label)
+        self.first_person_speed_slider.valueChanged.connect(
+            self._handle_first_person_speed_changed
+        )
+        canvas_form.addRow(
+            "First person speed",
+            self.first_person_speed_control,
+        )
+
         self.ignore_top_down_ceiling_checkbox = QCheckBox()
         self.ignore_top_down_ceiling_checkbox.setObjectName(
             "ignore_top_down_ceiling_checkbox"
@@ -1320,6 +1391,12 @@ class SettingsWidget(QWidget):
         )
         self.first_person_navigation_combo.setCurrentIndex(
             max(0, first_person_navigation_index)
+        )
+        self.first_person_speed_slider.setValue(
+            round(
+                read_first_person_speed(self._application_settings)
+                / FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND
+            )
         )
         self.ignore_top_down_ceiling_checkbox.setChecked(
             read_ignore_top_down_ceiling(self._application_settings)
@@ -1865,6 +1942,28 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_first_person_speed_changed(self, _value: int) -> None:
+        """Persist and display the first-person movement speed."""
+
+        speed = self._first_person_speed_from_slider()
+        self.first_person_speed_value_label.setText(f"{speed:.1f} m/s")
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            FIRST_PERSON_SPEED_SETTING_KEY,
+            speed,
+        )
+        self.settings_changed.emit()
+
+    def _first_person_speed_from_slider(self) -> float:
+        """Return the slider's integer-tenths value in meters per second."""
+
+        return round(
+            self.first_person_speed_slider.value()
+            * FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND,
+            1,
+        )
+
     def _handle_ignore_top_down_ceiling_changed(self, enabled: bool) -> None:
         """Persist whether orbit navigation suppresses Canvas ceilings."""
 
@@ -2316,6 +2415,21 @@ def read_first_person_navigation_mode(
         return normalize_first_person_navigation_mode(value)
     except ValueError:
         return DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+
+
+def read_first_person_speed(
+    application_settings: ApplicationSettingsStore,
+) -> float:
+    """Read the first-person movement speed with a safe default."""
+
+    value = application_settings.get(
+        FIRST_PERSON_SPEED_SETTING_KEY,
+        DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+    )
+    try:
+        return normalize_first_person_speed_meters_per_second(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
 
 
 def read_ignore_top_down_ceiling(

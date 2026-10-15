@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QImage
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -488,7 +488,37 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertEqual(self.workspace._canvas_window_undo_ids, [])
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
-    def test_detached_scene_has_no_window_widgets_and_keeps_canvas_add_button(
+    def test_canvas_window_button_arms_both_available_views(self) -> None:
+        level = _build_square_level()
+        self.workspace.levels = [level]
+        self.workspace.current_level_index = 0
+        self.workspace._sync_canvas_to_current_level()
+        self.workspace.canvas.blueprint_image = QImage(
+            100,
+            100,
+            QImage.Format.Format_RGB32,
+        )
+        self.workspace.viewer.set_wall_targets(
+            tuple(build_fixed_surfaces([level]))
+        )
+        scene_button = self.workspace.viewer.add_window_frame_button
+        assert scene_button is not None
+
+        self.workspace.add_window_button.click()
+
+        self.assertTrue(self.workspace.add_window_button.isChecked())
+        self.assertTrue(scene_button.isChecked())
+        self.assertTrue(self.workspace.canvas.is_window_placement_active())
+        self.assertTrue(self.workspace.viewer.is_window_placement_active())
+
+        self.workspace.viewer.cancel_window_placement()
+
+        self.assertFalse(self.workspace.add_window_button.isChecked())
+        self.assertFalse(scene_button.isChecked())
+        self.assertFalse(self.workspace.canvas.is_window_placement_active())
+        self.assertFalse(self.workspace.viewer.is_window_placement_active())
+
+    def test_detached_scene_contains_its_window_frame_button(
         self,
     ) -> None:
         level = _build_square_level()
@@ -507,16 +537,26 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertTrue(viewer.select_wall_target(wall.surface_id))
         panel = viewer.window_tools_panel
         button = self.workspace.add_window_button
+        scene_button = viewer.add_window_frame_button
         undo_button = viewer.undo_window_button
         self.assertIs(panel, viewer.canvas_tools_panel)
         assert panel is not None
+        self.assertIsNotNone(scene_button)
+        assert scene_button is not None
         self.assertIsNone(undo_button)
         self.assertIsNone(viewer.window_tools_status_label)
-        self.assertFalse(hasattr(viewer, "add_window_button"))
         self.assertIsNone(
             panel.findChild(type(button), "canvas-add-window-button")
         )
+        self.assertIs(
+            panel.findChild(
+                type(scene_button),
+                "canvas-scene-add-window-frame-button",
+            ),
+            scene_button,
+        )
         self.assertFalse(viewer.isAncestorOf(button))
+        self.assertTrue(viewer.isAncestorOf(scene_button))
 
         screen = _primary_screen()
         with patch(
@@ -540,7 +580,10 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertGreaterEqual(panel.geometry().left(), viewer.view.width())
         self.assertIsNone(viewer.undo_window_button)
         self.assertEqual(button.text(), "Add window frame")
+        self.assertEqual(scene_button.text(), "Add window frame")
         self.assertTrue(button.isEnabled())
+        self.assertTrue(scene_button.isVisibleTo(host.window))
+        self.assertTrue(scene_button.isEnabled())
 
         self.workspace._apply_scene_3d_display_screen(None)
         _qt_application.processEvents()
@@ -555,6 +598,7 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertIs(viewer.window_tools_panel, panel)
         self.assertIsNone(viewer.undo_window_button)
         self.assertFalse(viewer.isAncestorOf(button))
+        self.assertTrue(viewer.isAncestorOf(scene_button))
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
 
 

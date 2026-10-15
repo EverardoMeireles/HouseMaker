@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from housemaker.models import (
     DOORWAY_SHAPE_ARCH,
     DoorwayData,
     LevelData,
+    SlopedCeilingData,
     WindowData,
 )
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
@@ -504,6 +506,86 @@ class CanvasOpeningMainTests(unittest.TestCase):
         self.assertIsNone(self.workspace._pending_window_mesh_level_index)
         self.assertFalse(self.workspace._doorway_mesh_update_timer.isActive())
         self.assertFalse(self.workspace._is_canvas_opening_drag_active)
+
+    def test_window_rehost_finish_and_ctrl_z_preserve_identity_and_hosts(
+        self,
+    ) -> None:
+        destination = self._get_target(CANVAS_OPENING_WINDOW)
+        slope_id = "a" * 32
+        source_bounds = CanvasOpeningBounds(0.2, 0.4, 0.25, 0.65)
+        diagonal = float(2**-0.5)
+        source = replace(
+            destination,
+            plane_start_world=(0.0, 1.0, 1.0),
+            wall_normal_world=(0.0, -diagonal, diagonal),
+            vertical_axis_world=(0.0, diagonal, diagonal),
+            wall_height_meters=2.0,
+            bounds=source_bounds,
+            sloped_ceiling_id=slope_id,
+        )
+        self.level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=slope_id,
+                wall_surface_id=self.wall.surface_id,
+                depth_meters=1.0,
+                wall_drop_meters=1.0,
+            )
+        ]
+        self.level.windows[0] = replace(
+            self.level.windows[0],
+            start_ratio=source_bounds.start_ratio,
+            end_ratio=source_bounds.end_ratio,
+            bottom_ratio=source_bounds.bottom_ratio,
+            top_ratio=source_bounds.top_ratio,
+            sloped_ceiling_id=slope_id,
+        )
+        self.workspace._reset_viewer_doorway_snapshots()
+        self.workspace._canvas_opening_targets_by_key[source.key] = source
+        self.workspace.viewer.update_canvas_opening_target(source)
+        start_edit = CanvasOpeningEdit(
+            reference=source.reference,
+            wall_surface_id=source.wall_surface_id,
+            bounds=source.bounds,
+            destination_target=source,
+        )
+        changed_edit = CanvasOpeningEdit(
+            reference=destination.reference,
+            wall_surface_id=destination.wall_surface_id,
+            bounds=destination.bounds,
+            destination_target=destination,
+        )
+        original_window_id = self.level.windows[0].window_id
+
+        self.workspace._handle_canvas_opening_edit_started(start_edit)
+        self.workspace._handle_canvas_opening_edit_preview_changed(changed_edit)
+        self.workspace.viewer.update_canvas_opening_target(destination)
+        self.workspace._handle_canvas_opening_edit_finished(changed_edit, True)
+
+        moved_window = self.level.windows[0]
+        self.assertEqual(moved_window.window_id, original_window_id)
+        self.assertEqual(moved_window.wall_surface_id, destination.wall_surface_id)
+        self.assertIsNone(moved_window.sloped_ceiling_id)
+        self.assertEqual(
+            self.workspace._canvas_opening_targets_by_key[source.key],
+            destination,
+        )
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        restored_window = self.level.windows[0]
+        self.assertEqual(restored_window.window_id, original_window_id)
+        self.assertEqual(restored_window.wall_surface_id, source.wall_surface_id)
+        self.assertEqual(restored_window.sloped_ceiling_id, slope_id)
+        self.assertEqual(
+            self.workspace._canvas_opening_targets_by_key[source.key],
+            source,
+        )
+        self.assertEqual(
+            self.workspace.viewer._canvas_opening_targets[source.key],
+            source,
+        )
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_switching_openings_stages_one_refresh_after_the_second_drag(
         self,

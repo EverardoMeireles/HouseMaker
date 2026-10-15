@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.camera_models import CameraPose
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
 )
@@ -28,6 +29,7 @@ from housemaker.pbr_maps import (
     PBR_MAP_ROUGHNESS,
 )
 from housemaker.surface_geometry import (
+    SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     FixedSurface,
@@ -330,6 +332,29 @@ class SurfaceTextureViewerCameraTests(unittest.TestCase):
                 Qt.KeyboardModifier.NoModifier,
             )
         )
+
+    def test_configurable_speed_scales_first_person_movement(self) -> None:
+        self.assertEqual(
+            self.viewer.get_first_person_speed(),
+            DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+        )
+        self.viewer.set_first_person_speed(5.0)
+        self.viewer.set_camera_pose(CameraPose(z=1.7))
+        view = self.viewer.view
+        view.enter_first_person_mode()
+        view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Z,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        view.step_movement(0.4)
+
+        self.assertAlmostEqual(self.viewer.get_camera_pose().x, 2.0)
+        with self.assertRaisesRegex(ValueError, "First-person speed"):
+            self.viewer.set_first_person_speed(0.0)
 
     def test_noclip_forward_movement_follows_camera_pitch(self) -> None:
         self.viewer.set_first_person_movement_mode(
@@ -841,6 +866,47 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
 
 
 class SurfaceTextureMappingTests(unittest.TestCase):
+    def test_vertical_ceiling_part_uses_measurable_normal_aware_uvs(self) -> None:
+        """Slope returns keep the same UV projection in both preview paths."""
+
+        wall_shape = _build_quad_surface("vertical-source", SURFACE_TYPE_WALL)
+        vertical_ceiling = FixedSurface(
+            surface_id="vertical-slope-return",
+            surface_type=SURFACE_TYPE_CEILING,
+            level_index=wall_shape.level_index,
+            room_index=wall_shape.room_index,
+            wall_key=None,
+            mesh=wall_shape.mesh.copy(),
+            area_square_meters=wall_shape.area_square_meters,
+        )
+        texture = np.full((4, 4, 4), 255, dtype=np.uint8)
+
+        preview_data = _build_surface_texture_mesh_data(
+            vertical_ceiling,
+            texture,
+            2.0,
+        )
+        exported_mesh = build_world_planar_textured_mesh(
+            vertical_ceiling.mesh,
+            vertical_ceiling.surface_type,
+            ResolvedSurfaceMaterial(
+                png_bytes=b"test-png-placeholder",
+                texture_rgba=texture,
+            ),
+            texture_world_size_meters=2.0,
+        )
+        preview_uvs = preview_data.texture_coordinates.reshape((-1, 3, 2))
+        exported_uvs = np.asarray(exported_mesh.visual.uv).reshape((-1, 3, 2))
+        first_uv_edges = preview_uvs[:, 1] - preview_uvs[:, 0]
+        second_uv_edges = preview_uvs[:, 2] - preview_uvs[:, 0]
+        signed_uv_areas = (
+            first_uv_edges[:, 0] * second_uv_edges[:, 1]
+            - first_uv_edges[:, 1] * second_uv_edges[:, 0]
+        )
+
+        self.assertTrue(np.all(np.abs(signed_uv_areas) > 1e-8))
+        np.testing.assert_allclose(preview_uvs, exported_uvs, atol=1e-7)
+
     def test_planar_uvs_use_world_scale_instead_of_each_surface_bounds(self) -> None:
         first = _build_quad_surface("wall-one", SURFACE_TYPE_WALL)
         second = _build_quad_surface(

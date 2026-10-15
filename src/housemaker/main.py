@@ -304,6 +304,7 @@ from housemaker.models import (
     DoorwayPreset,
     EditableSurfaceMeshData,
     LevelData,
+    SlopedCeilingData,
     StairData,
     StairSectionData,
     VertexData,
@@ -357,6 +358,18 @@ from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
+)
+from housemaker.sloped_ceiling import (
+    SLOPED_CEILING_HANDLE_CREATE_DEPTH,
+    SlopedCeilingEdit,
+    SlopedCeilingEditTarget,
+    SlopedCeilingWindowPlacement,
+    add_sloped_ceiling_window,
+    apply_sloped_ceiling_edit,
+    build_sloped_ceiling_edit_targets,
+    build_sloped_ceiling_preview_meshes,
+    build_sloped_ceiling_window_hosts,
+    preserve_sloped_ceiling_window_dimensions,
 )
 from housemaker.surface_geometry import (
     SURFACE_TYPE_WALL,
@@ -1155,6 +1168,10 @@ class _CanvasBlueprintUndoState:
         tuple[int, tuple[ArchitecturalTrimData, ...]],
         ...,
     ] = ()
+    sloped_ceilings_by_level: tuple[
+        tuple[int, tuple[SlopedCeilingData, ...]],
+        ...,
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -1178,6 +1195,10 @@ class _CanvasTopologyUndoState:
         tuple[int, tuple[ArchitecturalTrimData, ...]],
         ...,
     ]
+    sloped_ceilings_by_level: tuple[
+        tuple[int, tuple[SlopedCeilingData, ...]],
+        ...,
+    ]
     assignments: tuple[SurfaceTextureAssignment, ...]
     assignment_targets_after: tuple[SurfaceTextureAssignment, ...]
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...]
@@ -1194,6 +1215,34 @@ class _CanvasSurfaceEditUndoState:
     """Immutable structural gizmo baselines for one committed edit."""
 
     targets: tuple[CanvasSurfaceEditHandleTarget, ...]
+
+
+@dataclass(frozen=True)
+class _CanvasSlopedCeilingUndoState:
+    """Affected slope collections before one wall-bound edit burst."""
+
+    level_index: int
+    sloped_ceilings: tuple[SlopedCeilingData, ...]
+    additional_levels: tuple[
+        tuple[int, tuple[SlopedCeilingData, ...]],
+        ...,
+    ] = ()
+    window_snapshots_by_level: tuple[
+        tuple[int, tuple[WindowData, ...]],
+        ...,
+    ] = ()
+    removed_window_placements: tuple[WindowPlacement, ...] = ()
+
+    @property
+    def sloped_ceilings_by_level(
+        self,
+    ) -> tuple[tuple[int, tuple[SlopedCeilingData, ...]], ...]:
+        """Expose every affected level while retaining legacy first-level fields."""
+
+        return (
+            (self.level_index, self.sloped_ceilings),
+            *self.additional_levels,
+        )
 
 
 @dataclass(frozen=True)
@@ -1331,6 +1380,7 @@ _CanvasUndoState = (
     | _CanvasPlanImageUndoState
     | _CanvasTopologyUndoState
     | _CanvasSurfaceEditUndoState
+    | _CanvasSlopedCeilingUndoState
     | _CanvasLevelPropertiesUndoState
     | _CanvasOuterWallMarkUndoState
     | _CanvasOpeningEditUndoState
@@ -1608,6 +1658,10 @@ class BlueprintWorkspace(QWidget):
             tuple[WindowData, ...],
         ] = {}
         self._viewer_floor_thickness_by_level_index: dict[int, float] = {}
+        self._viewer_sloped_ceilings_by_level_index: dict[
+            int,
+            tuple[SlopedCeilingData, ...],
+        ] = {}
         self._reset_viewer_doorway_snapshots()
         self._mesh_edit_update_delay_seconds = DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
         self._pending_wall_vertex_mesh_update = False
@@ -1625,9 +1679,18 @@ class BlueprintWorkspace(QWidget):
             CanvasOpeningTarget,
         ] = {}
         self._canvas_surface_targets_by_id: dict[str, FixedSurface] = {}
+        self._sloped_ceiling_host_surfaces: tuple[FixedSurface, ...] = ()
         self._canvas_surface_edit_targets_by_key: dict[
             tuple[str, str],
             CanvasSurfaceEditHandleTarget,
+        ] = {}
+        self._sloped_ceiling_edit_targets_by_wall_id: dict[
+            str,
+            SlopedCeilingEditTarget,
+        ] = {}
+        self._sloped_ceiling_edit_targets_by_key: dict[
+            tuple[str, str],
+            SlopedCeilingEditTarget,
         ] = {}
         self._active_canvas_surface_edit_target: (
             CanvasSurfaceEditHandleTarget | None
@@ -1650,6 +1713,21 @@ class BlueprintWorkspace(QWidget):
             _CanvasTopologyUndoState | None
         ) = None
         self._pending_canvas_face_orientation_surface_ids: set[str] = set()
+        self._active_sloped_ceiling_edit: SlopedCeilingEdit | None = None
+        self._active_sloped_ceiling_edits: tuple[SlopedCeilingEdit, ...] = ()
+        self._active_sloped_ceiling_undo_state: (
+            _CanvasSlopedCeilingUndoState | None
+        ) = None
+        self._pending_sloped_ceiling_undo_state: (
+            _CanvasSlopedCeilingUndoState | None
+        ) = None
+        self._pending_sloped_ceiling_id: str | None = None
+        self._pending_sloped_ceiling_wall_surface_id: str | None = None
+        self._pending_sloped_ceiling_target_keys: tuple[
+            tuple[int, str, str],
+            ...,
+        ] = ()
+        self._pending_sloped_ceiling_wall_surface_ids: tuple[str, ...] = ()
         self._pending_canvas_opening_key: str | None = None
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
@@ -1680,6 +1758,14 @@ class BlueprintWorkspace(QWidget):
         )
         self._canvas_face_orientation_update_timer.timeout.connect(
             self._commit_pending_canvas_face_orientation_update
+        )
+        self._sloped_ceiling_mesh_update_timer = QTimer(self)
+        self._sloped_ceiling_mesh_update_timer.setSingleShot(True)
+        self._sloped_ceiling_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._sloped_ceiling_mesh_update_timer.timeout.connect(
+            self._commit_pending_sloped_ceiling_mesh_update
         )
         self._architectural_trim_mesh_update_timer = QTimer(self)
         self._architectural_trim_mesh_update_timer.setSingleShot(True)
@@ -1878,6 +1964,8 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_canvas_face_orientation_update(restore=False)
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
+        self._cancel_active_sloped_ceiling_edit()
+        self._cancel_pending_sloped_ceiling_mesh_update(restore=False)
         self._clear_pending_architectural_trim_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
@@ -2428,6 +2516,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_first_person_movement_mode(
             generation_settings.first_person_navigation_mode
         )
+        self.viewer.set_first_person_speed(
+            generation_settings.first_person_speed_meters_per_second
+        )
         self.viewer.set_ignore_top_down_ceiling(
             generation_settings.ignore_top_down_ceiling
         )
@@ -2607,6 +2698,12 @@ class BlueprintWorkspace(QWidget):
         self.canvas.window_placement_changed.connect(
             self._handle_window_placement_mode_changed
         )
+        self.viewer.window_placement_requested.connect(
+            self._handle_canvas_window_placement_requested
+        )
+        self.viewer.window_placement_changed.connect(
+            self._handle_window_placement_mode_changed
+        )
         self.viewer.canvas_opening_selection_changed.connect(
             self._handle_canvas_opening_selection_changed
         )
@@ -2726,6 +2823,18 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_surface_edit_cancelled.connect(
             self._handle_canvas_surface_edit_cancelled
+        )
+        self.viewer.sloped_ceiling_edit_started.connect(
+            self._handle_sloped_ceiling_edit_started
+        )
+        self.viewer.sloped_ceiling_edit_preview_changed.connect(
+            self._handle_sloped_ceiling_edit_preview_changed
+        )
+        self.viewer.sloped_ceiling_edit_finished.connect(
+            self._handle_sloped_ceiling_edit_finished
+        )
+        self.viewer.sloped_ceiling_edit_cancelled.connect(
+            self._handle_sloped_ceiling_edit_cancelled
         )
         self.viewer.placed_object_removal_requested.connect(
             self._handle_placed_object_removal_requested
@@ -4438,42 +4547,59 @@ class BlueprintWorkspace(QWidget):
 
     # ### Canvas window placement ###
     def _handle_add_window_button_toggled(self, checked: bool) -> None:
-        """Arm or cancel window-frame placement on the 2D Canvas."""
+        """Arm the same window tool in both the 2D and 3D Canvas views."""
 
         if self._is_syncing_window_placement_modes:
             return
-        canvas_started = False
         self._is_syncing_window_placement_modes = True
         try:
             if not checked:
                 self.canvas.cancel_window_placement()
+                self.viewer.cancel_window_placement(status_message=None)
                 return
-
-            canvas_started = self.canvas.start_window_placement()
+            canvas_started, viewer_started = (
+                self._activate_window_placement_modes()
+            )
         finally:
             self._is_syncing_window_placement_modes = False
 
-        if not canvas_started:
+        if not canvas_started and not viewer_started:
             self._set_add_window_button_checked(False)
             QMessageBox.information(
                 self,
                 "Add window frame",
-                "Load a plan image with walls before adding a window frame.",
+                "Load a plan image with walls, or show a wall or straight "
+                "sloped surface in the 3D scene, before adding a window frame.",
             )
+
+    def _activate_window_placement_modes(self) -> tuple[bool, bool]:
+        """Start every available view so the next drag may occur in either."""
+
+        self._commit_pending_sloped_ceiling_mesh_update()
+        canvas_started = bool(
+            self.canvas.is_window_placement_active()
+            or self.canvas.start_window_placement()
+        )
+        viewer_started = bool(
+            self.viewer.is_window_placement_active()
+            or self.viewer.begin_window_placement()
+        )
+        self._set_add_window_button_checked(canvas_started or viewer_started)
+        return canvas_started, viewer_started
 
     def _handle_window_placement_mode_changed(self, active: bool) -> None:
         """Keep the Canvas placement tool and its button synchronized."""
 
         if self._is_syncing_window_placement_modes:
             return
-        if active:
-            self._set_add_window_button_checked(True)
-            return
-
         self._is_syncing_window_placement_modes = True
         try:
+            if active:
+                self._activate_window_placement_modes()
+                return
             self._set_add_window_button_checked(False)
             self.canvas.cancel_window_placement()
+            self.viewer.cancel_window_placement(status_message=None)
         finally:
             self._is_syncing_window_placement_modes = False
 
@@ -4488,17 +4614,25 @@ class BlueprintWorkspace(QWidget):
         self,
         raw_placement: object,
     ) -> None:
-        """Commit one validated Canvas rectangle as a real wall opening."""
+        """Commit one validated Canvas or sloped-surface window opening."""
 
-        if not isinstance(raw_placement, WallWindowPlacement):
+        if not isinstance(
+            raw_placement,
+            (WallWindowPlacement, SlopedCeilingWindowPlacement),
+        ):
             self.viewer.set_window_tools_status(
                 "The requested window placement is invalid."
             )
             return
 
         self._commit_pending_architectural_trim_mesh_update()
+        self._commit_pending_sloped_ceiling_mesh_update()
         try:
-            window = add_wall_window(self.levels, raw_placement)
+            window = (
+                add_sloped_ceiling_window(self.levels, raw_placement)
+                if isinstance(raw_placement, SlopedCeilingWindowPlacement)
+                else add_wall_window(self.levels, raw_placement)
+            )
         except (TypeError, ValueError) as error:
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
@@ -4994,6 +5128,28 @@ class BlueprintWorkspace(QWidget):
         self._canvas_surface_targets_by_id = {
             surface.surface_id: surface for surface in surface_targets
         }
+        try:
+            slope_free_base_surfaces = tuple(
+                build_base_fixed_surfaces(
+                    semantic_levels,
+                    stairs=self.stairs,
+                    clip_open_spaces=False,
+                    apply_sloped_ceilings=False,
+                )
+            )
+            self._sloped_ceiling_host_surfaces = tuple(
+                surface
+                for surface in build_fixed_surfaces(
+                    semantic_levels,
+                    stairs=self.stairs,
+                    base_surfaces=slope_free_base_surfaces,
+                )
+                if not is_architectural_trim_surface_id(surface.surface_id)
+            )
+        except (TypeError, ValueError):
+            # Keep older or partially edited projects interactive. The next
+            # successful scene rebuild will replace this fallback snapshot.
+            self._sloped_ceiling_host_surfaces = surface_targets
         self._desired_canvas_surface_ids = tuple(
             surface_id
             for surface_id in self._desired_canvas_surface_ids
@@ -5001,6 +5157,9 @@ class BlueprintWorkspace(QWidget):
         )
         self._is_syncing_canvas_scene_selection = True
         try:
+            selected_slope_wall_id = (
+                self.viewer.get_selected_sloped_ceiling_wall_surface_id()
+            )
             self.viewer.set_wall_targets(surface_targets)
             try:
                 edit_targets = build_canvas_surface_edit_targets(
@@ -5014,6 +5173,30 @@ class BlueprintWorkspace(QWidget):
                 for target in edit_targets
             }
             self.viewer.set_canvas_surface_edit_targets(edit_targets)
+            try:
+                sloped_ceiling_targets = build_sloped_ceiling_edit_targets(
+                    self.levels,
+                    self._sloped_ceiling_host_surfaces,
+                )
+            except (TypeError, ValueError):
+                sloped_ceiling_targets = ()
+            self._remember_sloped_ceiling_edit_targets(sloped_ceiling_targets)
+            self.viewer.set_sloped_ceiling_edit_targets(
+                sloped_ceiling_targets,
+                preserve_selection=(
+                    self._has_sloped_ceiling_edit_target_for_wall(
+                        selected_slope_wall_id
+                    )
+                ),
+            )
+            try:
+                sloped_window_hosts = build_sloped_ceiling_window_hosts(
+                    semantic_levels,
+                    self._sloped_ceiling_host_surfaces,
+                )
+            except (TypeError, ValueError):
+                sloped_window_hosts = ()
+            self.viewer.set_sloped_ceiling_window_hosts(sloped_window_hosts)
             self._sync_canvas_surface_drawing_overlay(semantic_levels)
             if self._desired_canvas_surface_ids:
                 self.viewer.set_selected_canvas_surface_ids(
@@ -6437,6 +6620,890 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.set_selected_wall_surface_id(selected_wall_id)
 
+    # ### Sloped-ceiling edits ###
+    @staticmethod
+    def _get_sloped_ceiling_target_key(
+        target: SlopedCeilingEditTarget,
+    ) -> tuple[str, str]:
+        """Return the same stable wall-and-target identity used by the viewer."""
+
+        return (
+            str(target.wall_surface_id).strip(),
+            str(target.target_id).strip(),
+        )
+
+    @staticmethod
+    def _get_sloped_ceiling_edit_target_key(
+        edit: SlopedCeilingEdit,
+    ) -> tuple[str, str]:
+        """Resolve an emitted edit back to one stable target identity."""
+
+        wall_surface_id = str(edit.wall_surface_id).strip()
+        target_id = edit.slope_id
+        if target_id is None:
+            target_id = (
+                "create:"
+                f"{wall_surface_id}:"
+                f"{edit.creation_start_ratio:.12f}:"
+                f"{edit.creation_end_ratio:.12f}"
+            )
+        return wall_surface_id, str(target_id).strip()
+
+    @classmethod
+    def _get_sloped_ceiling_edit_scope_keys(
+        cls,
+        edits: Sequence[SlopedCeilingEdit],
+    ) -> tuple[tuple[int, str, str], ...]:
+        """Return order-independent identities for every target in one drag."""
+
+        return tuple(
+            sorted(
+                (
+                    edit.level_index,
+                    *cls._get_sloped_ceiling_edit_target_key(edit),
+                )
+                for edit in edits
+            )
+        )
+
+    def _remember_sloped_ceiling_edit_targets(
+        self,
+        targets: Sequence[SlopedCeilingEditTarget],
+    ) -> None:
+        """Index all targets without collapsing slopes or gaps on one wall."""
+
+        targets_by_key: dict[tuple[str, str], SlopedCeilingEditTarget] = {}
+        compatibility_targets: dict[str, SlopedCeilingEditTarget] = {}
+        for target in targets:
+            target_key = self._get_sloped_ceiling_target_key(target)
+            targets_by_key[target_key] = target
+            current = compatibility_targets.get(target.wall_surface_id)
+            if current is None or (
+                current.slope_id is None and target.slope_id is not None
+            ):
+                # Legacy callers expect one target per wall. Prefer an authored
+                # slope over a free creation interval when both are available.
+                compatibility_targets[target.wall_surface_id] = target
+        self._sloped_ceiling_edit_targets_by_key = targets_by_key
+        self._sloped_ceiling_edit_targets_by_wall_id = compatibility_targets
+
+    def _has_sloped_ceiling_edit_target_for_wall(
+        self,
+        wall_surface_id: str | None,
+    ) -> bool:
+        """Return whether the canonical target map contains one wall."""
+
+        return bool(
+            wall_surface_id is not None
+            and any(
+                target_key[0] == wall_surface_id
+                for target_key in self._sloped_ceiling_edit_targets_by_key
+            )
+        )
+
+    @classmethod
+    def _normalize_sloped_ceiling_edit_batch(
+        cls,
+        raw_edits: object,
+    ) -> tuple[SlopedCeilingEdit, ...] | None:
+        """Accept one legacy edit or one non-empty immutable viewer batch."""
+
+        if isinstance(raw_edits, SlopedCeilingEdit):
+            edits = (raw_edits,)
+        elif isinstance(raw_edits, tuple) and raw_edits and all(
+            isinstance(edit, SlopedCeilingEdit) for edit in raw_edits
+        ):
+            edits = raw_edits
+        else:
+            return None
+        scope_keys = cls._get_sloped_ceiling_edit_scope_keys(edits)
+        if len(scope_keys) != len(set(scope_keys)):
+            return None
+        return edits
+
+    def _sloped_ceiling_edit_batch_is_available(
+        self,
+        edits: Sequence[SlopedCeilingEdit],
+    ) -> bool:
+        """Validate every emitted edit against its exact installed target."""
+
+        for edit in edits:
+            target = self._find_sloped_ceiling_edit_target(edit)
+            if (
+                target is None
+                or target.level_index != edit.level_index
+                or target.slope_id != edit.slope_id
+                or not any(
+                    handle.handle_kind == edit.handle_kind
+                    for handle in target.handles
+                )
+            ):
+                return False
+        return True
+
+    def _find_sloped_ceiling_edit_target(
+        self,
+        edit: SlopedCeilingEdit,
+    ) -> SlopedCeilingEditTarget | None:
+        """Resolve edits whose joined creation span was physically normalized."""
+
+        exact_target = self._sloped_ceiling_edit_targets_by_key.get(
+            self._get_sloped_ceiling_edit_target_key(edit)
+        )
+        if exact_target is not None or edit.slope_id is not None:
+            return exact_target
+        candidates = tuple(
+            target
+            for target in self._sloped_ceiling_edit_targets_by_key.values()
+            if target.level_index == edit.level_index
+            and target.wall_surface_id == edit.wall_surface_id
+            and target.slope_id is None
+            and target.creation_start_ratio <= edit.creation_start_ratio + 1e-9
+            and target.creation_end_ratio >= edit.creation_end_ratio - 1e-9
+        )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda target: (
+                target.creation_end_ratio - target.creation_start_ratio,
+                target.target_id,
+            ),
+        )
+
+    def _capture_sloped_ceiling_undo_state(
+        self,
+        level_indices: int | Iterable[int],
+    ) -> _CanvasSlopedCeilingUndoState:
+        """Capture every affected level's slope collection before a drag."""
+
+        requested_indices = (
+            (level_indices,)
+            if isinstance(level_indices, int)
+            else tuple(level_indices)
+        )
+        normalized_indices = tuple(sorted({int(index) for index in requested_indices}))
+        if not normalized_indices:
+            raise ValueError("A sloped-ceiling edit must affect at least one level.")
+        levels_by_index = {level.index: level for level in self.levels}
+        missing_indices = tuple(
+            index for index in normalized_indices if index not in levels_by_index
+        )
+        if missing_indices:
+            raise ValueError("The sloped-ceiling level no longer exists.")
+        snapshots = tuple(
+            (
+                level_index,
+                self._copy_sloped_ceilings(
+                    levels_by_index[level_index].sloped_ceilings
+                ),
+            )
+            for level_index in normalized_indices
+        )
+        first_level_index, first_sloped_ceilings = snapshots[0]
+        return _CanvasSlopedCeilingUndoState(
+            level_index=first_level_index,
+            sloped_ceilings=first_sloped_ceilings,
+            additional_levels=snapshots[1:],
+            window_snapshots_by_level=tuple(
+                (
+                    level_index,
+                    self._copy_windows(levels_by_index[level_index].windows),
+                )
+                for level_index in normalized_indices
+            ),
+        )
+
+    def _stage_sloped_ceiling_edit_batch(
+        self,
+        edits: Sequence[SlopedCeilingEdit],
+    ) -> tuple[list[LevelData], tuple[SlopedCeilingData, ...]]:
+        """Apply one complete slope batch to detached levels for validation."""
+
+        wall_surfaces = self._sloped_ceiling_host_surfaces
+        affected_slope_keys = {
+            (edit.level_index, edit.slope_id)
+            for edit in edits
+            if edit.slope_id is not None
+        }
+        has_affected_windows = any(
+            (level.index, window.sloped_ceiling_id) in affected_slope_keys
+            for level in self.levels
+            for window in level.windows
+        )
+        previous_hosts = (
+            build_sloped_ceiling_window_hosts(self.levels, wall_surfaces)
+            if has_affected_windows
+            else ()
+        )
+        staged_levels: list[LevelData] = []
+        for level in self.levels:
+            staged_level = copy.copy(level)
+            staged_level.sloped_ceilings = list(
+                self._copy_sloped_ceilings(level.sloped_ceilings)
+            )
+            staged_level.windows = list(self._copy_windows(level.windows))
+            staged_levels.append(staged_level)
+        applied_records = tuple(
+            apply_sloped_ceiling_edit(staged_levels, edit) for edit in edits
+        )
+        applied_records = self._join_created_sloped_ceiling_records(
+            staged_levels,
+            edits,
+            applied_records,
+        )
+        preserve_sloped_ceiling_window_dimensions(
+            staged_levels,
+            wall_surfaces,
+            previous_hosts,
+            edits,
+        )
+        return staged_levels, applied_records
+
+    def _detach_sloped_ceiling_window_placements(
+        self,
+        window_frame_ids: Iterable[str],
+    ) -> tuple[WindowPlacement, ...]:
+        """Detach fixtures whose slope edit removed their structural frames."""
+
+        removed_frame_ids = {
+            str(window_frame_id).strip()
+            for window_frame_id in window_frame_ids
+            if str(window_frame_id).strip()
+        }
+        if not removed_frame_ids:
+            return ()
+        library = self.doors_workspace.data()
+        removed = tuple(
+            placement
+            for placement in library.window_placements
+            if placement.window_frame_id in removed_frame_ids
+        )
+        if not removed:
+            return ()
+        removed_placement_ids = {
+            placement.placement_id for placement in removed
+        }
+        self.doors_workspace.set_data(
+            DoorLibraryData(
+                doors=list(library.doors),
+                placements=list(library.placements),
+                windows=list(library.windows),
+                window_placements=[
+                    placement
+                    for placement in library.window_placements
+                    if placement.placement_id not in removed_placement_ids
+                ],
+            )
+        )
+        self._refresh_canvas_window_asset_list()
+        return removed
+
+    def _restore_sloped_ceiling_window_placements(
+        self,
+        placements: Sequence[WindowPlacement],
+    ) -> None:
+        """Restore detached fixtures whose structural frames were undone."""
+
+        if not placements:
+            return
+        library = self.doors_workspace.data()
+        existing_placement_ids = {
+            placement.placement_id for placement in library.window_placements
+        }
+        occupied_frames = {
+            (placement.level_index, placement.window_frame_id)
+            for placement in library.window_placements
+        }
+        known_window_ids = {window.window_id for window in library.windows}
+        frames_by_level = {
+            level.index: {window.window_id for window in level.windows}
+            for level in self.levels
+        }
+        restored = list(library.window_placements)
+        for placement in placements:
+            target = (placement.level_index, placement.window_frame_id)
+            if (
+                placement.placement_id in existing_placement_ids
+                or target in occupied_frames
+                or placement.window_id not in known_window_ids
+                or placement.window_frame_id
+                not in frames_by_level.get(placement.level_index, set())
+            ):
+                continue
+            restored.append(placement)
+            existing_placement_ids.add(placement.placement_id)
+            occupied_frames.add(target)
+        if len(restored) == len(library.window_placements):
+            return
+        self.doors_workspace.set_data(
+            DoorLibraryData(
+                doors=list(library.doors),
+                placements=list(library.placements),
+                windows=list(library.windows),
+                window_placements=restored,
+            )
+        )
+        self._refresh_canvas_window_asset_list()
+
+    def _join_created_sloped_ceiling_records(
+        self,
+        levels: Sequence[LevelData],
+        edits: Sequence[SlopedCeilingEdit],
+        records: Sequence[SlopedCeilingData],
+    ) -> tuple[SlopedCeilingData, ...]:
+        """Persist one identity for slopes created by a shared wall drag."""
+
+        normalized_records = tuple(records)
+        if (
+            len(normalized_records) < 2
+            or len(normalized_records) != len(edits)
+            or any(edit.slope_id is not None for edit in edits)
+            or any(
+                edit.handle_kind != SLOPED_CEILING_HANDLE_CREATE_DEPTH
+                for edit in edits
+            )
+        ):
+            return normalized_records
+
+        targets = tuple(
+            self._find_sloped_ceiling_edit_target(edit) for edit in edits
+        )
+        if any(target is None for target in targets):
+            return normalized_records
+        resolved_targets = tuple(
+            target for target in targets if target is not None
+        )
+        if len({target.level_index for target in resolved_targets}) != 1:
+            return normalized_records
+        reference_direction = np.asarray(
+            resolved_targets[0].wall_end_world,
+            dtype=float,
+        ) - np.asarray(resolved_targets[0].wall_start_world, dtype=float)
+        reference_length = float(np.linalg.norm(reference_direction))
+        if reference_length <= 1e-9:
+            return normalized_records
+        reference_direction /= reference_length
+        projected_intervals: list[tuple[float, float]] = []
+        for edit, target in zip(edits, resolved_targets):
+            wall_start = np.asarray(target.wall_start_world, dtype=float)
+            wall_end = np.asarray(target.wall_end_world, dtype=float)
+            direction = wall_end - wall_start
+            direction_length = float(np.linalg.norm(direction))
+            if (
+                direction_length <= 1e-9
+                or abs(
+                    float(
+                        np.dot(
+                            reference_direction,
+                            direction / direction_length,
+                        )
+                    )
+                )
+                < 1.0 - 1e-6
+            ):
+                return normalized_records
+            endpoints = tuple(
+                wall_start + direction * ratio
+                for ratio in (
+                    edit.creation_start_ratio,
+                    edit.creation_end_ratio,
+                )
+            )
+            projections = tuple(
+                float(np.dot(point, reference_direction)) for point in endpoints
+            )
+            projected_intervals.append(
+                (min(projections), max(projections))
+            )
+        first_interval = projected_intervals[0]
+        if any(
+            not np.allclose(interval, first_interval, atol=1e-6, rtol=0.0)
+            for interval in projected_intervals[1:]
+        ):
+            return normalized_records
+
+        joined_group_id = uuid.uuid4().hex
+        replacements = {
+            (edit.level_index, record.slope_id): replace(
+                record,
+                joined_group_id=joined_group_id,
+            )
+            for edit, record in zip(edits, normalized_records)
+        }
+        for level in levels:
+            level.sloped_ceilings = [
+                replacements.get((level.index, record.slope_id), record)
+                for record in level.sloped_ceilings
+            ]
+        return tuple(
+            replacements[(edit.level_index, record.slope_id)]
+            for edit, record in zip(edits, normalized_records)
+        )
+
+    def _refresh_sloped_ceiling_edit_targets(
+        self,
+        *,
+        preserve_selection: bool,
+    ) -> None:
+        """Rebase wall-bound handles against the current live slope values."""
+
+        wall_surfaces = self._sloped_ceiling_host_surfaces
+        try:
+            targets = build_sloped_ceiling_edit_targets(
+                self.levels,
+                wall_surfaces,
+            )
+        except (TypeError, ValueError) as error:
+            self._sloped_ceiling_edit_targets_by_key = {}
+            self._sloped_ceiling_edit_targets_by_wall_id = {}
+            self.viewer.set_sloped_ceiling_edit_targets(())
+            self.viewer.set_surface_tools_status(
+                f"Sloped-ceiling controls unavailable: {error}"
+            )
+            return
+        self._remember_sloped_ceiling_edit_targets(targets)
+        self.viewer.set_sloped_ceiling_edit_targets(
+            targets,
+            preserve_selection=preserve_selection,
+        )
+
+    def _set_sloped_ceiling_preview(
+        self,
+        raw_edits: object | None = None,
+    ) -> bool:
+        """Replace translucent skins for every wall affected by one drag."""
+
+        try:
+            preview_levels: Sequence[LevelData] = self.levels
+            if raw_edits is None:
+                wall_surface_ids = self._pending_sloped_ceiling_wall_surface_ids
+            else:
+                edits = self._normalize_sloped_ceiling_edit_batch(raw_edits)
+                if edits is None:
+                    return False
+                preview_levels, _applied_records = (
+                    self._stage_sloped_ceiling_edit_batch(edits)
+                )
+                wall_surface_ids = tuple(
+                    dict.fromkeys(edit.wall_surface_id for edit in edits)
+                )
+            meshes = tuple(
+                mesh
+                for wall_surface_id in wall_surface_ids
+                for mesh in build_sloped_ceiling_preview_meshes(
+                    preview_levels,
+                    self._sloped_ceiling_host_surfaces,
+                    wall_surface_id=wall_surface_id,
+                )
+            )
+        except (TypeError, ValueError) as error:
+            self.viewer.set_surface_tools_status(
+                f"Sloped-ceiling preview stopped: {error}"
+            )
+            return False
+        self.viewer.set_sloped_ceiling_preview_meshes(meshes)
+        return True
+
+    @staticmethod
+    def _sloped_ceiling_edits_share_target(
+        first: SlopedCeilingEdit,
+        second: SlopedCeilingEdit,
+    ) -> bool:
+        """Return whether two edits belong to the same immutable drag target."""
+
+        return (
+            first.level_index == second.level_index
+            and first.wall_surface_id == second.wall_surface_id
+            and first.slope_id == second.slope_id
+            and first.handle_kind == second.handle_kind
+        )
+
+    @classmethod
+    def _sloped_ceiling_edit_batches_share_targets(
+        cls,
+        first: Sequence[SlopedCeilingEdit],
+        second: Sequence[SlopedCeilingEdit],
+    ) -> bool:
+        """Return whether two batches address the same handles and targets."""
+
+        first_handles = tuple(
+            sorted(
+                (
+                    edit.level_index,
+                    *cls._get_sloped_ceiling_edit_target_key(edit),
+                    edit.handle_kind,
+                )
+                for edit in first
+            )
+        )
+        second_handles = tuple(
+            sorted(
+                (
+                    edit.level_index,
+                    *cls._get_sloped_ceiling_edit_target_key(edit),
+                    edit.handle_kind,
+                )
+                for edit in second
+            )
+        )
+        return first_handles == second_handles
+
+    def _handle_sloped_ceiling_edit_started(self, raw_edits: object) -> None:
+        """Begin one atomic lightweight drag without rebuilding scene meshes."""
+
+        edits = self._normalize_sloped_ceiling_edit_batch(raw_edits)
+        if (
+            edits is None
+            or self._active_sloped_ceiling_edits
+            or not self._sloped_ceiling_edit_batch_is_available(edits)
+        ):
+            return
+        edit_scope_keys = self._get_sloped_ceiling_edit_scope_keys(edits)
+        pending_state = self._pending_sloped_ceiling_undo_state
+        pending_is_same_batch = bool(
+            pending_state is not None
+            and edit_scope_keys == self._pending_sloped_ceiling_target_keys
+        )
+        if pending_state is not None and not pending_is_same_batch:
+            self._commit_pending_sloped_ceiling_mesh_update(
+                defer_viewer_refresh=True
+            )
+        self._sloped_ceiling_mesh_update_timer.stop()
+        try:
+            undo_state = self._capture_sloped_ceiling_undo_state(
+                edit.level_index for edit in edits
+            )
+        except ValueError as error:
+            self.viewer.set_surface_tools_status(str(error))
+            return
+        self._active_sloped_ceiling_edits = edits
+        self._active_sloped_ceiling_edit = edits[0]
+        self._active_sloped_ceiling_undo_state = undo_state
+
+    def _handle_sloped_ceiling_edit_preview_changed(
+        self,
+        raw_edits: object,
+    ) -> None:
+        """Preview absolute handle values without mutating project data."""
+
+        edits = self._normalize_sloped_ceiling_edit_batch(raw_edits)
+        active_edits = self._active_sloped_ceiling_edits
+        if (
+            edits is None
+            or not active_edits
+            or not self._sloped_ceiling_edit_batches_share_targets(
+                active_edits,
+                edits,
+            )
+        ):
+            return
+        self._set_sloped_ceiling_preview(edits)
+
+    def _handle_sloped_ceiling_edit_finished(
+        self,
+        raw_edits: object,
+        changed: bool,
+    ) -> None:
+        """Persist one released batch atomically and restart its debounce."""
+
+        edits = self._normalize_sloped_ceiling_edit_batch(raw_edits)
+        active_edits = self._active_sloped_ceiling_edits
+        active_undo_state = self._active_sloped_ceiling_undo_state
+        if (
+            edits is None
+            or not active_edits
+            or active_undo_state is None
+            or not self._sloped_ceiling_edit_batches_share_targets(
+                active_edits,
+                edits,
+            )
+        ):
+            return
+        self._active_sloped_ceiling_edits = ()
+        self._active_sloped_ceiling_edit = None
+        self._active_sloped_ceiling_undo_state = None
+        if not changed:
+            self._resume_pending_sloped_ceiling_preview()
+            self._queue_viewer_preview_refresh()
+            return
+        try:
+            staged_levels, applied_records = (
+                self._stage_sloped_ceiling_edit_batch(edits)
+            )
+        except (TypeError, ValueError) as error:
+            self.viewer.set_surface_tools_status(
+                f"Sloped-ceiling edit stopped: {error}"
+            )
+            self._resume_pending_sloped_ceiling_preview()
+            self._refresh_sloped_ceiling_edit_targets(preserve_selection=True)
+            self._queue_viewer_preview_refresh()
+            return
+        staged_levels_by_index = {
+            level.index: level for level in staged_levels
+        }
+        levels_by_index = {level.index: level for level in self.levels}
+        removed_window_frame_ids = {
+            window.window_id
+            for level_index, baseline_windows in (
+                active_undo_state.window_snapshots_by_level
+            )
+            for window in baseline_windows
+            if window.window_id
+            not in {
+                staged_window.window_id
+                for staged_window in staged_levels_by_index[level_index].windows
+            }
+        }
+        for level_index, _sloped_ceilings in (
+            active_undo_state.sloped_ceilings_by_level
+        ):
+            level = levels_by_index[level_index]
+            staged_level = staged_levels_by_index[level_index]
+            level.sloped_ceilings = list(staged_level.sloped_ceilings)
+            level.windows = list(staged_level.windows)
+        removed_window_placements = (
+            self._detach_sloped_ceiling_window_placements(
+                removed_window_frame_ids
+            )
+        )
+        if removed_window_placements:
+            active_undo_state = replace(
+                active_undo_state,
+                removed_window_placements=removed_window_placements,
+            )
+        if self._pending_sloped_ceiling_undo_state is None:
+            self._pending_sloped_ceiling_undo_state = active_undo_state
+        elif removed_window_placements:
+            pending_state = self._pending_sloped_ceiling_undo_state
+            placements_by_id = {
+                placement.placement_id: placement
+                for placement in pending_state.removed_window_placements
+            }
+            placements_by_id.update(
+                {
+                    placement.placement_id: placement
+                    for placement in removed_window_placements
+                }
+            )
+            self._pending_sloped_ceiling_undo_state = replace(
+                pending_state,
+                removed_window_placements=tuple(placements_by_id.values()),
+            )
+        self._pending_sloped_ceiling_target_keys = tuple(
+            sorted(
+                (
+                    edit.level_index,
+                    applied.wall_surface_id,
+                    applied.slope_id,
+                )
+                for edit, applied in zip(edits, applied_records)
+            )
+        )
+        self._pending_sloped_ceiling_wall_surface_ids = tuple(
+            dict.fromkeys(applied.wall_surface_id for applied in applied_records)
+        )
+        first_applied = applied_records[0]
+        self._pending_sloped_ceiling_id = first_applied.slope_id
+        self._pending_sloped_ceiling_wall_surface_id = (
+            first_applied.wall_surface_id
+        )
+        self._set_sloped_ceiling_preview()
+        self._refresh_sloped_ceiling_edit_targets(preserve_selection=True)
+        self._sloped_ceiling_mesh_update_timer.start()
+
+    def _handle_sloped_ceiling_edit_cancelled(self, raw_edits: object) -> None:
+        """Discard a drag-only slope preview and resume an older debounce."""
+
+        active_edits = self._active_sloped_ceiling_edits
+        edits = self._normalize_sloped_ceiling_edit_batch(raw_edits)
+        if (
+            not active_edits
+            or (
+                edits is not None
+                and not self._sloped_ceiling_edit_batches_share_targets(
+                    active_edits,
+                    edits,
+                )
+            )
+        ):
+            return
+        self._active_sloped_ceiling_edits = ()
+        self._active_sloped_ceiling_edit = None
+        self._active_sloped_ceiling_undo_state = None
+        self._resume_pending_sloped_ceiling_preview()
+        self._queue_viewer_preview_refresh()
+
+    def _resume_pending_sloped_ceiling_preview(self) -> None:
+        """Restore the released preview or clear a cancelled first edit."""
+
+        if self._pending_sloped_ceiling_undo_state is None:
+            self.viewer.clear_sloped_ceiling_preview()
+            return
+        self._set_sloped_ceiling_preview()
+        self._sloped_ceiling_mesh_update_timer.start()
+
+    def _commit_pending_sloped_ceiling_mesh_update(
+        self,
+        *,
+        defer_viewer_refresh: bool = False,
+    ) -> None:
+        """Publish one slope burst, optionally rebuilding with the next edit."""
+
+        self._sloped_ceiling_mesh_update_timer.stop()
+        undo_state = self._pending_sloped_ceiling_undo_state
+        if undo_state is None:
+            return
+        levels_by_index = {level.index: level for level in self.levels}
+        if any(
+            level_index not in levels_by_index
+            for level_index, _sloped_ceilings in undo_state.sloped_ceilings_by_level
+        ):
+            self._cancel_pending_sloped_ceiling_mesh_update(restore=False)
+            return
+        current_by_level = tuple(
+            (
+                level_index,
+                self._copy_sloped_ceilings(
+                    levels_by_index[level_index].sloped_ceilings
+                ),
+            )
+            for level_index, _sloped_ceilings in undo_state.sloped_ceilings_by_level
+        )
+        current_windows_by_level = tuple(
+            (
+                level_index,
+                self._copy_windows(levels_by_index[level_index].windows),
+            )
+            for level_index, _windows in undo_state.window_snapshots_by_level
+        )
+        current_slopes_by_level = dict(current_by_level)
+        current_windows_lookup = dict(current_windows_by_level)
+        changed = (
+            any(
+                current_slopes_by_level[level_index] != baseline
+                for level_index, baseline in undo_state.sloped_ceilings_by_level
+            )
+            or any(
+                current_windows_lookup[level_index] != baseline
+                for level_index, baseline in undo_state.window_snapshots_by_level
+            )
+        )
+        for level_index, current_slopes in current_by_level:
+            self._viewer_sloped_ceilings_by_level_index[level_index] = current_slopes
+        for level_index, current_windows in current_windows_by_level:
+            self._viewer_windows_by_level_index[level_index] = current_windows
+        self._pending_sloped_ceiling_undo_state = None
+        self._pending_sloped_ceiling_id = None
+        self._pending_sloped_ceiling_wall_surface_id = None
+        self._pending_sloped_ceiling_target_keys = ()
+        self._pending_sloped_ceiling_wall_surface_ids = ()
+        self.viewer.clear_sloped_ceiling_preview()
+        if changed:
+            self._record_canvas_undo_state(
+                undo_state,
+                commit_pending_sloped_ceiling_edit=False,
+            )
+        if defer_viewer_refresh:
+            self._mark_viewer_preview_dirty(preserve_camera=True)
+            return
+        self._refresh_sloped_ceiling_edit_targets(preserve_selection=True)
+        self._reconcile_canvas_surface_edit_and_refresh()
+
+    def _cancel_pending_sloped_ceiling_mesh_update(
+        self,
+        *,
+        restore: bool,
+    ) -> bool:
+        """Clear queued slope work, optionally restoring its first baseline."""
+
+        self._sloped_ceiling_mesh_update_timer.stop()
+        undo_state = self._pending_sloped_ceiling_undo_state
+        if undo_state is None:
+            return False
+        levels_by_index = {level.index: level for level in self.levels}
+        for level_index, sloped_ceilings in undo_state.sloped_ceilings_by_level:
+            level = levels_by_index.get(level_index)
+            if level is None:
+                continue
+            if restore:
+                level.sloped_ceilings = list(sloped_ceilings)
+            self._viewer_sloped_ceilings_by_level_index[level.index] = (
+                self._copy_sloped_ceilings(level.sloped_ceilings)
+            )
+        for level_index, windows in undo_state.window_snapshots_by_level:
+            level = levels_by_index.get(level_index)
+            if level is None:
+                continue
+            if restore:
+                level.windows = list(windows)
+            self._viewer_windows_by_level_index[level.index] = (
+                self._copy_windows(level.windows)
+            )
+        if restore:
+            self._restore_sloped_ceiling_window_placements(
+                undo_state.removed_window_placements
+            )
+        self._pending_sloped_ceiling_undo_state = None
+        self._pending_sloped_ceiling_id = None
+        self._pending_sloped_ceiling_wall_surface_id = None
+        self._pending_sloped_ceiling_target_keys = ()
+        self._pending_sloped_ceiling_wall_surface_ids = ()
+        self.viewer.clear_sloped_ceiling_preview()
+        self._refresh_sloped_ceiling_edit_targets(preserve_selection=True)
+        return True
+
+    def _undo_pending_sloped_ceiling_mesh_update(self) -> bool:
+        """Undo one released slope edit before it enters shared history."""
+
+        if not self._cancel_pending_sloped_ceiling_mesh_update(restore=True):
+            return False
+        self._reconcile_canvas_surface_edit_and_refresh()
+        return True
+
+    def _cancel_active_sloped_ceiling_edit(self) -> bool:
+        """Cancel viewer ownership or clear a stranded controller drag."""
+
+        viewer_cancelled = self.viewer.cancel_sloped_ceiling_edit()
+        if not self._active_sloped_ceiling_edits:
+            return viewer_cancelled
+        self._active_sloped_ceiling_edits = ()
+        self._active_sloped_ceiling_edit = None
+        self._active_sloped_ceiling_undo_state = None
+        self._resume_pending_sloped_ceiling_preview()
+        return True
+
+    def _restore_canvas_sloped_ceiling_undo_state(
+        self,
+        state: _CanvasSlopedCeilingUndoState,
+    ) -> None:
+        """Restore one committed slope collection and rebuild its ceiling."""
+
+        levels_by_index = {level.index: level for level in self.levels}
+        if any(
+            level_index not in levels_by_index
+            for level_index, _sloped_ceilings in state.sloped_ceilings_by_level
+        ):
+            raise ValueError("The sloped-ceiling level no longer exists.")
+        for level_index, sloped_ceilings in state.sloped_ceilings_by_level:
+            level = levels_by_index[level_index]
+            level.sloped_ceilings = list(sloped_ceilings)
+            self._viewer_sloped_ceilings_by_level_index[level.index] = (
+                self._copy_sloped_ceilings(level.sloped_ceilings)
+            )
+        for level_index, windows in state.window_snapshots_by_level:
+            level = levels_by_index[level_index]
+            level.windows = list(windows)
+            self._viewer_windows_by_level_index[level.index] = (
+                self._copy_windows(level.windows)
+            )
+        self._restore_sloped_ceiling_window_placements(
+            state.removed_window_placements
+        )
+        self.viewer.clear_sloped_ceiling_preview()
+        self._refresh_sloped_ceiling_edit_targets(preserve_selection=True)
+        self._reconcile_canvas_surface_edit_and_refresh()
+
     # ### Canvas persistent surface topology edits ###
     def _record_canvas_undo_state(
         self,
@@ -6444,6 +7511,7 @@ class BlueprintWorkspace(QWidget):
         *,
         commit_pending_level_transform_edit: bool = True,
         commit_pending_surface_edit: bool = True,
+        commit_pending_sloped_ceiling_edit: bool = True,
         commit_pending_architectural_trim_edit: bool = True,
         commit_pending_face_orientation_edit: bool = True,
     ) -> None:
@@ -6457,6 +7525,8 @@ class BlueprintWorkspace(QWidget):
             self._commit_pending_level_transform_update()
         if commit_pending_surface_edit:
             self._commit_pending_canvas_surface_mesh_update()
+        if commit_pending_sloped_ceiling_edit:
+            self._commit_pending_sloped_ceiling_mesh_update()
         if commit_pending_architectural_trim_edit:
             self._commit_pending_architectural_trim_mesh_update()
         self._canvas_undo_stack.append(state)
@@ -6465,6 +7535,7 @@ class BlueprintWorkspace(QWidget):
         """Start a new history branch after replacing Canvas coordinates."""
 
         self._cancel_pending_canvas_face_orientation_update(restore=False)
+        self._cancel_pending_sloped_ceiling_mesh_update(restore=False)
         self._stair_point_mesh_update_timer.stop()
         self._pending_stair_point_mesh_update = False
         self._pending_stair_point_undo_state = None
@@ -6525,6 +7596,10 @@ class BlueprintWorkspace(QWidget):
                 ),
                 architectural_trims_by_level=tuple(
                     (level.index, tuple(level.architectural_trims))
+                    for level in self.levels
+                ),
+                sloped_ceilings_by_level=tuple(
+                    (level.index, tuple(level.sloped_ceilings))
                     for level in self.levels
                 ),
             )
@@ -6634,6 +7709,9 @@ class BlueprintWorkspace(QWidget):
             ),
             architectural_trims_by_level=tuple(
                 (level.index, tuple(level.architectural_trims)) for level in self.levels
+            ),
+            sloped_ceilings_by_level=tuple(
+                (level.index, tuple(level.sloped_ceilings)) for level in self.levels
             ),
             assignments=assignments,
             assignment_targets_after=(),
@@ -6808,6 +7886,9 @@ class BlueprintWorkspace(QWidget):
         if self._undo_pending_canvas_surface_mesh_update():
             self.viewer.set_surface_tools_status("Canvas surface edit undone.")
             return
+        if self._undo_pending_sloped_ceiling_mesh_update():
+            self.viewer.set_surface_tools_status("Sloped ceiling edit undone.")
+            return
         if self._undo_pending_architectural_trim_mesh_update():
             self.viewer.set_architectural_trim_status(
                 "Architectural trim preview undone."
@@ -6837,6 +7918,7 @@ class BlueprintWorkspace(QWidget):
         self._is_restoring_canvas_undo = True
         try:
             self._cancel_pending_canvas_surface_mesh_update()
+            self._cancel_pending_sloped_ceiling_mesh_update(restore=False)
             self._clear_pending_architectural_trim_mesh_update()
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
@@ -6852,6 +7934,8 @@ class BlueprintWorkspace(QWidget):
                 )
             elif isinstance(state, _CanvasSurfaceEditUndoState):
                 self._restore_canvas_surface_edit_undo_state(state)
+            elif isinstance(state, _CanvasSlopedCeilingUndoState):
+                self._restore_canvas_sloped_ceiling_undo_state(state)
             elif isinstance(state, _CanvasLevelPropertiesUndoState):
                 self._restore_canvas_level_properties_undo_state(state)
             elif isinstance(state, _CanvasOuterWallMarkUndoState):
@@ -7466,9 +8550,18 @@ class BlueprintWorkspace(QWidget):
                     "An architectural-trim level in this undo step no longer exists."
                 )
             trim_level.architectural_trims = list(architectural_trims)
+        for level_index, sloped_ceilings in state.sloped_ceilings_by_level:
+            slope_level = self._get_level_by_index(level_index)
+            if slope_level is None:
+                raise ValueError(
+                    "A sloped-ceiling level in this undo step no longer exists."
+                )
+            slope_level.sloped_ceilings = list(sloped_ceilings)
+        if state.sloped_ceilings_by_level:
+            self._reset_viewer_sloped_ceiling_snapshots()
         self.outer_wall_marks = state.outer_wall_marks
         self._sync_canvas_outer_wall_marking()
-        if state.architectural_trims_by_level:
+        if state.architectural_trims_by_level or state.sloped_ceilings_by_level:
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
         return self._restore_blueprint_surface_bindings(
@@ -7613,6 +8706,13 @@ class BlueprintWorkspace(QWidget):
             if level is None:
                 raise ValueError("The Canvas level in this undo step no longer exists.")
             level.architectural_trims = list(architectural_trims)
+        for level_index, sloped_ceilings in state.sloped_ceilings_by_level:
+            level = levels_by_index.get(level_index)
+            if level is None:
+                raise ValueError("The Canvas level in this undo step no longer exists.")
+            level.sloped_ceilings = list(sloped_ceilings)
+        if state.sloped_ceilings_by_level:
+            self._reset_viewer_sloped_ceiling_snapshots()
         self._desired_canvas_surface_ids = state.selected_surface_ids
         self._desired_canvas_architectural_trim_part_ids = (
             state.selected_architectural_trim_part_ids
@@ -7884,6 +8984,7 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_canvas_face_orientation_update()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_architectural_trim_mesh_update()
+        self._commit_pending_sloped_ceiling_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
         undo_state = BlueprintWorkspace._capture_canvas_topology_undo_state(self)
@@ -14103,8 +15204,9 @@ class BlueprintWorkspace(QWidget):
             target_surface_ids,
         ):
             self.texture_atlas_workspace.status_label.setText(
-                "The selected texture can only be assigned to surfaces of the "
-                f"same type ({assignment.surface_type})."
+                "The selected texture can only be assigned to compatible "
+                f"{assignment.surface_type} surfaces. Sloped-ceiling faces "
+                "accept wall or ceiling textures."
             )
             return
         source_ids_to_remove = self._atlas_surface_sources_displaced_by(
@@ -16629,6 +17731,14 @@ class BlueprintWorkspace(QWidget):
 
         return tuple(copy.deepcopy(tuple(windows)))
 
+    @staticmethod
+    def _copy_sloped_ceilings(
+        sloped_ceilings: Sequence[SlopedCeilingData],
+    ) -> tuple[SlopedCeilingData, ...]:
+        """Own an immutable slope snapshot for delayed scene rebuilding."""
+
+        return tuple(copy.deepcopy(tuple(sloped_ceilings)))
+
     def _reset_viewer_doorway_snapshots(self) -> None:
         """Make every rendered structural snapshot match the project."""
 
@@ -16637,6 +17747,7 @@ class BlueprintWorkspace(QWidget):
         }
         self._reset_viewer_window_snapshots()
         self._reset_viewer_floor_thickness_snapshots()
+        self._reset_viewer_sloped_ceiling_snapshots()
 
     def _reset_viewer_window_snapshots(self) -> None:
         """Make every rendered window snapshot match the loaded project."""
@@ -16650,6 +17761,14 @@ class BlueprintWorkspace(QWidget):
 
         self._viewer_floor_thickness_by_level_index = {
             level.index: float(level.floor_thickness_meters) for level in self.levels
+        }
+
+    def _reset_viewer_sloped_ceiling_snapshots(self) -> None:
+        """Make rendered ceiling slopes match authoritative level data."""
+
+        self._viewer_sloped_ceilings_by_level_index = {
+            level.index: self._copy_sloped_ceilings(level.sloped_ceilings)
+            for level in self.levels
         }
 
     def _commit_viewer_floor_thickness_snapshot(self) -> None:
@@ -16717,6 +17836,15 @@ class BlueprintWorkspace(QWidget):
             preview_level.doorways = list(copy.deepcopy(doorway_snapshot))
             preview_level.windows = list(copy.deepcopy(window_snapshot))
             preview_level.floor_thickness_meters = floor_thickness
+            slope_snapshot = self._viewer_sloped_ceilings_by_level_index.get(
+                level.index
+            )
+            if slope_snapshot is None:
+                slope_snapshot = self._copy_sloped_ceilings(level.sloped_ceilings)
+                self._viewer_sloped_ceilings_by_level_index[level.index] = (
+                    slope_snapshot
+                )
+            preview_level.sloped_ceilings = list(copy.deepcopy(slope_snapshot))
             preview_levels.append(preview_level)
         return preview_levels
 
@@ -16839,6 +17967,7 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer,
             self._canvas_surface_mesh_update_timer,
             self._canvas_face_orientation_update_timer,
+            self._sloped_ceiling_mesh_update_timer,
             self._architectural_trim_mesh_update_timer,
             self._level_transform_mesh_update_timer,
             self._stair_point_mesh_update_timer,
@@ -17044,8 +18173,13 @@ class BlueprintWorkspace(QWidget):
     ]:
         """Choose included authored placements and JSON-only linked instances."""
 
+        opening_targets_by_key = self._build_opening_target_lookup_for_levels(
+            self.levels,
+            include_excluded_levels=False,
+        )
         all_placed_models = self._build_placed_generated_models(
-            include_instances=True
+            include_instances=True,
+            window_opening_targets_by_key=opening_targets_by_key,
         )
         placed_models = tuple(
             placement
@@ -17155,6 +18289,7 @@ class BlueprintWorkspace(QWidget):
         """Build render data without paying the GLB serialization cost."""
 
         trim_models: tuple[PlacedGeneratedModel, ...] = ()
+        preview_opening_targets_by_key: dict[str, CanvasOpeningTarget] = {}
         try:
             try:
                 preview_levels = self._viewer_preview_levels_for_model_build
@@ -17181,6 +18316,12 @@ class BlueprintWorkspace(QWidget):
                         self._generation_settings.make_ceilings_double_sided
                     ),
                 )
+                preview_opening_targets_by_key = (
+                    self._build_opening_target_lookup_for_levels(
+                        preview_levels,
+                        include_excluded_levels=True,
+                    )
+                )
             except NoUsableBlueprintGeometryError:
                 base_model = GeneratedModel(
                     mesh=trimesh.Trimesh(process=False),
@@ -17192,6 +18333,7 @@ class BlueprintWorkspace(QWidget):
                 include_instances=True,
                 preview_only=True,
                 precomputed_architectural_trim_models=trim_models,
+                window_opening_targets_by_key=preview_opening_targets_by_key,
             )
             if not placed_models:
                 return base_model
@@ -17203,6 +18345,34 @@ class BlueprintWorkspace(QWidget):
             if failure_title is not None:
                 QMessageBox.warning(self, failure_title, str(error))
             return None
+
+    def _build_opening_target_lookup_for_levels(
+        self,
+        levels: Sequence[LevelData],
+        *,
+        include_excluded_levels: bool,
+    ) -> dict[str, CanvasOpeningTarget]:
+        """Build current opening planes without depending on viewer cache order."""
+
+        opening_levels: list[LevelData] = []
+        for level in levels:
+            opening_level = copy.copy(level)
+            if include_excluded_levels:
+                opening_level.include_in_export = True
+            opening_levels.append(opening_level)
+        surfaces = tuple(
+            build_fixed_surfaces(
+                opening_levels,
+                stairs=self.stairs,
+            )
+        )
+        return {
+            target.key: target
+            for target in build_canvas_opening_targets(
+                opening_levels,
+                surfaces,
+            )
+        }
 
     def _build_surface_preview_material_sources(self) -> dict[str, object]:
         """Use cached 256px Atlas thumbnails for the first scene model."""
@@ -17671,6 +18841,9 @@ class BlueprintWorkspace(QWidget):
         precomputed_architectural_trim_models: (
             Sequence[PlacedGeneratedModel] | None
         ) = None,
+        window_opening_targets_by_key: (
+            Mapping[str, CanvasOpeningTarget] | None
+        ) = None,
     ) -> tuple[PlacedGeneratedModel, ...]:
         """Resolve authored placements and optional linked preview instances."""
 
@@ -17730,6 +18903,7 @@ class BlueprintWorkspace(QWidget):
                 self._build_placed_window_models(
                     visible_level_by_index=visible_level_by_index,
                     preview_only=preview_only,
+                    opening_targets_by_key=window_opening_targets_by_key,
                 )
             )
         trim_models = precomputed_architectural_trim_models
@@ -18328,10 +19502,18 @@ class BlueprintWorkspace(QWidget):
         *,
         visible_level_by_index: Mapping[int, LevelData],
         preview_only: bool = False,
+        opening_targets_by_key: (
+            Mapping[str, CanvasOpeningTarget] | None
+        ) = None,
     ) -> tuple[PlacedGeneratedModel, ...]:
         """Resolve frame-bound reusable windows into authored scene meshes."""
 
         library = self.doors_workspace.data()
+        target_lookup = (
+            self._canvas_opening_targets_by_key
+            if opening_targets_by_key is None
+            else opening_targets_by_key
+        )
         placed_models: list[PlacedGeneratedModel] = []
         for placement in library.window_placements:
             window = library.get_window(placement.window_id)
@@ -18344,10 +19526,17 @@ class BlueprintWorkspace(QWidget):
                 item_index=0,
                 stable_id=placement.window_frame_id,
             )
-            resolved = self._resolve_window_frame_reference(reference)
-            if resolved is None:
+            frame = next(
+                (
+                    candidate
+                    for candidate in level.windows
+                    if candidate.window_id == placement.window_frame_id
+                ),
+                None,
+            )
+            target = target_lookup.get(reference.key)
+            if frame is None or target is None:
                 continue
-            _resolved_level, _frame, target = resolved
             try:
                 fitted_window, model = self._assemble_window_for_frame(
                     window,
@@ -18378,7 +19567,8 @@ class BlueprintWorkspace(QWidget):
         model: GeneratedModel,
         anchor_world: Sequence[float],
         *,
-        yaw_radians: float,
+        yaw_radians: float | None = None,
+        rotation_matrix: np.ndarray | None = None,
         axis_scales: Sequence[float],
     ) -> tuple[float, float, float] | None:
         """Offset the model pivot while keeping its local origin on the opening."""
@@ -18404,14 +19594,21 @@ class BlueprintWorkspace(QWidget):
             ),
             dtype=float,
         )
-        rotation = np.asarray(
-            (
-                (math.cos(yaw_radians), -math.sin(yaw_radians), 0.0),
-                (math.sin(yaw_radians), math.cos(yaw_radians), 0.0),
-                (0.0, 0.0, 1.0),
-            ),
-            dtype=float,
-        )
+        if rotation_matrix is None:
+            if yaw_radians is None or not math.isfinite(float(yaw_radians)):
+                return None
+            rotation = np.asarray(
+                (
+                    (math.cos(yaw_radians), -math.sin(yaw_radians), 0.0),
+                    (math.sin(yaw_radians), math.cos(yaw_radians), 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+                dtype=float,
+            )
+        else:
+            rotation = np.asarray(rotation_matrix, dtype=float)
+            if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
+                return None
         world_position = anchor + rotation @ (scales * local_bottom_center)
         return tuple(float(value) for value in world_position)
 
@@ -18484,15 +19681,39 @@ class BlueprintWorkspace(QWidget):
             target.bounds.bottom_ratio,
         )
         tangent = np.asarray(target.wall_tangent_world, dtype=float)
-        if tangent.shape != (3,) or math.hypot(tangent[0], tangent[1]) <= 1e-9:
+        vertical_axis = np.asarray(target.vertical_axis_world, dtype=float)
+        if tangent.shape != (3,) or vertical_axis.shape != (3,):
             return None
-        yaw_degrees = math.degrees(math.atan2(tangent[1], tangent[0]))
-        yaw_radians = math.radians(yaw_degrees)
+        tangent_length = float(np.linalg.norm(tangent))
+        vertical_length = float(np.linalg.norm(vertical_axis))
+        if tangent_length <= 1e-9 or vertical_length <= 1e-9:
+            return None
+        local_x = tangent / tangent_length
+        local_z = vertical_axis / vertical_length
+        local_y = np.cross(local_z, local_x)
+        local_y_length = float(np.linalg.norm(local_y))
+        if local_y_length <= 1e-9:
+            return None
+        local_y /= local_y_length
+        local_z = np.cross(local_x, local_y)
+        local_z /= float(np.linalg.norm(local_z))
+        rotation = np.column_stack((local_x, local_y, local_z))
+        homogeneous_rotation = np.eye(4, dtype=float)
+        homogeneous_rotation[:3, :3] = rotation
+        rotation_degrees = tuple(
+            float(value)
+            for value in np.degrees(
+                trimesh.transformations.euler_from_matrix(
+                    homogeneous_rotation,
+                    axes="sxyz",
+                )
+            )
+        )
         axis_scales = (level.scale, level.scale, 1.0)
         world_position = BlueprintWorkspace._build_opening_fixture_world_position(
             model,
             bottom_world,
-            yaw_radians=yaw_radians,
+            rotation_matrix=rotation,
             axis_scales=axis_scales,
         )
         if world_position is None:
@@ -18503,7 +19724,7 @@ class BlueprintWorkspace(QWidget):
             object_name=window.name,
             model=model,
             world_position=world_position,
-            rotation_degrees=(0.0, 0.0, yaw_degrees),
+            rotation_degrees=rotation_degrees,
             axis_scales=axis_scales,
         )
 
@@ -19000,6 +20221,8 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
+            or bool(self._active_sloped_ceiling_edits)
+            or self._pending_sloped_ceiling_undo_state is not None
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
             or self._active_architectural_trim_undo_state is not None
@@ -19152,6 +20375,8 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
+            or bool(self._active_sloped_ceiling_edits)
+            or self._pending_sloped_ceiling_undo_state is not None
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
             or self._active_architectural_trim_undo_state is not None
@@ -19207,6 +20432,8 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
+            or bool(self._active_sloped_ceiling_edits)
+            or self._pending_sloped_ceiling_undo_state is not None
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
             or self._active_architectural_trim_undo_state is not None
@@ -26642,6 +27869,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_first_person_movement_mode(
             settings.first_person_navigation_mode
         )
+        self.viewer.set_first_person_speed(
+            settings.first_person_speed_meters_per_second
+        )
         self.viewer.set_ignore_top_down_ceiling(settings.ignore_top_down_ceiling)
         self.viewer.set_hide_stair_mesh_when_previewing(
             settings.hide_stair_mesh_when_previewing
@@ -26754,6 +27984,30 @@ class BlueprintWorkspace(QWidget):
         )
         return tuple(sorted(removed_trim_ids))
 
+    def _remove_sloped_ceilings_without_host_walls(self) -> tuple[str, ...]:
+        """Remove slope records whose stable host walls no longer exist."""
+
+        live_wall_ids = {
+            surface.surface_id
+            for surface in build_base_fixed_surfaces(
+                self.levels,
+                stairs=self.stairs,
+            )
+            if surface.surface_type == SURFACE_TYPE_WALL
+        }
+        removed_slope_ids: set[str] = set()
+        for level in self.levels:
+            retained_slopes = []
+            for slope in level.sloped_ceilings:
+                if slope.wall_surface_id in live_wall_ids:
+                    retained_slopes.append(slope)
+                else:
+                    removed_slope_ids.add(slope.slope_id)
+            level.sloped_ceilings = retained_slopes
+        if removed_slope_ids:
+            self._reset_viewer_sloped_ceiling_snapshots()
+        return tuple(sorted(removed_slope_ids))
+
     def _handle_canvas_wall_vertex_interaction_changed(
         self,
         active: bool,
@@ -26788,7 +28042,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._pending_wall_vertex_mesh_update = False
         self._pending_open_space_corner_mesh_update = False
-        remove_orphaned_trims = self._pending_deleted_wall_cleanup
+        remove_orphaned_wall_records = self._pending_deleted_wall_cleanup
         self._pending_deleted_wall_cleanup = False
         doorway_level_indices = self._pending_wall_vertex_doorway_level_indices
         self._pending_wall_vertex_doorway_level_indices = set()
@@ -26801,8 +28055,9 @@ class BlueprintWorkspace(QWidget):
         if doorway_level_indices:
             self._reconcile_door_placements()
             self._reconcile_window_placements()
-        if remove_orphaned_trims:
+        if remove_orphaned_wall_records:
             self._remove_architectural_trims_without_host_walls()
+            self._remove_sloped_ceilings_without_host_walls()
         self._reconcile_canvas_surface_edit_and_refresh()
 
     def _cancel_pending_wall_vertex_update(self) -> None:
@@ -26987,6 +28242,8 @@ class BlueprintWorkspace(QWidget):
         self.canvas.clear_level_comparison_overlay()
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
+        self._cancel_active_sloped_ceiling_edit()
+        self._cancel_pending_sloped_ceiling_mesh_update(restore=False)
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self._stair_point_mesh_update_timer.stop()

@@ -75,6 +75,9 @@ _SURFACE_ID_PATTERN = re.compile(
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
     r"(?:(?P<wall>wall):(?P<wall_key>[1-9]\d*:[1-9]\d*)|"
     r"(?P<plane>floor|ceiling))|"
+    r"sloped-ceiling:(?P<sloped_ceiling_id>[0-9a-f]{32}):"
+    r"(?:part:(?P<sloped_ceiling_part>[a-z0-9][a-z0-9-]*):)?"
+    r"(?P<sloped_ceiling_type>ceiling)|"
     r"edit-face:(?P<edit_face_id>[0-9a-f]{32}):"
     r"(?P<edit_face_type>wall|floor|ceiling)"
     r")|"
@@ -101,6 +104,31 @@ def get_surface_type_for_id(surface_id: object) -> str:
 
     normalized_id = _normalize_surface_id(surface_id)
     return _surface_type_for_id(normalized_id)
+
+
+def surface_id_accepts_texture_type(
+    surface_id: object,
+    texture_surface_type: object,
+) -> bool:
+    """Return whether one semantic surface accepts a texture family type.
+
+    Sloped-ceiling faces retain their ceiling identity and projection, but are
+    intentional transition surfaces between a wall and a ceiling.  They may
+    therefore use either texture family without making ordinary ceilings
+    compatible with wall textures.
+    """
+
+    normalized_id = _normalize_surface_id(surface_id)
+    normalized_type = _normalize_surface_type(texture_surface_type)
+    encoded_type = _surface_type_for_id(normalized_id)
+    if encoded_type == normalized_type:
+        return True
+    match = _SURFACE_ID_PATTERN.fullmatch(normalized_id)
+    return bool(
+        match is not None
+        and match.group("sloped_ceiling_id") is not None
+        and normalized_type in {SURFACE_TYPE_WALL, SURFACE_TYPE_CEILING}
+    )
 
 
 # ### Generated-texture models ###
@@ -159,7 +187,7 @@ class SurfaceTextureVariant:
 
 @dataclass(frozen=True)
 class SurfaceTextureAssignment:
-    """One generated texture assigned to a homogeneous group of surfaces."""
+    """One generated texture assigned to a compatible group of surfaces."""
 
     assignment_id: str
     surface_type: str
@@ -202,6 +230,7 @@ class SurfaceTextureAssignment:
             expected_type=surface_type,
             allow_empty=True,
             maximum_count=MAX_SELECTED_SURFACES,
+            allow_sloped_ceiling_compatibility=True,
         )
         asset_path = _normalize_safe_relative_asset_path(self.asset_path)
         provider_task_id = _normalize_optional_text(
@@ -895,6 +924,7 @@ def _normalize_surface_ids(
     expected_type: str,
     allow_empty: bool,
     maximum_count: int,
+    allow_sloped_ceiling_compatibility: bool = False,
 ) -> tuple[str, ...]:
     try:
         surface_ids = tuple(raw_surface_ids)  # type: ignore[arg-type]
@@ -909,7 +939,12 @@ def _normalize_surface_ids(
     seen_ids: set[str] = set()
     for raw_surface_id in surface_ids:
         surface_id = _normalize_surface_id(raw_surface_id)
-        if _surface_type_for_id(surface_id) != expected_type:
+        types_are_compatible = (
+            surface_id_accepts_texture_type(surface_id, expected_type)
+            if allow_sloped_ceiling_compatibility
+            else _surface_type_for_id(surface_id) == expected_type
+        )
+        if not types_are_compatible:
             raise ValueError("All selected surfaces must have the selected type.")
         if surface_id in seen_ids:
             continue
@@ -949,6 +984,9 @@ def _surface_type_for_id(surface_id: str) -> str:
     edit_face_type = match.group("edit_face_type")
     if edit_face_type is not None:
         return str(edit_face_type)
+    sloped_ceiling_type = match.group("sloped_ceiling_type")
+    if sloped_ceiling_type is not None:
+        return str(sloped_ceiling_type)
     stair_surface_type = match.group("stair_surface_type")
     if stair_surface_type is not None:
         return str(stair_surface_type)

@@ -18,6 +18,10 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from housemaker.glb import GeneratedModel
+from housemaker.sloped_ceiling import (
+    SlopedCeilingWindowHost,
+    SlopedCeilingWindowPlacement,
+)
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
@@ -104,6 +108,51 @@ def _build_ceiling() -> FixedSurface:
     )
 
 
+def _build_sloped_window_host_and_ceiling(
+) -> tuple[SlopedCeilingWindowHost, FixedSurface]:
+    """Build one inclined rectangular host and its matching semantic ceiling."""
+
+    diagonal = float(np.sqrt(0.5))
+    host = SlopedCeilingWindowHost(
+        slope_id="a" * 32,
+        wall_surface_id="level:0/wall:1:2",
+        level_index=0,
+        room_index=None,
+        plane_start_world=(0.0, 0.0, 1.0),
+        wall_tangent_world=(1.0, 0.0, 0.0),
+        wall_normal_world=(0.0, -diagonal, diagonal),
+        vertical_axis_world=(0.0, diagonal, diagonal),
+        wall_width_meters=4.0,
+        wall_height_meters=2.0,
+    )
+    vertices = np.asarray(
+        tuple(
+            host.local_to_world(horizontal, vertical)
+            for horizontal, vertical in (
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+            )
+        ),
+        dtype=float,
+    )
+    mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64),
+        process=False,
+    )
+    ceiling = FixedSurface(
+        surface_id="level:0/ceiling:slope-host",
+        surface_type=SURFACE_TYPE_CEILING,
+        level_index=0,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=float(mesh.area),
+    )
+    return host, ceiling
+
+
 def _build_model() -> GeneratedModel:
     mesh = trimesh.creation.box(extents=(4.0, 0.2, 3.0))
     return GeneratedModel(mesh=mesh, scene=trimesh.Scene(mesh), glb_bytes=b"")
@@ -153,7 +202,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
         ):
             viewer._handle_window_pointer_moved(QPointF(40.0, 40.0))
 
-    def test_window_tools_are_canvas_opt_in_and_placement_requires_one_wall(
+    def test_window_tools_are_canvas_opt_in_and_require_one_visible_host(
         self,
     ) -> None:
         ordinary_viewer = self._build_viewer(enabled=False)
@@ -166,9 +215,10 @@ class CanvasWindowEditorTests(unittest.TestCase):
         self.assertIsNotNone(canvas_viewer.window_tools_panel)
         self.assertIsNone(canvas_viewer.undo_window_button)
         self.assertIsNone(canvas_viewer.window_tools_status_label)
-        self.assertFalse(hasattr(ordinary_viewer, "add_window_button"))
-        self.assertFalse(hasattr(canvas_viewer, "add_window_button"))
+        self.assertIsNone(ordinary_viewer.add_window_frame_button)
+        self.assertIsNotNone(canvas_viewer.add_window_frame_button)
         assert canvas_viewer.canvas_tools_panel is not None
+        assert canvas_viewer.add_window_frame_button is not None
         labels = tuple(
             label.text()
             for label in canvas_viewer.canvas_tools_panel.findChildren(QLabel)
@@ -177,16 +227,45 @@ class CanvasWindowEditorTests(unittest.TestCase):
             button.text()
             for button in canvas_viewer.canvas_tools_panel.findChildren(QPushButton)
         )
-        self.assertNotIn("Window tools", labels)
+        self.assertIn("Window frames", labels)
+        self.assertIn("Add window frame", buttons)
         self.assertNotIn("Undo window", buttons)
+        self.assertTrue(canvas_viewer.add_window_frame_button.isCheckable())
+        self.assertFalse(canvas_viewer.add_window_frame_button.isEnabled())
+        self.assertFalse(canvas_viewer.begin_window_placement())
 
         wall = _build_wall()
         canvas_viewer.set_wall_targets((_build_floor(), wall))
 
-        self.assertFalse(canvas_viewer.begin_window_placement())
-        self.assertTrue(canvas_viewer.select_wall_target(wall.surface_id))
+        self.assertTrue(canvas_viewer.add_window_frame_button.isEnabled())
         self.assertTrue(canvas_viewer.begin_window_placement())
         self.assertTrue(canvas_viewer.is_window_placement_active())
+        self.assertTrue(canvas_viewer.add_window_frame_button.isChecked())
+
+        canvas_viewer.cancel_window_placement()
+
+        self.assertFalse(canvas_viewer.is_window_placement_active())
+        self.assertFalse(canvas_viewer.add_window_frame_button.isChecked())
+
+    def test_scene_add_window_button_arms_and_cancels_without_preselection(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        viewer.set_wall_targets((_build_wall(),))
+        button = viewer.add_window_frame_button
+        assert button is not None
+
+        self.assertIsNone(viewer.get_selected_wall_surface_id())
+
+        button.click()
+
+        self.assertTrue(button.isChecked())
+        self.assertTrue(viewer.is_window_placement_active())
+
+        button.click()
+
+        self.assertFalse(button.isChecked())
+        self.assertFalse(viewer.is_window_placement_active())
 
     def test_removed_window_undo_api_remains_an_inert_compatibility_shim(
         self,
@@ -247,7 +326,8 @@ class CanvasWindowEditorTests(unittest.TestCase):
             (floor.surface_id,),
         )
         self.assertIsNone(viewer.get_selected_wall_surface_id())
-        self.assertFalse(viewer.begin_window_placement())
+        assert viewer.add_window_frame_button is not None
+        self.assertTrue(viewer.add_window_frame_button.isEnabled())
 
         with (
             patch.object(
@@ -333,7 +413,8 @@ class CanvasWindowEditorTests(unittest.TestCase):
             (ceiling.surface_id,),
         )
         self.assertIsNone(viewer.get_selected_wall_surface_id())
-        self.assertFalse(viewer.begin_window_placement())
+        assert viewer.add_window_frame_button is not None
+        self.assertTrue(viewer.add_window_frame_button.isEnabled())
 
     def test_floor_hit_occludes_a_placed_object_behind_it(self) -> None:
         viewer = self._build_viewer()
@@ -470,6 +551,104 @@ class CanvasWindowEditorTests(unittest.TestCase):
             placement.start_ratio = 0.0  # type: ignore[misc]
         self.assertFalse(viewer.is_window_placement_active())
         self.assertIsNone(viewer._window_preview_item)
+
+    def test_direct_drag_picks_sloped_host_without_preselection(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        host, ceiling = _build_sloped_window_host_and_ceiling()
+        viewer.set_wall_targets((ceiling,))
+        viewer.set_sloped_ceiling_window_hosts((host,))
+        normal = np.asarray(host.wall_normal_world, dtype=float)
+        button = viewer.add_window_frame_button
+        assert button is not None
+        self.assertIsNone(viewer.get_selected_sloped_ceiling_window_host_id())
+        button.click()
+        self.assertTrue(viewer.is_window_placement_active())
+
+        emitted: list[object] = []
+        viewer.window_placement_requested.connect(emitted.append)
+        first = np.asarray(host.local_to_world(0.25, 0.2), dtype=float)
+        second = np.asarray(host.local_to_world(0.75, 0.8), dtype=float)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(first + normal, -normal),
+        ):
+            viewer._handle_window_pointer_pressed(QPointF())
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(second + normal, -normal),
+        ):
+            viewer._handle_window_pointer_released(QPointF())
+
+        self.assertEqual(len(emitted), 1)
+        placement = emitted[0]
+        self.assertIsInstance(placement, SlopedCeilingWindowPlacement)
+        assert isinstance(placement, SlopedCeilingWindowPlacement)
+        self.assertEqual(placement.slope_id, host.slope_id)
+        self.assertFalse(viewer.is_window_placement_active())
+        self.assertFalse(button.isChecked())
+        self.assertTrue(
+            np.allclose(
+                (
+                    placement.start_ratio,
+                    placement.end_ratio,
+                    placement.bottom_ratio,
+                    placement.top_ratio,
+                ),
+                (0.25, 0.75, 0.2, 0.8),
+            )
+        )
+
+    def test_sloped_host_is_pickable_when_top_down_ceiling_is_ignored(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        host, ceiling = _build_sloped_window_host_and_ceiling()
+        viewer.set_wall_targets((ceiling,))
+        viewer.set_sloped_ceiling_window_hosts((host,))
+        viewer.set_ignore_top_down_ceiling(True)
+        normal = np.asarray(host.wall_normal_world, dtype=float)
+        center = np.asarray(host.local_to_world(0.5, 0.5), dtype=float)
+
+        self.assertFalse(viewer._canvas_surface_is_visible(ceiling))
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(center + normal, -normal),
+        ):
+            viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertEqual(
+            viewer.get_selected_sloped_ceiling_window_host_id(),
+            host.target_id,
+        )
+        self.assertEqual(viewer.get_selected_canvas_surface_ids(), ())
+        self.assertTrue(viewer.begin_window_placement())
+
+    def test_armed_sloped_window_placement_survives_stable_target_refresh(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        host, ceiling = _build_sloped_window_host_and_ceiling()
+        viewer.set_wall_targets((ceiling,))
+        viewer.set_sloped_ceiling_window_hosts((host,))
+        viewer._set_sloped_ceiling_window_host_selection(host.target_id)
+        self.assertTrue(viewer.begin_window_placement())
+
+        viewer.set_wall_targets((ceiling,))
+        viewer.set_sloped_ceiling_window_hosts((host,))
+
+        self.assertTrue(viewer.is_window_placement_active())
+        self.assertEqual(
+            viewer.get_selected_sloped_ceiling_window_host_id(),
+            host.target_id,
+        )
+        viewer.set_sloped_ceiling_window_hosts(())
+        self.assertFalse(viewer.is_window_placement_active())
+        self.assertIsNone(viewer.get_selected_sloped_ceiling_window_host_id())
 
     def test_out_of_wall_drag_shows_invalid_preview_and_emits_nothing(self) -> None:
         viewer = self._build_viewer()

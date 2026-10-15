@@ -1,7 +1,6 @@
 # ### Imports ###
 import math
 
-
 # ### Constants ###
 FIRST_PERSON_NAVIGATION_MODE_GRAVITY = "gravity"
 FIRST_PERSON_NAVIGATION_MODE_NOCLIP = "noclip"
@@ -16,6 +15,10 @@ FIRST_PERSON_NAVIGATION_MODE_OPTIONS = (
     ("Noclip", FIRST_PERSON_NAVIGATION_MODE_NOCLIP),
 )
 DEFAULT_FIRST_PERSON_NAVIGATION_MODE = FIRST_PERSON_NAVIGATION_MODE_GRAVITY
+DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 2.5
+MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 0.1
+MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 20.0
+FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND = 0.1
 
 
 # ### Normalization ###
@@ -32,6 +35,26 @@ def normalize_first_person_navigation_mode(value: object) -> str:
             f"{value!r}; expected one of: {supported}."
         )
     return normalized
+
+
+def normalize_first_person_speed_meters_per_second(value: object) -> float:
+    """Return one finite first-person movement speed in supported bounds."""
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError("First-person speed must be a number.")
+    normalized = float(value)
+    if not math.isfinite(normalized) or not (
+        MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
+        <= normalized
+        <= MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
+    ):
+        raise ValueError(
+            "First-person speed must be between "
+            f"{MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND} and "
+            f"{MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND} meters per "
+            "second."
+        )
+    return round(normalized, 1)
 
 
 # ### Movement vectors ###

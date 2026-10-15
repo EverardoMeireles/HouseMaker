@@ -45,6 +45,7 @@ from housemaker.pbr_maps import (
 )
 from housemaker.settings_widget import (
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+    FIRST_PERSON_SPEED_SETTING_KEY,
     SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
@@ -350,6 +351,8 @@ def _edited_face_surface(
     *,
     area_square_meters: float,
     x_offset: float = 0.0,
+    surface_type: str = "wall",
+    surface_alias_ids: tuple[str, ...] = (),
 ) -> FixedSurface:
     """Build one logical edited face without depending on topology models."""
 
@@ -368,11 +371,12 @@ def _edited_face_surface(
     )
     return FixedSurface(
         surface_id=surface_id,
-        surface_type="wall",
+        surface_type=surface_type,
         level_index=2,
         room_index=None,
         mesh=mesh,
         area_square_meters=area_square_meters,
+        surface_alias_ids=surface_alias_ids,
     )
 
 
@@ -618,7 +622,8 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             GenerationServiceSettings(
                 first_person_navigation_mode=(
                     FIRST_PERSON_NAVIGATION_MODE_NOCLIP
-                )
+                ),
+                first_person_speed_meters_per_second=4.2,
             )
         )
 
@@ -629,6 +634,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertTrue(
             self.workspace.surface_view.view.is_first_person_active
         )
+        self.assertEqual(
+            self.workspace.surface_view.get_first_person_speed(),
+            4.2,
+        )
 
     def test_persisted_first_person_mode_initializes_surface_view(self) -> None:
         settings = ApplicationSettingsStore(
@@ -638,6 +647,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
             FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
         )
+        settings.set(FIRST_PERSON_SPEED_SETTING_KEY, 6.3)
         workspace = SurfaceTextureGenerationWorkspace(
             provider=self.provider,
             asset_directory=self._temporary_path / "noclip-surface-assets",
@@ -648,6 +658,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(
                 workspace.surface_view.get_first_person_movement_mode(),
                 FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+            )
+            self.assertEqual(
+                workspace.surface_view.get_first_person_speed(),
+                6.3,
             )
         finally:
             workspace.shutdown()
@@ -1115,6 +1129,179 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(changed.count(), 1)
         self.assertEqual(content_changed.count(), 1)
         self.assertEqual(removed.count(), 0)
+
+    def test_reconcile_migrates_retired_alias_to_canonical_surface(self) -> None:
+        canonical_id = (
+            f"level:2/sloped-ceiling:{'1' * 32}:"
+            "part:start-return:ceiling"
+        )
+        retired_id = (
+            f"level:2/sloped-ceiling:{'2' * 32}:"
+            "part:end-return:ceiling"
+        )
+        area_square_meters = 7.5
+        canonical_surface = _edited_face_surface(
+            canonical_id,
+            area_square_meters=area_square_meters,
+            surface_type="ceiling",
+            surface_alias_ids=(retired_id,),
+        )
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "joined-side.png"
+        asset_path.write_bytes(_colored_texture_png((150, 70, 30, 255)))
+        assignment = SurfaceTextureAssignment(
+            assignment_id="retired-joined-side",
+            surface_type="ceiling",
+            surface_ids=(retired_id,),
+            provider="meshy",
+            asset_path=asset_path.name,
+            provider_task_id="image-task",
+            provider_pbr_task_id="pbr-task",
+            combined_area_m2=2.0,
+            area_description="Retired half-side",
+            reference_frame_indices=(2, 7),
+            texture_width=1024,
+            texture_height=1024,
+            display_name="Joined side plaster",
+            enabled_pbr_maps=(PBR_MAP_NORMAL, PBR_MAP_ROUGHNESS),
+            tiling_mode=SURFACE_TILING_MODE_EDGE_VARIANTS,
+            tiling_seed=42,
+            texture_repeat_size_m=1.25,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        next_level = copy.deepcopy(_test_level())
+        next_level.height_meters += 0.125
+
+        with patch(
+            "housemaker.surface_texture_workspace.build_fixed_surfaces",
+            return_value=[canonical_surface],
+        ):
+            reconciled = self.workspace.reconcile_assignments_with_levels(
+                [next_level]
+            )
+
+        self.assertTrue(reconciled)
+        updated = self.workspace.get_assignment(assignment.assignment_id)
+        assert updated is not None
+        self.assertEqual(updated.surface_ids, (canonical_id,))
+        self.assertAlmostEqual(
+            updated.combined_area_m2,
+            area_square_meters,
+        )
+        self.assertIn(f"{area_square_meters:.2f}", updated.area_description)
+        for field_name in (
+            "assignment_id",
+            "surface_type",
+            "provider",
+            "asset_path",
+            "provider_task_id",
+            "provider_pbr_task_id",
+            "reference_frame_indices",
+            "texture_width",
+            "texture_height",
+            "display_name",
+            "enabled_pbr_maps",
+            "available_pbr_maps",
+            "tiling_mode",
+            "tiling_seed",
+            "texture_repeat_size_m",
+        ):
+            self.assertEqual(
+                getattr(updated, field_name),
+                getattr(assignment, field_name),
+            )
+
+    def test_reconcile_prefers_direct_canonical_owner_over_alias(self) -> None:
+        canonical_id = (
+            f"level:2/sloped-ceiling:{'3' * 32}:"
+            "part:start-return:ceiling"
+        )
+        retired_id = (
+            f"level:2/sloped-ceiling:{'4' * 32}:"
+            "part:end-return:ceiling"
+        )
+        area_square_meters = 6.25
+        canonical_surface = _edited_face_surface(
+            canonical_id,
+            area_square_meters=area_square_meters,
+            surface_type="ceiling",
+            surface_alias_ids=(retired_id,),
+        )
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        alias_asset_path = asset_directory / "alias-side.png"
+        canonical_asset_path = asset_directory / "canonical-side.png"
+        alias_asset_path.write_bytes(
+            _colored_texture_png((150, 70, 30, 255))
+        )
+        canonical_asset_path.write_bytes(
+            _colored_texture_png((30, 120, 210, 255))
+        )
+        alias_assignment = SurfaceTextureAssignment(
+            assignment_id="alias-owner",
+            surface_type="ceiling",
+            surface_ids=(retired_id,),
+            provider="meshy",
+            asset_path=alias_asset_path.name,
+            combined_area_m2=3.0,
+            area_description="Retired side",
+            display_name="Alias finish",
+        )
+        canonical_assignment = SurfaceTextureAssignment(
+            assignment_id="canonical-owner",
+            surface_type="ceiling",
+            surface_ids=(canonical_id,),
+            provider="meshy",
+            asset_path=canonical_asset_path.name,
+            combined_area_m2=4.0,
+            area_description="Canonical side",
+            display_name="Canonical finish",
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[alias_assignment, canonical_assignment]
+            )
+        )
+        next_level = copy.deepcopy(_test_level())
+        next_level.height_meters += 0.125
+
+        with patch(
+            "housemaker.surface_texture_workspace.build_fixed_surfaces",
+            return_value=[canonical_surface],
+        ):
+            reconciled = self.workspace.reconcile_assignments_with_levels(
+                [next_level]
+            )
+
+        self.assertTrue(reconciled)
+        alias_updated = self.workspace.get_assignment(
+            alias_assignment.assignment_id
+        )
+        canonical_updated = self.workspace.get_assignment(
+            canonical_assignment.assignment_id
+        )
+        assert alias_updated is not None
+        assert canonical_updated is not None
+        self.assertEqual(alias_updated.surface_ids, ())
+        self.assertEqual(alias_updated.combined_area_m2, 0.0)
+        self.assertEqual(canonical_updated.surface_ids, (canonical_id,))
+        self.assertAlmostEqual(
+            canonical_updated.combined_area_m2,
+            area_square_meters,
+        )
+        self.assertEqual(
+            canonical_updated.display_name,
+            canonical_assignment.display_name,
+        )
+        canonical_owners = tuple(
+            assignment.assignment_id
+            for assignment in self.workspace.get_assignments()
+            if canonical_id in assignment.surface_ids
+        )
+        self.assertEqual(canonical_owners, (canonical_assignment.assignment_id,))
 
     def test_lineage_remap_preserves_family_and_expands_split_face(self) -> None:
         parent_id = "level:2/room:5/wall:1:2"

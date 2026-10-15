@@ -54,6 +54,26 @@ MAX_DOORWAY_ID_LENGTH = 128
 MAX_WINDOW_ID_LENGTH = 128
 MAX_WINDOW_SURFACE_ID_LENGTH = 512
 MIN_WINDOW_RATIO_SPAN = 1e-6
+DEFAULT_SLOPED_CEILING_DEPTH_METERS = 0.5
+MIN_SLOPED_CEILING_DEPTH_METERS = 0.01
+MAX_SLOPED_CEILING_DEPTH_METERS = 20.0
+DEFAULT_SLOPED_CEILING_ANGLE_DEGREES = 45.0
+MIN_SLOPED_CEILING_ANGLE_DEGREES = 1.0
+MAX_SLOPED_CEILING_ANGLE_DEGREES = 89.0
+DEFAULT_SLOPED_CEILING_WALL_DROP_METERS = (
+    DEFAULT_SLOPED_CEILING_DEPTH_METERS
+    * math.tan(math.radians(DEFAULT_SLOPED_CEILING_ANGLE_DEGREES))
+)
+MIN_SLOPED_CEILING_WALL_DROP_METERS = 0.0
+MAX_SLOPED_CEILING_WALL_DROP_METERS = (
+    MAX_SLOPED_CEILING_DEPTH_METERS
+    * math.tan(math.radians(MAX_SLOPED_CEILING_ANGLE_DEGREES))
+)
+DEFAULT_SLOPED_CEILING_TRANSITION_RADIUS_METERS = 0.0
+MIN_SLOPED_CEILING_TRANSITION_RADIUS_METERS = 0.0
+MAX_SLOPED_CEILING_TRANSITION_RADIUS_METERS = 20.0
+MIN_SLOPED_CEILING_RATIO_SPAN = 1e-6
+MAX_SLOPED_CEILING_ID_LENGTH = 128
 MAX_OPEN_SPACE_ID_LENGTH = 128
 MIN_OPEN_SPACE_SPAN_PIXELS = 1e-6
 TRIM_KIND_SKIRTING_BOARD = "skirting_board"
@@ -172,6 +192,7 @@ _WINDOW_WALL_SURFACE_ID_PATTERN = re.compile(
     r"wall:[1-9]\d*:[1-9]\d*$"
 )
 _ARCHITECTURAL_TRIM_UUID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_SLOPED_CEILING_UUID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 EDITABLE_SURFACE_FRAME_WALL_RATIO = "wall_ratio"
 EDITABLE_SURFACE_FRAME_LEVEL_IMAGE = "level_image"
 EDITABLE_SURFACE_FRAME_KINDS = frozenset(
@@ -271,7 +292,7 @@ class DoorwayData:
 
 @dataclass(frozen=True)
 class WindowData:
-    """One stable rectangular opening attached to a semantic wall."""
+    """One stable rectangular opening attached to a wall or its ceiling slope."""
 
     window_id: str
     wall_surface_id: str
@@ -279,6 +300,7 @@ class WindowData:
     end_ratio: float
     bottom_ratio: float
     top_ratio: float
+    sloped_ceiling_id: str | None = None
 
     def __post_init__(self) -> None:
         window_id = _normalize_window_text(
@@ -304,6 +326,11 @@ class WindowData:
             "bottom",
         )
         top_ratio = _normalize_window_ratio(self.top_ratio, "top")
+        sloped_ceiling_id = (
+            None
+            if self.sloped_ceiling_id is None
+            else _normalize_sloped_ceiling_id(self.sloped_ceiling_id)
+        )
         if end_ratio - start_ratio <= MIN_WINDOW_RATIO_SPAN:
             raise ValueError("A window must have a positive wall-local width.")
         if top_ratio - bottom_ratio <= MIN_WINDOW_RATIO_SPAN:
@@ -315,9 +342,10 @@ class WindowData:
         object.__setattr__(self, "end_ratio", end_ratio)
         object.__setattr__(self, "bottom_ratio", bottom_ratio)
         object.__setattr__(self, "top_ratio", top_ratio)
+        object.__setattr__(self, "sloped_ceiling_id", sloped_ceiling_id)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "window_id": self.window_id,
             "wall_surface_id": self.wall_surface_id,
             "start_ratio": self.start_ratio,
@@ -325,6 +353,9 @@ class WindowData:
             "bottom_ratio": self.bottom_ratio,
             "top_ratio": self.top_ratio,
         }
+        if self.sloped_ceiling_id is not None:
+            payload["sloped_ceiling_id"] = self.sloped_ceiling_id
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "WindowData":
@@ -337,6 +368,230 @@ class WindowData:
             end_ratio=payload.get("end_ratio"),
             bottom_ratio=payload.get("bottom_ratio"),
             top_ratio=payload.get("top_ratio"),
+            sloped_ceiling_id=payload.get("sloped_ceiling_id"),
+        )
+
+
+# ### Sloped-ceiling models ###
+@dataclass(frozen=True)
+class SlopedCeilingData:
+    """One persistent wall-bound sloped section of a level ceiling."""
+
+    slope_id: str
+    wall_surface_id: str
+    depth_meters: float = DEFAULT_SLOPED_CEILING_DEPTH_METERS
+    angle_degrees: float = DEFAULT_SLOPED_CEILING_ANGLE_DEGREES
+    transition_radius_meters: float = (
+        DEFAULT_SLOPED_CEILING_TRANSITION_RADIUS_METERS
+    )
+    start_ratio: float = 0.0
+    end_ratio: float = 1.0
+    wall_drop_meters: float | None = None
+    wall_transition_radius_meters: float = (
+        DEFAULT_SLOPED_CEILING_TRANSITION_RADIUS_METERS
+    )
+    side_transition_radius_meters: float | None = None
+    start_transition_radius_meters: float | None = None
+    end_transition_radius_meters: float | None = None
+    joined_group_id: str | None = None
+
+    def __post_init__(self) -> None:
+        slope_id = _normalize_sloped_ceiling_id(self.slope_id)
+        wall_surface_id = _normalize_window_text(
+            self.wall_surface_id,
+            "Sloped-ceiling wall surface ID",
+            MAX_WINDOW_SURFACE_ID_LENGTH,
+        )
+        if _WINDOW_WALL_SURFACE_ID_PATTERN.fullmatch(wall_surface_id) is None:
+            raise ValueError(
+                "A sloped ceiling must reference a stable wall surface ID."
+            )
+
+        depth_meters = _normalize_sloped_ceiling_number(
+            self.depth_meters,
+            "depth",
+            MIN_SLOPED_CEILING_DEPTH_METERS,
+            MAX_SLOPED_CEILING_DEPTH_METERS,
+        )
+        if self.wall_drop_meters is None:
+            legacy_angle_degrees = _normalize_sloped_ceiling_number(
+                self.angle_degrees,
+                "angle",
+                MIN_SLOPED_CEILING_ANGLE_DEGREES,
+                MAX_SLOPED_CEILING_ANGLE_DEGREES,
+            )
+            wall_drop_meters = depth_meters * math.tan(
+                math.radians(legacy_angle_degrees)
+            )
+        else:
+            wall_drop_meters = _normalize_sloped_ceiling_number(
+                self.wall_drop_meters,
+                "wall drop",
+                MIN_SLOPED_CEILING_WALL_DROP_METERS,
+                MAX_SLOPED_CEILING_WALL_DROP_METERS,
+            )
+        angle_degrees = math.degrees(
+            math.atan2(wall_drop_meters, depth_meters)
+        )
+        transition_radius_meters = _normalize_sloped_ceiling_number(
+            self.transition_radius_meters,
+            "ceiling transition radius",
+            MIN_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+            MAX_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+        )
+        wall_transition_radius_meters = _normalize_sloped_ceiling_number(
+            self.wall_transition_radius_meters,
+            "wall transition radius",
+            MIN_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+            MAX_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+        )
+        start_ratio = _normalize_sloped_ceiling_ratio(
+            self.start_ratio,
+            "start",
+        )
+        end_ratio = _normalize_sloped_ceiling_ratio(self.end_ratio, "end")
+        if end_ratio - start_ratio <= MIN_SLOPED_CEILING_RATIO_SPAN:
+            raise ValueError(
+                "A sloped ceiling must have a positive wall-local width."
+            )
+        if self.side_transition_radius_meters is not None:
+            side_transition_radius_meters = _normalize_sloped_ceiling_number(
+                self.side_transition_radius_meters,
+                "side transition radius",
+                MIN_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+                MAX_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+            )
+        else:
+            legacy_start_radius = _normalize_sloped_ceiling_number(
+                (
+                    transition_radius_meters
+                    if self.start_transition_radius_meters is None
+                    else self.start_transition_radius_meters
+                ),
+                "start transition radius",
+                MIN_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+                MAX_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+            )
+            legacy_end_radius = _normalize_sloped_ceiling_number(
+                (
+                    transition_radius_meters
+                    if self.end_transition_radius_meters is None
+                    else self.end_transition_radius_meters
+                ),
+                "end transition radius",
+                MIN_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+                MAX_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+            )
+            exposed_legacy_radii = []
+            if start_ratio > MIN_SLOPED_CEILING_RATIO_SPAN:
+                exposed_legacy_radii.append(legacy_start_radius)
+            if end_ratio < 1.0 - MIN_SLOPED_CEILING_RATIO_SPAN:
+                exposed_legacy_radii.append(legacy_end_radius)
+            side_transition_radius_meters = max(
+                exposed_legacy_radii
+                or (legacy_start_radius, legacy_end_radius)
+            )
+
+        object.__setattr__(self, "slope_id", slope_id)
+        object.__setattr__(self, "wall_surface_id", wall_surface_id)
+        object.__setattr__(self, "depth_meters", depth_meters)
+        object.__setattr__(self, "angle_degrees", angle_degrees)
+        object.__setattr__(self, "wall_drop_meters", wall_drop_meters)
+        object.__setattr__(
+            self,
+            "transition_radius_meters",
+            transition_radius_meters,
+        )
+        object.__setattr__(
+            self,
+            "wall_transition_radius_meters",
+            wall_transition_radius_meters,
+        )
+        object.__setattr__(
+            self,
+            "side_transition_radius_meters",
+            side_transition_radius_meters,
+        )
+        object.__setattr__(
+            self,
+            "start_transition_radius_meters",
+            side_transition_radius_meters,
+        )
+        object.__setattr__(
+            self,
+            "end_transition_radius_meters",
+            side_transition_radius_meters,
+        )
+        object.__setattr__(self, "start_ratio", start_ratio)
+        object.__setattr__(self, "end_ratio", end_ratio)
+        object.__setattr__(
+            self,
+            "joined_group_id",
+            (
+                None
+                if self.joined_group_id is None
+                else _normalize_sloped_ceiling_id(self.joined_group_id)
+            ),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "slope_id": self.slope_id,
+            "wall_surface_id": self.wall_surface_id,
+            "depth_meters": self.depth_meters,
+            "angle_degrees": self.angle_degrees,
+            "wall_drop_meters": self.wall_drop_meters,
+            "transition_radius_meters": self.transition_radius_meters,
+            "wall_transition_radius_meters": (
+                self.wall_transition_radius_meters
+            ),
+            "side_transition_radius_meters": (
+                self.side_transition_radius_meters
+            ),
+            "start_ratio": self.start_ratio,
+            "end_ratio": self.end_ratio,
+        }
+        if self.joined_group_id is not None:
+            payload["joined_group_id"] = self.joined_group_id
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SlopedCeilingData":
+        if not isinstance(payload, dict):
+            raise ValueError("Sloped-ceiling JSON must contain an object.")
+        legacy_transition_radius = payload.get(
+            "transition_radius_meters",
+            DEFAULT_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+        )
+        return cls(
+            slope_id=payload.get("slope_id", ""),
+            wall_surface_id=payload.get("wall_surface_id", ""),
+            depth_meters=payload.get(
+                "depth_meters",
+                DEFAULT_SLOPED_CEILING_DEPTH_METERS,
+            ),
+            angle_degrees=payload.get(
+                "angle_degrees",
+                DEFAULT_SLOPED_CEILING_ANGLE_DEGREES,
+            ),
+            wall_drop_meters=payload.get("wall_drop_meters"),
+            transition_radius_meters=legacy_transition_radius,
+            wall_transition_radius_meters=payload.get(
+                "wall_transition_radius_meters",
+                DEFAULT_SLOPED_CEILING_TRANSITION_RADIUS_METERS,
+            ),
+            side_transition_radius_meters=payload.get(
+                "side_transition_radius_meters"
+            ),
+            start_transition_radius_meters=payload.get(
+                "start_transition_radius_meters"
+            ),
+            end_transition_radius_meters=payload.get(
+                "end_transition_radius_meters"
+            ),
+            joined_group_id=payload.get("joined_group_id"),
+            start_ratio=payload.get("start_ratio", 0.0),
+            end_ratio=payload.get("end_ratio", 1.0),
         )
 
 
@@ -1655,6 +1910,7 @@ class LevelData:
     flipped_surface_ids: set[str] = field(default_factory=set)
     original_image_path: str | None = None
     architectural_trims: list[ArchitecturalTrimData] = field(default_factory=list)
+    sloped_ceilings: list[SlopedCeilingData] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -1749,6 +2005,49 @@ def _normalize_finite_float(value: object, field_name: str) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"Editable surface {field_name} must be finite.")
     return normalized
+
+
+# ### Sloped-ceiling validation helpers ###
+def _normalize_sloped_ceiling_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Sloped-ceiling ID must be a string.")
+    slope_id = value.strip().lower()
+    if len(slope_id) > MAX_SLOPED_CEILING_ID_LENGTH:
+        raise ValueError("Sloped-ceiling ID is too long.")
+    if _SLOPED_CEILING_UUID_PATTERN.fullmatch(slope_id) is None:
+        raise ValueError("Sloped-ceiling IDs must be 32-character UUID hex.")
+    return slope_id
+
+
+def _normalize_sloped_ceiling_number(
+    value: object,
+    field_name: str,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Sloped-ceiling {field_name} must be a number.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Sloped-ceiling {field_name} must be a number."
+        ) from error
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        raise ValueError(
+            f"Sloped-ceiling {field_name} must be between "
+            f"{minimum:g} and {maximum:g}."
+        )
+    return number
+
+
+def _normalize_sloped_ceiling_ratio(value: object, field_name: str) -> float:
+    return _normalize_sloped_ceiling_number(
+        value,
+        f"{field_name} ratio",
+        0.0,
+        1.0,
+    )
 
 
 # ### Architectural trim validation helpers ###

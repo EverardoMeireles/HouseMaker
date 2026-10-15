@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
@@ -53,6 +54,7 @@ from housemaker.settings_widget import (
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
     DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+    FIRST_PERSON_SPEED_SETTING_KEY,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     GENERATION_DISPLAY_SCREEN_SETTING_KEY,
     HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
@@ -91,6 +93,7 @@ from housemaker.settings_widget import (
     read_clear_mask_hotkey,
     read_doors_and_windows_point_light_intensity,
     read_first_person_navigation_mode,
+    read_first_person_speed,
     read_generation_display_screen_id,
     read_hide_stair_mesh_when_previewing,
     read_ignore_top_down_ceiling,
@@ -391,6 +394,74 @@ class SettingsWidgetTests(unittest.TestCase):
             )
             widget.dispose()
             restored.dispose()
+
+    def test_first_person_speed_slider_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertEqual(
+                widget.get_settings().first_person_speed_meters_per_second,
+                DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+            )
+            self.assertEqual(
+                widget.first_person_speed_value_label.text(),
+                "2.5 m/s",
+            )
+
+            widget.first_person_speed_slider.setValue(47)
+
+            self.assertEqual(
+                application_settings.get(FIRST_PERSON_SPEED_SETTING_KEY),
+                4.7,
+            )
+            self.assertEqual(
+                widget.get_settings().first_person_speed_meters_per_second,
+                4.7,
+            )
+            self.assertEqual(
+                widget.first_person_speed_value_label.text(),
+                "4.7 m/s",
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(restored.first_person_speed_slider.value(), 47)
+            self.assertEqual(
+                restored.get_settings().first_person_speed_meters_per_second,
+                4.7,
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_first_person_speed_rejects_malformed_values(self) -> None:
+        for value in (True, 0.0, 20.1, float("nan"), "fast"):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(ValueError, "First-person speed"):
+                    GenerationServiceSettings(
+                        first_person_speed_meters_per_second=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(FIRST_PERSON_SPEED_SETTING_KEY, "fast")
+
+            self.assertEqual(
+                read_first_person_speed(application_settings),
+                DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+            )
 
     def test_ignore_top_down_ceiling_defaults_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

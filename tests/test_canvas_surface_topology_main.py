@@ -55,6 +55,7 @@ def _build_workspace(level: LevelData) -> SimpleNamespace:
         _commit_pending_canvas_face_orientation_update=Mock(),
         _commit_pending_canvas_surface_mesh_update=Mock(),
         _commit_pending_architectural_trim_mesh_update=Mock(),
+        _commit_pending_sloped_ceiling_mesh_update=Mock(),
         _commit_pending_wall_vertex_update=Mock(),
         _commit_pending_doorway_mesh_update=Mock(),
         _canvas_surface_mesh_update_timer=Mock(),

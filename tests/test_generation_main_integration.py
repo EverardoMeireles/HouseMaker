@@ -545,16 +545,19 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         viewer.enter_first_person_mode()
         pointer_was_captured = viewer.is_first_person_pointer_captured
         combo = self.workspace.settings_widget.first_person_navigation_combo
+        speed_slider = self.workspace.settings_widget.first_person_speed_slider
 
         combo.setCurrentIndex(
             combo.findData(FIRST_PERSON_NAVIGATION_MODE_NOCLIP)
         )
+        speed_slider.setValue(38)
         _qt_application.processEvents()
 
         self.assertEqual(
             viewer.get_first_person_movement_mode(),
             FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
         )
+        self.assertEqual(viewer.get_first_person_speed(), 3.8)
         self.assertEqual(viewer.get_navigation_mode(), "first_person")
         self.assertEqual(viewer.get_first_person_camera_pose(), camera_pose)
         self.assertEqual(

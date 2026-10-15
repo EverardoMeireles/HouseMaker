@@ -59,6 +59,7 @@ from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     GenerationServiceSettings,
     read_first_person_navigation_mode,
+    read_first_person_speed,
     read_surface_texture_provider,
 )
 from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
@@ -80,6 +81,7 @@ from housemaker.surface_texture_state import (
     SurfaceTextureVariant,
     get_surface_type_for_id,
     normalize_surface_id,
+    surface_id_accepts_texture_type,
 )
 from housemaker.surface_texture_variants import (
     DEFAULT_SURFACE_TEXTURE_RESOLUTION,
@@ -200,6 +202,8 @@ def _semantic_surface_catalogs_match(
             first_surface.surface_type != second_surface.surface_type
             or first_surface.level_index != second_surface.level_index
             or first_surface.room_index != second_surface.room_index
+            or first_surface.surface_alias_ids
+            != second_surface.surface_alias_ids
             or not math.isclose(
                 float(first_surface.area_square_meters),
                 float(second_surface.area_square_meters),
@@ -217,6 +221,24 @@ def _semantic_surface_catalogs_match(
         ):
             return False
     return True
+
+
+# ### Surface texture target compatibility ###
+def _live_surface_accepts_texture_type(
+    surface: FixedSurface,
+    texture_surface_type: str,
+) -> bool:
+    """Validate semantic identity and texture compatibility together."""
+
+    try:
+        encoded_type = get_surface_type_for_id(surface.surface_id)
+        accepts_texture = surface_id_accepts_texture_type(
+            surface.surface_id,
+            texture_surface_type,
+        )
+    except ValueError:
+        return False
+    return surface.surface_type == encoded_type and accepts_texture
 
 
 # ### Surface lineage helpers ###
@@ -304,7 +326,10 @@ def _remap_assignment_surface_ids(
         if surface_id in surfaces_by_id
     )
     if any(
-        surfaces_by_id[surface_id].surface_type != assignment.surface_type
+        not _live_surface_accepts_texture_type(
+            surfaces_by_id[surface_id],
+            assignment.surface_type,
+        )
         for surface_id in current_ids
     ):
         raise ValueError(
@@ -312,6 +337,62 @@ def _remap_assignment_surface_ids(
             "surface type."
         )
     return current_ids
+
+
+def _resolve_assignment_surface_aliases(
+    assignments: Sequence[SurfaceTextureAssignment],
+    surfaces_by_id: Mapping[str, FixedSurface],
+) -> tuple[tuple[str, ...], ...]:
+    """Retarget retired semantic IDs without creating duplicate owners.
+
+    Joined sloped-ceiling sides used to expose one semantic surface per wall.
+    Their replacement is one physical surface, so either retired half may
+    resolve to the same canonical ID.  A direct canonical assignment wins;
+    otherwise the first persisted retired assignment remains the owner.
+    """
+
+    alias_targets: dict[str, str] = {}
+    for canonical_id in sorted(surfaces_by_id):
+        surface = surfaces_by_id[canonical_id]
+        for alias_id in surface.surface_alias_ids:
+            if alias_id in surfaces_by_id:
+                continue
+            alias_targets.setdefault(alias_id, canonical_id)
+
+    canonical_ids_with_aliases = set(alias_targets.values())
+    winning_assignment_by_id: dict[str, tuple[int, int]] = {}
+    for assignment_index, assignment in enumerate(assignments):
+        direct_ids = set(assignment.surface_ids).intersection(
+            canonical_ids_with_aliases
+        )
+        alias_ids = set(assignment.surface_ids).intersection(alias_targets)
+        candidates = (
+            *((surface_id, 0) for surface_id in direct_ids),
+            *((alias_targets[surface_id], 1) for surface_id in alias_ids),
+        )
+        for canonical_id, priority in candidates:
+            candidate = (priority, assignment_index)
+            current = winning_assignment_by_id.get(canonical_id)
+            if current is None or candidate < current:
+                winning_assignment_by_id[canonical_id] = candidate
+
+    resolved: list[tuple[str, ...]] = []
+    for assignment_index, assignment in enumerate(assignments):
+        target_ids: list[str] = []
+        for surface_id in assignment.surface_ids:
+            canonical_id = (
+                surface_id
+                if surface_id in surfaces_by_id
+                else alias_targets.get(surface_id)
+            )
+            if canonical_id is None:
+                continue
+            winner = winning_assignment_by_id.get(canonical_id)
+            if winner is not None and winner[1] != assignment_index:
+                continue
+            target_ids.append(canonical_id)
+        resolved.append(tuple(dict.fromkeys(target_ids)))
+    return tuple(resolved)
 
 
 # ### Asset revision helpers ###
@@ -721,6 +802,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             first_person_navigation_mode=read_first_person_navigation_mode(
                 self._application_settings
             ),
+            first_person_speed_meters_per_second=read_first_person_speed(
+                self._application_settings
+            ),
         )
         self._is_syncing_provider = False
         self._data = SurfaceTextureData()
@@ -752,6 +836,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self.surface_view is not None:
             self.surface_view.set_first_person_movement_mode(
                 self._settings.first_person_navigation_mode
+            )
+            self.surface_view.set_first_person_speed(
+                self._settings.first_person_speed_meters_per_second
             )
         self._sync_video_controls()
         self._sync_controls()
@@ -863,7 +950,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             dict.fromkeys(normalize_surface_id(value) for value in surface_ids)
         )
         if any(
-            get_surface_type_for_id(surface_id) != normalized_surface_type
+            not surface_id_accepts_texture_type(
+                surface_id,
+                normalized_surface_type,
+            )
             for surface_id in normalized_surface_ids
         ):
             raise ValueError(
@@ -873,7 +963,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         surfaces_by_id = self._all_existing_surfaces_by_id()
         if any(
             (surface := surfaces_by_id.get(surface_id)) is None
-            or surface.surface_type != normalized_surface_type
+            or not _live_surface_accepts_texture_type(
+                surface,
+                normalized_surface_type,
+            )
             for surface_id in normalized_surface_ids
         ):
             raise ValueError(
@@ -2169,7 +2262,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         surfaces_by_id = self._all_existing_surfaces_by_id()
         return all(
             (surface := surfaces_by_id.get(surface_id)) is not None
-            and surface.surface_type == assignment.surface_type
+            and _live_surface_accepts_texture_type(
+                surface,
+                assignment.surface_type,
+            )
             for surface_id in target_ids
         )
 
@@ -2320,14 +2416,21 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         if not self._data.assignments:
             return False
-        surface_areas = self._all_existing_surface_areas(levels)
+        surfaces_by_id = self._all_existing_surfaces_by_id(levels)
+        surface_areas = {
+            surface_id: float(surface.area_square_meters)
+            for surface_id, surface in surfaces_by_id.items()
+        }
+        resolved_ids_by_assignment = _resolve_assignment_surface_aliases(
+            self._data.assignments,
+            surfaces_by_id,
+        )
         next_assignments: list[SurfaceTextureAssignment] = []
-        for assignment in self._data.assignments:
-            retained_surface_ids = tuple(
-                surface_id
-                for surface_id in assignment.surface_ids
-                if surface_id in surface_areas
-            )
+        for assignment, retained_surface_ids in zip(
+            self._data.assignments,
+            resolved_ids_by_assignment,
+            strict=True,
+        ):
             combined_area_m2 = sum(
                 surface_areas[surface_id]
                 for surface_id in retained_surface_ids
@@ -2651,7 +2754,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         texture_size: tuple[int, int],
         map_texture_pngs: Mapping[str, bytes] | None = None,
     ) -> bool:
-        """Commit one validated active family asset to homogeneous surfaces."""
+        """Commit one validated active family asset to compatible surfaces."""
 
         normalized_targets = tuple(
             dict.fromkeys(str(surface_id) for surface_id in target_surface_ids)
@@ -2666,12 +2769,15 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if normalized_targets:
             if any(
                 (surface := surface_by_id.get(surface_id)) is None
-                or surface.surface_type != source_assignment.surface_type
+                or not _live_surface_accepts_texture_type(
+                    surface,
+                    source_assignment.surface_type,
+                )
                 for surface_id in normalized_targets
             ):
                 return self._reject_assignment_texture_application(
-                    "One or more selected surfaces no longer exist or have a "
-                    "different surface type."
+                    "One or more selected surfaces no longer exist or cannot "
+                    "accept this texture type."
                 )
         else:
             normalized_targets = tuple(
@@ -3043,6 +3149,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self.surface_view is not None:
             self.surface_view.set_first_person_movement_mode(
                 settings.first_person_navigation_mode
+            )
+            self.surface_view.set_first_person_speed(
+                settings.first_person_speed_meters_per_second
             )
         self._sync_provider_combo(settings.surface_texture_provider)
         self._sync_controls()

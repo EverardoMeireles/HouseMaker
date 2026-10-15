@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -34,6 +35,7 @@ CANVAS_OPENING_KINDS = frozenset(
 )
 OPENING_FRAME_EPSILON = 1e-9
 DOORWAY_WALL_ALIGNMENT_MINIMUM = 0.75
+SLOPED_CEILING_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 # ### Opening edit models ###
@@ -111,7 +113,7 @@ class CanvasOpeningBounds:
 
 @dataclass(frozen=True)
 class CanvasOpeningTarget:
-    """World-space wall frame and current bounds for one editable opening."""
+    """World-space planar frame and current bounds for one editable opening."""
 
     reference: CanvasOpeningReference
     wall_surface_id: str
@@ -124,6 +126,8 @@ class CanvasOpeningTarget:
     minimum_height_meters: float
     bounds: CanvasOpeningBounds
     arch_amount: float | None = None
+    vertical_axis_world: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    sloped_ceiling_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasOpeningReference):
@@ -143,8 +147,16 @@ class CanvasOpeningTarget:
             self.wall_normal_world,
             "opening wall normal",
         )
-        if abs(float(np.dot(tangent, normal))) > 1e-6:
-            raise ValueError("Canvas opening wall axes must be perpendicular.")
+        vertical_axis = _normalize_unit_vector(
+            self.vertical_axis_world,
+            "opening vertical axis",
+        )
+        if (
+            abs(float(np.dot(tangent, normal))) > 1e-6
+            or abs(float(np.dot(tangent, vertical_axis))) > 1e-6
+            or abs(float(np.dot(normal, vertical_axis))) > 1e-6
+        ):
+            raise ValueError("Canvas opening frame axes must be perpendicular.")
         wall_width = _normalize_positive_number(
             self.wall_width_meters,
             "opening wall width",
@@ -167,15 +179,25 @@ class CanvasOpeningTarget:
             self.reference,
             self.arch_amount,
         )
+        sloped_ceiling_id = _normalize_optional_sloped_ceiling_id(
+            self.sloped_ceiling_id
+        )
+        if (
+            sloped_ceiling_id is not None
+            and self.reference.kind != CANVAS_OPENING_WINDOW
+        ):
+            raise ValueError("Only Canvas windows can target a sloped ceiling.")
         object.__setattr__(self, "wall_surface_id", normalized_surface_id)
         object.__setattr__(self, "plane_start_world", plane_start)
         object.__setattr__(self, "wall_tangent_world", tangent)
         object.__setattr__(self, "wall_normal_world", normal)
+        object.__setattr__(self, "vertical_axis_world", vertical_axis)
         object.__setattr__(self, "wall_width_meters", wall_width)
         object.__setattr__(self, "wall_height_meters", wall_height)
         object.__setattr__(self, "minimum_width_meters", minimum_width)
         object.__setattr__(self, "minimum_height_meters", minimum_height)
         object.__setattr__(self, "arch_amount", arch_amount)
+        object.__setattr__(self, "sloped_ceiling_id", sloped_ceiling_id)
 
     @property
     def key(self) -> str:
@@ -215,10 +237,11 @@ class CanvasOpeningTarget:
     ) -> tuple[float, float, float]:
         origin = np.asarray(self.plane_start_world, dtype=float)
         tangent = np.asarray(self.wall_tangent_world, dtype=float)
+        vertical_axis = np.asarray(self.vertical_axis_world, dtype=float)
         point = (
             origin
             + tangent * float(horizontal_ratio) * self.wall_width_meters
-            + np.asarray((0.0, 0.0, 1.0), dtype=float)
+            + vertical_axis
             * float(vertical_ratio)
             * self.wall_height_meters
         )
@@ -234,7 +257,10 @@ class CanvasOpeningTarget:
             np.dot(offset, np.asarray(self.wall_tangent_world, dtype=float))
             / self.wall_width_meters
         )
-        vertical_ratio = float(offset[2] / self.wall_height_meters)
+        vertical_ratio = float(
+            np.dot(offset, np.asarray(self.vertical_axis_world, dtype=float))
+            / self.wall_height_meters
+        )
         return horizontal_ratio, vertical_ratio
 
     def with_bounds(self, bounds: CanvasOpeningBounds) -> CanvasOpeningTarget:
@@ -253,6 +279,10 @@ class CanvasOpeningTarget:
 
         if edit.reference != self.reference:
             raise ValueError("The Canvas opening edit targets another opening.")
+        if edit.destination_target is not None:
+            if self.reference.kind != CANVAS_OPENING_WINDOW:
+                raise ValueError("Only Canvas windows can move to another host.")
+            return edit.destination_target
         if edit.wall_surface_id != self.wall_surface_id:
             raise ValueError("The Canvas opening edit targets another wall.")
         if (edit.arch_amount is None) != (self.arch_amount is None):
@@ -272,6 +302,7 @@ class CanvasOpeningEdit:
     wall_surface_id: str
     bounds: CanvasOpeningBounds
     arch_amount: float | None = None
+    destination_target: CanvasOpeningTarget | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasOpeningReference):
@@ -285,6 +316,30 @@ class CanvasOpeningEdit:
             self.reference,
             self.arch_amount,
         )
+        destination_target = self.destination_target
+        if destination_target is not None:
+            if not isinstance(destination_target, CanvasOpeningTarget):
+                raise TypeError(
+                    "A Canvas opening destination must be an opening target."
+                )
+            if self.reference.kind != CANVAS_OPENING_WINDOW:
+                raise ValueError("Only Canvas windows can move to another host.")
+            if destination_target.reference != self.reference:
+                raise ValueError(
+                    "The Canvas opening destination targets another opening."
+                )
+            if destination_target.wall_surface_id != normalized_surface_id:
+                raise ValueError(
+                    "The Canvas opening destination targets another wall."
+                )
+            if destination_target.bounds != self.bounds:
+                raise ValueError(
+                    "The Canvas opening destination bounds do not match the edit."
+                )
+            if destination_target.arch_amount != arch_amount:
+                raise ValueError(
+                    "The Canvas opening destination arch does not match the edit."
+                )
         object.__setattr__(self, "wall_surface_id", normalized_surface_id)
         object.__setattr__(self, "arch_amount", arch_amount)
 
@@ -307,9 +362,10 @@ def build_canvas_opening_targets(
     """Build explicit hole-plane targets because openings have no render faces."""
 
     level_sequence = tuple(levels)
+    all_surfaces = tuple(surfaces)
     surface_sequence = tuple(
         surface
-        for surface in surfaces
+        for surface in all_surfaces
         if isinstance(surface, FixedSurface)
         and surface.surface_type == SURFACE_TYPE_WALL
     )
@@ -332,6 +388,8 @@ def build_canvas_opening_targets(
             if target is not None:
                 targets.append(target)
         for window_index, window in enumerate(level.windows):
+            if window.sloped_ceiling_id is not None:
+                continue
             surface = surface_by_id.get(window.wall_surface_id)
             target = _build_window_target(
                 window,
@@ -340,6 +398,18 @@ def build_canvas_opening_targets(
             )
             if target is not None:
                 targets.append(target)
+    # Imported lazily to avoid the surface_geometry/sloped_ceiling module
+    # cycle while still returning one unified target stream to the viewer.
+    from housemaker.sloped_ceiling import (
+        build_sloped_ceiling_window_opening_targets,
+    )
+
+    targets.extend(
+        build_sloped_ceiling_window_opening_targets(
+            level_sequence,
+            all_surfaces,
+        )
+    )
     return tuple(sorted(targets, key=lambda target: target.key))
 
 
@@ -375,6 +445,7 @@ def _build_window_target(
             bottom_ratio=window.bottom_ratio,
             top_ratio=window.top_ratio,
         ),
+        sloped_ceiling_id=None,
     )
 
 
@@ -424,6 +495,7 @@ def _build_doorway_target(
             if doorway.shape == DOORWAY_SHAPE_ARCH
             else None
         ),
+        sloped_ceiling_id=None,
     )
 
 
@@ -547,11 +619,18 @@ def apply_canvas_opening_edit(
         raise TypeError("Canvas opening edits require an edit payload.")
     if edit.reference != target.reference:
         raise ValueError("The Canvas opening edit target changed during the drag.")
-    if edit.wall_surface_id != target.wall_surface_id:
+    destination_target = edit.destination_target
+    applied_target = target if destination_target is None else destination_target
+    if destination_target is None and edit.wall_surface_id != target.wall_surface_id:
         raise ValueError("The Canvas opening edit moved to a different wall.")
-    if (edit.arch_amount is None) != (target.arch_amount is None):
+    if (edit.arch_amount is None) != (applied_target.arch_amount is None):
         raise ValueError("The Canvas doorway arch mode changed during the drag.")
-    _validate_committed_bounds(target, edit.bounds)
+    if (
+        edit.reference.kind == CANVAS_OPENING_DOORWAY
+        and applied_target.sloped_ceiling_id is not None
+    ):
+        raise ValueError("Canvas doorways cannot move to sloped ceilings.")
+    _validate_committed_bounds(applied_target, edit.bounds)
     level = next(
         (
             candidate
@@ -564,8 +643,8 @@ def apply_canvas_opening_edit(
         raise ValueError("The edited Canvas opening level no longer exists.")
 
     if edit.reference.kind == CANVAS_OPENING_WINDOW:
-        return _apply_window_edit(level, target, edit)
-    return _apply_doorway_edit(level, target, edit)
+        return _apply_window_edit(level, applied_target, edit)
+    return _apply_doorway_edit(level, applied_target, edit)
 
 
 def _apply_window_edit(
@@ -592,6 +671,7 @@ def _apply_window_edit(
         end_ratio=edit.bounds.end_ratio,
         bottom_ratio=edit.bounds.bottom_ratio,
         top_ratio=edit.bounds.top_ratio,
+        sloped_ceiling_id=target.sloped_ceiling_id,
     )
     level.windows[window_index] = current
     return AppliedCanvasOpeningEdit(
@@ -668,6 +748,21 @@ def _validate_committed_bounds(
 
 
 # ### Validation helpers ###
+def _normalize_optional_sloped_ceiling_id(value: object | None) -> str | None:
+    """Normalize one optional persistent slope host identity."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("Sloped-ceiling target IDs must be strings.")
+    normalized = value.strip().lower()
+    if SLOPED_CEILING_ID_PATTERN.fullmatch(normalized) is None:
+        raise ValueError(
+            "Sloped-ceiling target IDs must be 32-character UUID hex."
+        )
+    return normalized
+
+
 def _normalize_optional_doorway_arch_amount(
     reference: CanvasOpeningReference,
     value: object | None,
