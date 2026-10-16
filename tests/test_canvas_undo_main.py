@@ -47,6 +47,7 @@ from housemaker.surface_geometry import (
 )
 from housemaker.surface_texture_state import SurfaceTextureAssignment
 from housemaker.texture_atlas_state import TextureAtlasData
+from tests.opening_dimension_assertions import get_opening_physical_size
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -1019,6 +1020,51 @@ class CanvasUndoMainTests(unittest.TestCase):
 
         _send_undo_to_viewer(self.workspace)
         self.assertEqual(self.level.vertex_data, original_vertices)
+
+    def test_direct_height_change_preserves_window_size_and_exact_undo(
+        self,
+    ) -> None:
+        wall = next(
+            surface
+            for surface in build_fixed_surfaces([self.level])
+            if surface.surface_id == "level:2/wall:1:2"
+        )
+        original_window = WindowData(
+            window_id="direct-height-window",
+            wall_surface_id=wall.surface_id,
+            start_ratio=0.2,
+            end_ratio=0.55,
+            bottom_ratio=0.2,
+            top_ratio=0.7,
+        )
+        self.level.windows.append(original_window)
+        original_size = get_opening_physical_size(
+            self.level,
+            original_window.window_id,
+        )
+
+        self.workspace._handle_height_level_changed(
+            self.level.height_meters + 1.0
+        )
+
+        self.assertNotEqual(self.level.windows[0], original_window)
+        resized_size = get_opening_physical_size(
+            self.level,
+            original_window.window_id,
+        )
+        self.assertAlmostEqual(resized_size[0], original_size[0])
+        self.assertAlmostEqual(resized_size[1], original_size[1])
+
+        _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(self.level.windows, [original_window])
+        self.assertEqual(
+            get_opening_physical_size(
+                self.level,
+                original_window.window_id,
+            ),
+            original_size,
+        )
 
     def test_2d_doorway_drag_returned_to_start_leaves_no_shared_undo(
         self,

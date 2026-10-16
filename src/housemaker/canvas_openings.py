@@ -354,6 +354,35 @@ class AppliedCanvasOpeningEdit:
     current: DoorwayData | WindowData
 
 
+@dataclass(frozen=True)
+class CanvasWindowDimensionSnapshot:
+    """One window's immutable physical size before its host is edited."""
+
+    level_index: int
+    window: WindowData
+    horizontal_center_ratio: float
+    width_meters: float
+    bottom_meters: float
+    height_meters: float
+
+    def __post_init__(self) -> None:
+        level_index = int(self.level_index)
+        if not isinstance(self.window, WindowData):
+            raise TypeError("Window dimension snapshots require WindowData.")
+        center = _normalize_finite_number(
+            self.horizontal_center_ratio,
+            "window center ratio",
+        )
+        width = _normalize_positive_number(self.width_meters, "window width")
+        bottom = _normalize_finite_number(self.bottom_meters, "window bottom")
+        height = _normalize_positive_number(self.height_meters, "window height")
+        object.__setattr__(self, "level_index", level_index)
+        object.__setattr__(self, "horizontal_center_ratio", center)
+        object.__setattr__(self, "width_meters", width)
+        object.__setattr__(self, "bottom_meters", bottom)
+        object.__setattr__(self, "height_meters", height)
+
+
 # ### Target builders ###
 def build_canvas_opening_targets(
     levels: Sequence[LevelData],
@@ -376,7 +405,7 @@ def build_canvas_opening_targets(
 
     targets: list[CanvasOpeningTarget] = []
     for level in level_sequence:
-        if not isinstance(level, LevelData) or not level.include_in_export:
+        if not isinstance(level, LevelData):
             continue
         for doorway_index, doorway in enumerate(level.doorways):
             target = _build_doorway_target(
@@ -411,6 +440,175 @@ def build_canvas_opening_targets(
         )
     )
     return tuple(sorted(targets, key=lambda target: target.key))
+
+
+def capture_canvas_window_dimensions(
+    levels: Sequence[LevelData],
+    surfaces: Sequence[FixedSurface],
+    *,
+    level_indices: Sequence[int] | None = None,
+) -> tuple[CanvasWindowDimensionSnapshot, ...]:
+    """Capture physical window rectangles before their hosts are reshaped."""
+
+    normalized_level_indices = (
+        None if level_indices is None else {int(value) for value in level_indices}
+    )
+    levels_by_index = {
+        level.index: level for level in levels if isinstance(level, LevelData)
+    }
+    targets = build_canvas_opening_targets(levels, surfaces)
+    snapshots: list[CanvasWindowDimensionSnapshot] = []
+    for target in targets:
+        reference = target.reference
+        if reference.kind != CANVAS_OPENING_WINDOW:
+            continue
+        if (
+            normalized_level_indices is not None
+            and reference.level_index not in normalized_level_indices
+        ):
+            continue
+        level = levels_by_index.get(reference.level_index)
+        window = (
+            None
+            if level is None
+            else next(
+                (
+                    candidate
+                    for candidate in level.windows
+                    if candidate.window_id == reference.stable_id
+                ),
+                None,
+            )
+        )
+        if window is None:
+            continue
+        bounds = target.bounds
+        snapshots.append(
+            CanvasWindowDimensionSnapshot(
+                level_index=level.index,
+                window=window,
+                horizontal_center_ratio=(
+                    bounds.start_ratio + bounds.end_ratio
+                )
+                * 0.5,
+                width_meters=(
+                    bounds.horizontal_span * target.wall_width_meters
+                ),
+                bottom_meters=(bounds.bottom_ratio * target.wall_height_meters),
+                height_meters=(
+                    bounds.vertical_span * target.wall_height_meters
+                ),
+            )
+        )
+    return tuple(
+        sorted(
+            snapshots,
+            key=lambda snapshot: (
+                snapshot.level_index,
+                snapshot.window.window_id,
+            ),
+        )
+    )
+
+
+def preserve_canvas_window_dimensions(
+    levels: Sequence[LevelData],
+    surfaces: Sequence[FixedSurface],
+    snapshots: Sequence[CanvasWindowDimensionSnapshot],
+    *,
+    require_every_window: bool = True,
+) -> None:
+    """Re-normalize windows against edited hosts without resizing them."""
+
+    snapshot_sequence = tuple(snapshots)
+    if not snapshot_sequence:
+        return
+    if not all(
+        isinstance(snapshot, CanvasWindowDimensionSnapshot)
+        for snapshot in snapshot_sequence
+    ):
+        raise TypeError("Window preservation requires dimension snapshots.")
+
+    targets_by_key = {
+        (target.reference.level_index, target.reference.stable_id): target
+        for target in build_canvas_opening_targets(levels, surfaces)
+        if target.reference.kind == CANVAS_OPENING_WINDOW
+    }
+    levels_by_index = {
+        level.index: level for level in levels if isinstance(level, LevelData)
+    }
+    replacements_by_level: dict[int, dict[str, WindowData]] = {}
+    for snapshot in snapshot_sequence:
+        window_id = snapshot.window.window_id
+        level = levels_by_index.get(snapshot.level_index)
+        target = targets_by_key.get((snapshot.level_index, window_id))
+        current_window = (
+            None
+            if level is None
+            else next(
+                (
+                    window
+                    for window in level.windows
+                    if window.window_id == window_id
+                ),
+                None,
+            )
+        )
+        if level is None or target is None or current_window is None:
+            if require_every_window:
+                raise ValueError(
+                    "A window frame lost its wall while preserving its dimensions."
+                )
+            continue
+        if (
+            current_window.wall_surface_id != snapshot.window.wall_surface_id
+            or current_window.sloped_ceiling_id
+            != snapshot.window.sloped_ceiling_id
+            or target.wall_surface_id != snapshot.window.wall_surface_id
+            or target.sloped_ceiling_id != snapshot.window.sloped_ceiling_id
+        ):
+            if require_every_window:
+                raise ValueError(
+                    "A window frame changed hosts while preserving its dimensions."
+                )
+            continue
+
+        half_width_ratio = (
+            snapshot.width_meters / target.wall_width_meters * 0.5
+        )
+        bottom_ratio = snapshot.bottom_meters / target.wall_height_meters
+        bounds = CanvasOpeningBounds(
+            start_ratio=(
+                snapshot.horizontal_center_ratio - half_width_ratio
+            ),
+            end_ratio=(snapshot.horizontal_center_ratio + half_width_ratio),
+            bottom_ratio=bottom_ratio,
+            top_ratio=(
+                bottom_ratio
+                + snapshot.height_meters / target.wall_height_meters
+            ),
+        )
+        try:
+            _validate_committed_bounds(target, bounds)
+        except ValueError as error:
+            raise ValueError(
+                "The edited wall or ceiling is too small to keep an existing "
+                "window frame at its current dimensions."
+            ) from error
+        replacements_by_level.setdefault(level.index, {})[window_id] = replace(
+            current_window,
+            start_ratio=bounds.start_ratio,
+            end_ratio=bounds.end_ratio,
+            bottom_ratio=bounds.bottom_ratio,
+            top_ratio=bounds.top_ratio,
+        )
+
+    for level_index, replacements in replacements_by_level.items():
+        level = levels_by_index[level_index]
+        level.windows[:] = [
+            replacements.get(window.window_id, window)
+            for window in level.windows
+        ]
 
 
 def _build_window_target(

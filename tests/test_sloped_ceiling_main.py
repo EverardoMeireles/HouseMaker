@@ -2011,6 +2011,56 @@ class SlopedCeilingMainTests(unittest.TestCase):
             (original_window,),
         )
 
+    def test_slope_window_transactions_keep_canvas_list_identity(self) -> None:
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._create_slope(commit=True)
+        self._add_centered_slope_window()
+        original_window = self.level.windows[0]
+        self.assertIs(self.workspace.canvas.windows, self.level.windows)
+
+        def apply_depth_edit(depth_meters: float) -> None:
+            slope = self.level.sloped_ceilings[0]
+            target = next(
+                candidate
+                for candidate in (
+                    self.workspace._sloped_ceiling_edit_targets_by_key.values()
+                )
+                if candidate.slope_id == slope.slope_id
+            )
+            depth_handle = next(
+                candidate
+                for candidate in target.handles
+                if candidate.handle_kind == SLOPED_CEILING_HANDLE_DEPTH
+            )
+            self.workspace._handle_sloped_ceiling_edit_started(
+                _edit(target, depth_handle.handle_kind, depth_handle.value)
+            )
+            self.workspace._handle_sloped_ceiling_edit_finished(
+                _edit(target, depth_handle.handle_kind, depth_meters),
+                True,
+            )
+
+        apply_depth_edit(1.1)
+        self.assertIs(self.workspace.canvas.windows, self.level.windows)
+        self.assertTrue(
+            self.workspace._cancel_pending_sloped_ceiling_mesh_update(
+                restore=True
+            )
+        )
+        self.assertIs(self.workspace.canvas.windows, self.level.windows)
+        self.assertEqual(self.level.windows, [original_window])
+
+        apply_depth_edit(1.15)
+        self.assertIs(self.workspace.canvas.windows, self.level.windows)
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self.workspace._commit_pending_sloped_ceiling_mesh_update()
+        self.assertIs(self.workspace.canvas.windows, self.level.windows)
+
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self.workspace._handle_canvas_undo_requested()
+        self.assertIs(self.workspace.canvas.windows, self.level.windows)
+        self.assertEqual(self.level.windows, [original_window])
+
     def test_committed_creation_undo_removes_the_slope(self) -> None:
         self.workspace._canvas_undo_stack.clear()
         with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):

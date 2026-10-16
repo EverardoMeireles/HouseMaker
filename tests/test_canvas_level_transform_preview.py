@@ -1,6 +1,7 @@
 # ### Environment setup ###
 from __future__ import annotations
 
+import copy
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -22,8 +23,10 @@ from housemaker.main import (
     LEVEL_SCALE_SLIDER_FACTOR,
     BlueprintWorkspace,
 )
-from housemaker.models import LevelData, VertexData
+from housemaker.models import DoorwayData, LevelData, VertexData, WindowData
+from housemaker.surface_geometry import SURFACE_TYPE_WALL, build_fixed_surfaces
 from housemaker.viewer import CANVAS_SURFACE_SELECTION_COLOR
+from tests.opening_dimension_assertions import get_opening_physical_size
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -238,6 +241,65 @@ class CanvasLevelTransformPreviewTests(unittest.TestCase):
             self.workspace._level_transform_mesh_update_timer.isActive()
         )
         self.assertEqual(self.workspace._canvas_undo_stack, [])
+
+    def test_level_scale_preserves_opening_sizes_and_undo_data(self) -> None:
+        host_wall = next(
+            surface
+            for surface in build_fixed_surfaces((self.level,))
+            if surface.surface_type == SURFACE_TYPE_WALL
+            and surface.wall_key == "1:2"
+        )
+        original_window = WindowData(
+            window_id="scale-window",
+            wall_surface_id=host_wall.surface_id,
+            start_ratio=0.15,
+            end_ratio=0.45,
+            bottom_ratio=0.2,
+            top_ratio=0.65,
+        )
+        original_doorway = DoorwayData(
+            doorway_id="scale-doorway",
+            center_x=50.0,
+            center_y=0.0,
+            width_meters=1.0,
+            height_meters=2.1,
+            depth_meters=0.3,
+        )
+        self.level.windows = [original_window]
+        self.level.doorways = [copy.deepcopy(original_doorway)]
+        self.workspace._reset_viewer_doorway_snapshots()
+        self.workspace._sync_canvas_to_current_level()
+        self.workspace._canvas_undo_stack.clear()
+        initial_window_size = get_opening_physical_size(
+            self.level,
+            original_window.window_id,
+        )
+        initial_doorway_size = get_opening_physical_size(
+            self.level,
+            original_doorway.doorway_id,
+        )
+
+        self.workspace._handle_level_scale_changed(1.5)
+        self.workspace._commit_pending_level_transform_update()
+
+        scaled_window_size = get_opening_physical_size(
+            self.level,
+            original_window.window_id,
+        )
+        scaled_doorway_size = get_opening_physical_size(
+            self.level,
+            original_doorway.doorway_id,
+        )
+        self.assertAlmostEqual(scaled_window_size[0], initial_window_size[0])
+        self.assertAlmostEqual(scaled_window_size[1], initial_window_size[1])
+        self.assertAlmostEqual(scaled_doorway_size[0], initial_doorway_size[0])
+        self.assertAlmostEqual(scaled_doorway_size[1], initial_doorway_size[1])
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(self.level.windows, [original_window])
+        self.assertEqual(self.level.doorways, [original_doorway])
+        self.assertAlmostEqual(self.level.scale, 1.0)
 
     def test_timer_applies_a_keyboard_level_transform(self) -> None:
         self.workspace._set_mesh_edit_update_delay_seconds(0.01)

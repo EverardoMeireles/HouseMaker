@@ -38,14 +38,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.ceiling_height_dialog import CeilingHeightAnalysisDialog
 from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_JOB_KIND,
+    CeilingHeightAnalysisResult,
     CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
     CeilingHeightEstimationError,
     CeilingHeightEstimator,
-    format_ceiling_height_estimate,
-    infer_ceiling_height,
+    aggregate_level_ceiling_height_estimates,
+    ceiling_height_model_requires_api_key,
+    estimate_ceiling_height_api_cost_usd,
+    format_ceiling_height_api_cost,
+    open_ceiling_height_estimator,
+    sample_entire_video_frame_indices,
 )
 from housemaker.door_state import is_door_body_slot
 from housemaker.generation_jobs import (
@@ -60,16 +67,23 @@ from housemaker.generation_state import (
 from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
+from housemaker.models import LevelData
 from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import SurfaceTextureGenerationWorkspace
-from housemaker.video_source import VIDEO_FILE_FILTER, VideoMetadata, probe_video
+from housemaker.video_source import (
+    VIDEO_FILE_FILTER,
+    VideoFrameSource,
+    VideoMetadata,
+    probe_video,
+)
 
 # ### Constants ###
 WORKFLOW_SECTION_SPACING = 10
 GENERATION_CONTROLS_PADDING = 10
 CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS = 100
 CEILING_HEIGHT_NOT_ESTIMATED_TEXT = "Ceiling height: Not estimated"
+MAX_CONSECUTIVE_CEILING_HEIGHT_FRAME_FAILURES = 3
 DOOR_SLOT_GENERATION_BLINK_INTERVAL_MILLISECONDS = 500
 DOOR_SLOT_GENERATION_ACTIVE_STYLE = "color: #ff3030; font-weight: 700;"
 DOOR_SLOT_GENERATION_HIDDEN_STYLE = (
@@ -87,30 +101,100 @@ GENERATION_ACTION_SURFACE_TEXTURE = "generate_surface_texture"
 
 # ### Ceiling-height inference jobs ###
 class _CeilingHeightInferenceThread(QThread):
-    """Analyze one immutable Generation frame outside the GUI thread."""
+    """Analyze sampled video frames with an independent background reader."""
+
+    progress_changed = Signal(int, int, int)
 
     def __init__(
         self,
-        frame_bgr: np.ndarray,
+        video_path: str,
+        frame_indices: tuple[int, ...],
         api_key: str,
-        estimator: CeilingHeightEstimator,
+        model: str,
+        estimator: CeilingHeightEstimator | None,
+        level_options: tuple[tuple[int, str], ...],
+        starting_level_index: int,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._frame_bgr = np.ascontiguousarray(frame_bgr).copy()
+        self._video_path = str(video_path)
+        self._frame_indices = tuple(int(index) for index in frame_indices)
         self._api_key = str(api_key)
+        self._model = str(model)
         self._estimator = estimator
-        self.result: CeilingHeightEstimate | None = None
+        self._level_options = tuple(level_options)
+        self._starting_level_index = int(starting_level_index)
+        self.result: CeilingHeightAnalysisResult | None = None
         self.error_message: str | None = None
         self.was_cancelled = False
 
     def run(self) -> None:  # type: ignore[override]
         try:
             try:
-                result = self._estimator(
-                    self._frame_bgr,
+                frame_estimates: list[tuple[int, CeilingHeightEstimate]] = []
+                previous_frame: np.ndarray | None = None
+                consecutive_failures = 0
+                with open_ceiling_height_estimator(
+                    model=self._model,
                     api_key=self._api_key,
-                    cancellation_check=self.isInterruptionRequested,
+                    estimator_override=self._estimator,
+                    startup_cancellation_check=self.isInterruptionRequested,
+                ) as estimator, VideoFrameSource(
+                    self._video_path
+                ) as video_source:
+                    total = len(self._frame_indices)
+                    for completed, frame_index in enumerate(
+                        self._frame_indices,
+                        start=1,
+                    ):
+                        if self.isInterruptionRequested():
+                            raise CeilingHeightEstimationCancelled("Cancelled")
+                        current_frame = video_source.get_frame(frame_index)
+                        try:
+                            estimate = estimator(
+                                current_frame,
+                                previous_frame_bgr=previous_frame,
+                                cancellation_check=(
+                                    self.isInterruptionRequested
+                                ),
+                            )
+                        except CeilingHeightEstimationCancelled:
+                            raise
+                        except CeilingHeightEstimationError:
+                            consecutive_failures += 1
+                            if (
+                                consecutive_failures
+                                >= MAX_CONSECUTIVE_CEILING_HEIGHT_FRAME_FAILURES
+                            ):
+                                raise
+                            estimate = CeilingHeightEstimate(
+                                status="insufficient_evidence",
+                                estimate_m=None,
+                                minimum_m=None,
+                                maximum_m=None,
+                                confidence="low",
+                                basis="This sampled frame could not be analysed.",
+                                level_movement="uncertain",
+                                movement_confidence="low",
+                            )
+                        else:
+                            consecutive_failures = 0
+                        frame_estimates.append(
+                            (
+                                frame_index,
+                                estimate,
+                            )
+                        )
+                        previous_frame = current_frame
+                        self.progress_changed.emit(
+                            completed,
+                            total,
+                            frame_index,
+                        )
+                result = aggregate_level_ceiling_height_estimates(
+                    frame_estimates,
+                    starting_level_index=self._starting_level_index,
+                    levels=self._level_options,
                 )
             except CeilingHeightEstimationCancelled:
                 self.was_cancelled = True
@@ -133,17 +217,63 @@ class _CeilingHeightInferenceThread(QThread):
             self.result = result
         finally:
             self._api_key = ""
-            self._frame_bgr = np.empty((0, 0, 3), dtype=np.uint8)
+            self._video_path = ""
 
 
 @dataclass
 class _CeilingHeightInferenceRuntime:
-    """GUI-owned lifecycle and stale-frame guard for one inference."""
+    """GUI-owned lifecycle for one source-bound video analysis."""
 
-    frame_revision: int
+    video_path: str
+    frame_indices: tuple[int, ...]
+    level_signature: tuple[tuple[int, str], ...]
+    starting_level_index: int
     job_id: str
     thread: _CeilingHeightInferenceThread
     cancel_requested: bool = False
+
+
+# ### Ceiling-height presentation helpers ###
+def _format_cost_confirmation_suffix(cost_usd: float | None) -> str:
+    formatted = format_ceiling_height_api_cost(cost_usd)
+    return f" ({formatted})" if formatted else ""
+
+
+def _format_unassigned_frame_suffix(
+    result: CeilingHeightAnalysisResult,
+) -> str:
+    count = len(result.unassigned_frame_indices)
+    if count == 0:
+        return ""
+    return (
+        f"; {count} transition or uncertain frame"
+        f"{'s were' if count != 1 else ' was'} not assigned to a level"
+    )
+
+
+def _format_level_height_result(
+    result: CeilingHeightAnalysisResult,
+) -> str:
+    lines = ["Detected ceiling heights:"]
+    for level_estimate in result.level_estimates:
+        analysis = level_estimate.analysis
+        if analysis.average_height_m is None:
+            lines.append(
+                f"{level_estimate.level_name}: no reliable height estimate"
+            )
+            continue
+        line = (
+            f"{level_estimate.level_name}: {analysis.average_height_m:.2f} m "
+            f"from {analysis.retained_count} consistent estimate"
+            f"{'s' if analysis.retained_count != 1 else ''}"
+        )
+        if analysis.outlier_count:
+            line += f"; {analysis.outlier_count} outlier(s) discarded"
+        lines.append(line)
+    unassigned_suffix = _format_unassigned_frame_suffix(result)
+    if unassigned_suffix:
+        lines.append(unassigned_suffix.removeprefix("; ").capitalize())
+    return "\n".join(lines)
 
 
 # ### Temporary generation references ###
@@ -172,6 +302,7 @@ class MergedGenerationWorkspace(QWidget):
         job_manager: GenerationJobManager,
         parent: QWidget | None = None,
         *,
+        application_settings: ApplicationSettingsStore | None = None,
         ceiling_height_estimator: CeilingHeightEstimator | None = None,
     ) -> None:
         super().__init__(parent)
@@ -179,13 +310,13 @@ class MergedGenerationWorkspace(QWidget):
         self.surface_workspace = surface_workspace
         self.object_workspace = object_workspace
         self.job_manager = job_manager
-        self._ceiling_height_estimator = (
-            infer_ceiling_height
-            if ceiling_height_estimator is None
-            else ceiling_height_estimator
-        )
-        self._ceiling_height_frame_revision = 0
+        self._application_settings = application_settings
+        self._ceiling_height_estimator = ceiling_height_estimator
         self._ceiling_height_runtime: _CeilingHeightInferenceRuntime | None = None
+        self._ceiling_height_dialog: CeilingHeightAnalysisDialog | None = None
+        self._ceiling_height_video_path = ""
+        self._ceiling_height_level_options: tuple[tuple[int, str], ...] = ()
+        self._ceiling_height_current_level_index: int | None = None
         self._temporary_object_reference_session: (
             _TemporaryObjectReferenceSession | None
         ) = None
@@ -247,6 +378,9 @@ class MergedGenerationWorkspace(QWidget):
                 runtime.thread.wait(CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS)
             runtime.thread.deleteLater()
         self._ceiling_height_runtime = None
+        if self._ceiling_height_dialog is not None:
+            self._ceiling_height_dialog.dispose()
+            self._ceiling_height_dialog = None
 
     def set_clear_mask_hotkey(self, hotkey: str) -> None:
         """Apply the selected Generation-only Clear mask keymapping."""
@@ -469,8 +603,8 @@ class MergedGenerationWorkspace(QWidget):
             "infer_ceiling_height_button"
         )
         self.infer_ceiling_height_button.setToolTip(
-            "Estimate floor-to-ceiling height from the current video frame "
-            "using visible perspective and scale cues."
+            "Open multi-frame video analysis controls for a robust "
+            "floor-to-ceiling height estimate."
         )
         ceiling_height_layout.addWidget(self.infer_ceiling_height_button)
         self.ceiling_height_result_label = QLabel(
@@ -715,7 +849,7 @@ class MergedGenerationWorkspace(QWidget):
             self.sync_shared_controls
         )
         self.infer_ceiling_height_button.clicked.connect(
-            self._start_ceiling_height_inference
+            self._show_ceiling_height_analysis_dialog
         )
 
         self.video_view.strokes_changed.connect(surface._handle_video_strokes_changed)
@@ -972,59 +1106,166 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_video_frame_changed(self) -> None:
-        """Invalidate estimates and preserve external current-frame updates."""
+        """Keep whole-video analysis running while tracking the displayed frame."""
 
         self._restore_temporary_reference_after_same_frame_refresh()
         self._sync_object_reference_preview()
-        self._ceiling_height_frame_revision += 1
-        runtime = self._ceiling_height_runtime
-        if runtime is not None:
-            runtime.cancel_requested = True
-            if not self.job_manager.cancel_job(runtime.job_id):
-                runtime.thread.requestInterruption()
-        self.ceiling_height_result_label.setText(
-            CEILING_HEIGHT_NOT_ESTIMATED_TEXT
-        )
+        self._sync_ceiling_height_analysis_source()
+        self._sync_ceiling_height_dialog_frame()
         self.current_video_frame_changed.emit()
         self.sync_shared_controls()
 
     @Slot()
-    def _start_ceiling_height_inference(self) -> None:
-        """Snapshot and analyze the exact frame currently shown to the user."""
+    def _show_ceiling_height_analysis_dialog(self) -> None:
+        """Show persistent controls while leaving Generation seeking usable."""
+
+        if self._is_shutdown:
+            return
+        self._sync_ceiling_height_analysis_source()
+        video_source = self._current_video_source()
+        if video_source is None:
+            self.ceiling_height_result_label.setText(
+                "Ceiling height: Load a video first."
+            )
+            return
+
+        dialog = self._ensure_ceiling_height_analysis_dialog()
+        metadata = video_source.metadata
+        dialog.set_video_metadata(
+            metadata.frame_count,
+            fps=metadata.fps,
+            width=metadata.width,
+            height=metadata.height,
+        )
+        self._sync_ceiling_height_dialog_levels()
+        self._sync_ceiling_height_dialog_frame()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _ensure_ceiling_height_analysis_dialog(
+        self,
+    ) -> CeilingHeightAnalysisDialog:
+        dialog = self._ceiling_height_dialog
+        if dialog is not None:
+            return dialog
+        dialog = CeilingHeightAnalysisDialog(
+            application_settings=self._application_settings,
+            parent=self,
+        )
+        dialog.analysis_requested.connect(
+            self._start_ceiling_height_inference
+        )
+        dialog.cancellation_requested.connect(
+            self._cancel_active_ceiling_height_inference
+        )
+        self._ceiling_height_dialog = dialog
+        self._sync_ceiling_height_dialog_levels()
+        return dialog
+
+    @Slot(str, int, int)
+    def _start_ceiling_height_inference(
+        self,
+        model: str,
+        frame_interval: int,
+        starting_level_index: int,
+    ) -> None:
+        """Analyze the complete video as one level-aware background job."""
 
         if self._is_shutdown or self._ceiling_height_runtime is not None:
             return
-        frame_bgr = self.get_current_video_frame_bgr()
-        if frame_bgr is None:
-            self.ceiling_height_result_label.setText(
-                "Ceiling height: Load a video frame first."
-            )
-            self.sync_shared_controls()
+        dialog = self._ensure_ceiling_height_analysis_dialog()
+        video_source = self._current_video_source()
+        if video_source is None:
+            dialog.set_result("Load a video before starting analysis.", is_error=True)
             return
-        api_key = (
-            self.object_workspace.get_runtime_settings().openai_api_key.strip()
+        level_options = self._ceiling_height_level_options
+        if starting_level_index not in dict(level_options):
+            dialog.set_result(
+                "Choose a valid starting level before analysis.",
+                is_error=True,
+            )
+            return
+        metadata = video_source.metadata
+        try:
+            frame_indices = sample_entire_video_frame_indices(
+                metadata.frame_count,
+                frame_interval,
+            )
+        except ValueError as error:
+            dialog.set_result(str(error), is_error=True)
+            return
+        if not frame_indices:
+            dialog.set_result("The loaded video contains no frames.", is_error=True)
+            return
+        estimated_cost = estimate_ceiling_height_api_cost_usd(
+            model=model,
+            frame_count=metadata.frame_count,
+            interval=frame_interval,
+            frame_width=metadata.width,
+            frame_height=metadata.height,
         )
-        if not api_key:
-            self.ceiling_height_result_label.setText(
-                "Ceiling height: Add an OpenAI API key in Settings first."
+        if len(frame_indices) > 120:
+            request_description = (
+                "paid vision requests"
+                if ceiling_height_model_requires_api_key(model)
+                else "local vision analyses"
+            )
+            answer = QMessageBox.question(
+                dialog,
+                "Analyse many video frames?",
+                (
+                    f"The complete video will run {len(frame_indices):,} "
+                    f"{request_description}"
+                    f"{_format_cost_confirmation_suffix(estimated_cost)}. "
+                    "Continue?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        uses_local_model = not ceiling_height_model_requires_api_key(model)
+        api_key = ""
+        if not uses_local_model:
+            api_key = (
+                self.object_workspace.get_runtime_settings()
+                .openai_api_key.strip()
+            )
+        if not uses_local_model and not api_key:
+            dialog.set_result(
+                "Add an OpenAI API key in Settings before starting analysis.",
+                is_error=True,
             )
             return
 
-        frame_revision = self._ceiling_height_frame_revision
+        video_path = str(video_source.metadata.path)
         thread = _CeilingHeightInferenceThread(
-            frame_bgr,
+            video_path,
+            frame_indices,
             api_key,
+            model,
             self._ceiling_height_estimator,
+            level_options,
+            starting_level_index,
             parent=self,
+        )
+        initial_stage = (
+            "Loading local Qwen model"
+            if uses_local_model
+            else f"Analysing 0 of {len(frame_indices)} video frames"
         )
         job = self.job_manager.create_job(
             kind=CEILING_HEIGHT_JOB_KIND,
             requested_name="",
             default_name="Ceiling height",
-            stage="Analyzing current video frame",
+            stage=initial_stage,
         )
         runtime = _CeilingHeightInferenceRuntime(
-            frame_revision=frame_revision,
+            video_path=video_path,
+            frame_indices=frame_indices,
+            level_signature=level_options,
+            starting_level_index=starting_level_index,
             job_id=job.job_id,
             thread=thread,
         )
@@ -1040,11 +1281,28 @@ class MergedGenerationWorkspace(QWidget):
                 thread,
             )
         )
-        self.ceiling_height_result_label.setText(
-            "Ceiling height: Estimating..."
+        thread.progress_changed.connect(
+            partial(
+                self._handle_ceiling_height_inference_progress,
+                job.job_id,
+                thread,
+            )
         )
+        self.ceiling_height_result_label.setText(
+            "Ceiling height: Loading local Qwen model..."
+            if uses_local_model
+            else f"Ceiling height: Analysing {len(frame_indices)} frames..."
+        )
+        dialog.set_running(True)
+        dialog.set_progress(0, len(frame_indices))
         self.sync_shared_controls()
         thread.start()
+
+    @Slot()
+    def _cancel_active_ceiling_height_inference(self) -> None:
+        runtime = self._ceiling_height_runtime
+        if runtime is not None:
+            self.job_manager.cancel_job(runtime.job_id)
 
     def _cancel_ceiling_height_inference(self, job_id: str) -> bool:
         runtime = self._ceiling_height_runtime
@@ -1055,12 +1313,45 @@ class MergedGenerationWorkspace(QWidget):
         self.sync_shared_controls()
         return True
 
+    def _handle_ceiling_height_inference_progress(
+        self,
+        job_id: str,
+        thread: _CeilingHeightInferenceThread,
+        completed_frames: int,
+        total_frames: int,
+        current_frame: int,
+    ) -> None:
+        runtime = self._ceiling_height_runtime
+        if (
+            runtime is None
+            or runtime.job_id != job_id
+            or runtime.thread is not thread
+        ):
+            return
+        progress = round(
+            100.0 * int(completed_frames) / max(int(total_frames), 1)
+        )
+        self.job_manager.update_job(
+            job_id,
+            stage=(
+                f"Analysing frame {int(current_frame) + 1:,} "
+                f"({int(completed_frames):,}/{int(total_frames):,})"
+            ),
+            progress=progress,
+        )
+        if self._ceiling_height_dialog is not None:
+            self._ceiling_height_dialog.set_progress(
+                completed_frames,
+                total_frames,
+                current_frame=current_frame,
+            )
+
     def _handle_ceiling_height_inference_finished(
         self,
         job_id: str,
         thread: _CeilingHeightInferenceThread,
     ) -> None:
-        """Publish a result only if the displayed frame is still identical."""
+        """Publish per-level consensus results for the source-bound video."""
 
         runtime = self._ceiling_height_runtime
         try:
@@ -1071,8 +1362,15 @@ class MergedGenerationWorkspace(QWidget):
             ):
                 return
             self.job_manager.set_cancel_callback(job_id, None)
-            is_stale = (
-                runtime.frame_revision != self._ceiling_height_frame_revision
+            current_source = self._current_video_source()
+            levels_are_stale = (
+                self._ceiling_height_level_options
+                != runtime.level_signature
+            )
+            is_stale = bool(
+                current_source is None
+                or str(current_source.metadata.path) != runtime.video_path
+                or levels_are_stale
             )
             if (
                 self._is_shutdown
@@ -1081,44 +1379,173 @@ class MergedGenerationWorkspace(QWidget):
                 or is_stale
             ):
                 stage = (
-                    "Ignored after the video frame changed"
+                    "Ignored after the video or project levels changed"
                     if is_stale
                     else "Cancelled"
                 )
                 self.job_manager.mark_cancelled(job_id, stage=stage)
-                if not self._is_shutdown and not is_stale:
-                    self.ceiling_height_result_label.setText(
-                        "Ceiling height: Inference cancelled."
-                    )
+                if not self._is_shutdown:
+                    if is_stale and self._ceiling_height_dialog is not None:
+                        self._ceiling_height_dialog.set_result(
+                            "Analysis stopped because the video or project "
+                            "levels changed."
+                        )
+                    elif not is_stale:
+                        self.ceiling_height_result_label.setText(
+                            "Ceiling height: Analysis cancelled."
+                        )
+                        if self._ceiling_height_dialog is not None:
+                            self._ceiling_height_dialog.set_result(
+                                "Ceiling height analysis cancelled."
+                            )
                 return
             if thread.error_message is not None or thread.result is None:
                 message = thread.error_message or (
-                    "Ceiling height inference returned no result."
+                    "Ceiling height analysis returned no result."
                 )
                 self.job_manager.fail_job(job_id, stage=f"Failed: {message}")
                 self.ceiling_height_result_label.setText(
-                    f"Ceiling height inference failed: {message}"
+                    f"Ceiling height analysis failed: {message}"
                 )
+                if self._ceiling_height_dialog is not None:
+                    self._ceiling_height_dialog.set_result(
+                        message,
+                        is_error=True,
+                    )
                 return
 
-            estimate = thread.result
-            self.ceiling_height_result_label.setText(
-                format_ceiling_height_estimate(estimate)
-            )
-            if estimate.has_estimate:
-                assert estimate.estimate_m is not None
+            analysis = thread.result
+            if analysis.has_consensus:
+                result_text = _format_level_height_result(analysis)
+                self.ceiling_height_result_label.setText(result_text)
+                if self._ceiling_height_dialog is not None:
+                    self._ceiling_height_dialog.set_result(result_text)
                 completion_stage = (
-                    f"Estimated ceiling height: {estimate.estimate_m:.2f} m"
+                    "Detected ceiling heights for "
+                    f"{sum(item.has_consensus for item in analysis.level_estimates)} "
+                    "level(s)"
+                )
+                self.job_manager.complete_job(job_id, stage=completion_stage)
+                QTimer.singleShot(
+                    0,
+                    partial(
+                        self.ceiling_height_estimate_changed.emit,
+                        analysis,
+                    ),
                 )
             else:
-                completion_stage = "Insufficient visual evidence"
-            self.job_manager.complete_job(job_id, stage=completion_stage)
-            self.ceiling_height_estimate_changed.emit(estimate)
+                result_text = (
+                    "No reliable ceiling-height result was found for any "
+                    f"detected level. Analysed {analysis.analyzed_count} "
+                    "sampled frames"
+                    f"{_format_unassigned_frame_suffix(analysis)}."
+                )
+                self.ceiling_height_result_label.setText(result_text)
+                if self._ceiling_height_dialog is not None:
+                    self._ceiling_height_dialog.set_result(
+                        result_text,
+                        is_error=True,
+                    )
+                self.job_manager.complete_job(
+                    job_id,
+                    stage="No reliable ceiling-height consensus",
+                )
         finally:
             if runtime is not None and runtime.thread is thread:
                 self._ceiling_height_runtime = None
+            if self._ceiling_height_dialog is not None:
+                self._ceiling_height_dialog.set_running(False)
             self.sync_shared_controls()
             thread.deleteLater()
+
+    # ### Ceiling-height analysis state ###
+    def set_ceiling_height_levels(
+        self,
+        levels: Iterable[LevelData],
+        current_level_index: int,
+    ) -> None:
+        """Publish the project levels available to whole-video analysis."""
+
+        options = tuple(
+            sorted(
+                (
+                    (int(level.index), str(level.display_name))
+                    for level in levels
+                ),
+                key=lambda item: item[0],
+            )
+        )
+        self._ceiling_height_level_options = options
+        self._ceiling_height_current_level_index = int(current_level_index)
+        self._sync_ceiling_height_dialog_levels()
+
+    def _current_video_source(self) -> VideoFrameSource | None:
+        return (
+            self.object_workspace._video_source
+            or self.surface_workspace._video_source
+        )
+
+    def _current_video_frame_index(self) -> int | None:
+        video_source = self._current_video_source()
+        if video_source is None:
+            return None
+        displayed_index = self.object_workspace._displayed_frame_index
+        if displayed_index is None:
+            displayed_index = self.surface_workspace._displayed_frame_index
+        if displayed_index is None:
+            return None
+        return min(
+            max(int(displayed_index), 0),
+            video_source.metadata.frame_count - 1,
+        )
+
+    def _sync_ceiling_height_analysis_source(self) -> None:
+        video_source = self._current_video_source()
+        next_path = (
+            "" if video_source is None else str(video_source.metadata.path)
+        )
+        if next_path != self._ceiling_height_video_path:
+            runtime = self._ceiling_height_runtime
+            if runtime is not None and runtime.video_path != next_path:
+                runtime.cancel_requested = True
+                if not self.job_manager.cancel_job(runtime.job_id):
+                    runtime.thread.requestInterruption()
+            self._ceiling_height_video_path = next_path
+            self.ceiling_height_result_label.setText(
+                CEILING_HEIGHT_NOT_ESTIMATED_TEXT
+            )
+        dialog = self._ceiling_height_dialog
+        if dialog is None:
+            return
+        if video_source is None:
+            dialog.set_video_metadata(0)
+            return
+        metadata = video_source.metadata
+        dialog.set_video_metadata(
+            metadata.frame_count,
+            fps=metadata.fps,
+            width=metadata.width,
+            height=metadata.height,
+        )
+
+    def _sync_ceiling_height_dialog_frame(self) -> None:
+        if self._ceiling_height_dialog is not None:
+            self._ceiling_height_dialog.set_current_frame(
+                self._current_video_frame_index()
+            )
+
+    def _sync_ceiling_height_dialog_levels(self) -> None:
+        if self._ceiling_height_dialog is None:
+            return
+        self._ceiling_height_dialog.set_level_options(
+            tuple(
+                (level_name, level_index)
+                for level_index, level_name in reversed(
+                    self._ceiling_height_level_options
+                )
+            ),
+            current_level_index=self._ceiling_height_current_level_index,
+        )
 
     # ### Temporary generation references ###
     def _remember_temporary_object_reference(
@@ -1446,18 +1873,14 @@ class MergedGenerationWorkspace(QWidget):
         self.pbr_map_control.setEnabled(not has_untracked_object_job)
         self.ai_prompt_edit.setEnabled(not has_untracked_object_job)
         self.video_view.set_interaction_enabled(inpainting_is_available)
-        ceiling_inference_is_running = self._ceiling_height_runtime is not None
         self.infer_ceiling_height_button.setEnabled(
             not self._is_shutdown
             and not self._door_slot_editing_active
-            and self.video_view.has_frame()
-            and not ceiling_inference_is_running
+            and has_video
         )
-        self.infer_ceiling_height_button.setText(
-            "Inferring..."
-            if ceiling_inference_is_running
-            else "Infer ceiling height"
-        )
+        self.infer_ceiling_height_button.setText("Infer ceiling height")
+        self._sync_ceiling_height_analysis_source()
+        self._sync_ceiling_height_dialog_frame()
         self._sync_opening_generation_sections()
         self._sync_generation_texture_context()
 

@@ -1,14 +1,19 @@
 # ### Imports ###
 from __future__ import annotations
 
+import math
+import re
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-import math
-import re
 
 import numpy as np
 
+from housemaker.canvas_openings import (
+    CanvasWindowDimensionSnapshot,
+    capture_canvas_window_dimensions,
+    preserve_canvas_window_dimensions,
+)
 from housemaker.level_coordinates import (
     get_level_world_pivot,
     level_image_to_world_xy,
@@ -22,6 +27,7 @@ from housemaker.models import (
     LevelData,
     RoomData,
     Vertex,
+    WindowData,
 )
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
@@ -31,13 +37,18 @@ from housemaker.surface_geometry import (
     build_fixed_surfaces,
 )
 
-
 # ### Constants ###
 CANVAS_SURFACE_EDIT_WALL_VERTEX = "wall_vertex"
 CANVAS_SURFACE_EDIT_WALL_TRANSLATION = "wall_translation"
 CANVAS_SURFACE_EDIT_LEVEL_HEIGHT = "level_height"
 CANVAS_SURFACE_EDIT_ROOM_HEIGHT = "room_height"
 CANVAS_SURFACE_EDIT_FLOOR_THICKNESS = "floor_thickness"
+CANVAS_SURFACE_EDIT_HEIGHT_KINDS = frozenset(
+    (
+        CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
+        CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
+    )
+)
 CANVAS_SURFACE_EDIT_WALL_KINDS = frozenset(
     (
         CANVAS_SURFACE_EDIT_WALL_VERTEX,
@@ -218,6 +229,7 @@ class CanvasSurfaceEditHandleTarget:
     chain_vertex_image_positions: tuple[tuple[float, float], ...] = ()
     required_surface_ids: tuple[str, ...] = ()
     level_image_size_pixels: tuple[float, float] | None = None
+    window_dimension_snapshots: tuple[CanvasWindowDimensionSnapshot, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasSurfaceEditReference):
@@ -281,6 +293,15 @@ class CanvasSurfaceEditHandleTarget:
             self.level_image_size_pixels,
             "level image size",
         )
+        window_dimension_snapshots = tuple(self.window_dimension_snapshots)
+        if not all(
+            isinstance(snapshot, CanvasWindowDimensionSnapshot)
+            and snapshot.level_index == self.reference.level_index
+            for snapshot in window_dimension_snapshots
+        ):
+            raise ValueError(
+                "Canvas surface targets require same-level window snapshots."
+            )
         _validate_target_chain(
             self.reference,
             chain_vertex_ids,
@@ -306,6 +327,11 @@ class CanvasSurfaceEditHandleTarget:
         )
         object.__setattr__(self, "required_surface_ids", required_surface_ids)
         object.__setattr__(self, "level_image_size_pixels", image_size)
+        object.__setattr__(
+            self,
+            "window_dimension_snapshots",
+            window_dimension_snapshots,
+        )
 
     def get_preview_origin(
         self,
@@ -358,6 +384,7 @@ class _LevelMutationSnapshot:
     height_meters: float
     floor_thickness_meters: float
     room_heights: tuple[tuple[int, float], ...]
+    windows: tuple[WindowData, ...]
 
 
 # ### Target builders ###
@@ -379,6 +406,10 @@ def build_canvas_surface_edit_targets(
                 if surface.level_index == level_index
             )
         )
+    window_dimensions_by_level = _capture_window_dimensions_by_level(
+        level_sequence,
+        surface_sequence,
+    )
 
     targets: list[CanvasSurfaceEditHandleTarget] = []
     for surface in sorted(
@@ -406,6 +437,7 @@ def build_canvas_surface_edit_targets(
             level,
             surface,
             required_ids_by_level[level.index],
+            window_dimensions_by_level.get(level.index, ()),
         )
         if surface.surface_type == SURFACE_TYPE_WALL:
             targets.extend(_build_wall_targets(level, surface, common))
@@ -462,8 +494,15 @@ def rebase_canvas_wall_edit_targets(
         )
 
     level = _find_level(level_sequence, level_index)
+    window_dimensions_by_level = _capture_current_window_dimensions_by_level(
+        level_sequence
+    )
     return tuple(
-        _rebase_canvas_wall_edit_target(level, target)
+        _rebase_canvas_wall_edit_target(
+            level,
+            target,
+            window_dimensions_by_level.get(level.index, ()),
+        )
         for target in target_sequence
     )
 
@@ -480,10 +519,14 @@ def rebase_canvas_wall_edit_targets_batch(
         "Canvas wall batch target rebasing",
         allow_empty=True,
     )
+    window_dimensions_by_level = _capture_current_window_dimensions_by_level(
+        level_sequence
+    )
     return tuple(
         _rebase_canvas_wall_edit_target(
             _find_level(level_sequence, target.reference.level_index),
             target,
+            window_dimensions_by_level.get(target.reference.level_index, ()),
         )
         for target in target_sequence
     )
@@ -524,6 +567,60 @@ def rebase_canvas_floor_edit_target(
             MAX_FLOOR_THICKNESS_METERS - current_thickness
         ),
         baseline_value_meters=current_thickness,
+        window_dimension_snapshots=(
+            _capture_current_window_dimensions_by_level(level_sequence).get(
+                level.index,
+                (),
+            )
+        ),
+    )
+
+
+def rebase_canvas_height_edit_target(
+    levels: Sequence[LevelData],
+    target: CanvasSurfaceEditHandleTarget,
+) -> CanvasSurfaceEditHandleTarget:
+    """Rebase a ceiling handle onto its current delayed height preview."""
+
+    level_sequence = _normalize_levels(levels)
+    if not isinstance(target, CanvasSurfaceEditHandleTarget):
+        raise TypeError("Canvas height target rebasing requires a handle target.")
+    if target.reference.kind not in CANVAS_SURFACE_EDIT_HEIGHT_KINDS:
+        raise ValueError("Canvas height target rebasing requires a ceiling handle.")
+
+    level = _find_level(level_sequence, target.reference.level_index)
+    _validate_level_baseline(level, target)
+    current_height = _validate_range(
+        (
+            level.height_meters
+            if target.reference.kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
+            else _get_required_room_height(level, target.reference)
+        ),
+        MIN_CANVAS_SURFACE_HEIGHT_METERS,
+        MAX_CANVAS_SURFACE_HEIGHT_METERS,
+        "Canvas surface height",
+    )
+    height_delta = current_height - target.baseline_value_meters
+    current_origin = (
+        np.asarray(target.origin_world, dtype=float)
+        + np.asarray(target.axis_world, dtype=float) * height_delta
+    )
+    return replace(
+        target,
+        origin_world=tuple(float(value) for value in current_origin),
+        minimum_delta_meters=(
+            MIN_CANVAS_SURFACE_HEIGHT_METERS - current_height
+        ),
+        maximum_delta_meters=(
+            MAX_CANVAS_SURFACE_HEIGHT_METERS - current_height
+        ),
+        baseline_value_meters=current_height,
+        window_dimension_snapshots=(
+            _capture_current_window_dimensions_by_level(level_sequence).get(
+                level.index,
+                (),
+            )
+        ),
     )
 
 
@@ -531,6 +628,7 @@ def _build_common_target_values(
     level: LevelData,
     surface: FixedSurface,
     required_surface_ids: tuple[str, ...],
+    window_dimension_snapshots: tuple[CanvasWindowDimensionSnapshot, ...],
 ) -> dict[str, object]:
     return {
         "surface_id": surface.surface_id,
@@ -544,6 +642,7 @@ def _build_common_target_values(
         ),
         "required_surface_ids": required_surface_ids,
         "level_image_size_pixels": level.image_size_pixels,
+        "window_dimension_snapshots": window_dimension_snapshots,
     }
 
 
@@ -722,8 +821,14 @@ def apply_canvas_surface_edit(
     )
     snapshot = _capture_level_mutation_snapshot(level)
     try:
+        _restore_target_window_baseline(level, target)
         _apply_target_delta(level, target, delta)
         _validate_applied_values(level, target)
+        if (
+            target.reference.kind != CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+            and abs(delta) > CANVAS_SURFACE_EDIT_EPSILON
+        ):
+            _preserve_target_window_dimensions(level_sequence, (target,))
         if validate_project_geometry:
             _validate_generated_surfaces(level_sequence, target)
     except Exception as error:
@@ -791,6 +896,10 @@ def apply_canvas_wall_edit_batch(
         for level_index, level in affected_levels.items()
     }
     try:
+        _restore_wall_batch_window_baselines(
+            affected_levels,
+            target_sequence,
+        )
         positions_by_level = _collect_wall_batch_positions(
             target_sequence,
             delta,
@@ -801,6 +910,8 @@ def apply_canvas_wall_edit_batch(
             target_sequence,
         )
         _validate_wall_batch_lengths(affected_levels, target_sequence)
+        if abs(delta) > CANVAS_SURFACE_EDIT_EPSILON:
+            _preserve_target_window_dimensions(level_sequence, target_sequence)
         if validate_project_geometry:
             _validate_generated_surfaces_batch(
                 level_sequence,
@@ -1171,6 +1282,7 @@ def _apply_target_delta(
 def _rebase_canvas_wall_edit_target(
     level: LevelData,
     target: CanvasSurfaceEditHandleTarget,
+    window_dimension_snapshots: tuple[CanvasWindowDimensionSnapshot, ...],
 ) -> CanvasSurfaceEditHandleTarget:
     """Copy one wall handle with the current chain as its new baseline."""
 
@@ -1220,6 +1332,7 @@ def _rebase_canvas_wall_edit_target(
             float(value) for value in get_level_world_pivot(level)
         ),
         chain_vertex_image_positions=chain_positions,
+        window_dimension_snapshots=window_dimension_snapshots,
     )
 
 
@@ -1671,6 +1784,103 @@ def _parse_wall_endpoint_ids(wall_key: object) -> tuple[int, int] | None:
     return first, second
 
 
+# ### Window dimension helpers ###
+def _capture_window_dimensions_by_level(
+    levels: Sequence[LevelData],
+    surfaces: Sequence[FixedSurface],
+) -> dict[int, tuple[CanvasWindowDimensionSnapshot, ...]]:
+    snapshots_by_level: dict[int, list[CanvasWindowDimensionSnapshot]] = {}
+    for snapshot in capture_canvas_window_dimensions(levels, surfaces):
+        snapshots_by_level.setdefault(snapshot.level_index, []).append(snapshot)
+    return {
+        level_index: tuple(snapshots)
+        for level_index, snapshots in snapshots_by_level.items()
+    }
+
+
+def _capture_current_window_dimensions_by_level(
+    levels: Sequence[LevelData],
+) -> dict[int, tuple[CanvasWindowDimensionSnapshot, ...]]:
+    if not any(level.windows for level in levels):
+        return {}
+    geometry_levels = tuple(
+        replace(level, include_in_export=True) for level in levels
+    )
+    return _capture_window_dimensions_by_level(
+        geometry_levels,
+        tuple(build_fixed_surfaces(geometry_levels)),
+    )
+
+
+def _restore_target_window_baseline(
+    level: LevelData,
+    target: CanvasSurfaceEditHandleTarget,
+) -> None:
+    baseline_by_id = {
+        snapshot.window.window_id: snapshot.window
+        for snapshot in target.window_dimension_snapshots
+    }
+    if not baseline_by_id:
+        return
+    level.windows[:] = [
+        baseline_by_id.get(window.window_id, window) for window in level.windows
+    ]
+
+
+def _restore_wall_batch_window_baselines(
+    levels_by_index: dict[int, LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+) -> None:
+    snapshots_by_level: dict[int, tuple[CanvasWindowDimensionSnapshot, ...]] = {}
+    for target in targets:
+        level_index = target.reference.level_index
+        existing = snapshots_by_level.setdefault(
+            level_index,
+            target.window_dimension_snapshots,
+        )
+        if existing != target.window_dimension_snapshots:
+            raise ValueError(
+                "Selected Canvas walls have inconsistent window baselines."
+            )
+    for level_index, snapshots in snapshots_by_level.items():
+        level = levels_by_index[level_index]
+        baseline_by_id = {
+            snapshot.window.window_id: snapshot.window for snapshot in snapshots
+        }
+        level.windows[:] = [
+            baseline_by_id.get(window.window_id, window)
+            for window in level.windows
+        ]
+
+
+def _preserve_target_window_dimensions(
+    levels: Sequence[LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+) -> None:
+    snapshots_by_key: dict[
+        tuple[int, str],
+        CanvasWindowDimensionSnapshot,
+    ] = {}
+    for target in targets:
+        for snapshot in target.window_dimension_snapshots:
+            key = (snapshot.level_index, snapshot.window.window_id)
+            existing = snapshots_by_key.setdefault(key, snapshot)
+            if existing != snapshot:
+                raise ValueError(
+                    "Selected Canvas walls have inconsistent window dimensions."
+                )
+    if not snapshots_by_key:
+        return
+    geometry_levels = tuple(
+        replace(level, include_in_export=True) for level in levels
+    )
+    preserve_canvas_window_dimensions(
+        levels,
+        tuple(build_fixed_surfaces(geometry_levels)),
+        tuple(snapshots_by_key.values()),
+    )
+
+
 # ### State snapshot helpers ###
 def _capture_level_mutation_snapshot(level: LevelData) -> _LevelMutationSnapshot:
     return _LevelMutationSnapshot(
@@ -1683,6 +1893,7 @@ def _capture_level_mutation_snapshot(level: LevelData) -> _LevelMutationSnapshot
             (room.center_vertex_id, float(room.height_meters))
             for room in level.rooms
         ),
+        windows=tuple(level.windows),
     )
 
 
@@ -1700,6 +1911,7 @@ def _restore_level_mutation_snapshot(
     for room in level.rooms:
         if room.center_vertex_id in room_height_by_id:
             room.height_meters = room_height_by_id[room.center_vertex_id]
+    level.windows[:] = snapshot.windows
 
 
 def _measure_current_delta(

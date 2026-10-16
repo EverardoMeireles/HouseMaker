@@ -24,6 +24,7 @@ from PySide6.QtCore import (
     QThread,
     QTimer,
     Signal,
+    Slot,
 )
 from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
@@ -123,11 +124,15 @@ from housemaker.canvas_openings import (
     CanvasOpeningEdit,
     CanvasOpeningReference,
     CanvasOpeningTarget,
+    CanvasWindowDimensionSnapshot,
     apply_canvas_opening_edit,
     build_canvas_opening_targets,
+    capture_canvas_window_dimensions,
+    preserve_canvas_window_dimensions,
 )
 from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
+    CANVAS_SURFACE_EDIT_HEIGHT_KINDS,
     CANVAS_SURFACE_EDIT_WALL_KINDS,
     CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
     AppliedCanvasSurfaceEdit,
@@ -138,12 +143,14 @@ from housemaker.canvas_surface_edits import (
     build_canvas_surface_edit_targets,
     canvas_surface_edit_targets_are_at_baseline,
     rebase_canvas_floor_edit_target,
+    rebase_canvas_height_edit_target,
     rebase_canvas_wall_edit_targets_batch,
     restore_canvas_surface_edit,
     restore_canvas_wall_edit_batch,
     validate_canvas_surface_edit_geometry,
     validate_canvas_wall_edit_batch_geometry,
 )
+from housemaker.ceiling_height_estimation import CeilingHeightAnalysisResult
 from housemaker.directional_light_state import (
     DirectionalLightData,
     create_directional_light,
@@ -491,6 +498,7 @@ SURFACE_ATLAS_ROUGHNESS_BYTE = round(LEGACY_SURFACE_ROUGHNESS_FACTOR * 255.0)
 DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
     (
         *CANVAS_SURFACE_EDIT_WALL_KINDS,
+        *CANVAS_SURFACE_EDIT_HEIGHT_KINDS,
         CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     )
 )
@@ -1260,6 +1268,15 @@ class _CanvasLevelPropertiesUndoState:
     offset_x_meters: float
     offset_y_meters: float
     include_in_export: bool
+    doorways: tuple[DoorwayData, ...] = ()
+    windows: tuple[WindowData, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CanvasLevelPropertiesGroupUndoState:
+    """Level-property baselines changed by one atomic multi-level action."""
+
+    members: tuple[_CanvasLevelPropertiesUndoState, ...]
 
 
 @dataclass(frozen=True)
@@ -1279,6 +1296,7 @@ class _PendingLevelTransform:
     scale: float
     offset_x_meters: float
     offset_y_meters: float
+    window_dimension_snapshots: tuple[CanvasWindowDimensionSnapshot, ...] = ()
 
     @property
     def level_index(self) -> int:
@@ -1384,6 +1402,7 @@ _CanvasUndoState = (
     | _CanvasSurfaceEditUndoState
     | _CanvasSlopedCeilingUndoState
     | _CanvasLevelPropertiesUndoState
+    | _CanvasLevelPropertiesGroupUndoState
     | _CanvasOuterWallMarkUndoState
     | _CanvasOpeningEditUndoState
     | _CanvasWindowAdditionUndoState
@@ -1672,6 +1691,10 @@ class BlueprintWorkspace(QWidget):
         self._pending_wall_vertex_doorway_level_indices: set[int] = set()
         self._pending_open_space_corner_mesh_update = False
         self._pending_deleted_wall_cleanup = False
+        self._pending_wall_vertex_window_dimensions: tuple[
+            CanvasWindowDimensionSnapshot,
+            ...,
+        ] = ()
         self._is_canvas_wall_vertex_interaction_active = False
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
@@ -2358,6 +2381,7 @@ class BlueprintWorkspace(QWidget):
             self.surface_texture_generation,
             self.generation,
             self.job_manager,
+            application_settings=self._application_settings,
         )
         self.first_person_generation_frame_shortcut = QShortcut(
             QKeySequence("A", QKeySequence.SequenceFormat.PortableText),
@@ -2375,6 +2399,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.merged_generation_workspace.current_video_frame_changed.connect(
             self._sync_first_person_generation_frame_overlay
+        )
+        self.merged_generation_workspace.ceiling_height_estimate_changed.connect(
+            self._handle_ceiling_height_analysis_completed
         )
         for checkbox in self.merged_generation_workspace.pbr_map_checkboxes.values():
             checkbox.toggled.connect(self._handle_generation_scene_pbr_maps_changed)
@@ -4544,6 +4571,121 @@ class BlueprintWorkspace(QWidget):
             self.merged_generation_workspace.get_current_video_frame_bgr()
         )
 
+    @Slot(object)
+    def _handle_ceiling_height_analysis_completed(
+        self,
+        result: CeilingHeightAnalysisResult,
+    ) -> None:
+        """Offer one atomic, undo-aware update for every detected level."""
+
+        detected_updates: list[tuple[LevelData, float, str]] = []
+        for level_estimate in result.level_estimates:
+            analysis = level_estimate.analysis
+            if not analysis.has_consensus or analysis.average_height_m is None:
+                continue
+            level = self._get_level_by_index(level_estimate.level_index)
+            if level is None:
+                continue
+            summary_parts = [
+                (
+                    f"{analysis.retained_count} estimate"
+                    f"{'s' if analysis.retained_count != 1 else ''} retained"
+                )
+            ]
+            if analysis.outlier_count:
+                summary_parts.append(
+                    f"{analysis.outlier_count} outlier"
+                    f"{'s' if analysis.outlier_count != 1 else ''} discarded"
+                )
+            if analysis.insufficient_count:
+                summary_parts.append(
+                    f"{analysis.insufficient_count} frame"
+                    f"{'s' if analysis.insufficient_count != 1 else ''} "
+                    "without enough visual evidence"
+                )
+            detected_updates.append(
+                (
+                    level,
+                    float(analysis.average_height_m),
+                    ", ".join(summary_parts),
+                )
+            )
+        if not detected_updates:
+            return
+
+        estimate_lines = [
+            f"{level.display_name}: {height_meters:.2f} m ({summary})"
+            for level, height_meters, summary in detected_updates
+        ]
+        ignored_frame_count = len(result.unassigned_frame_indices)
+        ignored_summary = (
+            ""
+            if not ignored_frame_count
+            else (
+                f"\n\n{ignored_frame_count} transition or uncertain frame"
+                f"{'s were' if ignored_frame_count != 1 else ' was'} "
+                "excluded from the height averages."
+            )
+        )
+        answer = QMessageBox.question(
+            self,
+            "Apply ceiling height estimates",
+            (
+                "The video analysis detected these level heights:\n\n"
+                + "\n".join(estimate_lines)
+                + ignored_summary
+                + "\n\nApply these heights to the project?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        # Finish an older level transform before this analysis captures its
+        # own baseline, so the two operations remain separate undo steps.
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        changed_updates = [
+            (level, height_meters)
+            for level, height_meters, _summary in detected_updates
+            if not math.isclose(level.height_meters, height_meters)
+        ]
+        if not changed_updates:
+            return
+        undo_state = _CanvasLevelPropertiesGroupUndoState(
+            members=tuple(
+                self._capture_canvas_level_properties_undo_state(level)
+                for level, _height_meters in changed_updates
+            )
+        )
+        window_dimensions = self._capture_canvas_window_dimension_snapshots(
+            tuple(level.index for level, _height_meters in changed_updates)
+        )
+        self._record_canvas_undo_state(undo_state)
+        for level, height_meters in changed_updates:
+            level.height_meters = height_meters
+        try:
+            self._preserve_canvas_window_dimension_snapshots(window_dimensions)
+        except (TypeError, ValueError) as error:
+            levels_by_index = {level.index: level for level in self.levels}
+            for member in undo_state.members:
+                level = levels_by_index[member.level_index]
+                level.height_meters = member.height_meters
+                level.windows[:] = member.windows
+            if self._canvas_undo_stack and self._canvas_undo_stack[-1] is undo_state:
+                self._canvas_undo_stack.pop()
+            QMessageBox.warning(
+                self,
+                "Apply ceiling height estimates",
+                f"The ceiling heights were not changed: {error}",
+            )
+            return
+        self._sync_level_controls()
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh()
+
     def _handle_canvas_3d_navigation_mode_changed(self, mode: str) -> None:
         """Keep the 2D camera indicator synchronized with scene navigation."""
 
@@ -4621,7 +4763,7 @@ class BlueprintWorkspace(QWidget):
         self,
         raw_placement: object,
     ) -> None:
-        """Commit one validated Canvas or sloped-surface window opening."""
+        """Stage one window opening for the shared delayed mesh rebuild."""
 
         if not isinstance(
             raw_placement,
@@ -4634,6 +4776,11 @@ class BlueprintWorkspace(QWidget):
 
         self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_sloped_ceiling_mesh_update()
+        if self._pending_window_mesh_level_index is not None:
+            self._stage_pending_canvas_opening_snapshots()
+        windows_before_by_level_index = {
+            level.index: self._copy_windows(level.windows) for level in self.levels
+        }
         try:
             window = (
                 add_sloped_ceiling_window(self.levels, raw_placement)
@@ -4652,49 +4799,30 @@ class BlueprintWorkspace(QWidget):
                 "Window not added because its owning level could not be found."
             )
             return
-        window_level, _, _ = added_window
-        self._sync_viewer_window_snapshot(window_level)
+        window_level, window_index, _ = added_window
+        self._viewer_windows_by_level_index[window_level.index] = (
+            windows_before_by_level_index.get(window_level.index, ())
+        )
         self._refresh_canvas_windows_for_level(window_level)
 
-        try:
-            validated_build = self._build_model_with_stable_dependencies(
-                lambda: self._build_viewer_preview_model(None)
-            )
-        except Exception as error:
-            self._rollback_canvas_window(window.window_id)
-            self._sync_viewer_window_snapshot(window_level)
-            self._refresh_canvas_windows_for_level(window_level)
-            self.viewer.set_window_tools_status(f"Window not added: {error}")
-            return
-        if validated_build is None:
-            self._rollback_canvas_window(window.window_id)
-            self._sync_viewer_window_snapshot(window_level)
-            self._refresh_canvas_windows_for_level(window_level)
-            self.viewer.set_window_tools_status(
-                "Window not added because the updated model could not be built."
-            )
-            return
-        generated_model, dependency_signature = validated_build
-
-        try:
-            self._apply_canvas_window_preview(
-                generated_model,
-                dependency_signature=dependency_signature,
-            )
-        except Exception as error:
-            self._rollback_canvas_window(window.window_id)
-            self._sync_viewer_window_snapshot(window_level)
-            self._refresh_canvas_windows_for_level(window_level)
-            self._restore_canvas_window_preview_after_rollback()
-            self.viewer.set_window_tools_status(f"Window not added: {error}")
-            return
+        reference = CanvasOpeningReference(
+            kind=CANVAS_OPENING_WINDOW,
+            level_index=window_level.index,
+            item_index=window_index,
+            stable_id=window.window_id,
+        )
+        self._refresh_pending_canvas_opening_state(reference)
+        self._doorway_mesh_update_timer.start()
 
         self._canvas_window_undo_ids.append(window.window_id)
         self._record_canvas_undo_state(
             _CanvasWindowAdditionUndoState(window_id=window.window_id)
         )
         self._sync_canvas_window_undo_availability()
-        self.viewer.set_window_tools_status("Window added.")
+        self.viewer.set_window_tools_status(
+            "Window frame added. The mesh will update after "
+            f"{self._mesh_edit_update_delay_seconds:g} seconds."
+        )
 
     def _handle_canvas_window_undo_requested(self) -> None:
         """Undo the latest successfully committed Canvas window transaction."""
@@ -7302,7 +7430,7 @@ class BlueprintWorkspace(QWidget):
             level = levels_by_index[level_index]
             staged_level = staged_levels_by_index[level_index]
             level.sloped_ceilings = list(staged_level.sloped_ceilings)
-            level.windows = list(staged_level.windows)
+            level.windows[:] = staged_level.windows
         removed_window_placements = (
             self._detach_sloped_ceiling_window_placements(
                 removed_window_frame_ids
@@ -7479,7 +7607,7 @@ class BlueprintWorkspace(QWidget):
             if level is None:
                 continue
             if restore:
-                level.windows = list(windows)
+                level.windows[:] = windows
             self._viewer_windows_by_level_index[level.index] = (
                 self._copy_windows(level.windows)
             )
@@ -7536,7 +7664,7 @@ class BlueprintWorkspace(QWidget):
             )
         for level_index, windows in state.window_snapshots_by_level:
             level = levels_by_index[level_index]
-            level.windows = list(windows)
+            level.windows[:] = windows
             self._viewer_windows_by_level_index[level.index] = (
                 self._copy_windows(level.windows)
             )
@@ -7597,6 +7725,18 @@ class BlueprintWorkspace(QWidget):
             CanvasSnapshot,
         ):
             return
+        if (
+            self._pending_wall_vertex_mesh_update
+            and self.canvas.active_vertex_id is None
+            and raw_snapshot.action_kind != CANVAS_SNAPSHOT_ACTION_OPEN_SPACE
+        ):
+            self._commit_pending_wall_vertex_update()
+        if not self._pending_wall_vertex_window_dimensions:
+            self._pending_wall_vertex_window_dimensions = (
+                self._capture_canvas_window_dimension_snapshots(
+                    (self.current_level.index,)
+                )
+            )
         tracks_surface_bindings = raw_snapshot.action_kind in {
             CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
             CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
@@ -7708,6 +7848,8 @@ class BlueprintWorkspace(QWidget):
                 and state.snapshot is raw_snapshot
             ):
                 del self._canvas_undo_stack[index]
+                if not self._pending_wall_vertex_mesh_update:
+                    self._pending_wall_vertex_window_dimensions = ()
                 return
 
     def _capture_canvas_level_properties_undo_state(
@@ -7726,6 +7868,8 @@ class BlueprintWorkspace(QWidget):
             offset_x_meters=float(level.offset_x_meters),
             offset_y_meters=float(level.offset_y_meters),
             include_in_export=bool(level.include_in_export),
+            doorways=self._copy_doorways(level.doorways),
+            windows=self._copy_windows(level.windows),
         )
 
     def _capture_canvas_topology_undo_state(self) -> _CanvasTopologyUndoState:
@@ -7981,6 +8125,8 @@ class BlueprintWorkspace(QWidget):
                 self._restore_canvas_sloped_ceiling_undo_state(state)
             elif isinstance(state, _CanvasLevelPropertiesUndoState):
                 self._restore_canvas_level_properties_undo_state(state)
+            elif isinstance(state, _CanvasLevelPropertiesGroupUndoState):
+                self._restore_canvas_level_properties_group_undo_state(state)
             elif isinstance(state, _CanvasOuterWallMarkUndoState):
                 self._restore_canvas_outer_wall_mark_undo_state(state)
             elif isinstance(state, _CanvasOpeningEditUndoState):
@@ -8203,6 +8349,12 @@ class BlueprintWorkspace(QWidget):
         if not state.targets:
             raise ValueError("Canvas surface undo has no structural baseline.")
         applied_edits = self._restore_canvas_surface_edit_targets(state.targets)
+        for level_index in sorted(
+            {target.reference.level_index for target in state.targets}
+        ):
+            level = self._get_level_by_index(level_index)
+            if level is not None:
+                self._sync_viewer_window_snapshot(level)
         self._sync_live_canvas_surface_edits(applied_edits)
         self._canvas_surface_edit_targets_by_key = {}
         self.viewer.set_canvas_surface_edit_targets(())
@@ -8227,6 +8379,12 @@ class BlueprintWorkspace(QWidget):
         level.offset_x_meters = state.offset_x_meters
         level.offset_y_meters = state.offset_y_meters
         level.include_in_export = state.include_in_export
+        level.doorways[:] = copy.deepcopy(state.doorways)
+        level.windows[:] = state.windows
+        self._viewer_doorways_by_level_index[level.index] = self._copy_doorways(
+            level.doorways
+        )
+        self._sync_viewer_window_snapshot(level)
         if level is self.current_level:
             self._sync_level_controls()
             self.canvas.set_canvas_level_scale(level.canvas_level_scale)
@@ -8236,6 +8394,50 @@ class BlueprintWorkspace(QWidget):
             )
             self.canvas.update()
             self._sync_canvas_placed_object_profiles()
+        self._sync_canvas_outer_wall_marking()
+        self._reconcile_surface_assignments_with_scene()
+        self._refresh_scene_atlas_texture_requirements()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _restore_canvas_level_properties_group_undo_state(
+        self,
+        state: _CanvasLevelPropertiesGroupUndoState,
+    ) -> None:
+        """Restore every level changed by one accepted video analysis."""
+
+        if not state.members:
+            raise ValueError("The multi-level Canvas undo has no baselines.")
+        self._cancel_pending_level_transform(sync_controls=False)
+        levels_by_index = {level.index: level for level in self.levels}
+        if any(
+            member.level_index not in levels_by_index
+            for member in state.members
+        ):
+            raise ValueError("A Canvas level in this undo step no longer exists.")
+        for member in state.members:
+            level = levels_by_index[member.level_index]
+            level.height_meters = member.height_meters
+            level.scale = member.scale
+            level.canvas_level_scale = member.canvas_level_scale
+            level.canvas_offset_x_pixels = member.canvas_offset_x_pixels
+            level.canvas_offset_y_pixels = member.canvas_offset_y_pixels
+            level.offset_x_meters = member.offset_x_meters
+            level.offset_y_meters = member.offset_y_meters
+            level.include_in_export = member.include_in_export
+            level.doorways[:] = copy.deepcopy(member.doorways)
+            level.windows[:] = member.windows
+            self._viewer_doorways_by_level_index[level.index] = self._copy_doorways(
+                level.doorways
+            )
+            self._sync_viewer_window_snapshot(level)
+        self._sync_level_controls()
+        self.canvas.set_canvas_level_scale(self.current_level.canvas_level_scale)
+        self.canvas.set_canvas_level_offsets(
+            self.current_level.canvas_offset_x_pixels,
+            self.current_level.canvas_offset_y_pixels,
+        )
+        self.canvas.update()
+        self._sync_canvas_placed_object_profiles()
         self._sync_canvas_outer_wall_marking()
         self._reconcile_surface_assignments_with_scene()
         self._refresh_scene_atlas_texture_requirements()
@@ -8581,11 +8783,14 @@ class BlueprintWorkspace(QWidget):
             level.rooms.extend(copy.deepcopy(state.snapshot.rooms))
             level.doorways.clear()
             level.doorways.extend(copy.deepcopy(state.snapshot.doorways))
+            level.windows.clear()
+            level.windows.extend(state.snapshot.windows)
             level.open_spaces.clear()
             level.open_spaces.extend(state.snapshot.open_spaces)
             self._reset_viewer_doorway_snapshots()
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self._sync_viewer_window_snapshot(level)
         for level_index, architectural_trims in state.architectural_trims_by_level:
             trim_level = self._get_level_by_index(level_index)
             if trim_level is None:
@@ -9268,6 +9473,8 @@ class BlueprintWorkspace(QWidget):
             return
         active_targets = self._active_canvas_surface_edit_targets or (target,)
         is_floor_edit = target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+        is_height_edit = target.reference.kind in CANVAS_SURFACE_EDIT_HEIGHT_KINDS
+        is_scalar_edit = is_floor_edit or is_height_edit
         uses_mesh_delay = target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
         if changed and not self._apply_active_canvas_surface_edit(
             raw_edit,
@@ -9298,12 +9505,12 @@ class BlueprintWorkspace(QWidget):
                 self._pending_canvas_surface_mesh_baseline = target
                 self._pending_canvas_surface_mesh_baselines = (
                     (target,)
-                    if is_floor_edit
+                    if is_scalar_edit
                     else self._get_selected_canvas_wall_baselines(target)
                 )
                 self._pending_canvas_wall_surface_ids = (
                     ()
-                    if is_floor_edit
+                    if is_scalar_edit
                     else self._get_canvas_wall_surface_ids(
                         self.viewer.get_selected_canvas_surface_ids()
                     )
@@ -9311,6 +9518,8 @@ class BlueprintWorkspace(QWidget):
             self._pending_canvas_surface_mesh_update = True
             if is_floor_edit:
                 self._pending_floor_thickness_level_index = target.reference.level_index
+                current_targets = (target,)
+            elif is_height_edit:
                 current_targets = (target,)
             else:
                 selected_wall_ids = set(
@@ -9326,19 +9535,19 @@ class BlueprintWorkspace(QWidget):
                     and candidate.reference.kind in CANVAS_SURFACE_EDIT_WALL_KINDS
                 )
             try:
-                rebased_targets = (
-                    (
-                        rebase_canvas_floor_edit_target(
-                            self.levels,
-                            target,
-                        ),
+                if is_floor_edit:
+                    rebased_targets = (
+                        rebase_canvas_floor_edit_target(self.levels, target),
                     )
-                    if is_floor_edit
-                    else rebase_canvas_wall_edit_targets_batch(
+                elif is_height_edit:
+                    rebased_targets = (
+                        rebase_canvas_height_edit_target(self.levels, target),
+                    )
+                else:
+                    rebased_targets = rebase_canvas_wall_edit_targets_batch(
                         self.levels,
                         current_targets,
                     )
-                )
             except (TypeError, ValueError) as error:
                 self._reject_pending_canvas_surface_mesh_update(error)
                 return
@@ -9353,8 +9562,8 @@ class BlueprintWorkspace(QWidget):
             self._canvas_surface_mesh_update_timer.start()
             return
 
-        # Height edits rebuild immediately, so their old immutable baselines
-        # are retired until the refreshed scene installs new ones.
+        # Any future non-debounced edit retires its immutable baseline until
+        # the refreshed scene installs a new target.
         self._record_canvas_undo_state(
             _CanvasSurfaceEditUndoState(targets=tuple(active_targets))
         )
@@ -9404,6 +9613,12 @@ class BlueprintWorkspace(QWidget):
                 _CanvasSurfaceEditUndoState(targets=tuple(baselines)),
                 commit_pending_surface_edit=False,
             )
+        for level_index in sorted(
+            {target.reference.level_index for target in baselines}
+        ):
+            level = self._get_level_by_index(level_index)
+            if level is not None:
+                self._sync_viewer_window_snapshot(level)
         self._commit_viewer_floor_thickness_snapshot()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
@@ -17789,6 +18004,57 @@ class BlueprintWorkspace(QWidget):
 
         return tuple(copy.deepcopy(tuple(sloped_ceilings)))
 
+    def _capture_canvas_window_dimension_snapshots(
+        self,
+        level_indices: Sequence[int],
+    ) -> tuple[CanvasWindowDimensionSnapshot, ...]:
+        """Capture metric window sizes before structural host changes."""
+
+        normalized_indices = tuple(dict.fromkeys(int(value) for value in level_indices))
+        if not normalized_indices or not any(
+            level.windows
+            for level in self.levels
+            if level.index in normalized_indices
+        ):
+            return ()
+        geometry_levels = [copy.copy(level) for level in self.levels]
+        for level in geometry_levels:
+            level.include_in_export = True
+        surfaces = tuple(build_fixed_surfaces(geometry_levels, stairs=self.stairs))
+        return capture_canvas_window_dimensions(
+            geometry_levels,
+            surfaces,
+            level_indices=normalized_indices,
+        )
+
+    def _preserve_canvas_window_dimension_snapshots(
+        self,
+        snapshots: Sequence[CanvasWindowDimensionSnapshot],
+        *,
+        require_every_window: bool = True,
+    ) -> None:
+        """Rebase windows after a structural change and publish their ratios."""
+
+        snapshot_sequence = tuple(snapshots)
+        if not snapshot_sequence:
+            return
+        geometry_levels = [copy.copy(level) for level in self.levels]
+        for level in geometry_levels:
+            level.include_in_export = True
+        surfaces = tuple(build_fixed_surfaces(geometry_levels, stairs=self.stairs))
+        preserve_canvas_window_dimensions(
+            self.levels,
+            surfaces,
+            snapshot_sequence,
+            require_every_window=require_every_window,
+        )
+        for level_index in sorted(
+            {snapshot.level_index for snapshot in snapshot_sequence}
+        ):
+            level = self._get_level_by_index(level_index)
+            if level is not None:
+                self._sync_viewer_window_snapshot(level)
+
     def _reset_viewer_doorway_snapshots(self) -> None:
         """Make every rendered structural snapshot match the project."""
 
@@ -22251,10 +22517,25 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_level_transform_update()
         if next_value == self.current_level.height_meters:
             return
-        self._record_canvas_undo_state(
-            self._capture_canvas_level_properties_undo_state(self.current_level)
+        level = self.current_level
+        baseline = self._capture_canvas_level_properties_undo_state(level)
+        window_dimensions = self._capture_canvas_window_dimension_snapshots(
+            (level.index,)
         )
-        self.current_level.height_meters = next_value
+        self._record_canvas_undo_state(baseline)
+        level.height_meters = next_value
+        try:
+            self._preserve_canvas_window_dimension_snapshots(window_dimensions)
+        except (TypeError, ValueError) as error:
+            level.height_meters = baseline.height_meters
+            level.windows[:] = baseline.windows
+            if self._canvas_undo_stack and self._canvas_undo_stack[-1] is baseline:
+                self._canvas_undo_stack.pop()
+            self._sync_level_controls()
+            self.viewer.set_surface_tools_status(
+                f"Ceiling height change stopped: {error}"
+            )
+            return
         assignments_changed = self._reconcile_surface_assignments_with_scene()
         if not assignments_changed:
             self._schedule_viewer_preview_refresh()
@@ -22488,6 +22769,9 @@ class BlueprintWorkspace(QWidget):
                 scale=float(level.scale),
                 offset_x_meters=float(level.offset_x_meters),
                 offset_y_meters=float(level.offset_y_meters),
+                window_dimension_snapshots=(
+                    self._capture_canvas_window_dimension_snapshots((level.index,))
+                ),
             )
 
         next_pending = replace(
@@ -22623,9 +22907,41 @@ class BlueprintWorkspace(QWidget):
             self.viewer.clear_level_transform_preview()
             return False
 
+        previous_scale = float(level.scale)
         level.scale = pending.scale
         level.offset_x_meters = pending.offset_x_meters
         level.offset_y_meters = pending.offset_y_meters
+        if not math.isclose(previous_scale, pending.scale):
+            scale_compensation = previous_scale / pending.scale
+            level.doorways[:] = [
+                replace(
+                    doorway,
+                    width_meters=doorway.width_meters * scale_compensation,
+                    depth_meters=doorway.depth_meters * scale_compensation,
+                )
+                for doorway in level.doorways
+            ]
+            try:
+                self._preserve_canvas_window_dimension_snapshots(
+                    pending.window_dimension_snapshots
+                )
+            except (TypeError, ValueError) as error:
+                level.scale = pending.baseline.scale
+                level.offset_x_meters = pending.baseline.offset_x_meters
+                level.offset_y_meters = pending.baseline.offset_y_meters
+                level.doorways[:] = copy.deepcopy(pending.baseline.doorways)
+                level.windows[:] = pending.baseline.windows
+                self._sync_level_controls()
+                self.viewer.clear_level_transform_preview()
+                self.viewer.set_surface_tools_status(
+                    f"Level scale change stopped: {error}"
+                )
+                return False
+            self._viewer_doorways_by_level_index[level.index] = self._copy_doorways(
+                level.doorways
+            )
+            self._reconcile_door_placements()
+            self._reconcile_window_placements()
         self._record_canvas_undo_state(
             pending.baseline,
             commit_pending_surface_edit=False,
@@ -28168,6 +28484,19 @@ class BlueprintWorkspace(QWidget):
         self._pending_deleted_wall_cleanup = False
         doorway_level_indices = self._pending_wall_vertex_doorway_level_indices
         self._pending_wall_vertex_doorway_level_indices = set()
+        window_dimensions = self._pending_wall_vertex_window_dimensions
+        self._pending_wall_vertex_window_dimensions = ()
+        try:
+            self._preserve_canvas_window_dimension_snapshots(
+                window_dimensions,
+                require_every_window=False,
+            )
+        except (TypeError, ValueError) as error:
+            self._handle_canvas_undo_requested()
+            self.viewer.set_surface_tools_status(
+                f"Wall edit stopped: {error}"
+            )
+            return
         for level_index in doorway_level_indices:
             level = self._get_level_by_index(level_index)
             if level is not None:
@@ -28190,6 +28519,7 @@ class BlueprintWorkspace(QWidget):
         self._pending_open_space_corner_mesh_update = False
         self._pending_deleted_wall_cleanup = False
         self._pending_wall_vertex_doorway_level_indices.clear()
+        self._pending_wall_vertex_window_dimensions = ()
         self._is_canvas_wall_vertex_interaction_active = False
 
     def _handle_include_toggled(self, checked: bool) -> None:
@@ -28587,6 +28917,12 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Display the current level, optionally retaining the shared 2D view."""
 
+        merged_workspace = getattr(self, "merged_generation_workspace", None)
+        if merged_workspace is not None:
+            merged_workspace.set_ceiling_height_levels(
+                self.levels,
+                self.current_level.index,
+            )
         self._viewer_doorways_by_level_index.setdefault(
             self.current_level.index,
             self._copy_doorways(self.current_level.doorways),

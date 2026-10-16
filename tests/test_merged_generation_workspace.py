@@ -11,8 +11,10 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -20,13 +22,14 @@ import trimesh
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QSignalSpy
-from PySide6.QtWidgets import QApplication, QLabel, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_JOB_KIND,
     CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
+    CeilingHeightEstimationError,
 )
 from housemaker.door_state import DOOR_SLOT_BODY, DOOR_SLOT_KNOB
 from housemaker.generation_jobs import JOB_STATUS_CANCELLING, GenerationJobManager
@@ -42,9 +45,12 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.merged_generation_workspace import (
-    CEILING_HEIGHT_NOT_ESTIMATED_TEXT,
     GENERATION_CONTROLS_PADDING,
     MergedGenerationWorkspace,
+)
+from housemaker.models import LevelData
+from housemaker.qwen_ceiling_height_estimation import (
+    LOCAL_QWEN_CEILING_HEIGHT_MODEL,
 )
 from housemaker.settings_widget import GenerationServiceSettings
 from housemaker.surface_geometry import FixedSurface
@@ -83,7 +89,7 @@ def _write_test_video(path: Path, frame_count: int = 3) -> None:
             writer.write(
                 np.full(
                     (48, 64, 3),
-                    30 + frame_index * 40,
+                    min(250, 30 + frame_index * 20),
                     dtype=np.uint8,
                 )
             )
@@ -204,6 +210,14 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             self.surfaces,
             self.objects,
             self.job_manager,
+        )
+        self.workspace.set_ceiling_height_levels(
+            (
+                LevelData(index=1, name="Underground 1"),
+                LevelData(index=2, name="Ground"),
+                LevelData(index=3, name="Story 1"),
+            ),
+            current_level_index=2,
         )
 
     def tearDown(self) -> None:
@@ -328,111 +342,335 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(changed.count(), 2)
         self.assertIsNone(self.workspace.get_current_video_frame_bgr())
 
-    def test_ceiling_height_control_analyzes_and_displays_current_frame(
+    def test_ceiling_height_control_analyzes_complete_video_with_frame_pairs(
         self,
     ) -> None:
-        captured_frames: list[np.ndarray] = []
-        captured_keys: list[str] = []
+        provider_calls: list[tuple[str, str]] = []
+        captured_pairs: list[tuple[float | None, float]] = []
+        movements = (
+            ("stable", "low", 2.6),
+            ("stable", "low", 2.6),
+            ("stable", "low", 2.6),
+            ("ascending", "medium", 2.8),
+            ("ascending", "medium", 2.8),
+            ("stable", "low", 3.0),
+            ("stable", "low", 3.0),
+            ("stable", "low", 3.0),
+        )
 
-        def estimator(
-            frame_bgr: np.ndarray,
+        @contextmanager
+        def estimator_provider(
             *,
+            model: str,
             api_key: str,
-            cancellation_check=None,
-        ) -> CeilingHeightEstimate:
-            captured_frames.append(frame_bgr.copy())
-            captured_keys.append(api_key)
-            frame_bgr[:] = 0
-            return CeilingHeightEstimate(
-                status="estimated",
-                estimate_m=2.6,
-                minimum_m=2.4,
-                maximum_m=2.8,
-                confidence="medium",
-                basis="Door proportions and visible room boundaries agree.",
-            )
+            estimator_override=None,
+            startup_cancellation_check=None,
+        ):
+            del estimator_override, startup_cancellation_check
+            provider_calls.append((model, api_key))
 
-        self.workspace._ceiling_height_estimator = estimator
+            def estimator(
+                frame_bgr: np.ndarray,
+                *,
+                previous_frame_bgr: np.ndarray | None = None,
+                cancellation_check=None,
+            ) -> CeilingHeightEstimate:
+                del cancellation_check
+                pair_index = len(captured_pairs)
+                captured_pairs.append(
+                    (
+                        None
+                        if previous_frame_bgr is None
+                        else float(previous_frame_bgr.mean()),
+                        float(frame_bgr.mean()),
+                    )
+                )
+                movement, movement_confidence, estimate_m = movements[
+                    pair_index
+                ]
+                return CeilingHeightEstimate(
+                    status="estimated",
+                    estimate_m=estimate_m,
+                    minimum_m=estimate_m - 0.2,
+                    maximum_m=estimate_m + 0.2,
+                    confidence="medium",
+                    basis="Visible room boundaries and door scale agree.",
+                    level_movement=movement,
+                    movement_confidence=movement_confidence,
+                )
+
+            yield estimator
+
         self.objects.set_runtime_settings(
             GenerationServiceSettings(openai_api_key="sk-test")
         )
-        frame_bgr = np.full((8, 12, 3), 137, dtype=np.uint8)
+        video_path = Path(self.temporary_directory.name) / "height-video.avi"
+        _write_test_video(video_path, frame_count=14)
 
         self.assertFalse(self.workspace.infer_ceiling_height_button.isEnabled())
-        self.workspace.video_view.set_frame(frame_bgr)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.workspace.sync_shared_controls()
         self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
 
         completed = QSignalSpy(
             self.workspace.ceiling_height_estimate_changed
         )
         self.workspace.infer_ceiling_height_button.click()
-
-        self.assertFalse(self.workspace.infer_ceiling_height_button.isEnabled())
+        dialog = self.workspace._ceiling_height_dialog
+        self.assertIsNotNone(dialog)
+        assert dialog is not None
+        self.assertFalse(hasattr(dialog, "mark_start_button"))
+        self.assertFalse(hasattr(dialog, "mark_end_button"))
+        self.assertEqual(dialog.current_level_combo.currentData(), 2)
         self.assertEqual(
-            self.workspace.infer_ceiling_height_button.text(),
-            "Inferring...",
+            tuple(
+                dialog.current_level_combo.itemText(index)
+                for index in range(dialog.current_level_combo.count())
+            ),
+            ("L3 Story 1", "L2 Ground", "L1 Underground 1"),
         )
-        self.assertTrue(_wait_until(lambda: completed.count() == 1))
-        self.assertEqual(captured_keys, ["sk-test"])
-        np.testing.assert_array_equal(captured_frames[0], frame_bgr)
-        np.testing.assert_array_equal(
-            self.workspace.get_current_video_frame_bgr(),
-            frame_bgr,
-        )
+        dialog.frame_interval_spinbox.setValue(2)
+        with patch(
+            "housemaker.merged_generation_workspace."
+            "open_ceiling_height_estimator",
+            estimator_provider,
+        ):
+            dialog.analysis_button.click()
+            self.assertTrue(_wait_until(lambda: completed.count() == 1))
+
+        self.assertEqual(provider_calls, [("gpt-5.6-luna", "sk-test")])
+        self.assertEqual(len(captured_pairs), len(movements))
+        self.assertIsNone(captured_pairs[0][0])
+        for pair_index in range(1, len(captured_pairs)):
+            self.assertAlmostEqual(
+                captured_pairs[pair_index][0],
+                captured_pairs[pair_index - 1][1],
+                places=3,
+            )
         self.assertIn(
-            "Estimated ceiling height: 2.6 m",
+            "L2 Ground: 2.60 m",
             self.workspace.ceiling_height_result_label.text(),
         )
+        self.assertIn(
+            "L3 Story 1: 3.00 m",
+            self.workspace.ceiling_height_result_label.text(),
+        )
+        result = completed.at(0)[0]
+        self.assertEqual(
+            result.sampled_frame_indices,
+            (0, 2, 4, 6, 8, 10, 12, 13),
+        )
+        self.assertEqual(result.transition_frame_indices, (6, 8))
         self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
         job = self.job_manager.jobs()[-1]
         self.assertEqual(job.kind, CEILING_HEIGHT_JOB_KIND)
         self.assertEqual(job.status, "completed")
 
-    def test_frame_change_cancels_and_clears_a_pending_height_estimate(
+    def test_frame_change_does_not_cancel_pending_video_height_analysis(
         self,
     ) -> None:
         started = threading.Event()
+        release = threading.Event()
+        call_count = 0
 
         def blocking_estimator(
             _frame_bgr: np.ndarray,
             *,
             api_key: str,
+            model: str,
             cancellation_check=None,
         ) -> CeilingHeightEstimate:
+            nonlocal call_count
             self.assertEqual(api_key, "sk-test")
+            self.assertEqual(model, "gpt-5.6-luna")
+            call_count += 1
             started.set()
-            while cancellation_check is None or not cancellation_check():
+            while not release.is_set():
+                if cancellation_check is not None and cancellation_check():
+                    raise CeilingHeightEstimationCancelled("Cancelled")
                 time.sleep(0.005)
-            raise CeilingHeightEstimationCancelled("Cancelled")
+            return CeilingHeightEstimate(
+                status="estimated",
+                estimate_m=2.7,
+                minimum_m=2.5,
+                maximum_m=2.9,
+                confidence="medium",
+                basis="Visible room boundaries and door scale agree.",
+            )
 
         self.workspace._ceiling_height_estimator = blocking_estimator
         self.objects.set_runtime_settings(
             GenerationServiceSettings(openai_api_key="sk-test")
         )
-        self.workspace.video_view.set_frame(
-            np.full((8, 12, 3), 40, dtype=np.uint8)
-        )
+        video_path = Path(self.temporary_directory.name) / "height-seek.avi"
+        _write_test_video(video_path, frame_count=3)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.workspace.sync_shared_controls()
         self.workspace.infer_ceiling_height_button.click()
+        dialog = self.workspace._ceiling_height_dialog
+        assert dialog is not None
+        dialog.frame_interval_spinbox.setValue(2)
+        dialog.analysis_button.click()
         self.assertTrue(started.wait(1.0))
-        self.assertEqual(self.objects.generate_geometry_button.text(), "Generate geometry")
-        self.assertEqual(self.objects.generate_texture_button.text(), "Generate texture")
-        self.assertEqual(self.objects.generate_button.text(), "Generate")
-
-        self.workspace.video_view.set_frame(
-            np.full((8, 12, 3), 210, dtype=np.uint8)
-        )
-
+        self.workspace.seekbar.setValue(1)
+        self.assertIsNotNone(self.workspace._ceiling_height_runtime)
+        release.set()
         self.assertTrue(
             _wait_until(
                 lambda: self.workspace._ceiling_height_runtime is None
             )
         )
-        self.assertEqual(
+        self.assertEqual(call_count, 2)
+        self.assertIn(
+            "L2 Ground: 2.70 m",
             self.workspace.ceiling_height_result_label.text(),
-            CEILING_HEIGHT_NOT_ESTIMATED_TEXT,
         )
-        self.assertEqual(self.job_manager.jobs()[-1].status, "cancelled")
+        self.assertEqual(self.job_manager.jobs()[-1].status, "completed")
         self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
+
+    def test_isolated_frame_failure_does_not_abort_video_analysis(self) -> None:
+        call_count = 0
+
+        def estimator(
+            _frame_bgr: np.ndarray,
+            *,
+            api_key: str,
+            model: str,
+            cancellation_check=None,
+        ) -> CeilingHeightEstimate:
+            nonlocal call_count
+            del api_key, model, cancellation_check
+            call_count += 1
+            if call_count == 1:
+                raise CeilingHeightEstimationError(
+                    "The first sampled frame could not be analysed."
+                )
+            return CeilingHeightEstimate(
+                status="estimated",
+                estimate_m=2.7,
+                minimum_m=2.5,
+                maximum_m=2.9,
+                confidence="medium",
+                basis="Visible room boundaries and door scale agree.",
+            )
+
+        self.workspace._ceiling_height_estimator = estimator
+        self.objects.set_runtime_settings(
+            GenerationServiceSettings(openai_api_key="sk-test")
+        )
+        video_path = Path(self.temporary_directory.name) / "height-retry.avi"
+        _write_test_video(video_path, frame_count=4)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.workspace.sync_shared_controls()
+
+        completed = QSignalSpy(
+            self.workspace.ceiling_height_estimate_changed
+        )
+        self.workspace.infer_ceiling_height_button.click()
+        dialog = self.workspace._ceiling_height_dialog
+        assert dialog is not None
+        dialog.frame_interval_spinbox.setValue(1)
+        dialog.analysis_button.click()
+
+        self.assertTrue(_wait_until(lambda: completed.count() == 1))
+        self.assertEqual(call_count, 4)
+        result = completed.at(0)[0]
+        self.assertEqual(result.unassigned_frame_indices, (0,))
+        self.assertIn(
+            "L2 Ground: 2.70 m",
+            self.workspace.ceiling_height_result_label.text(),
+        )
+        self.assertEqual(self.job_manager.jobs()[-1].status, "completed")
+
+    def test_local_qwen_analysis_does_not_require_an_openai_key(self) -> None:
+        captured_keys: list[str] = []
+        captured_models: list[str] = []
+
+        def local_estimator(
+            _frame_bgr: np.ndarray,
+            *,
+            api_key: str,
+            model: str,
+            cancellation_check=None,
+        ) -> CeilingHeightEstimate:
+            del cancellation_check
+            captured_keys.append(api_key)
+            captured_models.append(model)
+            return CeilingHeightEstimate(
+                status="estimated",
+                estimate_m=2.7,
+                minimum_m=2.5,
+                maximum_m=2.9,
+                confidence="medium",
+                basis="Visible room boundaries and door proportions agree.",
+            )
+
+        self.workspace._ceiling_height_estimator = local_estimator
+        self.objects.set_runtime_settings(GenerationServiceSettings())
+        video_path = Path(self.temporary_directory.name) / "local-height.avi"
+        _write_test_video(video_path, frame_count=3)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.workspace.sync_shared_controls()
+
+        completed = QSignalSpy(
+            self.workspace.ceiling_height_estimate_changed
+        )
+        self.workspace.infer_ceiling_height_button.click()
+        dialog = self.workspace._ceiling_height_dialog
+        self.assertIsNotNone(dialog)
+        assert dialog is not None
+        model_index = dialog.model_combo.findData(
+            LOCAL_QWEN_CEILING_HEIGHT_MODEL
+        )
+        self.assertGreaterEqual(model_index, 0)
+        dialog.model_combo.setCurrentIndex(model_index)
+        dialog.frame_interval_spinbox.setValue(2)
+        dialog.analysis_button.click()
+
+        self.assertTrue(_wait_until(lambda: completed.count() == 1))
+        self.assertEqual(captured_keys, ["", ""])
+        self.assertEqual(
+            captured_models,
+            [LOCAL_QWEN_CEILING_HEIGHT_MODEL] * 2,
+        )
+        self.assertEqual(self.job_manager.jobs()[-1].status, "completed")
+
+    def test_paid_whole_video_analysis_displays_and_confirms_total_cost(
+        self,
+    ) -> None:
+        video_path = Path(self.temporary_directory.name) / "paid-height.avi"
+        _write_test_video(video_path, frame_count=121)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.workspace.sync_shared_controls()
+        self.workspace.infer_ceiling_height_button.click()
+        dialog = self.workspace._ceiling_height_dialog
+        self.assertIsNotNone(dialog)
+        assert dialog is not None
+        dialog.frame_interval_spinbox.setValue(1)
+
+        button_text = dialog.analysis_button.text()
+        self.assertRegex(
+            button_text,
+            r"Analyse video's ceiling height \(estimated .+\)",
+        )
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as question:
+            dialog.analysis_button.click()
+
+        question.assert_called_once()
+        confirmation_text = str(question.call_args.args[2])
+        self.assertIn("121 paid vision requests", confirmation_text)
+        self.assertRegex(confirmation_text, r"\(estimated .+\)")
+        self.assertIsNone(self.workspace._ceiling_height_runtime)
+        self.assertEqual(self.job_manager.jobs(), ())
 
     def test_default_window_splits_views_evenly_and_uses_one_shared_column(
         self,

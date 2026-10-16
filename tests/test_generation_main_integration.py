@@ -18,10 +18,15 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
+from housemaker.ceiling_height_estimation import (
+    CeilingHeightAnalysisResult,
+    CeilingHeightLevelEstimate,
+    CeilingHeightVideoEstimate,
+)
 from housemaker.first_person_navigation import (
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
 )
@@ -63,6 +68,33 @@ def _project_data(generation: GenerationData) -> ProjectData:
         current_level_index=GROUND_LEVEL_INDEX,
         levels=levels,
         generation=generation,
+    )
+
+
+def _ceiling_height_result(
+    *level_estimates: tuple[int, str, float],
+    unassigned_frame_indices: tuple[int, ...] = (),
+) -> CeilingHeightAnalysisResult:
+    """Build one concise, reliable multi-level result fixture."""
+
+    estimates = tuple(
+        CeilingHeightLevelEstimate(
+            level_index=level_index,
+            level_name=level_name,
+            analysis=CeilingHeightVideoEstimate(
+                average_height_m=height_meters,
+                retained_frame_indices=(0, 15, 30),
+                outlier_frame_indices=(45,),
+                insufficient_frame_indices=(),
+            ),
+        )
+        for level_index, level_name, height_meters in level_estimates
+    )
+    return CeilingHeightAnalysisResult(
+        level_estimates=estimates,
+        sampled_frame_indices=(0, 15, 30, 45),
+        transition_frame_indices=unassigned_frame_indices,
+        unassigned_frame_indices=unassigned_frame_indices,
     )
 
 
@@ -209,6 +241,134 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(
             merged.isAncestorOf(self.workspace.generation.object_3d_panel)
+        )
+
+    def test_confirmed_ceiling_analysis_updates_levels_as_one_undo_action(
+        self,
+    ) -> None:
+        ground_level = self.workspace._get_level_by_index(GROUND_LEVEL_INDEX)
+        story_level = self.workspace._get_level_by_index(GROUND_LEVEL_INDEX + 1)
+        assert ground_level is not None
+        assert story_level is not None
+        original_ground_height = ground_level.height_meters
+        original_story_height = story_level.height_meters
+        undo_count = len(self.workspace._canvas_undo_stack)
+        result = _ceiling_height_result(
+            (GROUND_LEVEL_INDEX, ground_level.display_name, 2.74),
+            (GROUND_LEVEL_INDEX + 1, story_level.display_name, 2.91),
+            unassigned_frame_indices=(60, 75),
+        )
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ) as question:
+            self.workspace.merged_generation_workspace.ceiling_height_estimate_changed.emit(
+                result
+            )
+
+        self.assertEqual(question.call_count, 1)
+        question_text = question.call_args.args[2]
+        self.assertIn(ground_level.display_name, question_text)
+        self.assertIn(story_level.display_name, question_text)
+        self.assertIn("2 transition or uncertain frames", question_text)
+        self.assertAlmostEqual(ground_level.height_meters, 2.74)
+        self.assertAlmostEqual(story_level.height_meters, 2.91)
+        self.assertAlmostEqual(self.workspace.height_level_spinbox.value(), 2.74)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count + 1)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertAlmostEqual(ground_level.height_meters, original_ground_height)
+        self.assertAlmostEqual(story_level.height_meters, original_story_height)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+
+    def test_confirmed_ceiling_analysis_commits_pending_scale_before_height(
+        self,
+    ) -> None:
+        ground_level = self.workspace._get_level_by_index(GROUND_LEVEL_INDEX)
+        story_level = self.workspace._get_level_by_index(GROUND_LEVEL_INDEX + 1)
+        assert ground_level is not None
+        assert story_level is not None
+        original_scale = ground_level.scale
+        original_ground_height = ground_level.height_meters
+        original_story_height = story_level.height_meters
+        undo_count = len(self.workspace._canvas_undo_stack)
+        next_scale = original_scale + 0.25
+        self.workspace._handle_level_scale_changed(next_scale)
+        self.assertIsNotNone(self.workspace._pending_level_transform)
+        self.assertAlmostEqual(ground_level.scale, original_scale)
+        result = _ceiling_height_result(
+            (GROUND_LEVEL_INDEX, ground_level.display_name, 2.74),
+            (GROUND_LEVEL_INDEX + 1, story_level.display_name, 2.91),
+        )
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.workspace.merged_generation_workspace.ceiling_height_estimate_changed.emit(
+                result
+            )
+
+        self.assertIsNone(self.workspace._pending_level_transform)
+        self.assertAlmostEqual(ground_level.scale, next_scale)
+        self.assertAlmostEqual(ground_level.height_meters, 2.74)
+        self.assertAlmostEqual(story_level.height_meters, 2.91)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count + 2)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertAlmostEqual(ground_level.scale, next_scale)
+        self.assertAlmostEqual(ground_level.height_meters, original_ground_height)
+        self.assertAlmostEqual(story_level.height_meters, original_story_height)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count + 1)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertAlmostEqual(ground_level.scale, original_scale)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+
+    def test_rejected_ceiling_analysis_keeps_current_level_height(self) -> None:
+        original_height = self.workspace.current_level.height_meters
+        result = _ceiling_height_result(
+            (
+                self.workspace.current_level.index,
+                self.workspace.current_level.display_name,
+                2.74,
+            )
+        )
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            self.workspace.merged_generation_workspace.ceiling_height_estimate_changed.emit(
+                result
+            )
+
+        self.assertAlmostEqual(
+            self.workspace.current_level.height_meters,
+            original_height,
+        )
+
+    def test_ceiling_height_start_level_tracks_canvas_selection(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        dialog = merged._ensure_ceiling_height_analysis_dialog()
+        target_position = next(
+            position
+            for position, level in enumerate(self.workspace.levels)
+            if level.index == GROUND_LEVEL_INDEX + 1
+        )
+
+        self.assertEqual(dialog.selected_level_index, GROUND_LEVEL_INDEX)
+
+        self.workspace._handle_level_selection_changed(target_position)
+
+        self.assertEqual(dialog.selected_level_index, GROUND_LEVEL_INDEX + 1)
+        self.assertEqual(
+            dialog.current_level_combo.currentText(),
+            self.workspace.current_level.display_name,
         )
 
     def test_shared_pbr_maps_control_only_requested_preview_lights(self) -> None:

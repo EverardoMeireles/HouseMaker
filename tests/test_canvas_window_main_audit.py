@@ -152,11 +152,13 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 
-    def test_main_commit_refreshes_canvas_surface_preview_and_targets(
+    def test_window_placement_waits_for_mesh_edit_delay_before_3d_rebuild(
         self,
     ) -> None:
+        self.workspace._set_mesh_edit_update_delay_seconds(60.0)
         level = _build_square_level()
         self.workspace.levels = [level]
+        self.workspace._reset_viewer_doorway_snapshots()
         wall = _get_target_wall(level)
         placement = build_wall_window_placement(
             wall,
@@ -164,51 +166,54 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             (1.5, 0.0, 2.25),
         )
 
-        self.workspace._handle_canvas_window_placement_requested(placement)
+        with (
+            patch.object(
+                self.workspace,
+                "_build_viewer_preview_model",
+            ) as build_preview,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            self.workspace._handle_canvas_window_placement_requested(placement)
 
-        self.assertEqual(len(level.windows), 1)
-        rebuilt_wall = _get_target_wall(level)
-        self.assertAlmostEqual(rebuilt_wall.area_square_meters, 4.5)
-        model = self.workspace.viewer.model
-        self.assertIsNotNone(model)
+            self.assertEqual(len(level.windows), 1)
+            self.assertAlmostEqual(
+                _get_target_wall(level).area_square_meters,
+                4.5,
+            )
+            preview_level = self.workspace._build_viewer_preview_levels()[0]
+            self.assertEqual(preview_level.windows, [])
+            self.assertAlmostEqual(
+                _get_target_wall(preview_level).area_square_meters,
+                6.0,
+            )
+            self.assertEqual(
+                self.workspace._pending_window_mesh_level_index,
+                level.index,
+            )
+            self.assertTrue(
+                self.workspace._doorway_mesh_update_timer.isActive()
+            )
+            build_preview.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            self.workspace._commit_pending_doorway_mesh_update()
+
+        self.assertFalse(self.workspace._doorway_mesh_update_timer.isActive())
+        self.assertIsNone(self.workspace._pending_window_mesh_level_index)
         self.assertEqual(
-            set(self.workspace.viewer._window_wall_targets),
-            {
-                surface.surface_id
-                for surface in build_fixed_surfaces([level])
-                if surface.surface_type == "wall"
-            },
+            len(self.workspace._build_viewer_preview_levels()[0].windows),
+            1,
         )
+        build_preview.assert_not_called()
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
         self.assertEqual(
             self.workspace._canvas_window_undo_ids,
             [level.windows[0].window_id],
         )
         self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
-        self.assertIsNone(self.workspace.surface_texture_generation.surface_view)
-        surface_wall = self.workspace.viewer._canvas_surface_targets.get(
-            wall.surface_id
-        )
-        self.assertIsNotNone(surface_wall)
-        assert surface_wall is not None
-        self.assertAlmostEqual(surface_wall.area_square_meters, 4.5)
-
-        self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.canvas_viewer_workspace
-        )
-        _qt_application.processEvents()
-        self.workspace.viewer.undo_requested.emit()
-
-        self.assertEqual(level.windows, [])
-        restored_wall = _get_target_wall(level)
-        self.assertAlmostEqual(restored_wall.area_square_meters, 6.0)
-        restored_surface_wall = self.workspace.viewer._canvas_surface_targets.get(
-            wall.surface_id
-        )
-        self.assertIsNotNone(restored_surface_wall)
-        assert restored_surface_wall is not None
-        self.assertAlmostEqual(restored_surface_wall.area_square_meters, 6.0)
-        self.assertEqual(self.workspace._canvas_window_undo_ids, [])
-        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_window_undo_is_lifo_across_successful_commits(self) -> None:
         level = _build_square_level()
@@ -261,12 +266,13 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         outer_center = (1.0, 0.2, 1.5)
 
         self.workspace._handle_canvas_window_placement_requested(placement)
+        self.workspace._commit_pending_doorway_mesh_update()
 
         cut_surfaces = {
             surface.surface_id: surface
             for surface in build_fixed_surfaces([level])
         }
-        model = self.workspace.viewer.model
+        model = self.workspace._build_viewer_preview_model(None)
         self.assertIsNotNone(model)
         assert model is not None
         self.assertTrue(
@@ -296,7 +302,7 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             surface.surface_id: surface
             for surface in build_fixed_surfaces([level])
         }
-        restored_model = self.workspace.viewer.model
+        restored_model = self.workspace._build_viewer_preview_model(None)
         self.assertIsNotNone(restored_model)
         assert restored_model is not None
         self.assertTrue(
@@ -396,62 +402,58 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
                 set_surface_levels.assert_not_called()
                 set_preview_model.assert_not_called()
 
-    def test_failed_model_refresh_rolls_back_only_the_new_window(self) -> None:
-        for failure_kind in ("none", "exception"):
-            with self.subTest(failure_kind=failure_kind):
-                level = _build_square_level()
-                first_wall = _get_target_wall(level)
-                first_placement = build_wall_window_placement(
-                    first_wall,
-                    (0.15, 0.0, 0.3),
-                    (0.55, 0.0, 0.8),
-                )
-                existing_window = add_wall_window(
-                    [level],
-                    first_placement,
-                    window_id="existing-window",
-                )
-                second_wall = _get_target_wall(level)
-                second_placement = build_wall_window_placement(
-                    second_wall,
-                    (1.0, 0.0, 1.0),
-                    (1.5, 0.0, 2.0),
-                )
-                self.workspace.levels = [level]
+    def test_window_placement_does_not_build_model_before_delay(self) -> None:
+        level = _build_square_level()
+        first_wall = _get_target_wall(level)
+        first_placement = build_wall_window_placement(
+            first_wall,
+            (0.15, 0.0, 0.3),
+            (0.55, 0.0, 0.8),
+        )
+        existing_window = add_wall_window(
+            [level],
+            first_placement,
+            window_id="existing-window",
+        )
+        second_wall = _get_target_wall(level)
+        second_placement = build_wall_window_placement(
+            second_wall,
+            (1.0, 0.0, 1.0),
+            (1.5, 0.0, 2.0),
+        )
+        self.workspace.levels = [level]
 
-                build_patch = (
-                    patch.object(
-                        self.workspace,
-                        "_build_viewer_preview_model",
-                        return_value=None,
-                    )
-                    if failure_kind == "none"
-                    else patch.object(
-                        self.workspace,
-                        "_build_viewer_preview_model",
-                        side_effect=RuntimeError("audit refresh failure"),
-                    )
-                )
-                with (
-                    build_patch,
-                    patch.object(self.workspace.viewer, "set_model") as set_model,
-                    patch.object(
-                        self.workspace.viewer,
-                        "set_wall_targets",
-                    ) as set_wall_targets,
-                    patch.object(
-                        self.workspace.surface_texture_generation,
-                        "set_preview_model",
-                    ) as set_preview_model,
-                ):
-                    self.workspace._handle_canvas_window_placement_requested(
-                        second_placement
-                    )
+        with (
+            patch.object(
+                self.workspace,
+                "_build_viewer_preview_model",
+                side_effect=RuntimeError("must not build before delay"),
+            ) as build_preview,
+            patch.object(self.workspace.viewer, "set_model") as set_model,
+            patch.object(
+                self.workspace.viewer,
+                "set_wall_targets",
+            ) as set_wall_targets,
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "set_preview_model",
+            ) as set_preview_model,
+        ):
+            self.workspace._handle_canvas_window_placement_requested(
+                second_placement
+            )
 
-                self.assertEqual(level.windows, [existing_window])
-                set_model.assert_not_called()
-                set_wall_targets.assert_not_called()
-                set_preview_model.assert_not_called()
+        self.assertEqual(len(level.windows), 2)
+        self.assertIs(level.windows[0], existing_window)
+        self.assertEqual(
+            self.workspace._pending_window_mesh_level_index,
+            level.index,
+        )
+        self.assertTrue(self.workspace._doorway_mesh_update_timer.isActive())
+        build_preview.assert_not_called()
+        set_model.assert_not_called()
+        set_wall_targets.assert_not_called()
+        set_preview_model.assert_not_called()
 
     def test_project_replacement_keeps_loaded_windows_but_clears_undo_history(
         self,

@@ -203,6 +203,7 @@ class CanvasSnapshot:
     vertex_data: VertexData
     rooms: list[RoomData]
     doorways: list[DoorwayData]
+    windows: list[WindowData]
     open_spaces: list[OpenSpaceData]
     active_vertex_id: int | None
     selected_vertex_id: int | None
@@ -2308,6 +2309,8 @@ class BlueprintCanvas(QWidget):
         self.rooms.extend(copy.deepcopy(snapshot.rooms))
         self.doorways.clear()
         self.doorways.extend(copy.deepcopy(snapshot.doorways))
+        self.windows.clear()
+        self.windows.extend(snapshot.windows)
         self.open_spaces.clear()
         self.open_spaces.extend(snapshot.open_spaces)
         self._set_active_vertex_id(snapshot.active_vertex_id)
@@ -6993,6 +6996,7 @@ class BlueprintCanvas(QWidget):
             vertex_data=self.vertex_data.clone(),
             rooms=copy.deepcopy(self.rooms),
             doorways=copy.deepcopy(self.doorways),
+            windows=list(self.windows),
             open_spaces=list(self.open_spaces),
             active_vertex_id=self.active_vertex_id,
             selected_vertex_id=self.selected_vertex_id,

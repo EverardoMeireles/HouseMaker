@@ -9,11 +9,24 @@ import numpy as np
 from housemaker import ceiling_height_estimation as estimation
 from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_INFERENCE_MODEL,
+    CEILING_HEIGHT_MODEL_OPTIONS,
+    CeilingHeightAnalysisResult,
+    CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
     CeilingHeightEstimationError,
+    CeilingHeightLevelEstimate,
+    aggregate_ceiling_height_estimates,
+    aggregate_level_ceiling_height_estimates,
     build_ceiling_height_request_body,
+    ceiling_height_model_requires_api_key,
+    estimate_ceiling_height_api_cost_usd,
     format_ceiling_height_estimate,
     infer_ceiling_height,
+    sample_entire_video_frame_indices,
+    sample_video_frame_indices,
+)
+from housemaker.qwen_ceiling_height_estimation import (
+    LOCAL_QWEN_CEILING_HEIGHT_MODEL,
 )
 
 
@@ -23,7 +36,7 @@ class _FakeResponse:
         self._payload = payload
         self._was_read = False
 
-    def __enter__(self) -> "_FakeResponse":
+    def __enter__(self) -> _FakeResponse:  # noqa: PYI034
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -63,11 +76,366 @@ def _estimated_result() -> dict[str, object]:
         "maximum_m": 2.85,
         "confidence": "medium",
         "basis": "Visible door and floor-to-ceiling boundaries agree.",
+        "level_movement": "stable",
+        "movement_confidence": "low",
     }
+
+
+def _estimate(height: float) -> CeilingHeightEstimate:
+    return CeilingHeightEstimate(
+        status="estimated",
+        estimate_m=height,
+        minimum_m=height - 0.2,
+        maximum_m=height + 0.2,
+        confidence="medium",
+        basis="Visible architectural scale cues agree.",
+    )
+
+
+def _movement(
+    level_movement: str,
+    *,
+    height: float | None = None,
+    confidence: str = "medium",
+) -> CeilingHeightEstimate:
+    if height is None:
+        return CeilingHeightEstimate(
+            status="insufficient_evidence",
+            estimate_m=None,
+            minimum_m=None,
+            maximum_m=None,
+            confidence="low",
+            basis="The camera is moving between levels.",
+            level_movement=level_movement,
+            movement_confidence=confidence,
+        )
+    return CeilingHeightEstimate(
+        status="estimated",
+        estimate_m=height,
+        minimum_m=height - 0.2,
+        maximum_m=height + 0.2,
+        confidence="medium",
+        basis="Visible architectural scale cues agree.",
+        level_movement=level_movement,
+        movement_confidence=confidence,
+    )
+
+
+def _insufficient() -> CeilingHeightEstimate:
+    return CeilingHeightEstimate(
+        status="insufficient_evidence",
+        estimate_m=None,
+        minimum_m=None,
+        maximum_m=None,
+        confidence="low",
+        basis="No reliable scale cue is visible.",
+    )
+
+
+# ### Video analysis tests ###
+class CeilingHeightVideoAnalysisTests(unittest.TestCase):
+    def test_entire_video_sampling_starts_at_zero_and_includes_last_frame(
+        self,
+    ) -> None:
+        sampled = sample_entire_video_frame_indices(350, 15)
+
+        self.assertEqual(len(sampled), 25)
+        self.assertEqual(sampled[:3], (0, 15, 30))
+        self.assertEqual(sampled[-2:], (345, 349))
+        self.assertEqual(sample_entire_video_frame_indices(0, 15), ())
+
+    def test_frame_sampling_is_inclusive_and_always_appends_end(self) -> None:
+        self.assertEqual(sample_video_frame_indices(4, 14, 5), (4, 9, 14))
+        self.assertEqual(sample_video_frame_indices(4, 15, 5), (4, 9, 14, 15))
+        self.assertEqual(sample_video_frame_indices(7, 7, 20), (7,))
+
+    def test_frame_sampling_rejects_invalid_ranges_and_intervals(self) -> None:
+        for arguments in ((-1, 10, 2), (10, 5, 2), (0, 10, 0), (0, 10, True)):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                sample_video_frame_indices(*arguments)
+
+    def test_aggregation_discards_distant_values_and_tracks_all_counts(self) -> None:
+        result = aggregate_ceiling_height_estimates(
+            (
+                (0, _estimate(2.6)),
+                (10, _estimate(2.7)),
+                (20, _estimate(2.8)),
+                (30, _estimate(5.4)),
+                (40, _insufficient()),
+            )
+        )
+
+        self.assertTrue(result.has_consensus)
+        self.assertEqual(result.average_height_m, 2.7)
+        self.assertEqual(result.retained_frame_indices, (0, 10, 20))
+        self.assertEqual(result.outlier_frame_indices, (30,))
+        self.assertEqual(result.insufficient_frame_indices, (40,))
+        self.assertEqual(result.retained_count, 3)
+        self.assertEqual(result.outlier_count, 1)
+        self.assertEqual(result.insufficient_count, 1)
+        self.assertEqual(result.analyzed_count, 5)
+
+    def test_aggregation_uses_the_densest_strict_majority_cluster(self) -> None:
+        result = aggregate_ceiling_height_estimates(
+            tuple(
+                (index * 10, _estimate(height))
+                for index, height in enumerate((2.5, 2.6, 2.7, 3.5, 3.6))
+            )
+        )
+
+        self.assertTrue(result.has_consensus)
+        self.assertEqual(result.average_height_m, 2.6)
+        self.assertEqual(result.retained_frame_indices, (0, 10, 20))
+        self.assertEqual(result.outlier_frame_indices, (30, 40))
+
+    def test_aggregation_reports_no_consensus_for_sparse_or_split_estimates(
+        self,
+    ) -> None:
+        cases = (
+            ((0, _estimate(2.6)), (10, _insufficient())),
+            (
+                (0, _estimate(2.5)),
+                (10, _estimate(2.6)),
+                (20, _estimate(4.0)),
+                (30, _estimate(4.1)),
+            ),
+        )
+
+        for estimates in cases:
+            with self.subTest(estimates=estimates):
+                result = aggregate_ceiling_height_estimates(estimates)
+                self.assertFalse(result.has_consensus)
+                self.assertIsNone(result.average_height_m)
+                self.assertEqual(
+                    result.analyzed_count,
+                    len(estimates),
+                )
+
+    def test_one_sample_range_preserves_single_frame_fallback(self) -> None:
+        result = aggregate_ceiling_height_estimates(((12, _estimate(2.65)),))
+
+        self.assertTrue(result.has_consensus)
+        self.assertEqual(result.average_height_m, 2.65)
+        self.assertEqual(result.retained_frame_indices, (12,))
+
+    def test_aggregation_rejects_duplicate_frame_indices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unique"):
+            aggregate_ceiling_height_estimates(
+                ((5, _estimate(2.6)), (5, _estimate(2.7)))
+            )
+
+    def test_level_aggregation_assigns_stable_frames_across_an_ascent(
+        self,
+    ) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            (
+                (0, _estimate(2.6)),
+                (15, _estimate(2.7)),
+                (30, _movement("ascending")),
+                (45, _movement("ascending")),
+                (60, _movement("arrived_up")),
+                (75, _estimate(2.8)),
+                (90, _estimate(2.9)),
+            ),
+            starting_level_index=1,
+            levels=((0, "Underground 1"), (1, "Ground"), (2, "Story 1")),
+        )
+
+        self.assertIsInstance(result, CeilingHeightAnalysisResult)
+        self.assertEqual(result.sampled_frame_indices, (0, 15, 30, 45, 60, 75, 90))
+        self.assertEqual(result.transition_frame_indices, (30, 45, 60))
+        self.assertEqual(result.unassigned_frame_indices, (30, 45))
+        self.assertEqual(
+            tuple(
+                (entry.level_index, entry.level_name)
+                for entry in result.level_estimates
+            ),
+            ((1, "Ground"), (2, "Story 1")),
+        )
+        self.assertTrue(
+            all(
+                isinstance(entry, CeilingHeightLevelEstimate)
+                for entry in result.level_estimates
+            )
+        )
+        ground, story = result.level_estimates
+        self.assertEqual(ground.analysis.average_height_m, 2.65)
+        self.assertEqual(ground.analysis.retained_frame_indices, (0, 15))
+        self.assertEqual(story.analysis.average_height_m, 2.85)
+        self.assertEqual(story.analysis.retained_frame_indices, (75, 90))
+
+    def test_level_aggregation_changes_level_only_on_arrival_events(self) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            (
+                (0, _estimate(2.7)),
+                (15, _movement("descending")),
+                (30, _movement("descending")),
+                (45, _movement("arrived_down")),
+                (60, _estimate(2.4)),
+                (75, _movement("uncertain")),
+            ),
+            starting_level_index=2,
+            levels=((0, "Underground 1"), (1, "Ground"), (2, "Story 1")),
+        )
+
+        self.assertEqual(result.transition_frame_indices, (15, 30, 45))
+        self.assertEqual(result.unassigned_frame_indices, (15, 30, 75))
+        self.assertEqual(
+            tuple(entry.level_index for entry in result.level_estimates),
+            (2, 1),
+        )
+        by_level = {
+            entry.level_index: entry.analysis
+            for entry in result.level_estimates
+        }
+        self.assertEqual(by_level[2].retained_frame_indices, (0,))
+        self.assertEqual(by_level[1].retained_frame_indices, (60,))
+
+    def test_level_aggregation_rejects_one_medium_transition_observation(
+        self,
+    ) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            (
+                (0, _estimate(2.6)),
+                (15, _movement("ascending", confidence="medium")),
+                (30, _estimate(2.7)),
+            ),
+            starting_level_index=1,
+            levels=((1, "Ground"), (2, "Story 1")),
+        )
+
+        self.assertEqual(result.transition_frame_indices, (15,))
+        self.assertEqual(result.unassigned_frame_indices, (15,))
+        self.assertEqual(len(result.level_estimates), 1)
+        self.assertEqual(result.level_estimates[0].level_index, 1)
+        self.assertEqual(
+            result.level_estimates[0].analysis.retained_frame_indices,
+            (0, 30),
+        )
+
+    def test_level_aggregation_commits_one_high_confidence_transition_once(
+        self,
+    ) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            (
+                (0, _estimate(2.6)),
+                (15, _movement("ascending", confidence="high")),
+                (30, _movement("arrived_up", confidence="high")),
+                (45, _estimate(2.9)),
+            ),
+            starting_level_index=1,
+            levels=((1, "Ground"), (2, "Story 1"), (3, "Story 2")),
+        )
+
+        self.assertEqual(result.transition_frame_indices, (15, 30))
+        self.assertEqual(
+            tuple(entry.level_index for entry in result.level_estimates),
+            (1, 2),
+        )
+
+    def test_repeated_arrival_labels_do_not_skip_a_level(self) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            (
+                (0, _estimate(2.6)),
+                (15, _estimate(2.7)),
+                (30, _movement("arrived_up", height=2.8)),
+                (45, _movement("arrived_up", height=3.1)),
+                (60, _estimate(2.9)),
+            ),
+            starting_level_index=0,
+            levels=((0, "Ground"), (1, "Story 1"), (2, "Story 2")),
+        )
+
+        self.assertEqual(
+            tuple(entry.level_index for entry in result.level_estimates),
+            (0, 1),
+        )
+        self.assertIn(45, result.unassigned_frame_indices)
+
+    def test_level_result_requires_two_stable_height_estimates(self) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            ((0, _estimate(2.7)),),
+            starting_level_index=1,
+            levels=((1, "Ground"),),
+        )
+
+        self.assertFalse(result.has_consensus)
+        self.assertFalse(result.level_estimates[0].has_consensus)
+        self.assertEqual(
+            result.level_estimates[0].analysis.retained_frame_indices,
+            (0,),
+        )
+
+    def test_level_aggregation_does_not_walk_beyond_known_levels(self) -> None:
+        result = aggregate_level_ceiling_height_estimates(
+            (
+                (0, _movement("ascending")),
+                (15, _movement("arrived_up")),
+                (30, _estimate(2.8)),
+            ),
+            starting_level_index=2,
+            levels=((1, "Ground"), (2, "Story 1")),
+        )
+
+        self.assertEqual(result.transition_frame_indices, (0, 15))
+        self.assertEqual(result.unassigned_frame_indices, (0, 15))
+        self.assertEqual(len(result.level_estimates), 1)
+        self.assertEqual(result.level_estimates[0].level_index, 2)
+        self.assertEqual(
+            result.level_estimates[0].analysis.retained_frame_indices,
+            (30,),
+        )
 
 
 # ### Request tests ###
 class CeilingHeightRequestTests(unittest.TestCase):
+    def test_model_options_include_supported_vision_models(self) -> None:
+        self.assertEqual(
+            CEILING_HEIGHT_MODEL_OPTIONS,
+            (
+                ("GPT-5.6 Luna", "gpt-5.6-luna"),
+                ("GPT-5.6 Terra", "gpt-5.6-terra"),
+                ("Qwen3-VL 8B (Local)", LOCAL_QWEN_CEILING_HEIGHT_MODEL),
+            ),
+        )
+
+    def test_only_local_qwen_skips_the_openai_api_key(self) -> None:
+        self.assertFalse(
+            ceiling_height_model_requires_api_key(
+                LOCAL_QWEN_CEILING_HEIGHT_MODEL
+            )
+        )
+        self.assertTrue(ceiling_height_model_requires_api_key("gpt-5.6-luna"))
+
+    def test_cost_estimate_covers_paired_frames_and_paid_models_only(self) -> None:
+        arguments = {
+            "frame_count": 350,
+            "interval": 15,
+            "frame_width": 1_920,
+            "frame_height": 1_080,
+        }
+        luna_cost = estimate_ceiling_height_api_cost_usd(
+            model="gpt-5.6-luna",
+            **arguments,
+        )
+        terra_cost = estimate_ceiling_height_api_cost_usd(
+            model="gpt-5.6-terra",
+            **arguments,
+        )
+
+        self.assertIsNotNone(luna_cost)
+        self.assertIsNotNone(terra_cost)
+        assert luna_cost is not None and terra_cost is not None
+        self.assertGreater(luna_cost, 0.02)
+        self.assertLess(luna_cost, 0.05)
+        self.assertAlmostEqual(terra_cost, luna_cost * 10.0)
+        self.assertIsNone(
+            estimate_ceiling_height_api_cost_usd(
+                model=LOCAL_QWEN_CEILING_HEIGHT_MODEL,
+                **arguments,
+            )
+        )
+
     def test_request_uses_vision_input_and_strict_structured_output(self) -> None:
         body = build_ceiling_height_request_body(
             "data:image/jpeg;base64,YWJj"
@@ -75,22 +443,65 @@ class CeilingHeightRequestTests(unittest.TestCase):
 
         self.assertEqual(body["model"], CEILING_HEIGHT_INFERENCE_MODEL)
         self.assertFalse(body["store"])
+        self.assertEqual(body["reasoning"], {"effort": "none"})
         content = body["input"][0]["content"]
         self.assertEqual(content[0]["type"], "input_text")
         self.assertIn("finished-floor", content[0]["text"])
+        self.assertIn("any height", content[0]["text"])
+        images = [item for item in content if item["type"] == "input_image"]
         self.assertEqual(
-            content[1],
-            {
-                "type": "input_image",
-                "image_url": "data:image/jpeg;base64,YWJj",
-                "detail": "high",
-            },
+            images,
+            [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/jpeg;base64,YWJj",
+                    "detail": "high",
+                }
+            ],
         )
         output_format = body["text"]["format"]
         self.assertEqual(output_format["type"], "json_schema")
         self.assertTrue(output_format["strict"])
         self.assertFalse(
             output_format["schema"]["additionalProperties"]
+        )
+        movement_schema = output_format["schema"]["properties"][
+            "level_movement"
+        ]
+        self.assertEqual(
+            set(movement_schema["enum"]),
+            {
+                "stable",
+                "ascending",
+                "descending",
+                "arrived_up",
+                "arrived_down",
+                "uncertain",
+            },
+        )
+        self.assertEqual(
+            set(
+                output_format["schema"]["properties"][
+                    "movement_confidence"
+                ]["enum"]
+            ),
+            {"low", "medium", "high"},
+        )
+
+    def test_request_orders_previous_frame_before_current_frame(self) -> None:
+        body = build_ceiling_height_request_body(
+            "data:image/jpeg;base64,Y3VycmVudA==",
+            previous_image_data_uri="data:image/jpeg;base64,cHJldmlvdXM=",
+        )
+
+        content = body["input"][0]["content"]
+        images = [item for item in content if item["type"] == "input_image"]
+        self.assertEqual(
+            [item["image_url"] for item in images],
+            [
+                "data:image/jpeg;base64,cHJldmlvdXM=",
+                "data:image/jpeg;base64,Y3VycmVudA==",
+            ],
         )
 
     def test_inference_encodes_frame_and_validates_estimate(self) -> None:
@@ -113,7 +524,11 @@ class CeilingHeightRequestTests(unittest.TestCase):
         self.assertEqual(result.maximum_m, 2.9)
         request, kwargs = captured[0]
         request_body = json.loads(request.data.decode("utf-8"))
-        image_input = request_body["input"][0]["content"][1]
+        image_input = next(
+            item
+            for item in request_body["input"][0]["content"]
+            if item["type"] == "input_image"
+        )
         self.assertTrue(
             image_input["image_url"].startswith(
                 "data:image/jpeg;base64,"
@@ -141,6 +556,8 @@ class CeilingHeightRequestTests(unittest.TestCase):
                         "maximum_m": None,
                         "confidence": "low",
                         "basis": "The ceiling boundary is not visible.",
+                        "level_movement": "stable",
+                        "movement_confidence": "low",
                     }
                 )
             ),
@@ -151,6 +568,33 @@ class CeilingHeightRequestTests(unittest.TestCase):
             "Could not estimate reliably",
             format_ceiling_height_estimate(result),
         )
+
+    def test_insufficient_evidence_ignores_local_numeric_placeholders(self) -> None:
+        result = infer_ceiling_height(
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            api_key="sk-test",
+            opener=lambda *_args, **_kwargs: _FakeResponse(
+                _response_payload(
+                    {
+                        "status": "insufficient_evidence",
+                        "estimate_m": 0.0,
+                        "minimum_m": 0.0,
+                        "maximum_m": 0.0,
+                        "confidence": "low",
+                        "basis": "The camera is between stable levels.",
+                        "level_movement": "ascending",
+                        "movement_confidence": "medium",
+                    }
+                )
+            ),
+        )
+
+        self.assertFalse(result.has_estimate)
+        self.assertIsNone(result.estimate_m)
+        self.assertIsNone(result.minimum_m)
+        self.assertIsNone(result.maximum_m)
+        self.assertEqual(result.level_movement, "ascending")
+        self.assertEqual(result.movement_confidence, "medium")
 
     def test_implausible_or_inconsistent_ranges_are_rejected(self) -> None:
         invalid = _estimated_result()

@@ -1,12 +1,18 @@
 # ### Imports ###
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
 import unittest
+from dataclasses import FrozenInstanceError, replace
 from unittest.mock import patch
 
 import numpy as np
 
+from housemaker.canvas_openings import (
+    CANVAS_OPENING_DOORWAY,
+    CANVAS_OPENING_WINDOW,
+    CanvasOpeningTarget,
+    build_canvas_opening_targets,
+)
 from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_AXIS_X,
     CANVAS_SURFACE_EDIT_AXIS_Y,
@@ -17,23 +23,25 @@ from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     CanvasSurfaceEdit,
     CanvasSurfaceEditReference,
-    apply_canvas_wall_edit_batch,
     apply_canvas_surface_edit,
+    apply_canvas_wall_edit_batch,
     build_canvas_surface_edit_targets,
-    rebase_canvas_wall_edit_targets_batch,
     rebase_canvas_wall_edit_targets,
-    restore_canvas_wall_edit_batch,
+    rebase_canvas_wall_edit_targets_batch,
     restore_canvas_surface_edit,
-    validate_canvas_wall_edit_batch_geometry,
+    restore_canvas_wall_edit_batch,
     validate_canvas_surface_edit_geometry,
+    validate_canvas_wall_edit_batch_geometry,
 )
 from housemaker.level_coordinates import level_image_to_world_xy
-from housemaker.models import LevelData, RoomData, VertexData
-from housemaker.surface_geometry import (
-    SURFACE_TYPE_CEILING,
-    SURFACE_TYPE_WALL,
-    build_fixed_surfaces,
+from housemaker.models import (
+    DoorwayData,
+    LevelData,
+    RoomData,
+    VertexData,
+    WindowData,
 )
+from housemaker.surface_geometry import build_fixed_surfaces
 
 
 # ### Fixture helpers ###
@@ -173,6 +181,61 @@ def _world_positions(level: LevelData) -> dict[int, tuple[float, float]]:
         vertex.id: level_image_to_world_xy(level, vertex.x, vertex.y)
         for vertex in level.vertex_data.vertices
     }
+
+
+def _add_standard_openings(level: LevelData) -> None:
+    level.windows = [
+        WindowData(
+            window_id="window-a",
+            wall_surface_id=f"level:{level.index}/wall:1:2",
+            start_ratio=0.2,
+            end_ratio=0.4,
+            bottom_ratio=0.25,
+            top_ratio=0.75,
+        )
+    ]
+    level.doorways = [
+        DoorwayData(
+            center_x=50.0,
+            center_y=0.0,
+            width_meters=0.8,
+            height_meters=2.1,
+            depth_meters=0.35,
+            rotation_degrees=90.0,
+            bottom_height_meters=0.1,
+            doorway_id="doorway-a",
+        )
+    ]
+
+
+def _find_opening_target(
+    level: LevelData,
+    opening_kind: str,
+) -> CanvasOpeningTarget:
+    surfaces = tuple(build_fixed_surfaces((level,)))
+    return next(
+        target
+        for target in build_canvas_opening_targets((level,), surfaces)
+        if target.reference.kind == opening_kind
+    )
+
+
+def _opening_size_meters(
+    target: CanvasOpeningTarget,
+) -> tuple[float, float]:
+    return (
+        target.bounds.horizontal_span * target.wall_width_meters,
+        target.bounds.vertical_span * target.wall_height_meters,
+    )
+
+
+def _doorway_dimensions(doorway: DoorwayData) -> tuple[float, ...]:
+    return (
+        doorway.width_meters,
+        doorway.height_meters,
+        doorway.depth_meters,
+        doorway.bottom_height_meters,
+    )
 
 
 # ### Target model and builder tests ###
@@ -968,6 +1031,175 @@ class CanvasSurfaceEditApplicationTests(unittest.TestCase):
             ),
         )
         self.assertAlmostEqual(plain_level.height_meters, 4.25)
+
+    def test_wall_length_edit_preserves_window_size_and_restores_state(
+        self,
+    ) -> None:
+        level = _build_plain_level()
+        _add_standard_openings(level)
+        baseline_window = level.windows[0]
+        baseline_size = _opening_size_meters(
+            _find_opening_target(level, CANVAS_OPENING_WINDOW)
+        )
+        _surfaces, targets = _build_targets(level)
+        target = _find_target(
+            targets,
+            "wall:1:2",
+            "level:2/vertex:2/axis:x",
+        )
+
+        apply_canvas_surface_edit(
+            (level,),
+            target,
+            CanvasSurfaceEdit(target.reference, target.surface_id, 1.0),
+            validate_project_geometry=False,
+        )
+
+        edited_size = _opening_size_meters(
+            _find_opening_target(level, CANVAS_OPENING_WINDOW)
+        )
+        np.testing.assert_allclose(edited_size, baseline_size, atol=1e-9)
+        self.assertNotEqual(level.windows[0], baseline_window)
+
+        restore_canvas_surface_edit(
+            (level,),
+            target,
+            validate_project_geometry=False,
+        )
+
+        self.assertEqual(level.windows[0], baseline_window)
+
+    def test_ceiling_height_edit_preserves_window_size_and_restores_state(
+        self,
+    ) -> None:
+        level = _build_plain_level()
+        _add_standard_openings(level)
+        baseline_window = level.windows[0]
+        baseline_size = _opening_size_meters(
+            _find_opening_target(level, CANVAS_OPENING_WINDOW)
+        )
+        _surfaces, targets = _build_targets(level)
+        target = next(
+            candidate
+            for candidate in targets
+            if candidate.reference.kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
+        )
+
+        apply_canvas_surface_edit(
+            (level,),
+            target,
+            CanvasSurfaceEdit(target.reference, target.surface_id, 1.25),
+            validate_project_geometry=False,
+        )
+
+        edited_size = _opening_size_meters(
+            _find_opening_target(level, CANVAS_OPENING_WINDOW)
+        )
+        np.testing.assert_allclose(edited_size, baseline_size, atol=1e-9)
+        self.assertNotEqual(level.windows[0], baseline_window)
+
+        restore_canvas_surface_edit(
+            (level,),
+            target,
+            validate_project_geometry=False,
+        )
+
+        self.assertEqual(level.windows[0], baseline_window)
+
+    def test_structural_edits_leave_doorway_dimensions_unchanged(self) -> None:
+        level = _build_plain_level()
+        _add_standard_openings(level)
+        baseline_dimensions = _doorway_dimensions(level.doorways[0])
+        _surfaces, targets = _build_targets(level)
+        wall_target = _find_target(
+            targets,
+            "wall:1:2",
+            "level:2/vertex:2/axis:x",
+        )
+        height_target = next(
+            candidate
+            for candidate in targets
+            if candidate.reference.kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
+        )
+
+        apply_canvas_surface_edit(
+            (level,),
+            wall_target,
+            CanvasSurfaceEdit(
+                wall_target.reference,
+                wall_target.surface_id,
+                1.0,
+            ),
+            validate_project_geometry=False,
+        )
+        self.assertEqual(
+            _doorway_dimensions(level.doorways[0]),
+            baseline_dimensions,
+        )
+
+        apply_canvas_surface_edit(
+            (level,),
+            height_target,
+            CanvasSurfaceEdit(
+                height_target.reference,
+                height_target.surface_id,
+                1.25,
+            ),
+            validate_project_geometry=False,
+        )
+        self.assertEqual(
+            _doorway_dimensions(level.doorways[0]),
+            baseline_dimensions,
+        )
+        doorway_size = _opening_size_meters(
+            _find_opening_target(level, CANVAS_OPENING_DOORWAY)
+        )
+        np.testing.assert_allclose(
+            doorway_size,
+            baseline_dimensions[:2],
+            atol=1e-9,
+        )
+
+    def test_floor_thickness_edit_keeps_opening_dimensions_unchanged(
+        self,
+    ) -> None:
+        level = _build_plain_level()
+        _add_standard_openings(level)
+        baseline_window = level.windows[0]
+        baseline_window_size = _opening_size_meters(
+            _find_opening_target(level, CANVAS_OPENING_WINDOW)
+        )
+        baseline_doorway_dimensions = _doorway_dimensions(level.doorways[0])
+        _surfaces, targets = _build_targets(level)
+        floor_target = next(
+            target
+            for target in targets
+            if target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+        )
+
+        apply_canvas_surface_edit(
+            (level,),
+            floor_target,
+            CanvasSurfaceEdit(
+                floor_target.reference,
+                floor_target.surface_id,
+                0.15,
+            ),
+            validate_project_geometry=False,
+        )
+
+        self.assertEqual(level.windows[0], baseline_window)
+        np.testing.assert_allclose(
+            _opening_size_meters(
+                _find_opening_target(level, CANVAS_OPENING_WINDOW)
+            ),
+            baseline_window_size,
+            atol=1e-9,
+        )
+        self.assertEqual(
+            _doorway_dimensions(level.doorways[0]),
+            baseline_doorway_dimensions,
+        )
 
     def test_wall_minimum_length_failure_is_atomic(self) -> None:
         level = _build_room_level()

@@ -20,7 +20,15 @@ from PySide6.QtWidgets import QApplication
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import DoorwayData, LevelData, OpenSpaceData, VertexData
+from housemaker.models import (
+    DoorwayData,
+    LevelData,
+    OpenSpaceData,
+    VertexData,
+    WindowData,
+)
+from housemaker.surface_geometry import SURFACE_TYPE_WALL, build_fixed_surfaces
+from tests.opening_dimension_assertions import get_opening_physical_size
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -397,6 +405,88 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertTrue(timer.isActive())
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
+
+    def test_delayed_vertex_move_preserves_window_size_and_undo_data(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        host_wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        original_window = WindowData(
+            window_id="vertex-window",
+            wall_surface_id=host_wall.surface_id,
+            start_ratio=0.25,
+            end_ratio=0.75,
+            bottom_ratio=0.2,
+            top_ratio=0.7,
+        )
+        level.windows = [original_window]
+        self._install_levels([level])
+        self.workspace._canvas_undo_stack.clear()
+        initial_size = get_opening_physical_size(level, original_window.window_id)
+        canvas = self.workspace.canvas
+        start = self._image_position(90.0, 50.0)
+        target = self._image_position(100.0, 50.0)
+
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+        _send_drag_move(canvas, target)
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=target)
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+
+        self.workspace._commit_pending_wall_vertex_update()
+
+        self.assertNotEqual(level.windows[0], original_window)
+        current_size = get_opening_physical_size(level, original_window.window_id)
+        self.assertAlmostEqual(current_size[0], initial_size[0])
+        self.assertAlmostEqual(current_size[1], initial_size[1])
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(level.windows, [original_window])
+        self.assertEqual(
+            get_opening_physical_size(level, original_window.window_id),
+            initial_size,
+        )
+
+    def test_active_vertex_chain_keeps_first_window_dimension_baseline(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        host_wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        window = WindowData(
+            window_id="chain-window",
+            wall_surface_id=host_wall.surface_id,
+            start_ratio=0.25,
+            end_ratio=0.75,
+            bottom_ratio=0.2,
+            top_ratio=0.7,
+        )
+        level.windows = [window]
+        self._install_levels([level])
+        self.workspace._canvas_undo_stack.clear()
+        initial_size = get_opening_physical_size(level, window.window_id)
+        canvas = self.workspace.canvas
+        first_vertex, second_vertex = level.vertex_data.vertices
+
+        canvas._set_active_vertex_id(first_vertex.id)
+        canvas._push_undo_state()
+        level.vertex_data.move_vertex(second_vertex.id, 100.0, 50.0)
+        self.workspace._handle_canvas_wall_vertex_added()
+
+        canvas._push_undo_state()
+        canvas._set_active_vertex_id(None)
+        self.workspace._commit_pending_wall_vertex_update()
+
+        current_size = get_opening_physical_size(level, window.window_id)
+        self.assertAlmostEqual(current_size[0], initial_size[0])
+        self.assertAlmostEqual(current_size[1], initial_size[1])
 
     def test_connecting_existing_vertices_waits_until_release_and_debounces(
         self,

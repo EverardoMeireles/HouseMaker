@@ -26,13 +26,14 @@ from housemaker.canvas_surface_edits import (
 )
 from housemaker.level_coordinates import level_image_to_world_xy
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import LevelData, RoomData, VertexData
+from housemaker.models import LevelData, RoomData, VertexData, WindowData
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_WALL,
     FixedSurface,
     build_fixed_surfaces,
 )
+from tests.opening_dimension_assertions import get_opening_physical_size
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -809,43 +810,137 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertTrue(surface_timer.isActive())
         self.assertGreater(surface_timer.remainingTime(), remaining_before)
 
-    def test_room_ceiling_finish_remains_immediate(self) -> None:
-        level = _build_square_level(with_room=True)
+    def test_ceiling_height_finish_waits_for_mesh_edit_delay(self) -> None:
+        self.workspace._set_mesh_edit_update_delay_seconds(60.0)
+
+        for with_room, edit_kind, delta_meters in (
+            (False, CANVAS_SURFACE_EDIT_LEVEL_HEIGHT, 0.25),
+            (True, CANVAS_SURFACE_EDIT_ROOM_HEIGHT, 0.2),
+        ):
+            with self.subTest(edit_kind=edit_kind):
+                level = _build_square_level(with_room=with_room)
+                surfaces = self._install_level(level)
+                ceiling = _surface(
+                    surfaces,
+                    surface_type=SURFACE_TYPE_CEILING,
+                    room_owned=with_room,
+                )
+                target = self._target(ceiling.surface_id, edit_kind)
+                initial_height = (
+                    level.rooms[0].height_meters
+                    if with_room
+                    else level.height_meters
+                )
+                expected_height = initial_height + delta_meters
+                final_edit = _edit(target, delta_meters)
+                self.workspace._handle_canvas_surface_edit_started(
+                    _edit(target, 0.0)
+                )
+                self.workspace._handle_canvas_surface_edit_preview_changed(
+                    final_edit
+                )
+
+                with (
+                    patch.object(
+                        self.workspace.surface_texture_generation,
+                        "reconcile_assignments_with_levels",
+                        return_value=False,
+                    ) as reconcile_assignments,
+                    patch.object(
+                        self.workspace,
+                        "_schedule_viewer_preview_refresh",
+                    ) as schedule_refresh,
+                ):
+                    self.workspace._handle_canvas_surface_edit_finished(
+                        final_edit,
+                        True,
+                    )
+
+                    current_height = (
+                        level.rooms[0].height_meters
+                        if with_room
+                        else level.height_meters
+                    )
+                    self.assertAlmostEqual(current_height, expected_height)
+                    self.assertTrue(
+                        self.workspace._pending_canvas_surface_mesh_update
+                    )
+                    self.assertTrue(
+                        self.workspace._canvas_surface_mesh_update_timer.isActive()
+                    )
+                    reconcile_assignments.assert_not_called()
+                    schedule_refresh.assert_not_called()
+
+                    rebased_targets = tuple(
+                        self.workspace._canvas_surface_edit_targets_by_key.values()
+                    )
+                    self.assertEqual(len(rebased_targets), 1)
+                    self.assertAlmostEqual(
+                        rebased_targets[0].baseline_value_meters,
+                        expected_height,
+                    )
+
+                    self.workspace._commit_pending_canvas_surface_mesh_update()
+
+                reconcile_assignments.assert_called_once_with([level])
+                schedule_refresh.assert_called_once_with(preserve_camera=True)
+                self.assertFalse(
+                    self.workspace._pending_canvas_surface_mesh_update
+                )
+                self.assertFalse(
+                    self.workspace._canvas_surface_mesh_update_timer.isActive()
+                )
+                self.assertEqual(
+                    self.workspace._canvas_surface_edit_targets_by_key,
+                    {},
+                )
+
+    def test_ceiling_height_preserves_window_size_and_undo_data(self) -> None:
+        level = _build_square_level(with_room=False)
+        initial_surfaces = tuple(build_fixed_surfaces((level,)))
+        host_wall = _surface(
+            initial_surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="1:2",
+        )
+        original_window = WindowData(
+            window_id="height-window",
+            wall_surface_id=host_wall.surface_id,
+            start_ratio=0.2,
+            end_ratio=0.6,
+            bottom_ratio=0.25,
+            top_ratio=0.75,
+        )
+        level.windows = [original_window]
         surfaces = self._install_level(level)
+        initial_size = get_opening_physical_size(level, original_window.window_id)
         ceiling = _surface(
             surfaces,
             surface_type=SURFACE_TYPE_CEILING,
-            room_owned=True,
+            room_owned=False,
         )
         target = self._target(
             ceiling.surface_id,
-            CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
+            CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
         )
-        final_edit = _edit(target, 0.2)
+        final_edit = _edit(target, 0.75)
+
         self.workspace._handle_canvas_surface_edit_started(_edit(target, 0.0))
         self.workspace._handle_canvas_surface_edit_preview_changed(final_edit)
+        self.workspace._handle_canvas_surface_edit_finished(final_edit, True)
+        self.workspace._commit_pending_canvas_surface_mesh_update()
 
-        with (
-            patch.object(
-                self.workspace.surface_texture_generation,
-                "reconcile_assignments_with_levels",
-                return_value=False,
-            ) as reconcile_assignments,
-            patch.object(
-                self.workspace,
-                "_schedule_viewer_preview_refresh",
-            ) as schedule_refresh,
-        ):
-            self.workspace._handle_canvas_surface_edit_finished(
-                final_edit,
-                True,
-            )
+        self.assertNotEqual(level.windows[0], original_window)
+        current_size = get_opening_physical_size(level, original_window.window_id)
+        self.assertAlmostEqual(current_size[0], initial_size[0])
+        self.assertAlmostEqual(current_size[1], initial_size[1])
 
-        reconcile_assignments.assert_called_once_with([level])
-        schedule_refresh.assert_called_once_with(preserve_camera=True)
-        self.assertFalse(self.workspace._pending_canvas_surface_mesh_update)
-        self.assertFalse(
-            self.workspace._canvas_surface_mesh_update_timer.isActive()
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(level.windows, [original_window])
+        self.assertEqual(
+            get_opening_physical_size(level, original_window.window_id),
+            initial_size,
         )
 
     def test_room_ceiling_edits_only_its_stable_room_owner(self) -> None:

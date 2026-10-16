@@ -759,7 +759,7 @@ def preserve_sloped_ceiling_window_dimensions(
         removed_ids = removed_ids_by_level.get(level.index, set())
         if not replacements and not removed_ids:
             continue
-        level.windows = [
+        level.windows[:] = [
             replacements.get(window.window_id, window)
             for window in level.windows
             if window.window_id not in removed_ids
