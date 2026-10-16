@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -42,12 +43,14 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.ceiling_height_dialog import CeilingHeightAnalysisDialog
 from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_JOB_KIND,
+    MAX_UNCERTAIN_MOVEMENT_GAPS,
     CeilingHeightAnalysisResult,
     CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
     CeilingHeightEstimationError,
     CeilingHeightEstimator,
     aggregate_level_ceiling_height_estimates,
+    build_ceiling_height_plan_image_data_uri,
     ceiling_height_model_requires_api_key,
     estimate_ceiling_height_api_cost_usd,
     format_ceiling_height_api_cost,
@@ -68,6 +71,10 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.models import LevelData
+from housemaker.plan_metric_state import (
+    PlanMetricCalibration,
+    build_ceiling_height_plan_context,
+)
 from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import SurfaceTextureGenerationWorkspace
@@ -99,6 +106,16 @@ GENERATION_ACTION_OBJECT_TEXTURE = "generate_object_texture"
 GENERATION_ACTION_SURFACE_TEXTURE = "generate_surface_texture"
 
 
+# ### Ceiling-height plan references ###
+@dataclass(frozen=True)
+class _CeilingHeightPlanSource:
+    """One corrected plan and its matching metric annotations."""
+
+    level_index: int
+    image_path: str
+    calibration: PlanMetricCalibration
+
+
 # ### Ceiling-height inference jobs ###
 class _CeilingHeightInferenceThread(QThread):
     """Analyze sampled video frames with an independent background reader."""
@@ -113,7 +130,9 @@ class _CeilingHeightInferenceThread(QThread):
         model: str,
         estimator: CeilingHeightEstimator | None,
         level_options: tuple[tuple[int, str], ...],
+        level_plan_contexts: tuple[tuple[int, str], ...],
         starting_level_index: int,
+        level_plan_sources: tuple[_CeilingHeightPlanSource, ...] = (),
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -123,6 +142,8 @@ class _CeilingHeightInferenceThread(QThread):
         self._model = str(model)
         self._estimator = estimator
         self._level_options = tuple(level_options)
+        self._level_plan_contexts = tuple(level_plan_contexts)
+        self._level_plan_sources = tuple(level_plan_sources)
         self._starting_level_index = int(starting_level_index)
         self.result: CeilingHeightAnalysisResult | None = None
         self.error_message: str | None = None
@@ -134,6 +155,30 @@ class _CeilingHeightInferenceThread(QThread):
                 frame_estimates: list[tuple[int, CeilingHeightEstimate]] = []
                 previous_frame: np.ndarray | None = None
                 consecutive_failures = 0
+                level_indices = tuple(
+                    level_index for level_index, _level_name in self._level_options
+                )
+                current_level_position = level_indices.index(
+                    self._starting_level_index
+                )
+                plan_context_by_level = dict(self._level_plan_contexts)
+                plan_image_by_level: dict[int, str] = {}
+                for source in self._level_plan_sources:
+                    if self.isInterruptionRequested():
+                        raise CeilingHeightEstimationCancelled("Cancelled")
+                    try:
+                        plan_image_by_level[source.level_index] = (
+                            build_ceiling_height_plan_image_data_uri(
+                                source.image_path,
+                                source.calibration,
+                            )
+                        )
+                    except CeilingHeightEstimationError:
+                        continue
+                pending_movement_direction = 0
+                pending_movement_votes = 0
+                pending_movement_uncertain_gaps = 0
+                arrival_latched = False
                 with open_ceiling_height_estimator(
                     model=self._model,
                     api_key=self._api_key,
@@ -151,12 +196,31 @@ class _CeilingHeightInferenceThread(QThread):
                             raise CeilingHeightEstimationCancelled("Cancelled")
                         current_frame = video_source.get_frame(frame_index)
                         try:
-                            estimate = estimator(
+                            current_level_index = level_indices[
+                                current_level_position
+                            ]
+                            plan_image_data_uri = (
+                                None
+                                if pending_movement_direction
+                                else plan_image_by_level.get(
+                                    current_level_index
+                                )
+                            )
+                            plan_context = (
+                                plan_context_by_level.get(
+                                    current_level_index,
+                                    "",
+                                )
+                                if plan_image_data_uri is not None
+                                else ""
+                            )
+                            estimate = _invoke_bound_ceiling_height_estimator(
+                                estimator,
                                 current_frame,
-                                previous_frame_bgr=previous_frame,
-                                cancellation_check=(
-                                    self.isInterruptionRequested
-                                ),
+                                previous_frame=previous_frame,
+                                plan_context=plan_context,
+                                plan_image_data_uri=plan_image_data_uri,
+                                cancellation_check=self.isInterruptionRequested,
                             )
                         except CeilingHeightEstimationCancelled:
                             raise
@@ -179,6 +243,23 @@ class _CeilingHeightInferenceThread(QThread):
                             )
                         else:
                             consecutive_failures = 0
+                        (
+                            current_level_position,
+                            pending_movement_direction,
+                            pending_movement_votes,
+                            pending_movement_uncertain_gaps,
+                            arrival_latched,
+                        ) = _advance_ceiling_height_plan_context(
+                            estimate,
+                            current_position=current_level_position,
+                            level_count=len(level_indices),
+                            pending_direction=pending_movement_direction,
+                            pending_votes=pending_movement_votes,
+                            pending_uncertain_gaps=(
+                                pending_movement_uncertain_gaps
+                            ),
+                            arrival_latched=arrival_latched,
+                        )
                         frame_estimates.append(
                             (
                                 frame_index,
@@ -227,10 +308,127 @@ class _CeilingHeightInferenceRuntime:
     video_path: str
     frame_indices: tuple[int, ...]
     level_signature: tuple[tuple[int, str], ...]
+    plan_context_signature: tuple[tuple[int, str], ...]
+    plan_source_signature: tuple[_CeilingHeightPlanSource, ...]
     starting_level_index: int
     job_id: str
     thread: _CeilingHeightInferenceThread
     cancel_requested: bool = False
+
+
+# ### Ceiling-height plan-context helpers ###
+def _invoke_bound_ceiling_height_estimator(
+    estimator: object,
+    frame_bgr: np.ndarray,
+    *,
+    previous_frame: np.ndarray | None,
+    plan_context: str,
+    plan_image_data_uri: str | None,
+    cancellation_check: Callable[[], bool],
+) -> CeilingHeightEstimate:
+    """Pass metric context when supported by an injected estimator."""
+
+    supports_context = True
+    supports_plan_image = True
+    try:
+        parameters = inspect.signature(estimator).parameters
+        accepts_keywords = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        supports_context = bool(
+            "plan_context" in parameters
+            or accepts_keywords
+        )
+        supports_plan_image = bool(
+            "plan_image_data_uri" in parameters or accepts_keywords
+        )
+    except (TypeError, ValueError):
+        pass
+    arguments = {
+        "previous_frame_bgr": previous_frame,
+        "cancellation_check": cancellation_check,
+    }
+    if supports_context:
+        arguments["plan_context"] = plan_context
+    if supports_plan_image:
+        arguments["plan_image_data_uri"] = plan_image_data_uri
+    return estimator(frame_bgr, **arguments)  # type: ignore[operator]
+
+
+def _advance_ceiling_height_plan_context(
+    estimate: CeilingHeightEstimate,
+    *,
+    current_position: int,
+    level_count: int,
+    pending_direction: int,
+    pending_votes: int,
+    pending_uncertain_gaps: int,
+    arrival_latched: bool,
+) -> tuple[int, int, int, int, bool]:
+    """Track the most likely level for the next sampled frame."""
+
+    movement = estimate.level_movement
+    reliable = estimate.movement_confidence in {"medium", "high"}
+    if movement in {"arrived_up", "arrived_down"}:
+        if arrival_latched:
+            return current_position, 0, 0, 0, True
+        direction = 1 if movement == "arrived_up" else -1
+        arrival_is_reliable = reliable or (
+            pending_direction == direction and pending_votes >= 2
+        )
+        if not arrival_is_reliable:
+            return current_position, 0, 0, 0, False
+        next_position = min(
+            max(current_position + direction, 0),
+            level_count - 1,
+        )
+        return next_position, 0, 0, 0, next_position != current_position
+    if reliable and movement in {"ascending", "descending"}:
+        direction = 1 if movement == "ascending" else -1
+        if estimate.movement_confidence == "high":
+            votes = 2
+        else:
+            votes = pending_votes + 1 if pending_direction == direction else 1
+        return current_position, direction, votes, 0, False
+    if movement == "stable" and pending_votes >= 2 and pending_direction:
+        next_position = min(
+            max(current_position + pending_direction, 0),
+            level_count - 1,
+        )
+        return next_position, 0, 0, 0, next_position != current_position
+    if movement == "stable":
+        return current_position, 0, 0, 0, False
+    if movement == "uncertain" and pending_direction:
+        uncertain_gaps = pending_uncertain_gaps + 1
+        if uncertain_gaps > MAX_UNCERTAIN_MOVEMENT_GAPS:
+            return current_position, 0, 0, 0, arrival_latched
+        return (
+            current_position,
+            pending_direction,
+            pending_votes,
+            uncertain_gaps,
+            arrival_latched,
+        )
+    return (
+        current_position,
+        pending_direction,
+        pending_votes,
+        pending_uncertain_gaps,
+        arrival_latched,
+    )
+
+
+def _largest_ceiling_height_plan_reference_size(
+    sources: Iterable[_CeilingHeightPlanSource],
+) -> tuple[int, int] | None:
+    """Return a conservative plan-image size for paid cost estimation."""
+
+    return max(
+        (source.calibration.normalized_image_size for source in sources),
+        key=lambda size: size[0] * size[1],
+        default=None,
+    )
 
 
 # ### Ceiling-height presentation helpers ###
@@ -316,6 +514,10 @@ class MergedGenerationWorkspace(QWidget):
         self._ceiling_height_dialog: CeilingHeightAnalysisDialog | None = None
         self._ceiling_height_video_path = ""
         self._ceiling_height_level_options: tuple[tuple[int, str], ...] = ()
+        self._ceiling_height_level_plan_contexts: tuple[tuple[int, str], ...] = ()
+        self._ceiling_height_level_plan_sources: tuple[
+            _CeilingHeightPlanSource, ...
+        ] = ()
         self._ceiling_height_current_level_index: int | None = None
         self._temporary_object_reference_session: (
             _TemporaryObjectReferenceSession | None
@@ -1180,6 +1382,8 @@ class MergedGenerationWorkspace(QWidget):
             dialog.set_result("Load a video before starting analysis.", is_error=True)
             return
         level_options = self._ceiling_height_level_options
+        level_plan_contexts = self._ceiling_height_level_plan_contexts
+        level_plan_sources = self._ceiling_height_level_plan_sources
         if starting_level_index not in dict(level_options):
             dialog.set_result(
                 "Choose a valid starting level before analysis.",
@@ -1198,12 +1402,16 @@ class MergedGenerationWorkspace(QWidget):
         if not frame_indices:
             dialog.set_result("The loaded video contains no frames.", is_error=True)
             return
+        plan_reference_size = _largest_ceiling_height_plan_reference_size(
+            level_plan_sources
+        )
         estimated_cost = estimate_ceiling_height_api_cost_usd(
             model=model,
             frame_count=metadata.frame_count,
             interval=frame_interval,
             frame_width=metadata.width,
             frame_height=metadata.height,
+            plan_reference_size=plan_reference_size,
         )
         if len(frame_indices) > 120:
             request_description = (
@@ -1247,7 +1455,9 @@ class MergedGenerationWorkspace(QWidget):
             model,
             self._ceiling_height_estimator,
             level_options,
+            level_plan_contexts,
             starting_level_index,
+            level_plan_sources=level_plan_sources,
             parent=self,
         )
         initial_stage = (
@@ -1265,6 +1475,8 @@ class MergedGenerationWorkspace(QWidget):
             video_path=video_path,
             frame_indices=frame_indices,
             level_signature=level_options,
+            plan_context_signature=level_plan_contexts,
+            plan_source_signature=level_plan_sources,
             starting_level_index=starting_level_index,
             job_id=job.job_id,
             thread=thread,
@@ -1366,6 +1578,10 @@ class MergedGenerationWorkspace(QWidget):
             levels_are_stale = (
                 self._ceiling_height_level_options
                 != runtime.level_signature
+                or self._ceiling_height_level_plan_contexts
+                != runtime.plan_context_signature
+                or self._ceiling_height_level_plan_sources
+                != runtime.plan_source_signature
             )
             is_stale = bool(
                 current_source is None
@@ -1466,6 +1682,7 @@ class MergedGenerationWorkspace(QWidget):
     ) -> None:
         """Publish the project levels available to whole-video analysis."""
 
+        levels = tuple(levels)
         options = tuple(
             sorted(
                 (
@@ -1476,6 +1693,33 @@ class MergedGenerationWorkspace(QWidget):
             )
         )
         self._ceiling_height_level_options = options
+        self._ceiling_height_level_plan_contexts = tuple(
+            sorted(
+                (
+                    (
+                        int(level.index),
+                        build_ceiling_height_plan_context(
+                            level.display_name,
+                            level.plan_metric_calibration,
+                        ),
+                    )
+                    for level in levels
+                ),
+                key=lambda item: item[0],
+            )
+        )
+        self._ceiling_height_level_plan_sources = tuple(
+            _CeilingHeightPlanSource(
+                level_index=int(level.index),
+                image_path=str(level.image_path),
+                calibration=level.plan_metric_calibration,
+            )
+            for level in levels
+            if (
+                level.plan_metric_calibration is not None
+                and level.image_path is not None
+            )
+        )
         self._ceiling_height_current_level_index = int(current_level_index)
         self._sync_ceiling_height_dialog_levels()
 
@@ -1545,6 +1789,11 @@ class MergedGenerationWorkspace(QWidget):
                 )
             ),
             current_level_index=self._ceiling_height_current_level_index,
+        )
+        self._ceiling_height_dialog.set_plan_reference_size(
+            _largest_ceiling_height_plan_reference_size(
+                self._ceiling_height_level_plan_sources
+            )
         )
 
     # ### Temporary generation references ###

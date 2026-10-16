@@ -5577,7 +5577,9 @@ class BlueprintCanvas(QWidget):
             frame.end_point[0] - frame.start_point[0],
             frame.end_point[1] - frame.start_point[1],
         )
-        wall_length_meters = wall_length_pixels * PIXEL_TO_METER * float(level.scale)
+        wall_length_meters = (
+            wall_length_pixels * level.meters_per_pixel * float(level.scale)
+        )
         if not math.isfinite(wall_length_meters) or wall_length_meters <= 0.0:
             return None
         return min(1.0, MIN_WINDOW_SIZE_METERS / wall_length_meters)
@@ -5682,7 +5684,7 @@ class BlueprintCanvas(QWidget):
         wall_delta_x = frame.end_point[0] - frame.start_point[0]
         wall_delta_y = frame.end_point[1] - frame.start_point[1]
         wall_length_pixels = math.hypot(wall_delta_x, wall_delta_y)
-        wall_length_meters = wall_length_pixels * PIXEL_TO_METER * level_scale
+        wall_length_meters = wall_length_pixels * level.meters_per_pixel * level_scale
         wall_height_meters = float(frame.height_meters)
         available_width_meters = (
             wall_length_meters - 2.0 * CANVAS_WINDOW_WALL_MARGIN_METERS
@@ -5893,6 +5895,7 @@ class BlueprintCanvas(QWidget):
                 self._screen_distance_to_image(
                     DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN
                 ),
+                meters_per_pixel=self._get_level_meters_per_pixel(),
             )
         if bridge_target is not None:
             self.pending_doorway = self._copy_doorway_with(
@@ -6126,7 +6129,7 @@ class BlueprintCanvas(QWidget):
             + (initial_doorway.center_y - start_vertex.y) * tangent_y
         )
         initial_half_width_pixels = (
-            initial_doorway.width_meters / PIXEL_TO_METER * 0.5
+            initial_doorway.width_meters / self._get_level_meters_per_pixel() * 0.5
         )
         anchored_position = (
             initial_center_position
@@ -6142,9 +6145,11 @@ class BlueprintCanvas(QWidget):
             if side_direction > 0.0
             else anchored_position
         )
-        minimum_width_pixels = MIN_DOORWAY_WIDTH_METERS / PIXEL_TO_METER
+        minimum_width_pixels = (
+            MIN_DOORWAY_WIDTH_METERS / self._get_level_meters_per_pixel()
+        )
         maximum_width_pixels = min(
-            MAX_DOORWAY_WIDTH_METERS / PIXEL_TO_METER,
+            MAX_DOORWAY_WIDTH_METERS / self._get_level_meters_per_pixel(),
             available_length_pixels,
         )
         if maximum_width_pixels < minimum_width_pixels:
@@ -6176,7 +6181,7 @@ class BlueprintCanvas(QWidget):
             initial_doorway,
             center_x=start_vertex.x + tangent_x * center_position,
             center_y=start_vertex.y + tangent_y * center_position,
-            width_meters=width_pixels * PIXEL_TO_METER,
+            width_meters=width_pixels * self._get_level_meters_per_pixel(),
         )
         if resized_doorway == self.doorways[doorway_index]:
             return
@@ -6205,7 +6210,9 @@ class BlueprintCanvas(QWidget):
         )
         side_direction_x = side_sign * depth_direction_x
         side_direction_y = side_sign * depth_direction_y
-        initial_depth_pixels = initial_doorway.depth_meters / PIXEL_TO_METER
+        initial_depth_pixels = (
+            initial_doorway.depth_meters / self._get_level_meters_per_pixel()
+        )
         anchored_x = (
             initial_doorway.center_x
             - side_direction_x * initial_depth_pixels * 0.5
@@ -6229,9 +6236,11 @@ class BlueprintCanvas(QWidget):
                 visual_distance_pixels - minimum_visual_half_depth
             )
 
-        minimum_depth_pixels = MIN_DOORWAY_DEPTH_METERS / PIXEL_TO_METER
+        minimum_depth_pixels = (
+            MIN_DOORWAY_DEPTH_METERS / self._get_level_meters_per_pixel()
+        )
         maximum_depth_pixels = min(
-            MAX_DOORWAY_DEPTH_METERS / PIXEL_TO_METER,
+            MAX_DOORWAY_DEPTH_METERS / self._get_level_meters_per_pixel(),
             self._get_image_ray_boundary_distance(
                 (anchored_x, anchored_y),
                 (side_direction_x, side_direction_y),
@@ -6249,7 +6258,7 @@ class BlueprintCanvas(QWidget):
             initial_doorway,
             center_x=(anchored_x + moving_x) * 0.5,
             center_y=(anchored_y + moving_y) * 0.5,
-            depth_meters=depth_pixels * PIXEL_TO_METER,
+            depth_meters=depth_pixels * self._get_level_meters_per_pixel(),
         )
         if resized_doorway == self.doorways[doorway_index]:
             return
@@ -6296,7 +6305,7 @@ class BlueprintCanvas(QWidget):
             + (image_point.y() - press_image_point[1]) * tangent_y
         )
         half_width_pixels = (
-            initial_doorway.width_meters / PIXEL_TO_METER * 0.5
+            initial_doorway.width_meters / self._get_level_meters_per_pixel() * 0.5
         )
         if half_width_pixels * 2.0 >= wall_length_pixels:
             wall_position = wall_length_pixels * 0.5
@@ -6357,8 +6366,9 @@ class BlueprintCanvas(QWidget):
             {room.center_vertex_id for room in self.rooms},
             (doorway.center_x, doorway.center_y),
             self._get_doorway_width_direction(doorway),
-            doorway.width_meters / PIXEL_TO_METER,
-            doorway.depth_meters / PIXEL_TO_METER,
+            doorway.width_meters / self._get_level_meters_per_pixel(),
+            doorway.depth_meters / self._get_level_meters_per_pixel(),
+            meters_per_pixel=self._get_level_meters_per_pixel(),
         )
         edge_added = False
         for target in targets:
@@ -6445,7 +6455,7 @@ class BlueprintCanvas(QWidget):
         depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
             doorway
         )
-        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
+        half_depth_pixels = doorway.depth_meters / self._get_level_meters_per_pixel() / 2.0
         depth_start = (
             center[0] - depth_direction_x * half_depth_pixels,
             center[1] - depth_direction_y * half_depth_pixels,
@@ -6592,8 +6602,12 @@ class BlueprintCanvas(QWidget):
             for vertex in (start_vertex, end_vertex)
         )
         tolerance = DOORWAY_WALL_SPAN_ALIGNMENT_TOLERANCE_PIXELS
-        half_width = doorway.width_meters / PIXEL_TO_METER * 0.5 + tolerance
-        half_depth = doorway.depth_meters / PIXEL_TO_METER * 0.5 + tolerance
+        half_width = (
+            doorway.width_meters / self._get_level_meters_per_pixel() * 0.5 + tolerance
+        )
+        half_depth = (
+            doorway.depth_meters / self._get_level_meters_per_pixel() * 0.5 + tolerance
+        )
         width_positions = tuple(position[0] for position in local_positions)
         depth_positions = tuple(position[1] for position in local_positions)
         return bool(
@@ -6758,7 +6772,7 @@ class BlueprintCanvas(QWidget):
             (doorway.center_x - origin_x) * width_axis[0]
             + (doorway.center_y - origin_y) * width_axis[1]
         )
-        half_width_pixels = doorway.width_meters / PIXEL_TO_METER * 0.5
+        half_width_pixels = doorway.width_meters / self._get_level_meters_per_pixel() * 0.5
         seed_end_position = (
             (seed_end.x - origin_x) * width_axis[0]
             + (seed_end.y - origin_y) * width_axis[1]
@@ -6843,8 +6857,8 @@ class BlueprintCanvas(QWidget):
         width_position = (
             point_delta_x * width_direction_x + point_delta_y * width_direction_y
         )
-        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
-        half_width_pixels = doorway.width_meters / PIXEL_TO_METER / 2.0
+        half_depth_pixels = doorway.depth_meters / self._get_level_meters_per_pixel() / 2.0
+        half_width_pixels = doorway.width_meters / self._get_level_meters_per_pixel() / 2.0
         handle_hits: list[tuple[float, str, float]] = []
         if include_width_handles:
             for side_sign in (-1.0, 1.0):
@@ -6892,7 +6906,7 @@ class BlueprintCanvas(QWidget):
         width_direction_x, width_direction_y = self._get_doorway_width_direction(
             doorway
         )
-        half_width_pixels = doorway.width_meters / PIXEL_TO_METER / 2.0
+        half_width_pixels = doorway.width_meters / self._get_level_meters_per_pixel() / 2.0
         visual_half_width_pixels = max(
             half_width_pixels,
             self._screen_distance_to_image(
@@ -6916,7 +6930,7 @@ class BlueprintCanvas(QWidget):
         depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
             doorway
         )
-        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
+        half_depth_pixels = doorway.depth_meters / self._get_level_meters_per_pixel() / 2.0
         visual_half_depth_pixels = max(
             half_depth_pixels,
             self._screen_distance_to_image(
@@ -7052,6 +7066,7 @@ class BlueprintCanvas(QWidget):
             self.vertex_data,
             self.doorways,
             removed_edges,
+            meters_per_pixel=self._get_level_meters_per_pixel(),
         )
         self.vertex_data.delete_vertices(deleted_vertex_id_set)
         for replacement_edge in replacement_edges:
@@ -7063,6 +7078,7 @@ class BlueprintCanvas(QWidget):
             self.vertex_data,
             self.doorways,
             replacement_edges,
+            meters_per_pixel=self._get_level_meters_per_pixel(),
         )
         removed_doorway_indices.difference_update(retained_doorway_indices)
         self._remove_vertices_from_rooms(deleted_vertex_id_set)
@@ -7096,7 +7112,7 @@ class BlueprintCanvas(QWidget):
         self,
         deleted_vertex_ids: set[int],
     ) -> None:
-        """Remove a deleted vertex group from room boundaries once."""
+        """Remove deleted boundaries and orphaned room-center helpers."""
 
         original_rooms = list(self.rooms)
         updated_rooms: list[RoomData] = []
@@ -7137,6 +7153,15 @@ class BlueprintCanvas(QWidget):
 
         self.rooms.clear()
         self.rooms.extend(updated_rooms)
+        retained_room_vertex_ids = {
+            vertex_id
+            for room in updated_rooms
+            for vertex_id in (*room.vertex_ids, room.center_vertex_id)
+        }
+        orphaned_center_vertex_ids = {
+            room.center_vertex_id for room in original_rooms
+        } - retained_room_vertex_ids
+        self.vertex_data.delete_vertices(orphaned_center_vertex_ids)
         if self.rooms != original_rooms:
             self.rooms_changed.emit()
 
@@ -7957,6 +7982,12 @@ class BlueprintCanvas(QWidget):
             max(1.0, self.height() - IMAGE_MARGIN * 2.0),
         )
 
+    def get_plan_alignment_viewport_size(self) -> tuple[float, float]:
+        """Return the Canvas fit area used to convert plan registrations."""
+
+        available_rect = self._available_image_rect()
+        return float(available_rect.width()), float(available_rect.height())
+
     def _widget_to_image(self, widget_point: QPointF) -> QPointF | None:
         if self.blueprint_image is None:
             return None
@@ -8422,7 +8453,7 @@ class BlueprintCanvas(QWidget):
         width_direction_x, width_direction_y = (
             self._get_doorway_width_direction(doorway)
         )
-        half_width_pixels = doorway.width_meters / PIXEL_TO_METER * 0.5
+        half_width_pixels = doorway.width_meters / self._get_level_meters_per_pixel() * 0.5
         painter.save()
         handle_pen = QPen(VERTEX_OUTLINE_COLOR, 2.0)
         handle_pen.setCosmetic(True)
@@ -8456,7 +8487,7 @@ class BlueprintCanvas(QWidget):
         depth_direction_x, depth_direction_y = (
             self._get_doorway_depth_direction(doorway)
         )
-        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER * 0.5
+        half_depth_pixels = doorway.depth_meters / self._get_level_meters_per_pixel() * 0.5
         for side_sign in (-1.0, 1.0):
             actual_side_center = self._image_to_widget(
                 doorway.center_x
@@ -9041,6 +9072,12 @@ class BlueprintCanvas(QWidget):
             ]
         )
 
+    def _get_level_meters_per_pixel(self) -> float:
+        """Use the loaded plan's metric density without baking in Level scale."""
+
+        level = self.level_context
+        return level.meters_per_pixel if level is not None else PIXEL_TO_METER
+
     def _get_doorway_corners(
         self,
         doorway: DoorwayData,
@@ -9050,8 +9087,8 @@ class BlueprintCanvas(QWidget):
         )
         width_direction_x = -depth_direction_y
         width_direction_y = depth_direction_x
-        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
-        half_width_pixels = doorway.width_meters / PIXEL_TO_METER / 2.0
+        half_depth_pixels = doorway.depth_meters / self._get_level_meters_per_pixel() / 2.0
+        half_width_pixels = doorway.width_meters / self._get_level_meters_per_pixel() / 2.0
         return [
             (
                 doorway.center_x

@@ -38,6 +38,8 @@ def find_doorway_bridge_target(
     raw_center: tuple[float, float],
     preset_width_meters: float,
     center_tolerance: float,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> DoorwayBridgeTarget | None:
     """Find aligned endpoints without an existing edge near the cursor."""
 
@@ -47,6 +49,7 @@ def find_doorway_bridge_target(
         raw_center,
         preset_width_meters,
         center_tolerance,
+        meters_per_pixel,
     )
     return targets[0] if targets else None
 
@@ -59,6 +62,8 @@ def find_doorway_bridges_covered_by_rectangle(
     width_pixels: float,
     depth_pixels: float,
     position_tolerance_pixels: float = STRAIGHT_ALIGNMENT_TOLERANCE_PIXELS,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> tuple[DoorwayBridgeTarget, ...]:
     """Find unconnected straight vertex pairs covered by one doorway."""
 
@@ -77,8 +82,9 @@ def find_doorway_bridges_covered_by_rectangle(
         vertex_data,
         room_center_vertex_ids,
         center,
-        width_pixels * PIXEL_TO_METER,
+        width_pixels * meters_per_pixel,
         math.hypot(half_width, half_depth) + tolerance,
+        meters_per_pixel,
     )
     vertices_by_id = {vertex.id: vertex for vertex in vertex_data.vertices}
     covered_targets: list[DoorwayBridgeTarget] = []
@@ -119,7 +125,14 @@ def _find_doorway_bridge_targets(
     raw_center: tuple[float, float],
     preset_width_meters: float,
     center_tolerance: float,
+    meters_per_pixel: float,
 ) -> tuple[DoorwayBridgeTarget, ...]:
+    if (
+        isinstance(meters_per_pixel, bool)
+        or not math.isfinite(meters_per_pixel)
+        or meters_per_pixel <= 0.0
+    ):
+        raise ValueError("Plan meters per pixel must be a finite positive number.")
     vertices_by_id = {vertex.id: vertex for vertex in vertex_data.vertices}
     neighbor_ids_by_vertex_id, existing_edge_keys = _build_wall_lookups(
         vertex_data
@@ -141,7 +154,7 @@ def _find_doorway_bridge_targets(
         delta_x = second.x - first.x
         delta_y = second.y - first.y
         span_pixels = math.hypot(delta_x, delta_y)
-        width_meters = span_pixels * PIXEL_TO_METER
+        width_meters = span_pixels * meters_per_pixel
         if not MIN_DOORWAY_WIDTH_METERS <= width_meters <= MAX_DOORWAY_WIDTH_METERS:
             continue
         center = (

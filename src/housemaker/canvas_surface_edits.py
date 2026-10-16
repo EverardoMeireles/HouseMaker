@@ -230,6 +230,7 @@ class CanvasSurfaceEditHandleTarget:
     required_surface_ids: tuple[str, ...] = ()
     level_image_size_pixels: tuple[float, float] | None = None
     window_dimension_snapshots: tuple[CanvasWindowDimensionSnapshot, ...] = ()
+    level_meters_per_pixel: float = PIXEL_TO_METER
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasSurfaceEditReference):
@@ -261,6 +262,10 @@ class CanvasSurfaceEditHandleTarget:
         level_scale = _normalize_positive_number(
             self.level_scale,
             "level scale",
+        )
+        meters_per_pixel = _normalize_positive_number(
+            self.level_meters_per_pixel,
+            "level meters per pixel",
         )
         level_offset = _normalize_pair(
             self.level_offset_world,
@@ -316,6 +321,7 @@ class CanvasSurfaceEditHandleTarget:
         object.__setattr__(self, "maximum_delta_meters", maximum_delta)
         object.__setattr__(self, "baseline_value_meters", baseline_value)
         object.__setattr__(self, "level_scale", level_scale)
+        object.__setattr__(self, "level_meters_per_pixel", meters_per_pixel)
         object.__setattr__(self, "level_offset_world", level_offset)
         object.__setattr__(self, "level_pivot_world", level_pivot)
         object.__setattr__(self, "chain_vertex_ids", chain_vertex_ids)
@@ -633,6 +639,7 @@ def _build_common_target_values(
     return {
         "surface_id": surface.surface_id,
         "level_scale": float(level.scale),
+        "level_meters_per_pixel": level.meters_per_pixel,
         "level_offset_world": (
             float(level.offset_x_meters),
             float(level.offset_y_meters),
@@ -1234,6 +1241,7 @@ def _wall_level_baselines_match(
             second.level_pivot_world,
         )
         and first.level_image_size_pixels == second.level_image_size_pixels
+        and math.isclose(first.level_meters_per_pixel, second.level_meters_per_pixel)
     )
 
 
@@ -1373,7 +1381,7 @@ def _build_wall_target_positions(
         return target.chain_vertex_image_positions
 
     image_delta = np.zeros(2, dtype=float)
-    image_distance = delta / (PIXEL_TO_METER * target.level_scale)
+    image_distance = delta / (target.level_meters_per_pixel * target.level_scale)
     if reference.axis_index == CANVAS_SURFACE_EDIT_AXIS_X:
         image_delta[0] = image_distance
     else:
@@ -1550,6 +1558,8 @@ def _validate_level_baseline(
     )
     if current_image_size != target.level_image_size_pixels:
         raise ValueError("The Canvas level image size changed during the edit.")
+    if not math.isclose(level.meters_per_pixel, target.level_meters_per_pixel):
+        raise ValueError("The Canvas level calibration changed during the edit.")
 
 
 def _validate_target_delta(

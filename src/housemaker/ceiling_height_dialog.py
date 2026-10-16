@@ -66,6 +66,7 @@ class CeilingHeightAnalysisDialog(QDialog):
         self._frame_count = 0
         self._frame_width = 0
         self._frame_height = 0
+        self._plan_reference_size: tuple[int, int] | None = None
 
         self._build_ui()
         self._restore_preferences()
@@ -158,6 +159,22 @@ class CeilingHeightAnalysisDialog(QDialog):
         self.current_frame_label.setText(
             f"Current frame: {bounded_frame + 1:,}"
         )
+
+    def set_plan_reference_size(
+        self,
+        size: tuple[int, int] | None,
+    ) -> None:
+        """Include calibrated plan-image tokens in paid-cost estimates."""
+
+        if size is None:
+            self._plan_reference_size = None
+        else:
+            width, height = size
+            self._plan_reference_size = (
+                max(1, int(width)),
+                max(1, int(height)),
+            )
+        self._refresh_controls()
 
     def set_running(self, running: bool) -> None:
         self._is_running = bool(running)
@@ -337,6 +354,7 @@ class CeilingHeightAnalysisDialog(QDialog):
                 interval=self.frame_analysis_interval,
                 frame_width=self._frame_width,
                 frame_height=self._frame_height,
+                plan_reference_size=self._plan_reference_size,
             )
         except ValueError:
             return base_text

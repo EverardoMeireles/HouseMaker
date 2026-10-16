@@ -27,6 +27,8 @@ def doorway_indices_on_removed_wall_edges(
     vertex_data: VertexData,
     doorways: Sequence[DoorwayData],
     removed_edges: Iterable[Edge],
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> set[int]:
     """Find openings supported by removed wall edges in image coordinates.
 
@@ -35,6 +37,9 @@ def doorway_indices_on_removed_wall_edges(
     and parallel walls outside that footprint are not owners.
     """
 
+    meters_per_pixel = _normalize_positive_measurement(
+        meters_per_pixel, "plan pixel density"
+    )
     edge_points: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for edge in removed_edges:
         start = vertex_data.get_vertex(edge.start_vertex_id)
@@ -46,7 +51,7 @@ def doorway_indices_on_removed_wall_edges(
         index
         for index, doorway in enumerate(doorways)
         if any(
-            _wall_edge_overlaps_doorway(doorway, start, end)
+            _wall_edge_overlaps_doorway(doorway, start, end, meters_per_pixel)
             for start, end in edge_points
         )
     }
@@ -56,6 +61,7 @@ def _wall_edge_overlaps_doorway(
     doorway: DoorwayData,
     start: tuple[float, float],
     end: tuple[float, float],
+    meters_per_pixel: float,
 ) -> bool:
     angle = math.radians(doorway.rotation_degrees)
     depth_axis = (math.cos(angle), math.sin(angle))
@@ -81,8 +87,8 @@ def _wall_edge_overlaps_doorway(
             (end[0] - doorway.center_x, end[1] - doorway.center_y),
         )
     )
-    half_width = doorway.width_meters / PIXEL_TO_METER / 2.0
-    half_depth = doorway.depth_meters / PIXEL_TO_METER / 2.0
+    half_width = doorway.width_meters / meters_per_pixel / 2.0
+    half_depth = doorway.depth_meters / meters_per_pixel / 2.0
     width_overlap = min(max(point[0] for point in local_points), half_width) - max(
         min(point[0] for point in local_points), -half_width
     )

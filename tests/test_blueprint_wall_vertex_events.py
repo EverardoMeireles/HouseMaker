@@ -527,7 +527,6 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
             [
                 second.id,
                 fourth.id,
-                center.id,
                 unrelated_start.id,
                 unrelated_end.id,
             ],
@@ -564,6 +563,52 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
             (first.id, third.id),
         )
         self.assertEqual(self.canvas.active_vertex_id, first.id)
+
+    def test_delete_cleans_only_the_removed_rooms_center_helper(self) -> None:
+        vertex_data = VertexData()
+        removed_boundary = tuple(
+            vertex_data.add_vertex(x, y)
+            for x, y in ((10.0, 10.0), (40.0, 10.0), (25.0, 40.0))
+        )
+        removed_center = vertex_data.add_vertex(25.0, 20.0)
+        retained_boundary = tuple(
+            vertex_data.add_vertex(x, y)
+            for x, y in ((60.0, 10.0), (90.0, 10.0), (75.0, 40.0))
+        )
+        retained_center = vertex_data.add_vertex(75.0, 20.0)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.rooms.extend(
+            (
+                RoomData(
+                    name="Removed room",
+                    vertex_ids=tuple(vertex.id for vertex in removed_boundary),
+                    center_vertex_id=removed_center.id,
+                    color_rgb=(100, 120, 140),
+                ),
+                RoomData(
+                    name="Retained room",
+                    vertex_ids=tuple(vertex.id for vertex in retained_boundary),
+                    center_vertex_id=retained_center.id,
+                    color_rgb=(140, 120, 100),
+                ),
+            )
+        )
+        self.canvas.set_selected_vertex_ids((removed_boundary[0].id,))
+
+        self.canvas._delete_selected_vertices()
+
+        self.assertEqual(
+            [room.name for room in self.canvas.rooms],
+            ["Retained room"],
+        )
+        self.assertIsNone(vertex_data.get_vertex(removed_center.id))
+        self.assertIsNotNone(vertex_data.get_vertex(retained_center.id))
+        self.assertTrue(
+            all(
+                vertex_data.get_vertex(vertex.id) is not None
+                for vertex in retained_boundary
+            )
+        )
 
     def test_delete_ignores_an_entirely_stale_vertex_selection(self) -> None:
         self.canvas.set_selected_vertex_ids((101, 102))

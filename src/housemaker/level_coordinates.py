@@ -11,7 +11,6 @@ from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
     GROUND_LEVEL_INDEX,
-    PIXEL_TO_METER,
     DoorwayData,
     LevelData,
 )
@@ -143,7 +142,7 @@ def build_doorway_world_outline_positions(
         math.sin(rotation_radians),
     )
     width_direction = (-depth_direction[1], depth_direction[0])
-    half_depth_pixels = depth_meters / PIXEL_TO_METER / 2.0
+    half_depth_pixels = depth_meters / level.meters_per_pixel / 2.0
     base_z_meters = _get_valid_doorway_outline_value(
         base_z_by_level_index[level.index],
         "base Z",
@@ -158,7 +157,7 @@ def build_doorway_world_outline_positions(
     for depth_sign in (-1.0, 1.0):
         profile_positions: list[tuple[float, float, float]] = []
         for width_offset_meters, height_offset_meters in cross_section:
-            width_offset_pixels = width_offset_meters / PIXEL_TO_METER
+            width_offset_pixels = width_offset_meters / level.meters_per_pixel
             image_x = (
                 center_x
                 + width_direction[0] * width_offset_pixels
@@ -263,6 +262,7 @@ def _get_level_coordinate_transform(level: LevelData) -> _LevelCoordinateTransfo
         id(vertex_data.vertices),
         len(vertex_data.vertices),
         level.image_size_pixels,
+        level.meters_per_pixel,
         scale,
         offset_x,
         offset_y,
@@ -345,7 +345,7 @@ def _image_to_unscaled_world_xy(
         image_width, image_height = level.image_size_pixels
         centered_x = float(image_x) - float(image_width) / 2.0
         centered_y = float(image_y) - float(image_height) / 2.0
-    return centered_x * PIXEL_TO_METER, -centered_y * PIXEL_TO_METER
+    return centered_x * level.meters_per_pixel, -centered_y * level.meters_per_pixel
 
 
 def _unscaled_world_to_image_xy(
@@ -353,8 +353,8 @@ def _unscaled_world_to_image_xy(
     raw_x: float,
     raw_y: float,
 ) -> tuple[float, float]:
-    image_x = float(raw_x) / PIXEL_TO_METER
-    image_y = -float(raw_y) / PIXEL_TO_METER
+    image_x = float(raw_x) / level.meters_per_pixel
+    image_y = -float(raw_y) / level.meters_per_pixel
     if level.image_size_pixels is not None:
         image_width, image_height = level.image_size_pixels
         image_x += float(image_width) / 2.0

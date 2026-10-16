@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import sys
 import uuid
@@ -339,6 +340,24 @@ from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
+from housemaker.plan_correction_alignment import (
+    PlanCorrectionAlignmentCoordinator,
+    PlanCorrectionAlignmentLevel,
+    PlanCorrectionAlignmentOutcome,
+)
+from housemaker.plan_correction_dialog import PlanCorrectionDialog
+from housemaker.plan_correction_exchange import (
+    ExternalPlanCorrection,
+    build_plan_correction_prompt,
+    load_plan_correction_json,
+)
+from housemaker.plan_correction_import import (
+    align_external_plan_levels,
+    apply_external_plan_metadata,
+    external_plan_uses_loaded_coordinates,
+    matches_external_plan_image,
+    prepare_external_plan_calibration,
+)
 from housemaker.plan_correction_models import (
     OPENAI_PLAN_CORRECTION_MODELS,
     PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
@@ -350,8 +369,15 @@ from housemaker.plan_image_correction import (
     CORRECTION_METHOD_QWEN,
     PlanCorrectionProgress,
     PlanImageCorrectionResult,
+    PlanMetricNormalizer,
     correct_plan_image,
 )
+from housemaker.plan_metric_batch import PlanMetricBatchCoordinator
+from housemaker.plan_metric_providers import (
+    create_multi_plan_measurement_analyzer,
+    create_plan_measurement_analyzer,
+)
+from housemaker.plan_metric_state import PlanMetricCalibration
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.qwen_plan_image_correction import (
     QwenPlanCorrectionError,
@@ -530,6 +556,110 @@ TOUR_VIEWER_POINT_KIND_BY_ACTION = {
 }
 
 
+# ### Plan metric presentation ###
+def _build_plan_metric_status_text(
+    calibration: PlanMetricCalibration | None,
+    *,
+    include_density: bool,
+) -> str:
+    """Describe whether a corrected plan has a validated metric scale."""
+
+    if calibration is None:
+        return "metric scale uncalibrated"
+    status = f"metric scale calibrated ({calibration.confidence} confidence)"
+    if include_density:
+        pixels_per_meter = 1.0 / calibration.target_meters_per_pixel
+        status += f", {pixels_per_meter:g} px/m"
+    diagnostics = calibration.diagnostics
+    accepted_count = (
+        diagnostics.accepted_count
+        if diagnostics is not None
+        else len(calibration.measurements)
+    )
+    status += (
+        f"; {accepted_count} measurements accepted, "
+        f"{calibration.relative_residual * 100.0:.1f}% disagreement"
+    )
+    if calibration.confidence != "high" and diagnostics is not None:
+        reason = (
+            diagnostics.reasons[0]
+            if diagnostics.reasons
+            else diagnostics.geometry_warning
+        )
+        if reason:
+            status += f"; {reason.rstrip('.')}"
+    return status
+
+
+def _build_plan_metric_evidence_tooltip(
+    calibration: PlanMetricCalibration | None,
+) -> str:
+    """Expose accepted scale evidence so unit mistakes are reviewable."""
+
+    if calibration is None:
+        return "No validated metric measurements are attached to this plan."
+    width, height = calibration.normalized_image_size
+    physical_width = width * calibration.target_meters_per_pixel
+    physical_height = height * calibration.target_meters_per_pixel
+    lines = [
+        (
+            "Calibrated plan-canvas extent: "
+            f"{physical_width:.2f} m × {physical_height:.2f} m at "
+            f"{1.0 / calibration.target_meters_per_pixel:g} px/m."
+        ),
+        (
+            f"Scale confidence: {calibration.confidence}; "
+            f"{calibration.relative_residual * 100.0:.1f}% disagreement "
+            "between accepted measurements."
+        ),
+        (
+            "Disagreement describes internal consistency, not guaranteed "
+            "real-world measurement accuracy."
+        ),
+    ]
+    if math.isclose(calibration.normalization_scale, 1.0):
+        lines.append(
+            "Image resolution preserved; geometry uses this level's calibrated "
+            "metres per pixel. Ceiling heights remain in metres."
+        )
+    diagnostics = calibration.diagnostics
+    if diagnostics is not None:
+        lines.extend(
+            (
+                f"Measurements: {diagnostics.accepted_count} accepted, "
+                f"{diagnostics.rejected_count} rejected, "
+                f"{diagnostics.candidate_count} candidates.",
+                f"Accepted axis coverage: {diagnostics.horizontal_count} horizontal, "
+                f"{diagnostics.vertical_count} vertical.",
+                f"Endpoints refined: {diagnostics.refined_count} measurements; "
+                f"additional analysis passes: {diagnostics.retry_count}.",
+            )
+        )
+        lines.extend(f"Reason: {reason}" for reason in diagnostics.reasons)
+        if diagnostics.geometry_warning:
+            lines.append(f"Geometry check: {diagnostics.geometry_warning}")
+    lines.append("Accepted plan dimensions:")
+    lines.extend(
+        f"• {measurement.label or 'Unlabelled span'}: "
+        f"{measurement.value_meters:g} m ({measurement.confidence})"
+        for measurement in calibration.measurements[:12]
+    )
+    return "\n".join(lines)
+
+
+def _build_plan_transform_revision(level: LevelData) -> tuple[float, ...]:
+    """Snapshot transforms whose replacement would invalidate a correction."""
+
+    return (
+        float(level.scale),
+        float(level.offset_x_meters),
+        float(level.offset_y_meters),
+        float(level.canvas_level_scale),
+        float(level.canvas_offset_x_pixels),
+        float(level.canvas_offset_y_pixels),
+    )
+
+
 # ### Plan-image correction jobs ###
 class _PlanImageCorrectionThread(QThread):
     """Correct one immutable plan photograph outside the GUI thread."""
@@ -555,6 +685,12 @@ class _PlanImageCorrectionThread(QThread):
         self.result: PlanImageCorrectionResult | None = None
         self.error_message: str | None = None
         self.was_cancelled = False
+        self._metric_normalizer: PlanMetricNormalizer | None = None
+        self._alignment_coordinator: (
+            PlanCorrectionAlignmentCoordinator | None
+        ) = None
+        self._alignment_level_index: int | None = None
+        self.alignment_outcome: PlanCorrectionAlignmentOutcome | None = None
 
     @property
     def model(self) -> str:
@@ -562,17 +698,65 @@ class _PlanImageCorrectionThread(QThread):
 
         return self._model
 
+    def set_metric_normalizer(
+        self,
+        metric_normalizer: PlanMetricNormalizer,
+    ) -> None:
+        """Use the immutable batch normalizer before this worker starts."""
+
+        if self.isRunning():
+            raise RuntimeError(
+                "A plan metric normalizer cannot change after correction starts."
+            )
+        self._metric_normalizer = metric_normalizer
+
+    def set_alignment_coordinator(
+        self,
+        coordinator: PlanCorrectionAlignmentCoordinator,
+        level_index: int,
+    ) -> None:
+        """Join the immutable post-correction registration batch."""
+
+        if self.isRunning():
+            raise RuntimeError(
+                "Plan alignment cannot change after correction starts."
+            )
+        self._alignment_coordinator = coordinator
+        self._alignment_level_index = int(level_index)
+
     def run(self) -> None:  # type: ignore[override]
         try:
+            measurement_analyzer = None
+            if self._metric_normalizer is None:
+                measurement_analyzer = create_plan_measurement_analyzer(
+                    self._model,
+                    api_key=self._api_key,
+                )
             result = correct_plan_image(
                 self._input_path,
                 self._output_path,
                 api_key=self._api_key,
                 model=self._model,
                 make_walls_continuous=self._make_walls_continuous,
+                measurement_analyzer=measurement_analyzer,
+                metric_normalizer=self._metric_normalizer,
                 progress_callback=self.progress.emit,
                 cancellation_check=self.isInterruptionRequested,
             )
+            if self._alignment_coordinator is not None:
+                assert self._alignment_level_index is not None
+                self.progress.emit(
+                    PlanCorrectionProgress(
+                        "level_alignment",
+                        100,
+                        "Aligning corrected level offsets from structural cues.",
+                    )
+                )
+                self.alignment_outcome = self._alignment_coordinator.align(
+                    self._alignment_level_index,
+                    result.output_path,
+                    cancellation_check=self.isInterruptionRequested,
+                )
         except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
             if self.isInterruptionRequested():
                 self.was_cancelled = True
@@ -594,7 +778,18 @@ class _PlanImageCorrectionRuntime:
     output_path: Path
     job_id: str
     thread: _PlanImageCorrectionThread
+    level_transform_revision: tuple[float, ...] = ()
     cancel_requested: bool = False
+
+
+@dataclass
+class _PlanImageCorrectionBatchRuntime:
+    """Atomic GUI state shared by every loaded-plan correction job."""
+
+    level_indices: tuple[int, ...]
+    metric_coordinator: PlanMetricBatchCoordinator
+    completed_results: dict[int, PlanImageCorrectionResult]
+    alignment_coordinator: PlanCorrectionAlignmentCoordinator | None = None
 
 
 # ### Automatic wall-generation jobs ###
@@ -1182,6 +1377,7 @@ class _CanvasBlueprintUndoState:
         tuple[int, tuple[SlopedCeilingData, ...]],
         ...,
     ] = ()
+    removed_window_placements: tuple[WindowPlacement, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1190,6 +1386,8 @@ class _CanvasPlanImageUndoState:
 
     level_index: int
     commit: PlanImageEraseCommit
+    metric_calibration: PlanMetricCalibration | None = None
+    external_correction: ExternalPlanCorrection | None = None
 
 
 @dataclass(frozen=True)
@@ -1270,6 +1468,9 @@ class _CanvasLevelPropertiesUndoState:
     include_in_export: bool
     doorways: tuple[DoorwayData, ...] = ()
     windows: tuple[WindowData, ...] = ()
+    plan_metric_calibration: PlanMetricCalibration | None = None
+    plan_meters_per_pixel: float | None = None
+    external_plan_correction: ExternalPlanCorrection | None = None
 
 
 @dataclass(frozen=True)
@@ -1885,6 +2086,10 @@ class BlueprintWorkspace(QWidget):
             int,
             _PlanImageCorrectionRuntime,
         ] = {}
+        self._plan_image_correction_batch: (
+            _PlanImageCorrectionBatchRuntime | None
+        ) = None
+        self._retired_plan_image_correction_threads: set[QThread] = set()
         self._plan_wall_detection_runtimes: dict[
             int,
             _PlanWallDetectionRuntime,
@@ -4086,9 +4291,18 @@ class BlueprintWorkspace(QWidget):
         self.image_correction_button = QPushButton("Image correction")
         self.image_correction_button.setMinimumHeight(44)
         self.image_correction_button.setToolTip(
-            "Use the plan correction model selected in Settings to flatten and "
-            "clean the loaded photograph into a black-and-white plan. The original "
-            "photo is retained. OpenAI models may incur usage and cost; the "
+            "Choose Use api for the model selected in Settings, or Copy prompt "
+            "to correct plans in ChatGPT and Browse json to import its results. "
+            "Load the returned corrected images manually using Load plan image. "
+            "The configured model can flatten and "
+            "clean every loaded plan photograph as one batch. Printed dimensions "
+            "from all plans are interpreted together. Each corrected raster keeps "
+            "its resolution; its own calibrated metres per pixel convert plan "
+            "coordinates into geometry. Ceiling heights remain in metres. The original "
+            "photos are retained and results are applied only when the whole "
+            "batch succeeds. Metric calibration adds a structured vision request "
+            "and may retry weak results once. OpenAI models may therefore incur "
+            "additional usage and cost; the "
             "local Qwen model is limited to non-commercial research or evaluation "
             "unless separately licensed under the Qwen Research License."
         )
@@ -7068,11 +7282,11 @@ class BlueprintWorkspace(QWidget):
         self._refresh_canvas_window_asset_list()
         return removed
 
-    def _restore_sloped_ceiling_window_placements(
+    def _restore_window_placements(
         self,
         placements: Sequence[WindowPlacement],
     ) -> None:
-        """Restore detached fixtures whose structural frames were undone."""
+        """Restore detached fixtures whose structural frames were restored."""
 
         if not placements:
             return
@@ -7612,7 +7826,7 @@ class BlueprintWorkspace(QWidget):
                 self._copy_windows(level.windows)
             )
         if restore:
-            self._restore_sloped_ceiling_window_placements(
+            self._restore_window_placements(
                 undo_state.removed_window_placements
             )
         self._pending_sloped_ceiling_undo_state = None
@@ -7668,7 +7882,7 @@ class BlueprintWorkspace(QWidget):
             self._viewer_windows_by_level_index[level.index] = (
                 self._copy_windows(level.windows)
             )
-        self._restore_sloped_ceiling_window_placements(
+        self._restore_window_placements(
             state.removed_window_placements
         )
         self.viewer.clear_sloped_ceiling_preview()
@@ -7870,6 +8084,9 @@ class BlueprintWorkspace(QWidget):
             include_in_export=bool(level.include_in_export),
             doorways=self._copy_doorways(level.doorways),
             windows=self._copy_windows(level.windows),
+            plan_metric_calibration=level.plan_metric_calibration,
+            plan_meters_per_pixel=level.plan_meters_per_pixel,
+            external_plan_correction=level.external_plan_correction,
         )
 
     def _capture_canvas_topology_undo_state(self) -> _CanvasTopologyUndoState:
@@ -8381,6 +8598,9 @@ class BlueprintWorkspace(QWidget):
         level.include_in_export = state.include_in_export
         level.doorways[:] = copy.deepcopy(state.doorways)
         level.windows[:] = state.windows
+        level.plan_metric_calibration = state.plan_metric_calibration
+        level.plan_meters_per_pixel = state.plan_meters_per_pixel
+        level.external_plan_correction = state.external_plan_correction
         self._viewer_doorways_by_level_index[level.index] = self._copy_doorways(
             level.doorways
         )
@@ -8394,16 +8614,20 @@ class BlueprintWorkspace(QWidget):
             )
             self.canvas.update()
             self._sync_canvas_placed_object_profiles()
+            self._update_blueprint_name_label()
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_directional_light_profiles()
         self._sync_canvas_outer_wall_marking()
+        self.merged_generation_workspace.set_ceiling_height_levels(self.levels, self.current_level.index)
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
         self._reconcile_surface_assignments_with_scene()
         self._refresh_scene_atlas_texture_requirements()
-        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _restore_canvas_level_properties_group_undo_state(
         self,
         state: _CanvasLevelPropertiesGroupUndoState,
     ) -> None:
-        """Restore every level changed by one accepted video analysis."""
+        """Restore levels changed together by calibration or height analysis."""
 
         if not state.members:
             raise ValueError("The multi-level Canvas undo has no baselines.")
@@ -8426,6 +8650,9 @@ class BlueprintWorkspace(QWidget):
             level.include_in_export = member.include_in_export
             level.doorways[:] = copy.deepcopy(member.doorways)
             level.windows[:] = member.windows
+            level.plan_metric_calibration = member.plan_metric_calibration
+            level.plan_meters_per_pixel = member.plan_meters_per_pixel
+            level.external_plan_correction = member.external_plan_correction
             self._viewer_doorways_by_level_index[level.index] = self._copy_doorways(
                 level.doorways
             )
@@ -8437,11 +8664,15 @@ class BlueprintWorkspace(QWidget):
             self.current_level.canvas_offset_y_pixels,
         )
         self.canvas.update()
+        self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_placed_object_profiles()
+        self._sync_canvas_directional_light_profiles()
         self._sync_canvas_outer_wall_marking()
+        self._update_blueprint_name_label()
+        self.merged_generation_workspace.set_ceiling_height_levels(self.levels, self.current_level.index)
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
         self._reconcile_surface_assignments_with_scene()
         self._refresh_scene_atlas_texture_requirements()
-        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _restore_canvas_outer_wall_mark_undo_state(
         self,
@@ -8744,6 +8975,8 @@ class BlueprintWorkspace(QWidget):
             raise RuntimeError("The previous plan image could not be restored.")
         level.image_path = previous_path
         level.image_size_pixels = tuple(commit.image_size_pixels)
+        level.plan_metric_calibration = state.metric_calibration
+        level.external_plan_correction = state.external_correction
         self._level_blueprint_image_revisions[level.index] = previous_revision
         if level is self.current_level:
             self._clear_plan_wall_preview(update_controls=False)
@@ -8809,6 +9042,7 @@ class BlueprintWorkspace(QWidget):
             self._reset_viewer_sloped_ceiling_snapshots()
         self.outer_wall_marks = state.outer_wall_marks
         self._sync_canvas_outer_wall_marking()
+        self._restore_window_placements(state.removed_window_placements)
         if state.architectural_trims_by_level or state.sloped_ceilings_by_level:
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -21402,10 +21636,20 @@ class BlueprintWorkspace(QWidget):
         file_path = self._get_image_file_path()
         if not file_path:
             return
-
+        correction = self.current_level.external_plan_correction
+        if correction is not None and Path(file_path).name.casefold() != correction.image_filename.casefold():
+            answer = QMessageBox.question(
+                self, "Replace imported plan correction?",
+                f"The imported JSON expects {correction.image_filename}. "
+                "Load this different image and discard the imported correction for this level?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         try:
             self._set_current_level_image(file_path)
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             QMessageBox.critical(self, "Image load failed", str(error))
 
     # ### Plan-image erasing ###
@@ -21484,17 +21728,43 @@ class BlueprintWorkspace(QWidget):
             )
             return
 
+        calibration = level.plan_metric_calibration
+        external_correction = level.external_plan_correction
+        if external_correction is not None and matches_external_plan_image(
+            external_correction, previous_path, level.image_size_pixels
+        ):
+            external_correction = replace(
+                external_correction, image_filename=Path(replacement_path).name,
+            )
+        if calibration is not None:
+            try:
+                calibration = replace(
+                    calibration,
+                    normalized_image_sha256=hashlib.sha256(
+                        Path(replacement_path).read_bytes()
+                    ).hexdigest(),
+                )
+            except OSError:
+                self.canvas.load_blueprint_image_preserving_view(previous_path)
+                self._handle_plan_image_erase_failed(
+                    "The edited plan could not be verified; its calibration was kept."
+                )
+                return
         self._clear_plan_wall_preview(update_controls=False)
         self._record_canvas_undo_state(
             _CanvasPlanImageUndoState(
                 level_index=level.index,
                 commit=raw_commit,
+                metric_calibration=level.plan_metric_calibration,
+                external_correction=level.external_plan_correction,
             )
         )
         if level.original_image_path is None:
             level.original_image_path = previous_path
         level.image_path = replacement_path
         level.image_size_pixels = tuple(raw_commit.image_size_pixels)
+        level.plan_metric_calibration = calibration
+        level.external_plan_correction = external_correction
         self._level_blueprint_image_revisions[level.index] = (
             raw_commit.replacement_revision
         )
@@ -21551,29 +21821,275 @@ class BlueprintWorkspace(QWidget):
         self.erase_plan_image_button.blockSignals(was_blocked)
 
     def _handle_image_correction_clicked(self) -> None:
-        """Start one non-blocking correction for the current level's source photo."""
+        """Choose the existing model workflow or an offline ChatGPT exchange."""
+        if self._is_shutdown or self._plan_image_correction_runtimes:
+            return
+        dialog = PlanCorrectionDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.chosen_action == "api":
+            self._handle_api_image_correction_clicked()
+        elif dialog.chosen_action == "copy_prompt":
+            self._copy_external_plan_correction_prompt()
+        elif dialog.chosen_action == "browse_json":
+            self._browse_external_plan_correction_json()
 
-        if self._is_shutdown:
+    # ### Manual ChatGPT plan correction ###
+    def _copy_external_plan_correction_prompt(self) -> None:
+        levels = tuple(
+            level for level in self.levels
+            if _local_file_revision_has_file(
+                _build_local_file_revision(self._get_plan_correction_source_path(level))
+            )
+        )
+        if not levels:
+            QMessageBox.warning(self, "No plan images", "Load the plan images first.")
+            return
+        prompt = build_plan_correction_prompt(levels)
+        QApplication.clipboard().setText(prompt)
+        QMessageBox.information(
+            self, "Prompt copied",
+            "Paste the prompt into ChatGPT and attach the original plans labelled "
+            "L1, L2, etc. Download its JSON and corrected PNGs. Import the JSON "
+            "with Browse json and load each PNG into its matching level using "
+            "Load plan image. Keep the filenames and image sizes from the JSON.",
+        )
+
+    def _browse_external_plan_correction_json(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import corrected plan JSON", str(Path.home()), "JSON files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            applied, pending = self._import_external_plan_correction_json(path)
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.critical(self, "Plan correction import failed", str(error))
+            return
+        message = f"Applied corrections to {applied} level(s)."
+        if pending:
+            message += (
+                "\n\nWaiting for manually loaded corrected images:\n"
+                + "\n".join(pending)
+                + "\n\nUse Load plan image on each matching level. Scale and alignment "
+                "will be applied when its corrected image is loaded."
+            )
+        QMessageBox.information(self, "Plan correction imported", message)
+
+    def _import_external_plan_correction_json(
+        self, path: str | Path,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Validate the complete manifest before changing any level."""
+        if (
+            self._is_shutdown
+            or self._plan_image_correction_runtimes
+            or self._retired_plan_image_correction_threads
+            or self._plan_wall_detection_runtimes
+            or self._plan_wall_preview_session is not None
+        ):
+            raise ValueError("Finish or cancel active plan correction/wall generation first.")
+        batch = load_plan_correction_json(path)
+        prepared = []
+        for correction in batch.levels:
+            level = self._get_level_by_index(correction.level_index)
+            if level is None:
+                raise ValueError(f"The project has no level L{correction.level_index}.")
+            # Matching names with wrong dimensions are errors, not pending imports.
+            matches_name = bool(
+                level.image_path
+                and Path(level.image_path).name.casefold() == correction.image_filename.casefold()
+            )
+            calibration = (
+                prepare_external_plan_calibration(correction, level.image_path)
+                if matches_name else None
+            )
+            prepared.append((level, correction, matches_name, calibration))
+        self._prepare_plan_correction_geometry()
+        for level, correction, matches_name, _calibration in prepared:
+            blockers = self._get_plan_correction_blockers(level)
+            if not blockers:
+                continue
+            if not matches_name or not self._external_plan_matches_loaded_coordinates(
+                level, correction, level.image_path,
+            ):
+                raise ValueError(self._build_plan_correction_blocker_message(level, blockers))
+        self._apply_external_plan_metadata_batch(prepared)
+        pending = []
+        applied = 0
+        for level, correction, matches_name, _calibration in prepared:
+            if matches_name:
+                applied += 1
+            else:
+                pending.append(f"L{level.index}: {correction.image_filename}")
+        return applied, tuple(pending)
+
+    def _external_plan_matches_loaded_coordinates(
+        self, level: LevelData, correction: ExternalPlanCorrection, path: str | Path,
+    ) -> bool:
+        loaded_revision = self._level_blueprint_image_revisions.get(level.index)
+        if level is self.current_level:
+            loaded_revision = self.canvas.get_blueprint_image_revision() or loaded_revision
+        return external_plan_uses_loaded_coordinates(
+            level, correction, path,
+            loaded_revision=loaded_revision,
+            current_revision=_build_local_file_revision(path),
+        )
+
+    def _prepare_plan_correction_geometry(self) -> None:
+        """Finish authored edits and remove only windows without a host wall."""
+        self.canvas.stop_plan_image_erasing()
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        self._cancel_active_canvas_surface_edit()
+        self._cancel_active_sloped_ceiling_edit()
+        self._commit_pending_canvas_face_orientation_update()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_sloped_ceiling_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_stair_point_mesh_update()
+        self._commit_pending_doorway_mesh_update()
+        removed = self._cleanup_orphaned_canvas_windows()
+        if removed:
+            # Cleanup also has to reach the scene when a later correction
+            # check rejects another level in this batch.
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            self.viewer.set_surface_tools_status(
+                f"Removed {len(removed)} orphaned window frame(s) whose walls no longer exist."
+            )
+
+    def _apply_external_plan_metadata_batch(
+        self,
+        prepared: Sequence[tuple[LevelData, ExternalPlanCorrection, bool, PlanMetricCalibration | None]],
+    ) -> None:
+        """Apply calibration as an undoable level edit, retaining opening sizes."""
+        baseline = _CanvasLevelPropertiesGroupUndoState(tuple(
+            self._capture_canvas_level_properties_undo_state(level) for level in self.levels
+        ))
+        window_dimensions = self._capture_canvas_window_dimension_snapshots(tuple(
+            level.index for level, _correction, matched, _calibration in prepared
+            if matched
+        ))
+        try:
+            for level, correction, matched, calibration in prepared:
+                level.external_plan_correction = correction
+                if not matched:
+                    continue
+                previous_scale = float(level.scale)
+                apply_external_plan_metadata(level, correction, calibration)
+                if not math.isclose(previous_scale, level.scale):
+                    compensation = previous_scale / level.scale
+                    level.doorways[:] = [
+                        replace(doorway,
+                                width_meters=doorway.width_meters * compensation,
+                                depth_meters=doorway.depth_meters * compensation)
+                        for doorway in level.doorways
+                    ]
+            self._preserve_canvas_window_dimension_snapshots(window_dimensions)
+        except (TypeError, ValueError):
+            self._restore_canvas_level_properties_group_undo_state(baseline)
+            raise
+        self._record_canvas_undo_state(baseline)
+        for level, _correction, matched, _calibration in prepared:
+            if matched:
+                self._viewer_doorways_by_level_index[level.index] = self._copy_doorways(level.doorways)
+                self._sync_viewer_window_snapshot(level)
+        self._reconcile_door_placements()
+        self._reconcile_window_placements()
+        self._refresh_external_plan_corrections()
+
+    def _refresh_external_plan_corrections(self) -> None:
+        align_external_plan_levels(self.levels, self.canvas.get_plan_alignment_viewport_size())
+        # Revision-based semantic caches must see the new calibration before
+        # texture assignments and procedural parts are reconciled.
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self.canvas.set_canvas_level_offsets(
+            self.current_level.canvas_offset_x_pixels,
+            self.current_level.canvas_offset_y_pixels,
+        )
+        self._sync_level_controls()
+        self._update_blueprint_name_label()
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_placed_object_profiles()
+        self._sync_canvas_directional_light_profiles()
+        self._sync_canvas_outer_wall_marking()
+        self.merged_generation_workspace.set_ceiling_height_levels(self.levels, self.current_level.index)
+        self._reconcile_surface_assignments_with_scene(emit_signals=False)
+        self._refresh_scene_atlas_texture_requirements()
+
+    # ### API/model plan correction ###
+    def _handle_api_image_correction_clicked(self) -> None:
+        """Correct every loaded plan as one atomic, metric-aware batch."""
+
+        if (
+            self._is_shutdown
+            or self._plan_image_correction_runtimes
+            or self._retired_plan_image_correction_threads
+        ):
             return
         self.canvas.stop_plan_image_erasing()
-        level = self.current_level
-        if level.index in self._plan_image_correction_runtimes:
-            return
-        source_path = self._get_plan_correction_source_path(level)
-        source_revision = _build_local_file_revision(source_path)
-        if source_path is None or not _local_file_revision_has_file(source_revision):
+        correction_inputs: list[
+            tuple[LevelData, Path, tuple[object, ...]]
+        ] = []
+        for level in self.levels:
+            source_path = self._get_plan_correction_source_path(level)
+            source_revision = _build_local_file_revision(source_path)
+            if source_path is None or not _local_file_revision_has_file(
+                source_revision
+            ):
+                continue
+            correction_inputs.append(
+                (level, Path(str(source_revision[0])), source_revision)
+            )
+        if not correction_inputs:
             QMessageBox.warning(
                 self,
                 "Image correction unavailable",
                 "Load a valid plan image before correcting it.",
             )
             return
-        if self._level_has_plan_dependent_geometry(level):
+
+        self._prepare_plan_correction_geometry()
+        blocked_levels = tuple(
+            (level, blockers)
+            for level, _source_path, _source_revision in correction_inputs
+            if (blockers := self._get_plan_correction_blockers(level))
+        )
+        if blocked_levels:
+            if len(correction_inputs) == 1:
+                warning_message = self._build_plan_correction_blocker_message(
+                    blocked_levels[0][0],
+                    blocked_levels[0][1],
+                )
+            else:
+                warning_message = (
+                    self._build_plan_correction_batch_blocker_message(
+                        blocked_levels
+                    )
+                )
             QMessageBox.warning(
                 self,
                 "Image correction unavailable",
-                "Correct the plan image before adding walls, openings, stairs, "
-                "open spaces, or editable surfaces to this level.",
+                warning_message,
+            )
+            return
+
+        loaded_level_indices = {
+            level.index for level, _source_path, _revision in correction_inputs
+        }
+        wall_preview = self._plan_wall_preview_session
+        wall_work_is_active = bool(
+            loaded_level_indices.intersection(self._plan_wall_detection_runtimes)
+            or (
+                wall_preview is not None
+                and wall_preview.level_index in loaded_level_indices
+            )
+        )
+        if wall_work_is_active:
+            QMessageBox.warning(
+                self,
+                "Image correction unavailable",
+                "Finish or cancel wall generation before correcting the plans.",
             )
             return
 
@@ -21598,58 +22114,131 @@ class BlueprintWorkspace(QWidget):
                 )
                 return
 
-        source_path = Path(str(source_revision[0]))
+        plan_ids = tuple(
+            f"level-{level.index}"
+            for level, _source_path, _source_revision in correction_inputs
+        )
+        metric_analyzer = create_multi_plan_measurement_analyzer(
+            correction_model,
+            api_key=api_key,
+        )
+        metric_coordinator = PlanMetricBatchCoordinator(
+            plan_ids,
+            metric_analyzer,
+        )
+        alignment_coordinator: PlanCorrectionAlignmentCoordinator | None = None
+        if len(correction_inputs) > 1:
+            loaded_level_indices = tuple(
+                level.index for level, _path, _revision in correction_inputs
+            )
+            anchor_level_index = (
+                GROUND_LEVEL_INDEX
+                if GROUND_LEVEL_INDEX in loaded_level_indices
+                else min(
+                    loaded_level_indices,
+                    key=lambda level_index: (
+                        abs(level_index - GROUND_LEVEL_INDEX),
+                        level_index,
+                    ),
+                )
+            )
+            alignment_coordinator = PlanCorrectionAlignmentCoordinator(
+                tuple(
+                    PlanCorrectionAlignmentLevel(
+                        level_index=level.index,
+                        canvas_level_scale=float(level.canvas_level_scale),
+                        canvas_offset_x_pixels=float(
+                            level.canvas_offset_x_pixels
+                        ),
+                        canvas_offset_y_pixels=float(
+                            level.canvas_offset_y_pixels
+                        ),
+                    )
+                    for level, _path, _revision in correction_inputs
+                ),
+                anchor_level_index=anchor_level_index,
+                viewport_size=self.canvas.get_plan_alignment_viewport_size(),
+            )
+        self._plan_image_correction_batch = _PlanImageCorrectionBatchRuntime(
+            level_indices=tuple(
+                level.index
+                for level, _source_path, _source_revision in correction_inputs
+            ),
+            metric_coordinator=metric_coordinator,
+            completed_results={},
+            alignment_coordinator=alignment_coordinator,
+        )
         correction_directory = (
             self._application_settings.path.parent / "corrected_plans"
         )
-        output_path = (
-            correction_directory
-            / f"corrected-plan-L{level.index}-{uuid.uuid4().hex}.png"
-        )
-        thread = _PlanImageCorrectionThread(
-            source_path,
-            output_path,
-            api_key,
-            correction_model,
-            parent=self,
-            make_walls_continuous=service_settings.make_walls_continuous,
-        )
-        job = self.job_manager.create_job(
-            kind="Image correction",
-            requested_name="",
-            default_name=f"Correct {level.display_name} plan",
-            stage="Preparing plan image (0%)",
-        )
-        runtime = _PlanImageCorrectionRuntime(
-            source_path=source_path,
-            source_revision=source_revision,
-            output_path=output_path,
-            job_id=job.job_id,
-            thread=thread,
-        )
-        self._plan_image_correction_runtimes[level.index] = runtime
-        self.job_manager.set_cancel_callback(
-            job.job_id,
-            partial(self._cancel_plan_image_correction_for_level, level.index),
-        )
-        thread.progress.connect(
-            partial(
-                self._handle_plan_image_correction_progress,
-                level.index,
-                job.job_id,
+        for plan_id, (level, source_path, source_revision) in zip(
+            plan_ids,
+            correction_inputs,
+            strict=True,
+        ):
+            output_path = (
+                correction_directory
+                / f"corrected-plan-L{level.index}-{uuid.uuid4().hex}.png"
             )
-        )
-        thread.finished.connect(
-            partial(
-                self._handle_plan_image_correction_finished,
-                level.index,
-                job.job_id,
-                thread,
+            thread = _PlanImageCorrectionThread(
+                source_path,
+                output_path,
+                api_key,
+                correction_model,
+                parent=self,
+                make_walls_continuous=(
+                    service_settings.make_walls_continuous
+                ),
             )
-        )
+            thread.set_metric_normalizer(
+                partial(metric_coordinator.normalize, plan_id)
+            )
+            if alignment_coordinator is not None:
+                thread.set_alignment_coordinator(
+                    alignment_coordinator,
+                    level.index,
+                )
+            job = self.job_manager.create_job(
+                kind="Image correction",
+                requested_name="",
+                default_name=f"Correct {level.display_name} plan",
+                stage="Preparing plan image (0%)",
+            )
+            runtime = _PlanImageCorrectionRuntime(
+                source_path=source_path,
+                source_revision=source_revision,
+                output_path=output_path,
+                job_id=job.job_id,
+                thread=thread,
+                level_transform_revision=_build_plan_transform_revision(level),
+            )
+            self._plan_image_correction_runtimes[level.index] = runtime
+            self.job_manager.set_cancel_callback(
+                job.job_id,
+                partial(
+                    self._cancel_plan_image_correction_for_level,
+                    level.index,
+                ),
+            )
+            thread.progress.connect(
+                partial(
+                    self._handle_plan_image_correction_progress,
+                    level.index,
+                    job.job_id,
+                )
+            )
+            thread.finished.connect(
+                partial(
+                    self._handle_plan_image_correction_finished,
+                    level.index,
+                    job.job_id,
+                    thread,
+                )
+            )
         self._update_image_correction_button_state()
         self._update_plan_wall_generation_controls_state()
-        thread.start()
+        for runtime in tuple(self._plan_image_correction_runtimes.values()):
+            runtime.thread.start()
 
     @staticmethod
     def _get_plan_correction_source_path(level: LevelData) -> Path | None:
@@ -21661,22 +22250,77 @@ class BlueprintWorkspace(QWidget):
         except (OSError, RuntimeError, ValueError):
             return None
 
+    def _get_plan_correction_blockers(
+        self,
+        level: LevelData,
+    ) -> tuple[tuple[int, str, str], ...]:
+        """Return counted coordinate-dependent records that prevent correction."""
+
+        connected_stair_count = sum(
+            stair.start_level_index == level.index
+            or stair.end_level_index == level.index
+            for stair in self.stairs
+        )
+        candidates = (
+            (len(level.vertex_data.vertices), "wall vertex", "wall vertices"),
+            (len(level.vertex_data.edges), "wall segment", "wall segments"),
+            (len(level.rooms), "legacy room", "legacy rooms"),
+            (len(level.doorways), "doorway", "doorways"),
+            (len(level.windows), "window frame", "window frames"),
+            (len(level.open_spaces), "open space", "open spaces"),
+            (
+                len(level.editable_surfaces),
+                "editable surface",
+                "editable surfaces",
+            ),
+            (connected_stair_count, "connected stair", "connected stairs"),
+        )
+        return tuple(candidate for candidate in candidates if candidate[0] > 0)
+
     def _level_has_plan_dependent_geometry(self, level: LevelData) -> bool:
         """Return whether changing this level's image coordinates is unsafe."""
 
-        return bool(
-            level.vertex_data.vertices
-            or level.vertex_data.edges
-            or level.rooms
-            or level.doorways
-            or level.windows
-            or level.open_spaces
-            or level.editable_surfaces
-            or any(
-                stair.start_level_index == level.index
-                or stair.end_level_index == level.index
-                for stair in self.stairs
+        return bool(self._get_plan_correction_blockers(level))
+
+    @staticmethod
+    def _build_plan_correction_blocker_message(
+        level: LevelData,
+        blockers: tuple[tuple[int, str, str], ...],
+    ) -> str:
+        """Explain exactly which retained records must be removed first."""
+
+        blocker_lines = "\n".join(
+            f"- {count} {singular if count == 1 else plural}"
+            for count, singular, plural in blockers
+        )
+        return (
+            "Image correction would change the plan coordinate system. Remove "
+            f"the following items from {level.display_name} before correcting it:\n\n"
+            f"{blocker_lines}\n\n"
+            "Reloading the plan image does not remove level geometry."
+        )
+
+    @staticmethod
+    def _build_plan_correction_batch_blocker_message(
+        blocked_levels: Sequence[
+            tuple[LevelData, tuple[tuple[int, str, str], ...]]
+        ],
+    ) -> str:
+        """Explain every loaded level that prevents an atomic batch."""
+
+        sections: list[str] = []
+        for level, blockers in blocked_levels:
+            lines = "\n".join(
+                f"- {count} {singular if count == 1 else plural}"
+                for count, singular, plural in blockers
             )
+            sections.append(f"{level.display_name}:\n{lines}")
+        joined_sections = "\n\n".join(sections)
+        return (
+            "Image correction would change the plan coordinate system. Remove "
+            "the following items before correcting the loaded plans:\n\n"
+            f"{joined_sections}\n\n"
+            "Reloading a plan image does not remove level geometry."
         )
 
     def _handle_plan_image_correction_progress(
@@ -21706,9 +22350,10 @@ class BlueprintWorkspace(QWidget):
         job_id: str,
         thread: _PlanImageCorrectionThread,
     ) -> None:
-        """Commit a correction only when its source and level are unchanged."""
+        """Stage one result and commit only after the whole batch succeeds."""
 
         runtime = self._plan_image_correction_runtimes.get(level_index)
+        batch = self._plan_image_correction_batch
         try:
             if (
                 runtime is None
@@ -21716,47 +22361,219 @@ class BlueprintWorkspace(QWidget):
                 or runtime.thread is not thread
             ):
                 return
-            self._plan_image_correction_runtimes.pop(level_index, None)
-            self.job_manager.set_cancel_callback(job_id, None)
             if self._is_shutdown or runtime.cancel_requested or thread.was_cancelled:
-                self.job_manager.mark_cancelled(job_id)
-                self._discard_plan_correction_output(runtime.output_path)
+                self._abort_plan_image_correction_batch(cancelled=True)
                 return
             if thread.error_message is not None or thread.result is None:
                 message = thread.error_message or (
                     "Image correction finished without returning an image."
                 )
-                self.job_manager.fail_job(job_id, f"Failed: {message}")
-                self._discard_plan_correction_output(runtime.output_path)
+                self._abort_plan_image_correction_batch(
+                    failed_level_index=level_index,
+                    failure_message=message,
+                )
                 QMessageBox.critical(self, "Image correction failed", message)
                 return
 
-            level = self._get_level_by_index(level_index)
-            if not self._plan_image_correction_context_is_current(level, runtime):
-                message = (
-                    "The plan or level changed while it was being corrected. "
-                    "The generated image was not applied."
+            if batch is None or level_index not in batch.level_indices:
+                self._abort_plan_image_correction_batch(
+                    failed_level_index=level_index,
+                    failure_message="The image correction batch is no longer active.",
                 )
-                self.job_manager.fail_job(job_id, f"Failed: {message}")
-                self._discard_plan_correction_output(runtime.output_path)
+                return
+            batch.completed_results[level_index] = thread.result
+            self.job_manager.update_job(
+                job_id,
+                stage="Corrected plan ready; waiting for the batch (100%)",
+                progress=100,
+            )
+            if len(batch.completed_results) < len(batch.level_indices):
+                return
+
+            invalid_level_indices = tuple(
+                candidate_level_index
+                for candidate_level_index in batch.level_indices
+                if not self._plan_image_correction_context_is_current(
+                    self._get_level_by_index(candidate_level_index),
+                    self._plan_image_correction_runtimes[
+                        candidate_level_index
+                    ],
+                )
+            )
+            if invalid_level_indices:
+                message = (
+                    "A plan or level changed while the plans were being "
+                    "corrected. The correction batch was not applied."
+                )
+                self._abort_plan_image_correction_batch(
+                    failed_level_index=invalid_level_indices[0],
+                    failure_message=message,
+                )
                 QMessageBox.warning(self, "Image correction not applied", message)
                 return
 
-            assert level is not None
-            self._apply_plan_image_correction_result(level, runtime, thread.result)
-            if thread.result.method in {
-                CORRECTION_METHOD_OPENAI,
-                CORRECTION_METHOD_QWEN,
-            }:
-                model_label = plan_correction_model_label(thread.model)
-                completion_stage = f"{model_label} plan correction completed"
-            else:
-                completion_stage = "Plan correction completed"
-            self.job_manager.complete_job(job_id, completion_stage)
+            runtimes = {
+                candidate_level_index: self._plan_image_correction_runtimes[
+                    candidate_level_index
+                ]
+                for candidate_level_index in batch.level_indices
+            }
+            results = dict(batch.completed_results)
+            alignment_outcome = (
+                batch.alignment_coordinator.outcome
+                if batch.alignment_coordinator is not None
+                else None
+            )
+            self._plan_image_correction_runtimes.clear()
+            self._plan_image_correction_batch = None
+            for candidate_runtime in runtimes.values():
+                self.job_manager.set_cancel_callback(
+                    candidate_runtime.job_id,
+                    None,
+                )
+
+            ordered_level_indices = tuple(
+                candidate_level_index
+                for candidate_level_index in batch.level_indices
+                if self._get_level_by_index(candidate_level_index)
+                is not self.current_level
+            ) + tuple(
+                candidate_level_index
+                for candidate_level_index in batch.level_indices
+                if self._get_level_by_index(candidate_level_index)
+                is self.current_level
+            )
+            metric_warnings: list[str] = []
+            current_metric_status = ""
+            for candidate_level_index in ordered_level_indices:
+                level = self._get_level_by_index(candidate_level_index)
+                assert level is not None
+                candidate_runtime = runtimes[candidate_level_index]
+                result = results[candidate_level_index]
+                self._apply_plan_image_correction_result(
+                    level,
+                    candidate_runtime,
+                    result,
+                )
+                metric_status = self._complete_plan_image_correction_job(
+                    candidate_runtime,
+                    result,
+                )
+                if level is self.current_level:
+                    current_metric_status = metric_status
+                if result.metric_warning:
+                    metric_warnings.append(
+                        f"{level.display_name}: {result.metric_warning}"
+                    )
+            aligned_level_count, alignment_warning = (
+                self._apply_plan_image_correction_alignment(
+                    alignment_outcome,
+                )
+            )
+            if current_metric_status:
+                status_parts = [
+                    "Plan image corrected.",
+                    f"{current_metric_status.capitalize()}.",
+                ]
+                if (
+                    alignment_outcome is not None
+                    and alignment_outcome.result is not None
+                ):
+                    status_parts.append(
+                        f"Aligned {aligned_level_count} level"
+                        f"{'s' if aligned_level_count != 1 else ''} from "
+                        "structural cues."
+                    )
+                if alignment_warning:
+                    status_parts.append(alignment_warning)
+                self.viewer.set_surface_tools_status(" ".join(status_parts))
+            if metric_warnings:
+                QMessageBox.warning(
+                    self,
+                    "Plans corrected without complete metric calibration",
+                    "The corrected plans were kept, but some metric scales "
+                    "could not be normalized.\n\n"
+                    + "\n".join(metric_warnings),
+                )
+            for candidate_runtime in runtimes.values():
+                if candidate_runtime.thread is not thread:
+                    candidate_runtime.thread.deleteLater()
         finally:
+            self._retired_plan_image_correction_threads.discard(thread)
             self._update_image_correction_button_state()
             self._update_plan_wall_generation_controls_state()
-            thread.deleteLater()
+            if level_index not in self._plan_image_correction_runtimes:
+                thread.deleteLater()
+
+    def _complete_plan_image_correction_job(
+        self,
+        runtime: _PlanImageCorrectionRuntime,
+        result: PlanImageCorrectionResult,
+    ) -> str:
+        """Complete one batch member and return its concise metric status."""
+
+        if result.method in {
+            CORRECTION_METHOD_OPENAI,
+            CORRECTION_METHOD_QWEN,
+        }:
+            model_label = plan_correction_model_label(runtime.thread.model)
+            completion_stage = f"{model_label} plan correction completed"
+        else:
+            completion_stage = "Plan correction completed"
+        metric_status = _build_plan_metric_status_text(
+            result.metric_calibration,
+            include_density=False,
+        )
+        completion_stage = f"{completion_stage}; {metric_status}"
+        if result.metric_warning:
+            completion_stage = f"{completion_stage}: {result.metric_warning}"
+        self.job_manager.complete_job(runtime.job_id, completion_stage)
+        return metric_status
+
+    def _abort_plan_image_correction_batch(
+        self,
+        *,
+        cancelled: bool = False,
+        failed_level_index: int | None = None,
+        failure_message: str = "",
+    ) -> None:
+        """Cancel every peer and discard every staged output atomically."""
+
+        batch = self._plan_image_correction_batch
+        if batch is not None:
+            batch.metric_coordinator.cancel()
+            if batch.alignment_coordinator is not None:
+                batch.alignment_coordinator.cancel()
+        runtimes = tuple(self._plan_image_correction_runtimes.items())
+        self._plan_image_correction_runtimes.clear()
+        self._plan_image_correction_batch = None
+        for candidate_level_index, candidate_runtime in runtimes:
+            self.job_manager.set_cancel_callback(
+                candidate_runtime.job_id,
+                None,
+            )
+            candidate_runtime.cancel_requested = cancelled
+            if candidate_runtime.thread.isRunning():
+                candidate_runtime.thread.requestInterruption()
+                self._retired_plan_image_correction_threads.add(
+                    candidate_runtime.thread
+                )
+            else:
+                candidate_runtime.thread.deleteLater()
+            self._discard_plan_correction_output(candidate_runtime.output_path)
+            if cancelled:
+                self.job_manager.mark_cancelled(candidate_runtime.job_id)
+            elif candidate_level_index == failed_level_index:
+                self.job_manager.fail_job(
+                    candidate_runtime.job_id,
+                    f"Failed: {failure_message}",
+                )
+            else:
+                self.job_manager.fail_job(
+                    candidate_runtime.job_id,
+                    "Failed: Image correction batch was not applied because "
+                    "another plan failed.",
+                )
 
     def _plan_image_correction_context_is_current(
         self,
@@ -21767,6 +22584,12 @@ class BlueprintWorkspace(QWidget):
             return False
         source_path = self._get_plan_correction_source_path(level)
         if source_path != runtime.source_path:
+            return False
+        if (
+            runtime.level_transform_revision
+            and _build_plan_transform_revision(level)
+            != runtime.level_transform_revision
+        ):
             return False
         return _build_local_file_revision(source_path) == runtime.source_revision
 
@@ -21782,23 +22605,85 @@ class BlueprintWorkspace(QWidget):
             self._set_current_level_image(
                 corrected_path,
                 original_image_path=source_path,
+                plan_metric_calibration=result.metric_calibration,
             )
+            if result.metric_calibration is not None:
+                level.scale = DEFAULT_LEVEL_SCALE
+            self._sync_level_controls()
             return
         level.image_path = corrected_path
         level.original_image_path = source_path
         level.image_size_pixels = tuple(float(value) for value in result.output_size)
+        level.plan_metric_calibration = result.metric_calibration
+        level.external_plan_correction = None
+        level.plan_meters_per_pixel = (
+            result.metric_calibration.target_meters_per_pixel
+            if result.metric_calibration is not None else None
+        )
+        if result.metric_calibration is not None:
+            level.scale = DEFAULT_LEVEL_SCALE
+        merged_workspace = getattr(self, "merged_generation_workspace", None)
+        if merged_workspace is not None:
+            merged_workspace.set_ceiling_height_levels(
+                self.levels,
+                self.current_level.index,
+            )
+
+    def _apply_plan_image_correction_alignment(
+        self,
+        outcome: PlanCorrectionAlignmentOutcome | None,
+    ) -> tuple[int, str]:
+        """Apply best-effort Canvas X/Y registration without changing scale."""
+
+        if outcome is None:
+            return 0, ""
+        if outcome.result is None:
+            return 0, outcome.warning
+
+        applied_level_count = 0
+        current_level_changed = False
+        for transform in outcome.result.transforms:
+            level = self._get_level_by_index(transform.level_index)
+            if level is None:
+                continue
+            level.canvas_offset_x_pixels = transform.canvas_offset_x_pixels
+            level.canvas_offset_y_pixels = transform.canvas_offset_y_pixels
+            if transform.level_index != outcome.result.anchor_level_index:
+                applied_level_count += 1
+            current_level_changed = current_level_changed or (
+                level is self.current_level
+            )
+
+        if current_level_changed:
+            self.canvas.set_canvas_level_offsets(
+                self.current_level.canvas_offset_x_pixels,
+                self.current_level.canvas_offset_y_pixels,
+            )
+            self._sync_level_controls()
+        return applied_level_count, outcome.warning
 
     def _cancel_plan_image_correction_for_level(self, level_index: int) -> bool:
         runtime = self._plan_image_correction_runtimes.get(int(level_index))
-        if runtime is None or not runtime.thread.isRunning():
+        batch = self._plan_image_correction_batch
+        if runtime is None or batch is None:
             return False
-        runtime.cancel_requested = True
-        runtime.thread.requestInterruption()
+        batch.metric_coordinator.cancel()
+        if batch.alignment_coordinator is not None:
+            batch.alignment_coordinator.cancel()
+        for candidate_runtime in self._plan_image_correction_runtimes.values():
+            candidate_runtime.cancel_requested = True
+            if candidate_runtime.thread.isRunning():
+                candidate_runtime.thread.requestInterruption()
         self._update_image_correction_button_state()
         return True
 
     def _cancel_and_join_plan_image_corrections(self) -> None:
         runtimes = tuple(self._plan_image_correction_runtimes.values())
+        batch = self._plan_image_correction_batch
+        if batch is not None:
+            batch.metric_coordinator.cancel()
+            if batch.alignment_coordinator is not None:
+                batch.alignment_coordinator.cancel()
         for runtime in runtimes:
             runtime.cancel_requested = True
             runtime.thread.requestInterruption()
@@ -21808,7 +22693,16 @@ class BlueprintWorkspace(QWidget):
                 runtime.thread.wait(PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS)
             self._discard_plan_correction_output(runtime.output_path)
             runtime.thread.deleteLater()
+        retired_threads = tuple(self._retired_plan_image_correction_threads)
+        for thread in retired_threads:
+            thread.requestInterruption()
+        for thread in retired_threads:
+            while thread.isRunning():
+                thread.wait(PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS)
+            thread.deleteLater()
         self._plan_image_correction_runtimes.clear()
+        self._retired_plan_image_correction_threads.clear()
+        self._plan_image_correction_batch = None
         if hasattr(self, "image_correction_button"):
             self._update_image_correction_button_state()
 
@@ -21822,32 +22716,25 @@ class BlueprintWorkspace(QWidget):
     def _update_image_correction_button_state(self) -> None:
         if not hasattr(self, "image_correction_button"):
             return
-        try:
-            level = self.current_level
-        except IndexError:
+        if not self.levels:
             self.image_correction_button.setEnabled(False)
             self.image_correction_button.setText("Image correction")
             self._update_plan_image_erase_button_state()
             return
-        runtime = self._plan_image_correction_runtimes.get(level.index)
-        wall_runtime = self._plan_wall_detection_runtimes.get(level.index)
-        wall_preview = self._plan_wall_preview_session
-        has_wall_preview = (
-            wall_preview is not None and wall_preview.level_index == level.index
+        batch_is_active = bool(
+            self._plan_image_correction_runtimes
+            or self._retired_plan_image_correction_threads
         )
-        source_path = self._get_plan_correction_source_path(level)
-        has_source = source_path is not None and _local_file_revision_has_file(
-            _build_local_file_revision(source_path)
-        )
+        wall_runtime_is_active = bool(self._plan_wall_detection_runtimes)
+        has_wall_preview = self._plan_wall_preview_session is not None
         self.image_correction_button.setEnabled(
             not self._is_shutdown
-            and has_source
-            and runtime is None
-            and wall_runtime is None
+            and not batch_is_active
+            and not wall_runtime_is_active
             and not has_wall_preview
         )
         self.image_correction_button.setText(
-            "Correcting..." if runtime is not None else "Image correction"
+            "Correcting..." if batch_is_active else "Image correction"
         )
         self._update_plan_image_erase_button_state()
 
@@ -28379,6 +29266,105 @@ class BlueprintWorkspace(QWidget):
         self._pending_wall_vertex_mesh_update = True
         self._restart_pending_wall_vertex_update_if_idle()
 
+    def _remove_canvas_windows_without_host_walls(self) -> tuple[str, ...]:
+        """Remove window frames whose stable wall surface no longer exists."""
+
+        if not any(level.windows for level in self.levels):
+            return ()
+        topology_levels: list[LevelData] = []
+        for level in self.levels:
+            topology_level = copy.copy(level)
+            topology_level.include_in_export = True
+            topology_level.windows = []
+            topology_levels.append(topology_level)
+        try:
+            live_wall_ids = {
+                surface.surface_id
+                for surface in build_base_fixed_surfaces(
+                    topology_levels,
+                    clip_open_spaces=False,
+                    apply_sloped_ceilings=False,
+                )
+                if surface.surface_type == SURFACE_TYPE_WALL
+            }
+        except (RuntimeError, TypeError, ValueError):
+            # A failed topology probe must never turn into destructive cleanup.
+            return ()
+
+        removed_window_ids: set[str] = set()
+        changed_levels: list[LevelData] = []
+        for level in self.levels:
+            retained_windows = [
+                window
+                for window in level.windows
+                if window.wall_surface_id in live_wall_ids
+            ]
+            if len(retained_windows) == len(level.windows):
+                continue
+            removed_window_ids.update(
+                window.window_id
+                for window in level.windows
+                if window.wall_surface_id not in live_wall_ids
+            )
+            level.windows[:] = retained_windows
+            changed_levels.append(level)
+
+        if not removed_window_ids:
+            return ()
+        for level in changed_levels:
+            self._sync_viewer_window_snapshot(level)
+            self._refresh_canvas_windows_for_level(level)
+        if self.canvas.selected_window_id in removed_window_ids:
+            self.canvas._set_selected_window_id(None, notify=False)
+        for window_id in removed_window_ids:
+            self._discard_removed_window_undo_states(window_id)
+        self._sync_canvas_window_undo_availability()
+        return tuple(sorted(removed_window_ids))
+
+    def _cleanup_orphaned_canvas_windows(self) -> tuple[str, ...]:
+        """Detach stale frames and placed fixtures, retaining library assets."""
+
+        removed_window_ids = self._remove_canvas_windows_without_host_walls()
+        if removed_window_ids:
+            library = self.doors_workspace.data()
+            removed_placements = tuple(
+                placement
+                for placement in library.window_placements
+                if placement.window_frame_id in removed_window_ids
+            )
+            self._reconcile_window_placements()
+            self._record_removed_window_placements_for_blueprint_undo(
+                removed_placements
+            )
+        return removed_window_ids
+
+    def _record_removed_window_placements_for_blueprint_undo(
+        self,
+        placements: Sequence[WindowPlacement],
+    ) -> None:
+        """Attach auto-detached fixtures to their wall-deletion undo step."""
+
+        if self._is_restoring_canvas_undo or not placements:
+            return
+        for index in range(len(self._canvas_undo_stack) - 1, -1, -1):
+            state = self._canvas_undo_stack[index]
+            if not isinstance(state, _CanvasBlueprintUndoState):
+                continue
+            if state.snapshot.action_kind != CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION:
+                return
+            placements_by_id = {
+                placement.placement_id: placement
+                for placement in state.removed_window_placements
+            }
+            placements_by_id.update(
+                {placement.placement_id: placement for placement in placements}
+            )
+            self._canvas_undo_stack[index] = replace(
+                state,
+                removed_window_placements=tuple(placements_by_id.values()),
+            )
+            return
+
     def _remove_architectural_trims_without_host_walls(self) -> tuple[str, ...]:
         """Remove trim records whose stable host walls no longer exist."""
 
@@ -28507,6 +29493,7 @@ class BlueprintWorkspace(QWidget):
             self._reconcile_door_placements()
             self._reconcile_window_placements()
         if remove_orphaned_wall_records:
+            self._cleanup_orphaned_canvas_windows()
             self._remove_architectural_trims_without_host_walls()
             self._remove_sloped_ceilings_without_host_walls()
         self._reconcile_canvas_surface_edit_and_refresh()
@@ -28797,6 +29784,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._join_available_door_hardware()
         self._reconcile_door_placements()
+        self._remove_canvas_windows_without_host_walls()
         self._reconcile_window_placements()
         self._refresh_canvas_door_list(
             selected_door_id=self.doors_workspace.selected_door_id()
@@ -28862,7 +29850,31 @@ class BlueprintWorkspace(QWidget):
         file_path: str,
         *,
         original_image_path: str | None = None,
+        plan_metric_calibration: PlanMetricCalibration | None = None,
     ) -> None:
+        external_correction = self.current_level.external_plan_correction
+        use_external = bool(
+            external_correction is not None
+            and original_image_path is None
+            and plan_metric_calibration is None
+            and Path(file_path).name.casefold() == external_correction.image_filename.casefold()
+        )
+        if use_external:
+            # Check the file before settling pending edits. A scale-only import
+            # can retain geometry, but a new raster still needs an empty level.
+            plan_metric_calibration = prepare_external_plan_calibration(external_correction, file_path)
+            self._prepare_plan_correction_geometry()
+            blockers = self._get_plan_correction_blockers(self.current_level)
+            if blockers:
+                if self._external_plan_matches_loaded_coordinates(
+                    self.current_level, external_correction, file_path,
+                ):
+                    self._apply_external_plan_metadata_batch((
+                        (self.current_level, external_correction, True, plan_metric_calibration),
+                    ))
+                    return
+                raise ValueError(self._build_plan_correction_blocker_message(self.current_level, blockers))
+            original_image_path = self.current_level.original_image_path or self.current_level.image_path
         self._cancel_outer_wall_marking_preview()
         active_correction = self._plan_image_correction_runtimes.get(
             self.current_level.index
@@ -28899,7 +29911,27 @@ class BlueprintWorkspace(QWidget):
         self.current_level.original_image_path = str(
             Path(original_image_path or normalized_path).resolve()
         )
+        self.current_level.plan_metric_calibration = plan_metric_calibration
+        self.current_level.plan_meters_per_pixel = (
+            plan_metric_calibration.target_meters_per_pixel
+            if plan_metric_calibration is not None else None
+        )
+        self.current_level.external_plan_correction = external_correction if use_external else None
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
+        self._remember_current_plan_image_revision()
+        if use_external:
+            apply_external_plan_metadata(self.current_level, external_correction, plan_metric_calibration)
+            align_external_plan_levels(self.levels, self.canvas.get_plan_alignment_viewport_size())
+            self.canvas.set_canvas_level_offsets(
+                self.current_level.canvas_offset_x_pixels, self.current_level.canvas_offset_y_pixels,
+            )
+            self._sync_level_controls()
+        merged_workspace = getattr(self, "merged_generation_workspace", None)
+        if merged_workspace is not None:
+            merged_workspace.set_ceiling_height_levels(
+                self.levels,
+                self.current_level.index,
+            )
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_placed_object_profiles()
         self._sync_canvas_directional_light_profiles()
@@ -28945,6 +29977,7 @@ class BlueprintWorkspace(QWidget):
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
+            self._remember_current_plan_image_revision()
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_opening_fixture_keys()
         # Project restore has not installed the incoming Generation data yet.
@@ -28962,6 +29995,13 @@ class BlueprintWorkspace(QWidget):
         self._update_open_space_controls()
         self._update_plan_wall_generation_controls_state()
 
+    def _remember_current_plan_image_revision(self) -> None:
+        """Keep the loaded raster's identity for subsequent metadata imports."""
+
+        revision = self.canvas.get_blueprint_image_revision()
+        if revision is not None:
+            self._level_blueprint_image_revisions[self.current_level.index] = revision
+
     def _update_blueprint_name_label(self) -> None:
         image_path = self.current_level.image_path
         if image_path is None:
@@ -28973,8 +30013,37 @@ class BlueprintWorkspace(QWidget):
             original_path = self.current_level.original_image_path
             if original_path and Path(original_path) != Path(image_path):
                 label_text += f" (corrected from {Path(original_path).name})"
+            label_text += " — " + _build_plan_metric_status_text(
+                self.current_level.plan_metric_calibration,
+                include_density=True,
+            )
 
+        correction = self.current_level.external_plan_correction
+        imported_tooltip = ""
+        if correction is not None:
+            if matches_external_plan_image(correction, image_path, self.current_level.image_size_pixels):
+                imported_tooltip = (
+                    "Imported ChatGPT correction. Its scale/confidence is supplied by "
+                    "the JSON, not independently verified by HouseMaker.\n" + correction.notes
+                )
+                if self.current_level.plan_metric_calibration is None and correction.meters_per_pixel is not None:
+                    label_text = label_text.replace(
+                        "metric scale uncalibrated",
+                        f"imported scale {correction.meters_per_pixel:g} m/pixel ({correction.confidence} confidence)",
+                    )
+            else:
+                label_text += f" — awaiting {correction.image_filename}"
+                imported_tooltip = (
+                    "Imported correction is waiting for this level's matching corrected "
+                    "image. Load it using Load plan image without renaming or resizing it."
+                )
         self.blueprint_name_label.setText(label_text)
+        self.blueprint_name_label.setToolTip(
+            _build_plan_metric_evidence_tooltip(
+                self.current_level.plan_metric_calibration
+            )
+            + ("\n\n" + imported_tooltip if imported_tooltip else "")
+        )
         self._update_image_correction_button_state()
 
 

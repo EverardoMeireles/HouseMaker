@@ -7,6 +7,12 @@ import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from housemaker.plan_metric_state import PlanMetricCalibration
+
+if TYPE_CHECKING:
+    from housemaker.plan_correction_exchange import ExternalPlanCorrection
 
 # ### Constants ###
 DEFAULT_LEVEL_HEIGHT_METERS = 3.0
@@ -1909,12 +1915,40 @@ class LevelData:
     editable_surfaces: list[EditableSurfaceMeshData] = field(default_factory=list)
     flipped_surface_ids: set[str] = field(default_factory=set)
     original_image_path: str | None = None
+    plan_metric_calibration: PlanMetricCalibration | None = None
     architectural_trims: list[ArchitecturalTrimData] = field(default_factory=list)
     sloped_ceilings: list[SlopedCeilingData] = field(default_factory=list)
+    plan_meters_per_pixel: float | None = None
+    external_plan_correction: ExternalPlanCorrection | None = None
 
     @property
     def display_name(self) -> str:
         return f"L{self.index} {self.name}"
+
+    @property
+    def meters_per_pixel(self) -> float:
+        """Metric density of this level's currently stored plan raster.
+
+        Older calibrated projects already resized their rasters and therefore
+        retain their saved target density. New calibrations preserve the raster
+        and store its measured density as the target. The authored density also
+        survives missing or edited image evidence. Never-calibrated plans keep
+        the historical conversion; manual level scale is applied separately.
+        """
+
+        calibration = self.plan_metric_calibration
+        if calibration is not None:
+            return calibration.target_meters_per_pixel
+        if self.plan_meters_per_pixel is None:
+            return PIXEL_TO_METER
+        density = float(self.plan_meters_per_pixel)
+        if (
+            isinstance(self.plan_meters_per_pixel, bool)
+            or not math.isfinite(density)
+            or density <= 0
+        ):
+            raise ValueError("Plan metres per pixel must be a finite positive number.")
+        return density
 
 
 # ### Doorway validation helpers ###

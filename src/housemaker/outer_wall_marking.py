@@ -11,7 +11,6 @@ from shapely import LineString, Point, Polygon
 from housemaker.models import (
     MAX_LEVEL_INDEX,
     MIN_LEVEL_INDEX,
-    PIXEL_TO_METER,
     LevelData,
     VertexData,
 )
@@ -488,7 +487,7 @@ def _image_to_raw_level_point(
         image_width, image_height = level.image_size_pixels
         centered_x -= float(image_width) / 2.0
         centered_y -= float(image_height) / 2.0
-    return centered_x * PIXEL_TO_METER, -centered_y * PIXEL_TO_METER
+    return centered_x * level.meters_per_pixel, -centered_y * level.meters_per_pixel
 
 
 def _raw_level_to_image_point(
@@ -496,8 +495,8 @@ def _raw_level_to_image_point(
     raw_x: float,
     raw_y: float,
 ) -> tuple[float, float]:
-    image_x = raw_x / PIXEL_TO_METER
-    image_y = -raw_y / PIXEL_TO_METER
+    image_x = raw_x / level.meters_per_pixel
+    image_y = -raw_y / level.meters_per_pixel
     if level.image_size_pixels is not None:
         image_width, image_height = level.image_size_pixels
         image_x += float(image_width) / 2.0

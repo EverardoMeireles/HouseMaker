@@ -26,7 +26,9 @@ from housemaker.plan_image_correction import (
     CORRECTION_METHOD_OPENAI,
     CORRECTION_METHOD_QWEN,
     PLAN_CORRECTION_PROMPT,
+    PLAN_MEASUREMENT_PRESERVING_CORRECTION_PROMPT,
     STAGE_COMPLETE,
+    STAGE_MEASUREMENT_REFERENCE,
     STAGE_SAVING,
     STAGE_WALL_CONTINUITY,
     PlanImageCorrectionCancelled,
@@ -88,6 +90,16 @@ class RecordingEditor:
     def __call__(self, image_bytes: bytes, **kwargs: object) -> bytes:
         self.calls.append({"image_bytes": image_bytes, **kwargs})
         return self.result
+
+
+class SequentialRecordingEditor:
+    def __init__(self, results: list[bytes]) -> None:
+        self.results = list(results)
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, image_bytes: bytes, **kwargs: object) -> bytes:
+        self.calls.append({"image_bytes": image_bytes, **kwargs})
+        return self.results[len(self.calls) - 1]
 
 
 class FakeResponse:
@@ -218,6 +230,96 @@ class PlanImageCorrectionPipelineTests(unittest.TestCase):
         self.assertIn("non-measurement room or feature label", normalized)
         self.assertNotIn("labels, dimensions", normalized)
         self.assertNotIn("changed dimensions", normalized)
+
+    def test_measurement_prepass_rectifies_before_annotations_are_removed(
+        self,
+    ) -> None:
+        expected_size = calculate_output_size(640, 480)
+        reference = correction._fit_complete_image(self.plan, expected_size)
+        reference[50:65, 70:85] = (18, 92, 173)
+        cleaned = reference.copy()
+        cleaned[50:65, 70:85] = 255
+        editor = SequentialRecordingEditor(
+            [_png_bytes(reference), _png_bytes(cleaned)]
+        )
+        metric_inputs: dict[str, np.ndarray] = {}
+
+        def record_metric_inputs(
+            original_image: np.ndarray,
+            corrected_image: np.ndarray,
+            *,
+            measurement_reference_image: np.ndarray | None = None,
+            cancellation_check=None,
+        ):
+            del cancellation_check
+            metric_inputs["original"] = original_image.copy()
+            metric_inputs["corrected"] = corrected_image.copy()
+            assert measurement_reference_image is not None
+            metric_inputs["reference"] = measurement_reference_image.copy()
+            raise correction.PlanMetricCalibrationError("Expected test warning.")
+
+        result = correct_plan_image(
+            self.input_path,
+            self.output_path,
+            api_key="test-key",
+            image_editor=editor,
+            metric_normalizer=record_metric_inputs,
+        )
+
+        self.assertEqual(len(editor.calls), 2)
+        self.assertEqual(
+            editor.calls[0]["prompt"],
+            PLAN_MEASUREMENT_PRESERVING_CORRECTION_PROMPT,
+        )
+        self.assertEqual(editor.calls[1]["prompt"], PLAN_CORRECTION_PROMPT)
+        second_input = cv2.imdecode(
+            np.frombuffer(editor.calls[1]["image_bytes"], dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        np.testing.assert_array_equal(second_input, reference)
+        np.testing.assert_array_equal(metric_inputs["original"], self.plan)
+        np.testing.assert_array_equal(metric_inputs["reference"], reference)
+        np.testing.assert_array_equal(metric_inputs["corrected"], cleaned)
+        self.assertIn(STAGE_MEASUREMENT_REFERENCE, result.stages)
+        self.assertEqual(result.metric_warning, "Expected test warning.")
+
+    def test_measurement_prepass_prompt_preserves_printed_dimensions(self) -> None:
+        normalized = " ".join(
+            PLAN_MEASUREMENT_PRESERVING_CORRECTION_PROMPT.casefold().split()
+        )
+        self.assertIn("retaining every printed measurement annotation", normalized)
+        self.assertIn("copy printed measurement text verbatim", normalized)
+        self.assertIn(
+            "do not reinterpret, replace, round, invent, or delete",
+            normalized,
+        )
+
+    def test_cancellation_between_correction_passes_preserves_output(self) -> None:
+        previous = b"previous output"
+        self.output_path.write_bytes(previous)
+        expected_size = calculate_output_size(640, 480)
+        reference = correction._fit_complete_image(self.plan, expected_size)
+        editor = RecordingEditor(_png_bytes(reference))
+        cancelled = False
+
+        def on_progress(update) -> None:
+            nonlocal cancelled
+            if update.stage == correction.STAGE_AI_CORRECTION:
+                cancelled = True
+
+        with self.assertRaises(PlanImageCorrectionCancelled):
+            correct_plan_image(
+                self.input_path,
+                self.output_path,
+                api_key="test-key",
+                image_editor=editor,
+                metric_normalizer=lambda *_args, **_kwargs: None,
+                progress_callback=on_progress,
+                cancellation_check=lambda: cancelled,
+            )
+
+        self.assertEqual(len(editor.calls), 1)
+        self.assertEqual(self.output_path.read_bytes(), previous)
 
     def test_missing_key_fails_without_writing_an_output(self) -> None:
         for model in OPENAI_PLAN_CORRECTION_MODELS:

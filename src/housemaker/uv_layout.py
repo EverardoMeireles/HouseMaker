@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import random
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import shapely
 from shapely import LineString, Point, Polygon
@@ -91,8 +91,10 @@ def build_uv_wall_layout(
     room: RoomData,
     vertex_data: VertexData,
     wall_height_meters: float,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> UvLayout:
-    walls = build_room_walls(room, vertex_data)
+    walls = _build_room_uv_walls(room, vertex_data, meters_per_pixel)
     return _build_uv_wall_layout_for_size(
         walls=walls,
         map_width=float(room.uv_map_width),
@@ -111,8 +113,12 @@ def calculate_unoccupied_uv_pixels(
     room: RoomData,
     vertex_data: VertexData,
     wall_height_meters: float,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> int:
-    layout = build_uv_wall_layout(room, vertex_data, wall_height_meters)
+    layout = build_uv_wall_layout(
+        room, vertex_data, wall_height_meters, meters_per_pixel=meters_per_pixel
+    )
     map_area = max(1.0, float(room.uv_map_width)) * max(
         1.0,
         float(room.uv_map_height),
@@ -131,8 +137,10 @@ def optimize_room_wall_uvs(
     use_complex_optimization: bool = False,
     use_subdivision_optimization: bool = False,
     complex_optimization_passes: int = 1,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> UvOptimizationResult:
-    walls = build_room_walls(room, vertex_data)
+    walls = _build_room_uv_walls(room, vertex_data, meters_per_pixel)
     if not walls:
         return UvOptimizationResult(
             wall_uv_rotations={},
@@ -228,11 +236,13 @@ def rebuild_room_subdivision_uvs(
     room: RoomData,
     vertex_data: VertexData,
     wall_height_meters: float,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> UvOptimizationResult | None:
     if not room.wall_subdivisions:
         return None
 
-    walls = build_room_walls(room, vertex_data)
+    walls = _build_room_uv_walls(room, vertex_data, meters_per_pixel)
     if not walls:
         return None
 
@@ -1095,8 +1105,10 @@ def calculate_minimum_uv_map_size(
     room: RoomData,
     vertex_data: VertexData,
     wall_height_meters: float,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> tuple[int, int]:
-    walls = build_room_walls(room, vertex_data)
+    walls = _build_room_uv_walls(room, vertex_data, meters_per_pixel)
     if not walls:
         return DEFAULT_UV_MAP_WIDTH, DEFAULT_UV_MAP_HEIGHT
 
@@ -1135,11 +1147,14 @@ def initialize_room_uv_map_size(
     room: RoomData,
     vertex_data: VertexData,
     wall_height_meters: float,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> None:
     uv_map_width, uv_map_height = calculate_minimum_uv_map_size(
         room=room,
         vertex_data=vertex_data,
         wall_height_meters=wall_height_meters,
+        meters_per_pixel=meters_per_pixel,
     )
     room.uv_map_width = uv_map_width
     room.uv_map_height = uv_map_height
@@ -1197,6 +1212,31 @@ def get_room_wall_keys(
 
 
 # ### Layout helpers ###
+def _build_room_uv_walls(
+    room: RoomData,
+    vertex_data: VertexData,
+    meters_per_pixel: float,
+) -> list[RoomWall]:
+    """Keep UV density physical without changing original image coordinates.
+
+    Layout dimensions use the historical texture-pixel density on both axes.
+    Only the wall's layout length is converted; its endpoints stay in the plan's
+    native pixels for surface reconstruction and doorway clipping.
+    """
+
+    if (
+        isinstance(meters_per_pixel, bool)
+        or not math.isfinite(meters_per_pixel)
+        or meters_per_pixel <= 0.0
+    ):
+        raise ValueError("UV layout requires a finite positive metres-per-pixel value.")
+    density_scale = meters_per_pixel / PIXEL_TO_METER
+    return [
+        replace(wall, length=wall.length * density_scale)
+        for wall in build_room_walls(room, vertex_data)
+    ]
+
+
 def _build_uv_wall_layout_for_size(
     walls: list[RoomWall],
     map_width: float,

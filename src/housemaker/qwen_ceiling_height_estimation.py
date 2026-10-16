@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -103,12 +103,14 @@ class QwenCeilingHeightServer:
         *,
         cancellation_check: CancellationCheck | None = None,
         opener: UrlOpenFunction | None = None,
+        context_tokens: int = QWEN_SERVER_CONTEXT_TOKENS,
     ) -> None:
         self._bundle = _validate_bundle(
             default_qwen_ceiling_height_bundle() if bundle is None else bundle
         )
         self._startup_cancellation_check = cancellation_check
         self._opener = urlopen if opener is None else opener
+        self._context_tokens = max(QWEN_SERVER_CONTEXT_TOKENS, int(context_tokens))
         self._process: subprocess.Popen[bytes] | None = None
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         self._log_file: object | None = None
@@ -199,6 +201,9 @@ class QwenCeilingHeightServer:
         image_data_uri: str,
         *,
         previous_image_data_uri: str | None = None,
+        plan_image_data_uri: str | None = None,
+        additional_images: Sequence[tuple[str, str]] = (),
+        max_output_tokens: int = QWEN_MAX_OUTPUT_TOKENS,
         prompt: str,
         result_schema: Mapping[str, Any],
         cancellation_check: CancellationCheck | None = None,
@@ -219,6 +224,9 @@ class QwenCeilingHeightServer:
         request_body = build_local_qwen_request_body(
             image_data_uri,
             previous_image_data_uri=previous_image_data_uri,
+            plan_image_data_uri=plan_image_data_uri,
+            additional_images=additional_images,
+            max_output_tokens=max_output_tokens,
             prompt=prompt,
             result_schema=result_schema,
         )
@@ -249,7 +257,7 @@ class QwenCeilingHeightServer:
             "--port",
             str(self._port),
             "--ctx-size",
-            str(QWEN_SERVER_CONTEXT_TOKENS),
+            str(self._context_tokens),
             "--n-gpu-layers",
             "all",
             "--fit",
@@ -372,6 +380,9 @@ def build_local_qwen_request_body(
     image_data_uri: str,
     *,
     previous_image_data_uri: str | None = None,
+    plan_image_data_uri: str | None = None,
+    additional_images: Sequence[tuple[str, str]] = (),
+    max_output_tokens: int = QWEN_MAX_OUTPUT_TOKENS,
     prompt: str,
     result_schema: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -380,6 +391,11 @@ def build_local_qwen_request_body(
         None
         if previous_image_data_uri is None
         else str(previous_image_data_uri).strip()
+    )
+    normalized_plan_uri = (
+        None
+        if plan_image_data_uri is None
+        else str(plan_image_data_uri).strip()
     )
     normalized_prompt = str(prompt).strip()
     if not normalized_uri.startswith("data:image/"):
@@ -396,9 +412,31 @@ def build_local_qwen_request_body(
         raise QwenCeilingHeightError(
             "The previous video frame could not be prepared for local analysis."
         )
+    if normalized_plan_uri is not None and not normalized_plan_uri.startswith(
+        "data:image/"
+    ):
+        raise QwenCeilingHeightError(
+            "The metric plan reference could not be prepared for local analysis."
+        )
     content: list[dict[str, object]] = [
         {"type": "text", "text": normalized_prompt}
     ]
+    if normalized_plan_uri is not None:
+        content.extend(
+            (
+                {
+                    "type": "text",
+                    "text": (
+                        "PLAN REFERENCE for the current level; M labels match "
+                        "the calibrated horizontal spans in the prompt:"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": normalized_plan_uri},
+                },
+            )
+        )
     if normalized_previous_uri is not None:
         content.extend(
             (
@@ -418,6 +456,17 @@ def build_local_qwen_request_body(
             },
         )
     )
+    for label, image_uri in additional_images:
+        if not str(label).strip() or not str(image_uri).startswith("data:image/"):
+            raise QwenCeilingHeightError(
+                "An additional reference image could not be prepared for local analysis."
+            )
+        content.extend(
+            (
+                {"type": "text", "text": str(label)},
+                {"type": "image_url", "image_url": {"url": str(image_uri)}},
+            )
+        )
     return {
         "model": LOCAL_QWEN_CEILING_HEIGHT_MODEL,
         "messages": [
@@ -427,7 +476,7 @@ def build_local_qwen_request_body(
             }
         ],
         "temperature": 0,
-        "max_tokens": QWEN_MAX_OUTPUT_TOKENS,
+        "max_tokens": max(1, int(max_output_tokens)),
         "reasoning_effort": "none",
         "chat_template_kwargs": {"enable_thinking": False},
         "response_format": {

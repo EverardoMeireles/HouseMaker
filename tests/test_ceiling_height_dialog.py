@@ -115,6 +115,11 @@ class CeilingHeightAnalysisDialogTests(unittest.TestCase):
         fifteen_frame_text = self.dialog.analysis_button.text()
         self.assertRegex(fifteen_frame_text, r"\([^)]*\$\d+\.\d{2}[^)]*\)$")
 
+        self.dialog.set_plan_reference_size((1_536, 1_536))
+        plan_guided_text = self.dialog.analysis_button.text()
+        self.assertRegex(plan_guided_text, r"\([^)]*\$\d+\.\d{2}[^)]*\)$")
+        self.assertNotEqual(fifteen_frame_text, plan_guided_text)
+
         self.dialog.frame_interval_spinbox.setValue(30)
         thirty_frame_text = self.dialog.analysis_button.text()
         self.assertRegex(thirty_frame_text, r"\([^)]*\$\d+\.\d{2}[^)]*\)$")

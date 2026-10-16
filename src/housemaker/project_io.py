@@ -1,6 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -84,6 +85,8 @@ from housemaker.outer_wall_marking import (
     outer_wall_marks_to_dicts,
     reconcile_outer_wall_marks,
 )
+from housemaker.plan_correction_exchange import ExternalPlanCorrection
+from housemaker.plan_metric_state import PlanMetricCalibration
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.tour_state import TourData, tours_from_payload, tours_to_dicts
@@ -205,6 +208,17 @@ def save_project(
                 "original_image_path": _normalize_optional_path(
                     level.original_image_path
                 ),
+                "plan_metric_calibration": (
+                    level.plan_metric_calibration.to_dict()
+                    if level.plan_metric_calibration is not None
+                    else None
+                ),
+                "plan_meters_per_pixel": level.meters_per_pixel,
+                "external_plan_correction": (
+                    level.external_plan_correction.to_dict()
+                    if level.external_plan_correction is not None
+                    else None
+                ),
                 "image_size_pixels": _serialize_image_size(level.image_size_pixels),
                 "include_in_export": bool(level.include_in_export),
                 "vertex_data": level.vertex_data.to_dict(),
@@ -303,6 +317,27 @@ def load_project(path: str | Path) -> ProjectData:
         )
         level.image_size_pixels = _deserialize_image_size(
             raw_level.get("image_size_pixels")
+        )
+        calibration = _deserialize_plan_metric_calibration(
+            raw_level.get("plan_metric_calibration")
+        )
+        # Evidence may become stale if the image is moved or edited. The
+        # authored coordinate system must survive that loss of confidence.
+        level.plan_meters_per_pixel = _deserialize_plan_meters_per_pixel(
+            raw_level.get("plan_meters_per_pixel"), calibration
+        )
+        level.plan_metric_calibration = (
+            calibration
+            if _plan_metric_calibration_matches_image(
+                calibration,
+                level.image_size_pixels,
+                level.image_path,
+            )
+            else None
+        )
+        level.external_plan_correction = _deserialize_external_plan_correction(
+            raw_level.get("external_plan_correction"),
+            level_index=level.index,
         )
         level.include_in_export = bool(
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
@@ -439,6 +474,89 @@ def _write_project_json_atomically(
 
 
 # ### Serialization helpers ###
+def _deserialize_external_plan_correction(
+    raw_correction: object,
+    *,
+    level_index: int,
+) -> ExternalPlanCorrection | None:
+    """Retain pending or applied exchanges without activating their transforms."""
+
+    if raw_correction is None:
+        return None
+    try:
+        correction = ExternalPlanCorrection.from_dict(raw_correction)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    # An optional stale descriptor must never target another level on load.
+    return correction if correction.level_index == level_index else None
+
+
+def _deserialize_plan_meters_per_pixel(
+    raw_density: object,
+    calibration: PlanMetricCalibration | None,
+) -> float | None:
+    if raw_density is not None and not isinstance(raw_density, bool):
+        try:
+            density = float(raw_density)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(density) and density > 0.0:
+                return density
+    # Legacy calibrated saves have no separate coordinate-density field.
+    return calibration.target_meters_per_pixel if calibration is not None else None
+
+
+def _deserialize_plan_metric_calibration(
+    raw_calibration: object,
+) -> PlanMetricCalibration | None:
+    """Restore valid metric evidence while keeping legacy projects loadable."""
+
+    if raw_calibration is None:
+        return None
+    try:
+        return PlanMetricCalibration.from_dict(raw_calibration)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _plan_metric_calibration_matches_image(
+    calibration: PlanMetricCalibration | None,
+    image_size_pixels: tuple[float, float] | None,
+    image_path: str | None,
+) -> bool:
+    """Reject metric evidence attached to a differently sized plan raster."""
+
+    if calibration is None:
+        return True
+    if image_size_pixels is None:
+        return False
+    dimensions_match = all(
+        math.isclose(
+            actual,
+            float(expected),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        for actual, expected in zip(
+            image_size_pixels,
+            calibration.normalized_image_size,
+            strict=True,
+        )
+    )
+    if not dimensions_match or not calibration.normalized_image_sha256:
+        return dimensions_match
+    if image_path is None:
+        return False
+    try:
+        current_fingerprint = hashlib.sha256(
+            Path(image_path).read_bytes()
+        ).hexdigest()
+    except OSError:
+        return False
+    return current_fingerprint == calibration.normalized_image_sha256
+
+
 def _deserialize_generation(
     raw_generation: object,
     raw_legacy_dynamic_generation: object,
@@ -553,6 +671,7 @@ def _clear_image_library_paths_from_levels(
 
         level.image_path = None
         level.image_size_pixels = None
+        level.plan_metric_calibration = None
 
 
 # ### Stair serialization helpers ###

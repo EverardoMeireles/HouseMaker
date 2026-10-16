@@ -19,6 +19,11 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
+from housemaker.door_state import (
+    DoorLibraryData,
+    WindowPlacement,
+    create_window_definition_for_frame,
+)
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
     DoorwayData,
@@ -27,6 +32,7 @@ from housemaker.models import (
     VertexData,
     WindowData,
 )
+from housemaker.project_io import ProjectData
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, build_fixed_surfaces
 from tests.opening_dimension_assertions import get_opening_physical_size
 
@@ -866,6 +872,127 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertEqual(len(level.vertex_data.vertices), 1)
         self.assertEqual(level.vertex_data.edges, [])
         self.assertIsNone(self.workspace.viewer.model)
+
+    def test_wall_delete_removes_orphan_window_and_undo_restores_fixture(
+        self,
+    ) -> None:
+        level = _build_level_with_two_walls()
+        host_wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_type == SURFACE_TYPE_WALL
+            and surface.wall_key == "1:2"
+        )
+        frame = WindowData(
+            window_id="deleted-wall-window-frame",
+            wall_surface_id=host_wall.surface_id,
+            start_ratio=0.25,
+            end_ratio=0.75,
+            bottom_ratio=0.2,
+            top_ratio=0.7,
+        )
+        level.windows = [frame]
+        self._install_levels([level])
+        window = create_window_definition_for_frame(
+            frame.window_id,
+            1.0,
+            1.0,
+            name="Reusable window",
+            window_id="reusable-window",
+        )
+        placement = WindowPlacement(
+            placement_id="placed-window",
+            window_id=window.window_id,
+            level_index=level.index,
+            window_frame_id=frame.window_id,
+        )
+        self.workspace.doors_workspace.set_data(
+            DoorLibraryData(
+                windows=[window],
+                window_placements=[placement],
+            )
+        )
+        self.workspace._canvas_undo_stack.clear()
+        deleted_vertex_ids = tuple(
+            vertex.id for vertex in level.vertex_data.vertices[:2]
+        )
+        self.workspace.canvas.set_selected_vertex_ids(deleted_vertex_ids)
+
+        self.workspace.canvas._delete_selected_vertices()
+
+        self.assertEqual(level.windows, [frame])
+        self.assertEqual(
+            self.workspace.doors_workspace.data().window_placements,
+            [placement],
+        )
+
+        self.workspace._commit_pending_wall_vertex_update()
+
+        detached_library = self.workspace.doors_workspace.data()
+        self.assertEqual(level.windows, [])
+        self.assertEqual(detached_library.window_placements, [])
+        self.assertEqual(detached_library.get_window(window.window_id), window)
+
+        self.workspace._handle_canvas_undo_requested()
+
+        restored_library = self.workspace.doors_workspace.data()
+        self.assertEqual(level.windows, [frame])
+        self.assertEqual(restored_library.window_placements, [placement])
+        self.assertEqual(restored_library.get_window(window.window_id), window)
+
+    def test_project_load_removes_only_stale_orphan_window_frames(self) -> None:
+        level = _build_level_with_wall()
+        host_wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        live_frame = WindowData(
+            window_id="live-frame",
+            wall_surface_id=host_wall.surface_id,
+            start_ratio=0.1,
+            end_ratio=0.35,
+            bottom_ratio=0.2,
+            top_ratio=0.7,
+        )
+        stale_frame = WindowData(
+            window_id="stale-frame",
+            wall_surface_id=f"level:{level.index}/wall:998:999",
+            start_ratio=0.55,
+            end_ratio=0.8,
+            bottom_ratio=0.2,
+            top_ratio=0.7,
+        )
+        level.windows = [live_frame, stale_frame]
+        window = create_window_definition_for_frame(
+            stale_frame.window_id,
+            1.0,
+            1.0,
+            name="Stale-frame asset",
+            window_id="stale-frame-window",
+        )
+        placement = WindowPlacement(
+            placement_id="stale-frame-placement",
+            window_id=window.window_id,
+            level_index=level.index,
+            window_frame_id=stale_frame.window_id,
+        )
+        project = ProjectData(
+            blueprint_path=None,
+            current_level_index=0,
+            levels=[level],
+            doors=DoorLibraryData(
+                windows=[window],
+                window_placements=[placement],
+            ),
+        )
+
+        self.workspace._apply_loaded_project(project)
+
+        self.assertEqual(self.workspace.current_level.windows, [live_frame])
+        loaded_library = self.workspace.doors_workspace.data()
+        self.assertEqual(loaded_library.window_placements, [])
+        self.assertEqual(loaded_library.get_window(window.window_id), window)
 
     def test_deleting_the_last_wall_clears_a_detached_3d_window(
         self,

@@ -47,8 +47,14 @@ from housemaker.generation_workspace import (
 from housemaker.merged_generation_workspace import (
     GENERATION_CONTROLS_PADDING,
     MergedGenerationWorkspace,
+    _CeilingHeightInferenceThread,
+    _invoke_bound_ceiling_height_estimator,
 )
 from housemaker.models import LevelData
+from housemaker.plan_metric_state import (
+    PlanMeasurementEvidence,
+    PlanMetricCalibration,
+)
 from housemaker.qwen_ceiling_height_estimation import (
     LOCAL_QWEN_CEILING_HEIGHT_MODEL,
 )
@@ -106,6 +112,76 @@ def _wait_until(predicate, timeout_seconds: float = 3.0) -> bool:
         time.sleep(0.005)
     _qt_application.processEvents()
     return bool(predicate())
+
+
+def _plan_metric_calibration(
+    label: str,
+    value_meters: float,
+) -> PlanMetricCalibration:
+    """Build distinct, valid plan evidence for routing tests."""
+
+    measurements = tuple(
+        PlanMeasurementEvidence(
+            label=measurement_label,
+            value_meters=measurement_value,
+            start_normalized=start,
+            end_normalized=end,
+            corrected_start_normalized=start,
+            corrected_end_normalized=end,
+            confidence="high",
+        )
+        for measurement_label, measurement_value, start, end in (
+            (label, value_meters, (0.1, 0.25), (0.9, 0.25)),
+            (
+                f"{label} secondary",
+                value_meters * 0.75,
+                (0.2, 0.35),
+                (0.8, 0.35),
+            ),
+        )
+    )
+    return PlanMetricCalibration(
+        estimated_meters_per_pixel=0.02,
+        target_meters_per_pixel=0.02,
+        normalization_scale=1.0,
+        relative_residual=0.01,
+        confidence="high",
+        source_image_size=(1_000, 800),
+        pre_normalization_size=(1_000, 800),
+        normalized_image_size=(1_000, 800),
+        measurements=measurements,
+    )
+
+
+def _calibrated_ceiling_levels() -> tuple[LevelData, ...]:
+    """Return three levels with distinguishable horizontal plan evidence."""
+
+    return (
+        LevelData(
+            index=1,
+            name="Underground 1",
+            plan_metric_calibration=_plan_metric_calibration(
+                "Underground span",
+                3.2,
+            ),
+        ),
+        LevelData(
+            index=2,
+            name="Ground",
+            plan_metric_calibration=_plan_metric_calibration(
+                "Ground span",
+                6.1,
+            ),
+        ),
+        LevelData(
+            index=3,
+            name="Story 1",
+            plan_metric_calibration=_plan_metric_calibration(
+                "Story span",
+                3.9,
+            ),
+        ),
+    )
 
 
 class _ActionJobGenerationWorkspace(GenerationWorkspace):
@@ -341,6 +417,144 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(changed.count(), 2)
         self.assertIsNone(self.workspace.get_current_video_frame_bgr())
+
+    def test_ceiling_height_levels_build_metric_context_per_level(self) -> None:
+        self.workspace.set_ceiling_height_levels(
+            iter(_calibrated_ceiling_levels()),
+            current_level_index=2,
+        )
+
+        contexts = dict(self.workspace._ceiling_height_level_plan_contexts)
+
+        self.assertEqual(tuple(contexts), (1, 2, 3))
+        self.assertIn("M1 - Underground span: 3.2 m", contexts[1])
+        self.assertIn("M1 - Ground span: 6.1 m", contexts[2])
+        self.assertIn("M1 - Story span: 3.9 m", contexts[3])
+        for context in contexts.values():
+            self.assertIn("horizontal plan distances only", context)
+            self.assertIn("never a ceiling-height measurement", context)
+
+    def test_whole_video_inference_routes_context_after_level_movement(
+        self,
+    ) -> None:
+        levels = _calibrated_ceiling_levels()
+        for level in levels:
+            level.image_path = str(
+                Path(self.temporary_directory.name)
+                / f"level-{level.index}.png"
+            )
+        self.workspace.set_ceiling_height_levels(levels, current_level_index=2)
+        movements = (
+            ("stable", "high"),
+            ("arrived_up", "high"),
+            ("stable", "high"),
+            ("arrived_down", "medium"),
+            ("arrived_down", "medium"),
+            ("stable", "high"),
+        )
+        captured_contexts: list[str] = []
+
+        @contextmanager
+        def estimator_provider(**_kwargs):
+            def estimator(
+                _frame_bgr: np.ndarray,
+                *,
+                previous_frame_bgr: np.ndarray | None = None,
+                plan_context: str = "",
+                cancellation_check=None,
+            ) -> CeilingHeightEstimate:
+                del previous_frame_bgr, cancellation_check
+                call_index = len(captured_contexts)
+                captured_contexts.append(plan_context)
+                movement, confidence = movements[call_index]
+                return CeilingHeightEstimate(
+                    status="estimated",
+                    estimate_m=2.6,
+                    minimum_m=2.4,
+                    maximum_m=2.8,
+                    confidence="medium",
+                    basis="Visible room boundaries agree.",
+                    level_movement=movement,
+                    movement_confidence=confidence,
+                )
+
+            yield estimator
+
+        video_path = Path(self.temporary_directory.name) / "context-video.avi"
+        _write_test_video(video_path, frame_count=len(movements))
+        thread = _CeilingHeightInferenceThread(
+            str(video_path),
+            tuple(range(len(movements))),
+            "sk-test",
+            "gpt-5.6-luna",
+            None,
+            self.workspace._ceiling_height_level_options,
+            self.workspace._ceiling_height_level_plan_contexts,
+            2,
+            level_plan_sources=(
+                self.workspace._ceiling_height_level_plan_sources
+            ),
+        )
+
+        with (
+            patch(
+                "housemaker.merged_generation_workspace."
+                "open_ceiling_height_estimator",
+                estimator_provider,
+            ),
+            patch(
+                "housemaker.merged_generation_workspace."
+                "build_ceiling_height_plan_image_data_uri",
+                return_value="data:image/jpeg;base64,cGxhbg==",
+            ),
+        ):
+            thread.run()
+
+        self.assertIsNone(thread.error_message)
+        self.assertIsNotNone(thread.result)
+        self.assertEqual(len(captured_contexts), len(movements))
+        self.assertIn("Ground span: 6.1 m", captured_contexts[0])
+        self.assertIn("Ground span: 6.1 m", captured_contexts[1])
+        self.assertIn("Story span: 3.9 m", captured_contexts[2])
+        self.assertIn("Story span: 3.9 m", captured_contexts[3])
+        self.assertIn("Ground span: 6.1 m", captured_contexts[4])
+        self.assertIn("Ground span: 6.1 m", captured_contexts[5])
+
+    def test_metric_context_keeps_legacy_bound_estimator_compatible(
+        self,
+    ) -> None:
+        captured_previous_frames: list[np.ndarray | None] = []
+
+        def legacy_estimator(
+            _frame_bgr: np.ndarray,
+            *,
+            previous_frame_bgr: np.ndarray | None = None,
+            cancellation_check=None,
+        ) -> CeilingHeightEstimate:
+            del cancellation_check
+            captured_previous_frames.append(previous_frame_bgr)
+            return CeilingHeightEstimate(
+                status="estimated",
+                estimate_m=2.6,
+                minimum_m=2.4,
+                maximum_m=2.8,
+                confidence="medium",
+                basis="Visible room boundaries agree.",
+            )
+
+        previous_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        estimate = _invoke_bound_ceiling_height_estimator(
+            legacy_estimator,
+            np.ones((4, 4, 3), dtype=np.uint8),
+            previous_frame=previous_frame,
+            plan_context="Metric floor-plan context for Ground: 6.1 m.",
+            plan_image_data_uri=None,
+            cancellation_check=lambda: False,
+        )
+
+        self.assertTrue(estimate.has_estimate)
+        self.assertEqual(len(captured_previous_frames), 1)
+        self.assertIs(captured_previous_frames[0], previous_frame)
 
     def test_ceiling_height_control_analyzes_complete_video_with_frame_pairs(
         self,

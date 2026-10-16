@@ -135,6 +135,21 @@ class QwenCeilingHeightDefaultBundleTests(unittest.TestCase):
 
 # ### Request tests ###
 class QwenCeilingHeightRequestTests(unittest.TestCase):
+    def test_additional_plan_details_and_output_budget_do_not_change_ceiling_defaults(self):
+        kwargs = {"prompt": "Read dimensions.", "result_schema": _result_schema()}
+        regular = build_local_qwen_request_body("data:image/png;base64,YWJj", **kwargs)
+        detailed = build_local_qwen_request_body(
+            "data:image/png;base64,YWJj", **kwargs,
+            additional_images=(("Raw detail at normalized bounds", "data:image/png;base64,ZGV0"),),
+            max_output_tokens=6144,
+        )
+
+        self.assertEqual(regular["max_tokens"], 500)
+        self.assertEqual(detailed["max_tokens"], 6144)
+        content = detailed["messages"][0]["content"]
+        self.assertEqual(content[-2]["text"], "Raw detail at normalized bounds")
+        self.assertEqual(content[-1]["image_url"]["url"], "data:image/png;base64,ZGV0")
+
     def test_request_uses_image_input_and_strict_json_schema(self) -> None:
         schema = _result_schema()
         body = build_local_qwen_request_body(
@@ -186,6 +201,30 @@ class QwenCeilingHeightRequestTests(unittest.TestCase):
         self.assertEqual(
             images,
             [
+                "data:image/jpeg;base64,cHJldmlvdXM=",
+                "data:image/jpeg;base64,Y3VycmVudA==",
+            ],
+        )
+
+    def test_request_places_annotated_plan_before_video_frames(self) -> None:
+        body = build_local_qwen_request_body(
+            "data:image/jpeg;base64,Y3VycmVudA==",
+            previous_image_data_uri="data:image/jpeg;base64,cHJldmlvdXM=",
+            plan_image_data_uri="data:image/jpeg;base64,cGxhbg==",
+            prompt="Use M1 only if its span is visible.",
+            result_schema=_result_schema(),
+        )
+
+        images = [
+            item["image_url"]["url"]
+            for item in body["messages"][0]["content"]
+            if item["type"] == "image_url"
+        ]
+
+        self.assertEqual(
+            images,
+            [
+                "data:image/jpeg;base64,cGxhbg==",
                 "data:image/jpeg;base64,cHJldmlvdXM=",
                 "data:image/jpeg;base64,Y3VycmVudA==",
             ],

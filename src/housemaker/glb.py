@@ -8,7 +8,7 @@ import math
 import os
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from io import BytesIO
 from itertools import permutations
 from pathlib import Path
@@ -592,6 +592,7 @@ class WallOpening:
     parallel_walls_only: bool = False
     penetrates_parallel_walls: bool = False
     profile_points: tuple[tuple[float, float], ...] = ()
+    meters_per_pixel: float = PIXEL_TO_METER
 
     @property
     def top_height_meters(self) -> float:
@@ -7410,9 +7411,13 @@ def _build_named_meshes_for_level(
         level,
         level_blueprint_size,
     )
+    # Recover floor topology in actual metres so its metric gap-closing and
+    # fascia tolerances do not depend on the plan photograph's pixel density.
+    density_scale = level.meters_per_pixel / PIXEL_TO_METER
+    metric_to_source = np.diag((1.0 / density_scale, 1.0 / density_scale, 1.0, 1.0))
     local_stair_opening_geometry = _transform_world_plan_geometry_to_source(
         stair_opening_geometry,
-        level_source_transform,
+        level_source_transform @ metric_to_source,
     )
     room_vertex_sets = _get_room_vertex_sets(level.rooms)
     wall_orientation = build_level_wall_orientation_resolver(
@@ -7424,10 +7429,13 @@ def _build_named_meshes_for_level(
         level=level,
         floor_base_z_meters=floor_base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
-        point_to_world_xy=_point_to_world_xy,
+        point_to_world_xy=partial(
+            _point_to_world_xy, meters_per_pixel=level.meters_per_pixel
+        ),
         additional_opening_geometry=local_stair_opening_geometry,
     )
     if floor_mesh is not None:
+        floor_mesh.apply_transform(metric_to_source)
         named_meshes.append(
             NamedMesh(
                 name=_get_level_floor_object_name(level),
@@ -7557,7 +7565,12 @@ def _build_level_meshes(
     if authoritative_orientation and wall_orientation is None:
         wall_orientation = build_level_wall_orientation_resolver(level)
     doorway_openings = [
-        *_build_wall_openings(doorways),
+        *_build_wall_openings(
+            doorways,
+            meters_per_pixel=(
+                level.meters_per_pixel if level is not None else PIXEL_TO_METER
+            ),
+        ),
         *window_openings,
     ]
     wall_meshes: list[trimesh.Trimesh] = []
@@ -7615,6 +7628,7 @@ def _build_room_mesh(
         room=room,
         vertex_data=level.vertex_data,
         wall_height_meters=room.height_meters,
+        meters_per_pixel=level.meters_per_pixel,
     )
     placements_by_key = _group_wall_placements_by_key(layout.placements)
     doorway_openings = _build_level_wall_openings(level, wall_orientation)
@@ -8062,7 +8076,7 @@ def _get_wall_opening_profile_points(
 
     if opening.profile_points:
         return opening.profile_points
-    half_width_meters = opening.half_width_pixels * PIXEL_TO_METER
+    half_width_meters = opening.half_width_pixels * opening.meters_per_pixel
     return (
         (-half_width_meters, 0.0),
         (half_width_meters, 0.0),
@@ -8072,7 +8086,11 @@ def _get_wall_opening_profile_points(
     )
 
 
-def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
+def _build_wall_openings(
+    doorways: Sequence[object],
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
+) -> list[WallOpening]:
     """Convert usable doorway data into clipping footprints once per mesh."""
     wall_openings: list[WallOpening] = []
     for doorway in doorways:
@@ -8133,11 +8151,12 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
                 width_direction_y=depth_direction_x,
                 depth_direction_x=depth_direction_x,
                 depth_direction_y=depth_direction_y,
-                half_width_pixels=width_meters / PIXEL_TO_METER / 2.0,
-                half_depth_pixels=depth_meters / PIXEL_TO_METER / 2.0,
+                half_width_pixels=width_meters / meters_per_pixel / 2.0,
+                half_depth_pixels=depth_meters / meters_per_pixel / 2.0,
                 height_meters=height_meters,
                 bottom_height_meters=bottom_height_meters,
                 profile_points=profile_points,
+                meters_per_pixel=meters_per_pixel,
             )
         )
 
@@ -8151,7 +8170,7 @@ def _build_level_wall_openings(
     """Build doorway and stable wall-attached window cuts for one level."""
 
     return [
-        *_build_wall_openings(level.doorways),
+        *_build_wall_openings(level.doorways, meters_per_pixel=level.meters_per_pixel),
         *_build_window_openings(level, wall_orientation),
     ]
 
@@ -8227,6 +8246,7 @@ def _build_window_openings(
                 target_surface_id=wall_surface_id,
                 parallel_walls_only=True,
                 penetrates_parallel_walls=True,
+                meters_per_pixel=level.meters_per_pixel,
             )
         )
     return openings
@@ -8320,7 +8340,7 @@ def _build_window_depth_footprint(
     """Extend a window 50 cm behind its selected semantic wall face."""
 
     depth_pixels = WINDOW_CUT_DEPTH_METERS / (
-        PIXEL_TO_METER * _get_valid_level_scale(level)
+        level.meters_per_pixel * _get_valid_level_scale(level)
     )
     exterior_direction = (
         target.exterior_direction
@@ -8587,7 +8607,8 @@ def _build_opening_polygon_on_wall(
     projected_profile = Polygon(
         [
             (
-                (width_meters / PIXEL_TO_METER - start_width_position) / width_delta,
+                (width_meters / opening.meters_per_pixel - start_width_position)
+                / width_delta,
                 opening.bottom_height_meters + height_meters,
             )
             for width_meters, height_meters in profile_points
@@ -8631,7 +8652,7 @@ def _build_constant_width_opening_polygon(
     profile_polygon = Polygon(
         [
             (
-                width_meters / PIXEL_TO_METER,
+                width_meters / opening.meters_per_pixel,
                 opening.bottom_height_meters + height_meters,
             )
             for width_meters, height_meters in profile_points
@@ -8929,7 +8950,9 @@ def _build_level_doorway_reveals(
 ) -> list[DoorwayReveal]:
     """Resolve actual wall contacts and one stable owner per doorway tunnel."""
 
-    doorway_openings = _build_wall_openings(level.doorways)
+    doorway_openings = _build_wall_openings(
+        level.doorways, meters_per_pixel=level.meters_per_pixel
+    )
     if not doorway_openings:
         return []
     wall_sources = _build_level_wall_sources(
@@ -9637,7 +9660,7 @@ def _clip_opening_profiles_to_reveal(
     profile_polygon = Polygon(
         [
             (
-                width_meters / PIXEL_TO_METER,
+                width_meters / opening.meters_per_pixel,
                 opening.bottom_height_meters + height_meters,
             )
             for width_meters, height_meters in (
@@ -10023,6 +10046,7 @@ def _build_level_preview_textured_walls(
             room=room,
             vertex_data=level.vertex_data,
             wall_height_meters=room.height_meters,
+            meters_per_pixel=level.meters_per_pixel,
         )
         if not layout.placements:
             continue
@@ -10212,10 +10236,20 @@ def _build_level_source_transform(
     level: LevelData,
     blueprint_size_pixels: tuple[float, float] | None,
 ) -> np.ndarray:
+    """Convert legacy local mesh XY to calibrated metres, then apply user edits.
+
+    Mesh-building helpers deliberately share one fixed local coordinate basis.
+    Raster calibration is an XY-only unit conversion at this boundary; heights
+    and slab thicknesses are already in metres and must not be rescaled.
+    """
+
     scale = _get_valid_level_scale(level)
+    density_scale = level.meters_per_pixel / PIXEL_TO_METER
     offset_x_meters = _get_valid_level_offset(level, "x")
     offset_y_meters = _get_valid_level_offset(level, "y")
     transform = np.eye(4, dtype=float)
+    transform[0, 0] = density_scale
+    transform[1, 1] = density_scale
     if scale != 1.0 and level.vertex_data.vertices:
         level_points = np.asarray(
             [
@@ -10231,9 +10265,9 @@ def _build_level_source_transform(
 
         minimum_point = np.min(level_points, axis=0)
         maximum_point = np.max(level_points, axis=0)
-        pivot_point = (minimum_point + maximum_point) / 2.0
-        transform[0, 0] = scale
-        transform[1, 1] = scale
+        pivot_point = (minimum_point + maximum_point) / 2.0 * density_scale
+        transform[0, 0] *= scale
+        transform[1, 1] *= scale
         transform[0, 3] = float(pivot_point[0] * (1.0 - scale))
         transform[1, 3] = float(pivot_point[1] * (1.0 - scale))
 
@@ -10404,6 +10438,8 @@ def _vertex_to_world_xy(
 def _point_to_world_xy(
     point: tuple[float, float],
     blueprint_size_pixels: tuple[float, float] | None,
+    *,
+    meters_per_pixel: float = PIXEL_TO_METER,
 ) -> np.ndarray:
     point_x, point_y = point
     if blueprint_size_pixels is None:
@@ -10416,8 +10452,8 @@ def _point_to_world_xy(
 
     return np.array(
         [
-            centered_x * PIXEL_TO_METER,
-            -centered_y * PIXEL_TO_METER,
+            centered_x * meters_per_pixel,
+            -centered_y * meters_per_pixel,
         ],
         dtype=float,
     )

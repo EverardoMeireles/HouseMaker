@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -17,6 +19,8 @@ from housemaker.ceiling_height_estimation import (
     CeilingHeightLevelEstimate,
     aggregate_ceiling_height_estimates,
     aggregate_level_ceiling_height_estimates,
+    build_ceiling_height_plan_image_data_uri,
+    build_ceiling_height_prompt,
     build_ceiling_height_request_body,
     ceiling_height_model_requires_api_key,
     estimate_ceiling_height_api_cost_usd,
@@ -25,9 +29,64 @@ from housemaker.ceiling_height_estimation import (
     sample_entire_video_frame_indices,
     sample_video_frame_indices,
 )
+from housemaker.plan_metric_state import (
+    PlanMeasurementEvidence,
+    PlanMetricCalibration,
+)
 from housemaker.qwen_ceiling_height_estimation import (
     LOCAL_QWEN_CEILING_HEIGHT_MODEL,
 )
+
+
+# ### Metric plan-reference tests ###
+class CeilingHeightPlanReferenceTests(unittest.TestCase):
+    def test_annotated_plan_reference_is_encoded_for_vision_input(self) -> None:
+        measurements = (
+            PlanMeasurementEvidence(
+                label="Room width",
+                value_meters=4.0,
+                start_normalized=(0.1, 0.25),
+                end_normalized=(0.9, 0.25),
+                corrected_start_normalized=(0.1, 0.25),
+                corrected_end_normalized=(0.9, 0.25),
+                confidence="high",
+            ),
+            PlanMeasurementEvidence(
+                label="Room depth",
+                value_meters=3.0,
+                start_normalized=(0.2, 0.1),
+                end_normalized=(0.2, 0.9),
+                corrected_start_normalized=(0.2, 0.1),
+                corrected_end_normalized=(0.2, 0.9),
+                confidence="high",
+            ),
+        )
+        calibration = PlanMetricCalibration(
+            estimated_meters_per_pixel=0.02,
+            target_meters_per_pixel=0.02,
+            normalization_scale=1.0,
+            relative_residual=0.01,
+            confidence="high",
+            source_image_size=(64, 48),
+            pre_normalization_size=(64, 48),
+            normalized_image_size=(64, 48),
+            measurements=measurements,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "plan.png"
+            self.assertTrue(
+                estimation.cv2.imwrite(
+                    str(image_path),
+                    np.full((48, 64, 3), 255, dtype=np.uint8),
+                )
+            )
+
+            data_uri = build_ceiling_height_plan_image_data_uri(
+                image_path,
+                calibration,
+            )
+
+        self.assertTrue(data_uri.startswith("data:image/jpeg;base64,"))
 
 
 # ### Fixtures ###
@@ -218,6 +277,23 @@ class CeilingHeightVideoAnalysisTests(unittest.TestCase):
         self.assertEqual(result.average_height_m, 2.65)
         self.assertEqual(result.retained_frame_indices, (12,))
 
+    def test_metric_plan_context_is_bounded_and_explicitly_horizontal(self) -> None:
+        prompt = build_ceiling_height_prompt(
+            "L2 Ground salon span: 6.1 m; doorway width: 0.8 m."
+        )
+
+        self.assertIn("CALIBRATED FLOOR-PLAN CONTEXT", prompt)
+        self.assertIn("6.1 m", prompt)
+        self.assertIn("horizontal X/Y distances only", prompt)
+        self.assertIn("never be converted directly", prompt)
+
+        body = build_ceiling_height_request_body(
+            "data:image/png;base64,current",
+            plan_context="room span: 6.1 m",
+        )
+        prompt_item = body["input"][0]["content"][0]
+        self.assertIn("room span: 6.1 m", prompt_item["text"])
+
     def test_aggregation_rejects_duplicate_frame_indices(self) -> None:
         with self.assertRaisesRegex(ValueError, "unique"):
             aggregate_ceiling_height_estimates(
@@ -244,7 +320,7 @@ class CeilingHeightVideoAnalysisTests(unittest.TestCase):
         self.assertIsInstance(result, CeilingHeightAnalysisResult)
         self.assertEqual(result.sampled_frame_indices, (0, 15, 30, 45, 60, 75, 90))
         self.assertEqual(result.transition_frame_indices, (30, 45, 60))
-        self.assertEqual(result.unassigned_frame_indices, (30, 45))
+        self.assertEqual(result.unassigned_frame_indices, (30, 45, 60))
         self.assertEqual(
             tuple(
                 (entry.level_index, entry.level_name)
@@ -279,7 +355,7 @@ class CeilingHeightVideoAnalysisTests(unittest.TestCase):
         )
 
         self.assertEqual(result.transition_frame_indices, (15, 30, 45))
-        self.assertEqual(result.unassigned_frame_indices, (15, 30, 75))
+        self.assertEqual(result.unassigned_frame_indices, (15, 30, 45, 75))
         self.assertEqual(
             tuple(entry.level_index for entry in result.level_estimates),
             (2, 1),
@@ -429,6 +505,14 @@ class CeilingHeightRequestTests(unittest.TestCase):
         self.assertGreater(luna_cost, 0.02)
         self.assertLess(luna_cost, 0.05)
         self.assertAlmostEqual(terra_cost, luna_cost * 10.0)
+        plan_guided_cost = estimate_ceiling_height_api_cost_usd(
+            model="gpt-5.6-luna",
+            plan_reference_size=(1_200, 900),
+            **arguments,
+        )
+        self.assertIsNotNone(plan_guided_cost)
+        assert plan_guided_cost is not None
+        self.assertGreater(plan_guided_cost, luna_cost)
         self.assertIsNone(
             estimate_ceiling_height_api_cost_usd(
                 model=LOCAL_QWEN_CEILING_HEIGHT_MODEL,
@@ -503,6 +587,27 @@ class CeilingHeightRequestTests(unittest.TestCase):
                 "data:image/jpeg;base64,Y3VycmVudA==",
             ],
         )
+
+    def test_request_places_annotated_plan_before_video_frames(self) -> None:
+        body = build_ceiling_height_request_body(
+            "data:image/jpeg;base64,Y3VycmVudA==",
+            previous_image_data_uri="data:image/jpeg;base64,cHJldmlvdXM=",
+            plan_context="M1 - Salon width: 6.1 m.",
+            plan_image_data_uri="data:image/jpeg;base64,cGxhbg==",
+        )
+
+        content = body["input"][0]["content"]
+        images = [item for item in content if item["type"] == "input_image"]
+
+        self.assertEqual(
+            [item["image_url"] for item in images],
+            [
+                "data:image/jpeg;base64,cGxhbg==",
+                "data:image/jpeg;base64,cHJldmlvdXM=",
+                "data:image/jpeg;base64,Y3VycmVudA==",
+            ],
+        )
+        self.assertIn("PLAN REFERENCE", content[1]["text"])
 
     def test_inference_encodes_frame_and_validates_estimate(self) -> None:
         captured: list[tuple[object, dict[str, object]]] = []

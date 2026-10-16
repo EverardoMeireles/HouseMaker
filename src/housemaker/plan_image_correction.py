@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -32,6 +33,14 @@ from housemaker.plan_correction_models import (
     PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
     PLAN_CORRECTION_MODELS,
 )
+from housemaker.plan_metric_calibration import (
+    NormalizedPlanMetricResult,
+    PlanMeasurementAnalyzer,
+    PlanMetricCalibrationCancelled,
+    PlanMetricCalibrationError,
+    calibrate_and_normalize_plan,
+)
+from housemaker.plan_metric_state import PlanMetricCalibration
 from housemaker.plan_wall_continuity import make_doorway_walls_continuous
 from housemaker.qwen_plan_image_correction import (
     QwenPlanCorrectionCancelled,
@@ -58,9 +67,9 @@ EDITOR_CANCELLATION_POLL_SECONDS = 0.1
 
 PLAN_CORRECTION_PROMPT = """Use case: precise-object-edit
 Asset type: preprocessing input for automatic architectural wall extraction
-Input image: the supplied top-down photograph is the edit target.
-Primary request: convert this photographed architectural floor plan into a clean,
-flat, orthographic black-and-white scanned plan.
+Input image: the supplied architectural plan image is the edit target. It may be
+a top-down photograph or a prior geometry-preserving rectification.
+Primary request: produce a clean, flat, orthographic black-and-white scanned plan.
 Preserve exactly: every wall, doorway, window, stair, room boundary,
 non-measurement symbol, room or feature label, relative position, proportion, and
 the complete outer perimeter. Do not redesign, infer new architecture, omit
@@ -72,6 +81,8 @@ they are part of a non-measurement room or feature label.
 Correct only the page photography: straighten overall rotation and perspective,
 gently correct fold-induced page deformation, remove fold creases, shadows, paper
 grain, stains, speckles, color casts, and photographic background.
+If the input is already flat and rectified, do not warp, scale, rotate, crop, or
+reposition its plan geometry while removing the measurement annotations.
 Composition: retain the entire sheet and complete floor plan with a safe white
 margin on all four sides. Nothing may touch or be clipped by an output edge.
 Style: crisp technical drawing, solid black ink lines on a uniform pure-white
@@ -80,6 +91,28 @@ them, while omitting all measurement graphics.
 Avoid: cropping, warped walls, curved straight lines, hallucinated details, missing
 plan sections, retained measurement annotations, gray texture, black smudges, blur,
 decorative styling, or a watermark."""
+
+PLAN_MEASUREMENT_PRESERVING_CORRECTION_PROMPT = """Use case: precise-object-edit
+Asset type: measurement-reference preprocessing for architectural wall extraction
+Input image: the supplied top-down photograph of a floor plan is the edit target.
+Primary request: rectify it into a clean, flat, orthographic, high-contrast plan
+while retaining every printed measurement annotation for a later transcription
+pass.
+Preserve exactly: every wall, doorway, window, stair, room boundary, symbol,
+label, dimension line, extension or witness line, arrowhead, tick mark, numeric
+measurement, decimal separator, and unit mark. Copy printed measurement text
+verbatim; do not reinterpret, replace, round, invent, or delete any value.
+Correct only the page photography: straighten overall rotation and perspective,
+gently correct fold-induced page deformation, remove fold creases, shadows, paper
+grain, stains, speckles, color casts, and photographic background. Keep straight
+architectural and measurement lines straight.
+Composition: retain the entire sheet and complete floor plan with a safe white
+margin on all four sides. Nothing may touch or be clipped by an output edge.
+Style: crisp technical drawing, solid black ink lines on a uniform pure-white
+background; retain fine and dashed lines without thickening them.
+Avoid: cropping, warped walls, curved straight lines, hallucinated details,
+missing plan sections, altered or missing measurements, gray texture, black
+smudges, blur, decorative styling, or a watermark."""
 
 
 # ### Image constants ###
@@ -95,7 +128,9 @@ CORRECTION_METHOD_QWEN = "qwen"
 
 STAGE_LOADING = "loading"
 STAGE_PREPARING = "preparing"
+STAGE_MEASUREMENT_REFERENCE = "measurement_reference"
 STAGE_AI_CORRECTION = "ai_correction"
+STAGE_METRIC_CALIBRATION = "metric_calibration"
 STAGE_BINARIZATION = "binarization"
 STAGE_WALL_CONTINUITY = "wall_continuity"
 STAGE_SAVING = "saving"
@@ -128,6 +163,19 @@ class ImageEditor(Protocol):
     ) -> bytes: ...
 
 
+class PlanMetricNormalizer(Protocol):
+    """Calibrate one native-resolution plan through a local or coordinated solve."""
+
+    def __call__(
+        self,
+        original_image: np.ndarray,
+        corrected_image: np.ndarray,
+        *,
+        measurement_reference_image: np.ndarray | None = None,
+        cancellation_check: CancellationCheck | None,
+    ) -> NormalizedPlanMetricResult: ...
+
+
 @dataclass(frozen=True)
 class PlanImageCorrectionResult:
     output_path: Path
@@ -135,6 +183,8 @@ class PlanImageCorrectionResult:
     input_size: tuple[int, int]
     output_size: tuple[int, int]
     stages: tuple[str, ...]
+    metric_calibration: PlanMetricCalibration | None = None
+    metric_warning: str = ""
 
 
 # ### Public exceptions ###
@@ -190,6 +240,70 @@ def _create_plan_image_editor(model: str) -> ImageEditor:
     raise PlanImageCorrectionError(f"Unsupported plan correction model: {model}.")
 
 
+# ### Correction-pass orchestration ###
+def _run_correction_pass(
+    editor: ImageEditor,
+    image: np.ndarray,
+    *,
+    api_key: str,
+    prompt: str,
+    output_size: tuple[int, int],
+    selected_model: str,
+    editor_was_injected: bool,
+    cancellation_check: CancellationCheck | None,
+) -> np.ndarray:
+    """Run and validate one correction pass with uniform cancellation handling."""
+
+    _raise_if_cancelled(cancellation_check)
+    editor_input = _encode_png(image)
+    _raise_if_cancelled(cancellation_check)
+    if len(editor_input) >= MAX_API_INPUT_BYTES:
+        raise PlanImageCorrectionInferenceError(
+            "The prepared plan is too large for image correction."
+        )
+    editor_arguments = {
+        "api_key": api_key,
+        "prompt": prompt,
+        "output_size": output_size,
+        "cancellation_check": cancellation_check,
+    }
+    try:
+        if (
+            selected_model == PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
+            and not editor_was_injected
+        ):
+            # sd-cli owns a child process and a global inference lock. Keep it
+            # in this QThread so cancellation cannot finish the worker before
+            # the child has terminated and the lock is released.
+            payload = editor(editor_input, **editor_arguments)
+        else:
+            # Remote calls and explicitly injected editors can be detached so
+            # a stalled transport cannot block application exit.
+            payload = _invoke_editor_cancellably(
+                editor,
+                editor_input,
+                **editor_arguments,
+            )
+    except PlanImageCorrectionCancelled:
+        raise
+    except QwenPlanCorrectionCancelled:
+        raise PlanImageCorrectionCancelled(
+            "Image correction was cancelled."
+        ) from None
+    except PlanImageCorrectionInferenceError:
+        raise
+    except QwenPlanCorrectionError as error:
+        raise PlanImageCorrectionInferenceError(str(error)) from None
+    except Exception:  # noqa: BLE001 - redact every untrusted editor failure.
+        # Do not forward untrusted exception text: it can contain credentials,
+        # request headers, or provider response bodies.
+        raise PlanImageCorrectionInferenceError(
+            f"The {selected_model} image correction failed."
+        ) from None
+    _raise_if_cancelled(cancellation_check)
+    return _decode_editor_image(payload, expected_size=output_size)
+
+
 # ### Public correction API ###
 def correct_plan_image(
     input_path: str | Path,
@@ -201,6 +315,8 @@ def correct_plan_image(
     progress_callback: ProgressCallback | None = None,
     cancellation_check: CancellationCheck | None = None,
     make_walls_continuous: bool = False,
+    measurement_analyzer: PlanMeasurementAnalyzer | None = None,
+    metric_normalizer: PlanMetricNormalizer | None = None,
 ) -> PlanImageCorrectionResult:
     """Create a safe black-and-white plan without ever overwriting the source."""
 
@@ -212,6 +328,11 @@ def correct_plan_image(
     if not isinstance(make_walls_continuous, bool):
         raise PlanImageCorrectionError(
             "Make walls continuous must be enabled or disabled."
+        )
+    if measurement_analyzer is not None and metric_normalizer is not None:
+        raise PlanImageCorrectionError(
+            "Plan metric calibration accepts either an analyzer or a "
+            "coordinated calibration callback, not both."
         )
     source_path = Path(input_path).expanduser()
     destination = Path(output_path).expanduser()
@@ -239,13 +360,6 @@ def correct_plan_image(
 
     reporter.emit(STAGE_PREPARING, 8, "Preparing the complete plan sheet.")
     prepared = _prepare_editor_image(source, output_size)
-    _raise_if_cancelled(cancellation_check)
-    editor_input = _encode_png(prepared)
-    _raise_if_cancelled(cancellation_check)
-    if len(editor_input) >= MAX_API_INPUT_BYTES:
-        raise PlanImageCorrectionInferenceError(
-            "The prepared plan is too large for image correction."
-        )
     key = str(api_key or "").strip()
     active_editor = image_editor or _create_plan_image_editor(selected_model)
     if (
@@ -256,53 +370,86 @@ def correct_plan_image(
         raise PlanImageCorrectionInferenceError(
             "OpenAI image correction is not configured."
         )
+    uses_metric_calibration = (
+        measurement_analyzer is not None or metric_normalizer is not None
+    )
+    measurement_reference: np.ndarray | None = None
+    correction_input = prepared
+    if uses_metric_calibration:
+        reporter.emit(
+            STAGE_MEASUREMENT_REFERENCE,
+            16,
+            "Rectifying the plan while preserving printed measurements.",
+        )
+        measurement_reference = _run_correction_pass(
+            active_editor,
+            prepared,
+            api_key=key,
+            prompt=PLAN_MEASUREMENT_PRESERVING_CORRECTION_PROMPT,
+            output_size=output_size,
+            selected_model=selected_model,
+            editor_was_injected=image_editor is not None,
+            cancellation_check=cancellation_check,
+        )
+        correction_input = measurement_reference
+
     reporter.emit(
         STAGE_AI_CORRECTION,
-        20,
-        f"Correcting the photographed plan with {selected_model}.",
+        46 if uses_metric_calibration else 20,
+        (
+            "Removing printed measurements from the rectified plan."
+            if uses_metric_calibration
+            else f"Correcting the photographed plan with {selected_model}."
+        ),
     )
-    _raise_if_cancelled(cancellation_check)
-    try:
-        editor_arguments = {
-            "api_key": key,
-            "prompt": PLAN_CORRECTION_PROMPT,
-            "output_size": output_size,
-            "cancellation_check": cancellation_check,
-        }
-        if (
-            selected_model == PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
-            and image_editor is None
-        ):
-            # sd-cli owns a child process and a global inference lock. Keep it
-            # in this QThread so cancellation cannot finish the worker before
-            # the child has terminated and the lock is released.
-            payload = active_editor(editor_input, **editor_arguments)
-        else:
-            # Remote OpenAI calls and explicitly injected editors can be
-            # detached so a stalled transport cannot block application exit.
-            payload = _invoke_editor_cancellably(
-                active_editor,
-                editor_input,
-                **editor_arguments,
+    corrected = _run_correction_pass(
+        active_editor,
+        correction_input,
+        api_key=key,
+        prompt=PLAN_CORRECTION_PROMPT,
+        output_size=output_size,
+        selected_model=selected_model,
+        editor_was_injected=image_editor is not None,
+        cancellation_check=cancellation_check,
+    )
+
+    metric_calibration: PlanMetricCalibration | None = None
+    metric_warning = ""
+    if measurement_analyzer is not None or metric_normalizer is not None:
+        _raise_if_cancelled(cancellation_check)
+        reporter.emit(
+            STAGE_METRIC_CALIBRATION,
+            74,
+            "Transcribing plan measurements and calibrating native image scale.",
+        )
+        try:
+            if metric_normalizer is not None:
+                calibrated = metric_normalizer(
+                    source,
+                    corrected,
+                    measurement_reference_image=measurement_reference,
+                    cancellation_check=cancellation_check,
+                )
+            else:
+                assert measurement_analyzer is not None
+                calibrated = calibrate_and_normalize_plan(
+                    source,
+                    corrected,
+                    measurement_analyzer,
+                    measurement_reference_image=measurement_reference,
+                    cancellation_check=cancellation_check,
+                )
+        except PlanMetricCalibrationCancelled:
+            raise PlanImageCorrectionCancelled(
+                "Image correction was cancelled."
+            ) from None
+        except PlanMetricCalibrationError as error:
+            metric_warning = str(error).strip() or (
+                "The plan measurements could not establish a reliable metric scale."
             )
-    except PlanImageCorrectionCancelled:
-        raise
-    except QwenPlanCorrectionCancelled:
-        raise PlanImageCorrectionCancelled(
-            "Image correction was cancelled."
-        ) from None
-    except PlanImageCorrectionInferenceError:
-        raise
-    except QwenPlanCorrectionError as error:
-        raise PlanImageCorrectionInferenceError(str(error)) from None
-    except Exception:  # noqa: BLE001 - redact every untrusted editor failure.
-        # Do not forward untrusted exception text: it can contain credentials,
-        # request headers, or provider response bodies.
-        raise PlanImageCorrectionInferenceError(
-            f"The {selected_model} image correction failed."
-        ) from None
-    _raise_if_cancelled(cancellation_check)
-    corrected = _decode_editor_image(payload, expected_size=output_size)
+        else:
+            corrected = calibrated.image
+            metric_calibration = calibrated.calibration
 
     _raise_if_cancelled(cancellation_check)
     reporter.emit(STAGE_BINARIZATION, 82, "Creating the black-and-white plan.")
@@ -325,6 +472,19 @@ def correct_plan_image(
 
     reporter.emit(STAGE_SAVING, 94, "Saving the corrected plan.")
     _write_png_atomically(destination, binary, cancellation_check)
+    if metric_calibration is not None:
+        try:
+            image_fingerprint = hashlib.sha256(
+                destination.read_bytes()
+            ).hexdigest()
+        except OSError:
+            raise PlanImageCorrectionError(
+                "The corrected plan fingerprint could not be recorded."
+            ) from None
+        metric_calibration = replace(
+            metric_calibration,
+            normalized_image_sha256=image_fingerprint,
+        )
     reporter.emit(STAGE_COMPLETE, 100, "Image correction complete.")
     return PlanImageCorrectionResult(
         output_path=destination,
@@ -332,6 +492,8 @@ def correct_plan_image(
         input_size=(source_width, source_height),
         output_size=(binary.shape[1], binary.shape[0]),
         stages=reporter.stages,
+        metric_calibration=metric_calibration,
+        metric_warning=metric_warning,
     )
 
 
