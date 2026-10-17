@@ -1,9 +1,10 @@
 # ### Imports ###
 from __future__ import annotations
 
+import heapq
 import math
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 
@@ -20,6 +21,9 @@ _POINT_KEY_PRECISION = 6
 _MINIMUM_STRUCTURAL_INK_RETENTION = 0.45
 _EXISTING_WALL_COLLINEAR_TOLERANCE_PX = 0.5
 _EXISTING_WALL_COLLINEAR_ANGLE_TOLERANCE_DEGREES = 0.5
+_REPAIR_MINIMUM_INK_COVERAGE = 0.92
+_REPAIR_MAXIMUM_INK_GAP_PIXELS = 2.0
+_REPAIR_MAXIMUM_TURNS = 4
 
 
 # ### Public data models ###
@@ -51,6 +55,7 @@ class PlanWallAnalysis:
     image_width: int
     image_height: int
     line_evidence: tuple[WallLineEvidence, ...]
+    structural_ink: np.ndarray | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +221,8 @@ def analyze_plan_wall_evidence(
     grayscale = _validated_grayscale_image(image)
     normalized = _normalized_binary_plan(grayscale)
     structural = _structural_binary_plan(normalized)
+    structural_ink = structural < 128
+    structural_ink.setflags(write=False)
     detector = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
     detected, _widths, _precisions, _nfa = detector.detect(normalized)
     if detected is None:
@@ -223,6 +230,7 @@ def analyze_plan_wall_evidence(
             image_width=int(grayscale.shape[1]),
             image_height=int(grayscale.shape[0]),
             line_evidence=(),
+            structural_ink=structural_ink,
         )
 
     minimum_dimension = float(min(grayscale.shape))
@@ -255,6 +263,7 @@ def analyze_plan_wall_evidence(
         image_width=int(grayscale.shape[1]),
         image_height=int(grayscale.shape[0]),
         line_evidence=_deduplicate_analysis_evidence(evidence),
+        structural_ink=structural_ink,
     )
 
 
@@ -307,6 +316,16 @@ def reconstruct_plan_walls(
         analysis.image_height,
         resolved_options,
     )
+    # Repair before capping ends: an artificial cap would hide the dangling
+    # vertices that identify incomplete wall continuations.
+    repaired_segments = _repair_image_supported_wall_lines(
+        analysis, preliminary_graph, result, wall_face_pairs, resolved_options,
+    )
+    if repaired_segments:
+        _append_segments_to_graph(
+            preliminary_graph, repaired_segments,
+            analysis.image_width, analysis.image_height, resolved_options,
+        )
     wall_face_pairs, end_connectors = _close_wall_face_pair_ends(
         wall_face_pairs,
         result,
@@ -319,6 +338,7 @@ def reconstruct_plan_walls(
         for segment in (pair.first, pair.second)
     ]
     paired_segments.extend(end_connectors)
+    paired_segments.extend(repaired_segments)
     paired_segments = _deduplicate_segments(paired_segments)
     pieces = _node_segments(paired_segments, resolved_options)
     _append_segments_to_graph(
@@ -488,6 +508,13 @@ def _validate_analysis(analysis: PlanWallAnalysis) -> None:
         raise PlanWallDetectionError("Wall reconstruction requires a PlanWallAnalysis.")
     if analysis.image_width <= 0 or analysis.image_height <= 0:
         raise PlanWallDetectionError("Wall analysis image dimensions must be positive.")
+    ink = analysis.structural_ink
+    if ink is not None and (
+        not isinstance(ink, np.ndarray)
+        or ink.dtype != np.bool_
+        or ink.shape != (analysis.image_height, analysis.image_width)
+    ):
+        raise PlanWallDetectionError("Wall analysis ink must match the plan image dimensions.")
     for evidence in analysis.line_evidence:
         values = (*evidence.start, *evidence.end, evidence.confidence)
         if not all(math.isfinite(value) for value in values):
@@ -2443,6 +2470,321 @@ def _incidents_span_wall_face_separation(
             ):
                 return True
     return False
+
+
+# ### Image-supported wall-line repair ###
+def _repair_image_supported_wall_lines(
+    analysis: PlanWallAnalysis,
+    graph: VertexData,
+    immutable_graph: VertexData,
+    wall_pairs: Sequence[_WallFacePair],
+    options: PlanWallDetectionOptions,
+) -> list[_Segment]:
+    """Trace unused ink between supported wall anchors, including corners.
+
+    A path must start at an unfinished wall and reach another wall. Its entire
+    length needs structural ink; the gap-bridging slider does not authorize this
+    pass to fill white doorway openings. Older analyses without pixels retain
+    their original reconstruction behavior.
+    """
+
+    if analysis.structural_ink is None or not graph.edges:
+        return []
+    graph_incidents = _repair_graph_incidents(graph)
+    sources = sorted(
+        vertex_id for vertex_id, items in graph_incidents.items() if len(items) == 1
+    )
+    if not sources:
+        return []
+    repair_options = replace(
+        options,
+        maximum_gap_bridge_pixels=min(
+            options.maximum_gap_bridge_pixels, _REPAIR_MAXIMUM_INK_GAP_PIXELS
+        ),
+        maximum_vertex_distance_pixels=min(options.maximum_vertex_distance_pixels, 2.0),
+    )
+    guides = [
+        segment
+        for segment in _segments_from_analysis(analysis, options)
+        if segment.confidence >= max(0.5, options.confidence_threshold)
+    ]
+    guides = _repair_remove_wall_interiors(guides, wall_pairs, options)
+    guides = _merge_collinear_segments(guides, repair_options)
+    guides = [
+        segment
+        for segment in guides
+        if _repair_line_has_ink(segment, analysis.structural_ink)
+    ]
+    # Subtraction eliminates already accepted faces before the more expensive
+    # intersection work, while retaining their endpoints as exact anchors.
+    guides = _subtract_existing_wall_geometry(guides, graph)
+    if not guides:
+        return []
+    graph_segments = _existing_graph_segments(graph)
+    pieces = _node_segments([*guides, *graph_segments], repair_options)
+    network = graph.clone()
+    _append_segments_to_graph(
+        network,
+        pieces,
+        analysis.image_width,
+        analysis.image_height,
+        repair_options,
+    )
+    points = {
+        vertex.id: np.asarray((vertex.x, vertex.y), dtype=np.float64)
+        for vertex in network.vertices
+    }
+    adjacency: dict[int, list[tuple[int, _Segment]]] = {}
+    for edge in network.edges[len(graph.edges) :]:
+        start_id, end_id = edge.start_vertex_id, edge.end_vertex_id
+        segment = _segment_from_vertices(
+            network.get_vertex(start_id), network.get_vertex(end_id)
+        )
+        if not _repair_line_has_ink(segment, analysis.structural_ink):
+            continue
+        adjacency.setdefault(start_id, []).append((end_id, segment))
+        adjacency.setdefault(end_id, []).append((start_id, segment))
+    if not adjacency:
+        return []
+
+    anchors = set(graph_incidents)
+    obstructions = set(anchors)
+    immutable_segments = _existing_graph_segments(immutable_graph)
+    for vertex_id, point in points.items():
+        if vertex_id in anchors:
+            continue
+        touching = [
+            segment
+            for segment in graph_segments
+            if _repair_point_on_segment(point, segment)
+        ]
+        if not touching:
+            continue
+        obstructions.add(vertex_id)
+        # Existing edge records are immutable. Only freshly generated target
+        # edges can be split by the final graph-noding pass.
+        if not any(
+            _repair_point_on_segment(point, segment) for segment in immutable_segments
+        ):
+            anchors.add(vertex_id)
+            graph_incidents[vertex_id] = touching
+
+    accepted: dict[tuple[int, int], _Segment] = {}
+    degrees = {vertex_id: len(items) for vertex_id, items in graph_incidents.items()}
+    # Each successful route consumes at least one dangling source, so iteration
+    # is bounded even when later routes attach to an earlier repaired segment.
+    for _iteration in range(len(sources)):
+        changed = False
+        for source_id in sources:
+            if degrees.get(source_id) != 1 or source_id not in adjacency:
+                continue
+            path = _repair_best_supported_path(
+                source_id,
+                points,
+                adjacency,
+                graph_incidents,
+                anchors,
+                obstructions,
+                accepted,
+                options,
+            )
+            if not path:
+                continue
+            for start_id, end_id in pairwise(path):
+                key = tuple(sorted((start_id, end_id)))
+                if key in accepted:
+                    continue
+                start, end = _canonical_endpoints(points[start_id], points[end_id])
+                repaired = _Segment(start=start, end=end, confidence=1.0)
+                accepted[key] = repaired
+                degrees[start_id] = degrees.get(start_id, 0) + 1
+                degrees[end_id] = degrees.get(end_id, 0) + 1
+                graph_incidents.setdefault(start_id, []).append(repaired)
+                graph_incidents.setdefault(end_id, []).append(repaired)
+                anchors.update((start_id, end_id))
+                obstructions.update((start_id, end_id))
+            changed = True
+        if not changed:
+            break
+    return sorted(accepted.values(), key=_segment_sort_key)
+
+
+def _repair_graph_incidents(graph: VertexData) -> dict[int, list[_Segment]]:
+    """Index connected anchors; isolated room-center vertices are not anchors."""
+
+    vertices = {vertex.id: vertex for vertex in graph.vertices}
+    incidents: dict[int, list[_Segment]] = {}
+    for edge in graph.edges:
+        segment = _segment_from_vertices(
+            vertices[edge.start_vertex_id], vertices[edge.end_vertex_id]
+        )
+        incidents.setdefault(edge.start_vertex_id, []).append(segment)
+        incidents.setdefault(edge.end_vertex_id, []).append(segment)
+    return incidents
+
+
+def _repair_remove_wall_interiors(
+    segments: Sequence[_Segment],
+    pairs: Sequence[_WallFacePair],
+    options: PlanWallDetectionOptions,
+) -> list[_Segment]:
+    """Clip decorative layers out of wall strips, even on longer guides."""
+
+    tolerance = math.radians(options.parallel_angle_tolerance_degrees)
+    retained: list[_Segment] = []
+    for segment in segments:
+        interiors: list[tuple[float, float]] = []
+        for pair in pairs:
+            if (
+                _angle_difference(_segment_angle(segment), _segment_angle(pair.first))
+                > tolerance
+            ):
+                continue
+            direction = _unit_direction(pair.first)
+            normal = np.asarray((-direction[1], direction[0]))
+            bounds = sorted(
+                (
+                    float(np.dot(pair.first.start, normal)),
+                    float(np.dot(pair.second.start, normal)),
+                )
+            )
+            offsets = [
+                float(np.dot(point, normal)) for point in (segment.start, segment.end)
+            ]
+            if min(offsets) <= bounds[0] + 0.5 or max(offsets) >= bounds[1] - 0.5:
+                continue
+            first_interval = _projection_interval(pair.first, direction)
+            second_interval = _projection_interval(pair.second, direction)
+            origin = float(np.dot(segment.start, direction))
+            span = float(np.dot(segment.vector, direction))
+            lower = (max(first_interval[0], second_interval[0]) - origin) / span
+            upper = (min(first_interval[1], second_interval[1]) - origin) / span
+            lower, upper = max(0.0, lower), min(1.0, upper)
+            if upper > lower:
+                interiors.append((lower, upper))
+        previous_end = 0.0
+        for lower, upper in [*_merged_parameter_intervals(interiors), (1.0, 1.0)]:
+            if (lower - previous_end) * segment.length > 0.25:
+                start = segment.start + previous_end * segment.vector
+                end = segment.start + lower * segment.vector
+                retained.append(
+                    _Segment(start=start, end=end, confidence=segment.confidence)
+                )
+            previous_end = upper
+    return retained
+
+
+def _repair_line_has_ink(segment: _Segment, ink: np.ndarray) -> bool:
+    """Check coverage and the longest white interruption, at pixel spacing."""
+
+    length = segment.length
+    if length <= _GEOMETRY_EPSILON:
+        return False
+    sample_count = max(2, math.ceil(length) + 1)
+    points = (
+        segment.start + np.linspace(0.0, 1.0, sample_count)[:, None] * segment.vector
+    )
+    direction = _unit_direction(segment)
+    normal = np.asarray((-direction[1], direction[0]))
+    supported = np.zeros(sample_count, dtype=bool)
+    for offset in (-1.0, 0.0, 1.0):
+        samples = np.rint(points + offset * normal).astype(np.int32)
+        inside = (
+            (samples[:, 0] >= 0)
+            & (samples[:, 0] < ink.shape[1])
+            & (samples[:, 1] >= 0)
+            & (samples[:, 1] < ink.shape[0])
+        )
+        supported[inside] |= ink[samples[inside, 1], samples[inside, 0]]
+    if float(np.mean(supported)) < _REPAIR_MINIMUM_INK_COVERAGE:
+        return False
+    white = np.concatenate(([False], ~supported, [False])).astype(np.int8)
+    transitions = np.diff(white)
+    starts = np.flatnonzero(transitions == 1)
+    ends = np.flatnonzero(transitions == -1)
+    longest_gap = int(np.max(ends - starts)) if len(starts) else 0
+    return longest_gap * length / (sample_count - 1) <= _REPAIR_MAXIMUM_INK_GAP_PIXELS
+
+
+def _repair_point_on_segment(point: np.ndarray, segment: _Segment) -> bool:
+    if _point_line_distance(point, segment) > 1e-4:
+        return False
+    parameter = float(np.dot(point - segment.start, segment.vector)) / segment.length**2
+    return -_GEOMETRY_EPSILON <= parameter <= 1.0 + _GEOMETRY_EPSILON
+
+
+def _repair_turn_is_supported(
+    first: np.ndarray, second: np.ndarray, tolerance: float
+) -> bool:
+    cosine = float(np.dot(first, second))
+    return cosine >= math.cos(tolerance) or abs(cosine) <= math.sin(tolerance)
+
+
+def _repair_best_supported_path(
+    source_id: int,
+    points: dict[int, np.ndarray],
+    adjacency: dict[int, list[tuple[int, _Segment]]],
+    incidents: dict[int, list[_Segment]],
+    anchors: set[int],
+    obstructions: set[int],
+    accepted: dict[tuple[int, int], _Segment],
+    options: PlanWallDetectionOptions,
+) -> tuple[int, ...]:
+    """Prefer the shortest straight continuation, then supported right turns."""
+
+    tolerance = math.radians(min(options.parallel_angle_tolerance_degrees, 15.0))
+    source_segment = incidents[source_id][0]
+    other_point = (
+        source_segment.end
+        if math.dist(source_segment.start, points[source_id]) < 1e-4
+        else source_segment.start
+    )
+    initial_direction = points[source_id] - other_point
+    initial_direction /= np.linalg.norm(initial_direction)
+    queue: list[tuple[int, float, tuple[int, ...]]] = [(0, 0.0, (source_id,))]
+    best_costs: dict[tuple[int, int, int], float] = {}
+    while queue:
+        turns, cost, path = heapq.heappop(queue)
+        vertex_id = path[-1]
+        if len(path) > 1 and vertex_id in obstructions:
+            incoming = points[vertex_id] - points[path[-2]]
+            incoming /= np.linalg.norm(incoming)
+            target_incidents = incidents.get(vertex_id, ())
+            if vertex_id in anchors and any(
+                _repair_turn_is_supported(
+                    incoming, sign * _unit_direction(segment), tolerance
+                )
+                for segment in target_incidents
+                for sign in (-1, 1)
+            ):
+                return path
+            continue
+        previous_direction = initial_direction
+        if len(path) > 1:
+            previous_direction = points[vertex_id] - points[path[-2]]
+            previous_direction /= np.linalg.norm(previous_direction)
+        for next_id, segment in sorted(
+            adjacency.get(vertex_id, ()), key=lambda item: item[0]
+        ):
+            if next_id in path or tuple(sorted((vertex_id, next_id))) in accepted:
+                continue
+            direction = points[next_id] - points[vertex_id]
+            direction /= np.linalg.norm(direction)
+            if not _repair_turn_is_supported(previous_direction, direction, tolerance):
+                continue
+            is_turn = abs(float(np.dot(previous_direction, direction))) <= math.sin(
+                tolerance
+            )
+            next_turns = turns + int(is_turn)
+            if next_turns > _REPAIR_MAXIMUM_TURNS:
+                continue
+            next_cost = cost + segment.length
+            key = (vertex_id, next_id, next_turns)
+            if next_cost >= best_costs.get(key, math.inf):
+                continue
+            best_costs[key] = next_cost
+            heapq.heappush(queue, (next_turns, next_cost, (*path, next_id)))
+    return ()
 
 
 # ### Existing-wall geometric subtraction ###
