@@ -349,6 +349,17 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertFalse(hasattr(self.surfaces, "texture_view"))
         self.assertFalse(hasattr(self.surfaces, "delete_texture_button"))
         self.assertFalse(hasattr(self.workspace, "reference_editing_section"))
+        self.assertEqual(
+            self.workspace.reference_generation_section.title(),
+            "Reference generation",
+        )
+        self.assertIs(
+            self.workspace.findChild(
+                QWidget,
+                "merged_generation_reference_generation_section",
+            ),
+            self.workspace.reference_generation_section,
+        )
         self.assertIsNone(
             self.workspace.findChild(
                 QWidget,

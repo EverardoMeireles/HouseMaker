@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -15,6 +16,7 @@ from PySide6.QtCore import (
     QByteArray,
     QIODevice,
     QMimeData,
+    QSignalBlocker,
     Qt,
     QThread,
     QTimer,
@@ -24,11 +26,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -75,6 +80,17 @@ from housemaker.plan_metric_state import (
     PlanMetricCalibration,
     build_ceiling_height_plan_context,
 )
+from housemaker.reference_generation_models import (
+    DEFAULT_REFERENCE_GENERATION_MODEL,
+    DEFAULT_REFERENCE_NEGATIVE_PROMPT,
+    REFERENCE_GENERATION_MODEL_OPTIONS,
+    REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+)
+from housemaker.reference_view_presets import (
+    DEFAULT_REFERENCE_VIEW_PRESETS,
+    ReferenceViewPreset,
+    read_reference_view_presets,
+)
 from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import SurfaceTextureGenerationWorkspace
@@ -104,6 +120,15 @@ GENERATION_ACTION_GENERATE = "generate"
 GENERATION_ACTION_GEOMETRY = "generate_geometry"
 GENERATION_ACTION_OBJECT_TEXTURE = "generate_object_texture"
 GENERATION_ACTION_SURFACE_TEXTURE = "generate_surface_texture"
+REFERENCE_GENERATION_JOB_KIND = "Reference generation"
+REFERENCE_GENERATION_MODEL_SETTINGS_KEY = "generation/reference_generation_model"
+REFERENCE_GENERATION_PROMPT_SETTINGS_KEY = "generation/reference_generation_prompt"
+REFERENCE_GENERATION_VIEW_SETTINGS_KEY = "generation/reference_generation_view"
+REFERENCE_GENERATION_CUSTOM_VIEW_ID = ""
+REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY = (
+    "generation/reference_generation_negative_prompt"
+)
+REFERENCE_GENERATION_STRENGTH_SETTINGS_KEY = "generation/reference_generation_strength"
 
 
 # ### Ceiling-height plan references ###
@@ -475,6 +500,79 @@ def _format_level_height_result(
 
 
 # ### Temporary generation references ###
+class _ReferenceGenerationThread(QThread):
+    """Keep image-model imports and expensive inference off the GUI thread."""
+
+    progress_changed = Signal(str, int)
+
+    def __init__(
+        self,
+        source_bgra: np.ndarray,
+        prompt: str,
+        model: str,
+        *,
+        api_key: str,
+        strength: float,
+        negative_prompt: str = DEFAULT_REFERENCE_NEGATIVE_PROMPT,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._source_bgra = np.ascontiguousarray(source_bgra).copy()
+        self._prompt = str(prompt)
+        self._model = str(model)
+        self._api_key = str(api_key)
+        self._strength = float(strength)
+        self._negative_prompt = str(negative_prompt)
+        self.result: np.ndarray | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from housemaker.reference_generation import generate_object_reference
+
+            self.result = generate_object_reference(
+                self._source_bgra,
+                self._prompt,
+                self._model,
+                api_key=self._api_key,
+                strength=self._strength,
+                negative_prompt=self._negative_prompt,
+                progress_callback=self.progress_changed.emit,
+                cancellation_check=self.isInterruptionRequested,
+            )
+            self.was_cancelled = self.isInterruptionRequested()
+        except Exception as error:  # noqa: BLE001 - report provider failures on the GUI thread.
+            self.was_cancelled = self.isInterruptionRequested()
+            if not self.was_cancelled:
+                self.error_message = (
+                    str(error).replace(self._api_key, "[redacted]")
+                    if self._api_key
+                    else str(error)
+                )
+        finally:
+            self._api_key = ""
+
+
+@dataclass
+class _ReferenceGenerationRuntime:
+    """Tie one cancellable request to the exact input it was launched from."""
+
+    thread: _ReferenceGenerationThread
+    job_id: str
+    context_signature: tuple[object, ...]
+    source_bgra: np.ndarray
+    cancel_requested: bool = False
+
+
+@dataclass
+class _ReferenceGenerationRetrySource:
+    """Retry from the original image, never from the previous model output."""
+
+    source_bgra: np.ndarray
+    context_signature: tuple[object, ...]
+
+
 @dataclass
 class _TemporaryObjectReferenceSession:
     """Keep one external reference coherent across same-frame refreshes."""
@@ -530,6 +628,17 @@ class MergedGenerationWorkspace(QWidget):
         self._generation_action_default_text: dict[str, str] = {}
         self._generation_action_default_tooltips: dict[str, str] = {}
         self._is_shutdown = False
+        self._reference_generation_runtime: (
+            _ReferenceGenerationRuntime | None
+        ) = None
+        self._retired_reference_generation_runtimes: dict[
+            str, _ReferenceGenerationRuntime
+        ] = {}
+        self._reference_generation_retry_source: (
+            _ReferenceGenerationRetrySource | None
+        ) = None
+        self._reference_generation_input_revision = 0
+        self._reference_view_presets = read_reference_view_presets(application_settings)
 
         self.surface_workspace.setParent(self)
         self.object_workspace.setParent(self)
@@ -560,6 +669,17 @@ class MergedGenerationWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._invalidate_reference_generation_input()
+        for retired_runtime in tuple(
+            self._retired_reference_generation_runtimes.values()
+        ):
+            retired_runtime.thread.requestInterruption()
+            while retired_runtime.thread.isRunning():
+                retired_runtime.thread.wait(
+                    CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS
+                )
+            retired_runtime.thread.deleteLater()
+        self._retired_reference_generation_runtimes.clear()
         self._door_slot_generation_blink_timer.stop()
         try:
             QApplication.clipboard().dataChanged.disconnect(
@@ -719,6 +839,9 @@ class MergedGenerationWorkspace(QWidget):
         root_layout.addWidget(self.seekbar)
 
         self.shared_controls = self._build_shared_controls()
+        self.reference_generation_section = (
+            self._build_reference_generation_controls()
+        )
         self.object_controls = self._build_object_controls()
         self.controls_row = QWidget()
         self.controls_row.setObjectName("merged_generation_controls_row")
@@ -731,6 +854,7 @@ class MergedGenerationWorkspace(QWidget):
         )
         controls_row_layout.setSpacing(WORKFLOW_SECTION_SPACING)
         controls_row_layout.addWidget(self.shared_controls, 1)
+        controls_row_layout.addWidget(self.reference_generation_section, 1)
         controls_row_layout.addWidget(self.object_controls, 2)
         self.controls_scroll = QScrollArea()
         self.controls_scroll.setObjectName("merged_generation_controls_scroll")
@@ -854,6 +978,553 @@ class MergedGenerationWorkspace(QWidget):
         layout.setColumnStretch(0, 1)
         return section
 
+    # ### Reference generation controls ###
+    def _build_reference_generation_controls(self) -> QWidget:
+        section, layout = _build_boxed_section(
+            "Reference generation",
+            "merged_generation_reference_generation_section",
+        )
+        self.reference_generation_model_combo = QComboBox()
+        self.reference_generation_model_combo.setObjectName(
+            "reference_generation_model_combo"
+        )
+        self.reference_generation_model_combo.setToolTip(
+            "OpenAI models use the API key in Settings. Qwen and Stable "
+            "Diffusion run locally. Stable Diffusion downloads its model "
+            "(about 7 GB) on first use."
+        )
+        for label, model in REFERENCE_GENERATION_MODEL_OPTIONS:
+            self.reference_generation_model_combo.addItem(label, model)
+        saved_model = self._reference_generation_preference(
+            REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+            DEFAULT_REFERENCE_GENERATION_MODEL,
+        )
+        model_index = self.reference_generation_model_combo.findData(
+            str(saved_model)
+        )
+        self.reference_generation_model_combo.setCurrentIndex(max(model_index, 0))
+        layout.addWidget(
+            _build_labeled_inline_control(
+                "Reference generation model",
+                self.reference_generation_model_combo,
+            )
+        )
+        self.reference_generation_view_combo = QComboBox()
+        self.reference_generation_view_combo.setObjectName(
+            "reference_generation_view_combo"
+        )
+        default_view = (
+            self._reference_view_presets[0].preset_id
+            if self._reference_view_presets
+            else REFERENCE_GENERATION_CUSTOM_VIEW_ID
+        )
+        self._populate_reference_generation_views(
+            str(self._reference_generation_preference(
+                REFERENCE_GENERATION_VIEW_SETTINGS_KEY, default_view
+            ))
+        )
+        layout.addWidget(
+            _build_labeled_inline_control(
+                "Reference view", self.reference_generation_view_combo
+            )
+        )
+        self.reference_generation_prompt_edit = QLineEdit()
+        self.reference_generation_prompt_edit.setObjectName(
+            "reference_generation_prompt_edit"
+        )
+        self.reference_generation_prompt_edit.setMaxLength(4_000)
+        self.reference_generation_prompt_edit.setPlaceholderText(
+            "Describe the object to generate for Meshy"
+        )
+        self.reference_generation_prompt_edit.setText(
+            str(self._reference_generation_preference(
+                REFERENCE_GENERATION_PROMPT_SETTINGS_KEY, ""
+            ))
+        )
+        self.reference_generation_prompt_control = _build_labeled_inline_control(
+            "Reference prompt", self.reference_generation_prompt_edit
+        )
+        self.reference_generation_prompt_control.setObjectName(
+            "reference_generation_prompt_control"
+        )
+        layout.addWidget(self.reference_generation_prompt_control)
+        self.reference_generation_strength_spinbox = QDoubleSpinBox()
+        self.reference_generation_strength_spinbox.setObjectName(
+            "reference_generation_strength_spinbox"
+        )
+        self.reference_generation_strength_spinbox.setRange(0.05, 0.95)
+        self.reference_generation_strength_spinbox.setSingleStep(0.05)
+        self.reference_generation_strength_spinbox.setDecimals(2)
+        saved_strength = self._reference_generation_preference(
+            REFERENCE_GENERATION_STRENGTH_SETTINGS_KEY, 0.45
+        )
+        try:
+            self.reference_generation_strength_spinbox.setValue(
+                float(saved_strength)
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.reference_generation_strength_spinbox.setValue(0.45)
+        self.reference_generation_strength_spinbox.setToolTip(
+            "Stable Diffusion img2img strength: lower preserves the input; "
+            "higher changes it more."
+        )
+        self.reference_generation_strength_control = _build_labeled_inline_control(
+            "Image change strength", self.reference_generation_strength_spinbox
+        )
+        layout.addWidget(self.reference_generation_strength_control)
+        self.reference_generation_negative_prompt_edit = QLineEdit()
+        self.reference_generation_negative_prompt_edit.setObjectName(
+            "reference_generation_negative_prompt_edit"
+        )
+        self.reference_generation_negative_prompt_edit.setMaxLength(4_000)
+        self.reference_generation_negative_prompt_edit.setText(
+            str(self._reference_generation_preference(
+                REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY,
+                DEFAULT_REFERENCE_NEGATIVE_PROMPT,
+            ))
+        )
+        self.reference_generation_negative_prompt_edit.setToolTip(
+            "Stable Diffusion only: things to avoid. The default favors a "
+            "front-facing isolated object. Remove the view-related terms "
+            "when requesting another angle. Clear this field to use no negative prompt."
+        )
+        self.reference_generation_negative_prompt_control = (
+            _build_labeled_inline_control(
+                "Negative prompt", self.reference_generation_negative_prompt_edit
+            )
+        )
+        layout.addWidget(self.reference_generation_negative_prompt_control)
+        self.generate_reference_button = QPushButton("Generate reference")
+        self.generate_reference_button.setObjectName(
+            "generate_reference_button"
+        )
+        self.generate_reference_button.setToolTip(
+            "Generate a 1024 × 1024 object reference from the current mask, "
+            "pasted image or loaded image. The result is automatically used "
+            "by the next generation. Click again to retry the original input."
+        )
+        layout.addWidget(self.generate_reference_button)
+        self.reference_generation_status_label = QLabel(
+            "Paint a mask, paste or load an image."
+        )
+        self.reference_generation_status_label.setObjectName(
+            "reference_generation_status_label"
+        )
+        self.reference_generation_status_label.setWordWrap(True)
+        self.reference_generation_status_label.setTextFormat(
+            Qt.TextFormat.PlainText
+        )
+        layout.addWidget(self.reference_generation_status_label)
+        layout.addStretch(1)
+        return section
+
+    # ### Reference view presets ###
+    def _populate_reference_generation_views(self, selected_id: str) -> None:
+        """Keep renamed views selected by ID without replacing a custom draft."""
+
+        combo = self.reference_generation_view_combo
+        with QSignalBlocker(combo):
+            combo.clear()
+            for preset in self._reference_view_presets:
+                combo.addItem(preset.name, preset.preset_id)
+                combo.setItemData(
+                    combo.count() - 1, preset.prompt, Qt.ItemDataRole.ToolTipRole
+                )
+            combo.addItem("(Write prompt)", REFERENCE_GENERATION_CUSTOM_VIEW_ID)
+            index = combo.findData(selected_id)
+            combo.setCurrentIndex(index if index >= 0 else combo.count() - 1)
+        self._update_reference_generation_view_tooltip()
+
+    def set_reference_view_presets(
+        self, presets: Iterable[ReferenceViewPreset]
+    ) -> None:
+        """Apply Settings edits to future requests, leaving active jobs untouched."""
+
+        selected_id = str(self.reference_generation_view_combo.currentData() or "")
+        updated_presets = tuple(presets)
+        if updated_presets == self._reference_view_presets:
+            return
+        self._reference_view_presets = updated_presets
+        self._populate_reference_generation_views(selected_id)
+        current_id = self.reference_generation_view_combo.currentData()
+        if current_id != selected_id and self._application_settings is not None:
+            self._application_settings.set(REFERENCE_GENERATION_VIEW_SETTINGS_KEY, current_id)
+        self._sync_reference_generation_controls()
+
+    def _selected_reference_generation_prompt(self) -> str:
+        selected_id = self.reference_generation_view_combo.currentData()
+        if selected_id == REFERENCE_GENERATION_CUSTOM_VIEW_ID:
+            return self.reference_generation_prompt_edit.text().strip()
+        return next(
+            (
+                preset.prompt
+                for preset in self._reference_view_presets
+                if preset.preset_id == selected_id
+            ),
+            "",
+        )
+
+    def _update_reference_generation_view_tooltip(self) -> None:
+        selected_prompt = next(
+            (
+                preset.prompt
+                for preset in self._reference_view_presets
+                if preset.preset_id == self.reference_generation_view_combo.currentData()
+            ),
+            "Write a custom reference prompt. Edit reusable views in Settings.",
+        )
+        self.reference_generation_view_combo.setToolTip(selected_prompt)
+
+    def _make_default_reference_negative_prompt_view_compatible(self) -> None:
+        """Do not let the old frontal default contradict a different saved view."""
+
+        if (
+            self.reference_generation_model_combo.currentData()
+            != REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
+            or self.reference_generation_negative_prompt_edit.text()
+            != DEFAULT_REFERENCE_NEGATIVE_PROMPT
+        ):
+            return
+        selected_view = next(
+            (
+                preset
+                for preset in self._reference_view_presets
+                if preset.preset_id == self.reference_generation_view_combo.currentData()
+            ),
+            None,
+        )
+        default_front_view = next(
+            preset for preset in DEFAULT_REFERENCE_VIEW_PRESETS if preset.preset_id == "front"
+        )
+        if selected_view is None or selected_view == default_front_view:
+            return
+        with QSignalBlocker(self.reference_generation_negative_prompt_edit):
+            self.reference_generation_negative_prompt_edit.setText(
+                DEFAULT_REFERENCE_NEGATIVE_PROMPT.removeprefix(
+                    "side view, three-quarter view, "
+                )
+            )
+
+    # ### Reference generation preferences and state ###
+    def _reference_generation_preference(
+        self, key: str, default: object
+    ) -> object:
+        if self._application_settings is None:
+            return default
+        return self._application_settings.get(key, default)
+
+    @Slot()
+    def _handle_reference_generation_preferences_changed(
+        self, *_arguments: object
+    ) -> None:
+        """Remember reference-only settings without changing Meshy's prompt."""
+
+        self._update_reference_generation_view_tooltip()
+        self._make_default_reference_negative_prompt_view_compatible()
+        if self._application_settings is not None:
+            for key, value in (
+                (
+                    REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+                    self.reference_generation_model_combo.currentData(),
+                ),
+                (
+                    REFERENCE_GENERATION_PROMPT_SETTINGS_KEY,
+                    self.reference_generation_prompt_edit.text(),
+                ),
+                (
+                    REFERENCE_GENERATION_VIEW_SETTINGS_KEY,
+                    self.reference_generation_view_combo.currentData(),
+                ),
+                (
+                    REFERENCE_GENERATION_STRENGTH_SETTINGS_KEY,
+                    self.reference_generation_strength_spinbox.value(),
+                ),
+                (
+                    REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY,
+                    self.reference_generation_negative_prompt_edit.text(),
+                ),
+            ):
+                self._application_settings.set(key, value)
+        self._sync_reference_generation_controls()
+
+    def _sync_reference_generation_controls(self) -> None:
+        """Keep local-only options and the cancellable action coherent."""
+
+        self._make_default_reference_negative_prompt_view_compatible()
+        running = self._reference_generation_runtime is not None
+        self.generate_reference_button.setText(
+            "Cancel" if running else "Generate reference"
+        )
+        self.generate_reference_button.setEnabled(
+            not self._is_shutdown
+            and (
+                running
+                or (
+                    bool(self._selected_reference_generation_prompt())
+                    and (
+                        self.object_workspace.has_temporary_object_reference()
+                        or self.video_view.has_selection()
+                    )
+                )
+            )
+        )
+        settings_available = not running and not self._is_shutdown
+        self.reference_generation_model_combo.setEnabled(settings_available)
+        self.reference_generation_view_combo.setEnabled(settings_available)
+        self.reference_generation_prompt_control.setVisible(
+            self.reference_generation_view_combo.currentData()
+            == REFERENCE_GENERATION_CUSTOM_VIEW_ID
+        )
+        self.reference_generation_prompt_edit.setEnabled(settings_available)
+        self.reference_generation_strength_spinbox.setEnabled(settings_available)
+        self.reference_generation_negative_prompt_edit.setEnabled(settings_available)
+        is_stable_diffusion = (
+            self.reference_generation_model_combo.currentData()
+            == REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
+        )
+        self.reference_generation_strength_control.setVisible(
+            is_stable_diffusion
+        )
+        self.reference_generation_negative_prompt_control.setVisible(
+            is_stable_diffusion
+        )
+
+    # ### Reference generation jobs ###
+    def _reference_generation_context_signature(self) -> tuple[object, ...]:
+        """Compare input bytes only at request boundaries, never every paint."""
+
+        objects = self.object_workspace
+        reference = objects.get_temporary_object_reference()
+        temporary_signature = None
+        if reference is not None:
+            temporary_signature = (
+                reference.shape,
+                hashlib.blake2b(
+                    np.ascontiguousarray(reference).tobytes(), digest_size=16
+                ).digest(),
+            )
+        door_target = objects._door_slot_editing_target
+        trim_target = objects._architectural_trim_editing_target
+        return (
+            self._reference_generation_input_revision,
+            id(objects._data),
+            id(objects._video_source),
+            objects._displayed_frame_index,
+            tuple(self.video_view.get_strokes()),
+            temporary_signature,
+            (
+                None
+                if door_target is None
+                else (door_target.door_id, door_target.slot_id)
+            ),
+            (
+                None
+                if trim_target is None
+                else (trim_target.level_index, trim_target.trim_id)
+            ),
+        )
+
+    def _cancel_reference_generation_if_context_changed(self) -> None:
+        """Honor non-interactive frame refreshes and programmatic source changes."""
+
+        runtime = self._reference_generation_runtime
+        retry_source = self._reference_generation_retry_source
+        if runtime is None and retry_source is None:
+            return
+        signature = self._reference_generation_context_signature()
+        if (
+            runtime is not None and runtime.context_signature != signature
+        ) or (
+            retry_source is not None and retry_source.context_signature != signature
+        ):
+            self._invalidate_reference_generation_input()
+
+    @Slot()
+    def _invalidate_reference_generation_input(self) -> None:
+        """A new mask, source or frame cannot receive an older async result."""
+
+        self._reference_generation_input_revision += 1
+        self._reference_generation_retry_source = None
+        runtime = self._reference_generation_runtime
+        if runtime is not None:
+            self._cancel_reference_generation(runtime.job_id)
+
+    @Slot()
+    def _handle_generate_reference_clicked(self) -> None:
+        runtime = self._reference_generation_runtime
+        if runtime is not None:
+            self.job_manager.cancel_job(runtime.job_id)
+            return
+        if self._is_shutdown:
+            return
+        prompt = self._selected_reference_generation_prompt()
+        source = self.object_workspace.get_current_object_generation_reference()
+        if source is None or not prompt:
+            self.reference_generation_status_label.setText(
+                "Paint a mask, paste or load an image, then choose a reference view "
+                "or select (Write prompt) and enter a custom prompt."
+            )
+            self._sync_reference_generation_controls()
+            return
+        signature = self._reference_generation_context_signature()
+        retry_source = self._reference_generation_retry_source
+        if retry_source is not None and retry_source.context_signature == signature:
+            source = retry_source.source_bgra.copy()
+        model = str(self.reference_generation_model_combo.currentData())
+        api_key = (
+            self.object_workspace.get_runtime_settings().openai_api_key.strip()
+        )
+        thread = _ReferenceGenerationThread(
+            source,
+            prompt,
+            model,
+            api_key=api_key,
+            strength=self.reference_generation_strength_spinbox.value(),
+            negative_prompt=self.reference_generation_negative_prompt_edit.text(),
+            parent=self,
+        )
+        job = self.job_manager.create_job(
+            kind=REFERENCE_GENERATION_JOB_KIND,
+            requested_name="",
+            default_name="Object reference",
+            stage="Preparing reference image",
+        )
+        self._reference_generation_runtime = _ReferenceGenerationRuntime(
+            thread=thread,
+            job_id=job.job_id,
+            context_signature=signature,
+            source_bgra=np.ascontiguousarray(source).copy(),
+        )
+        self.job_manager.set_cancel_callback(
+            job.job_id, partial(self._cancel_reference_generation, job.job_id)
+        )
+        thread.progress_changed.connect(
+            partial(
+                self._handle_reference_generation_progress, job.job_id, thread
+            )
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_reference_generation_finished, job.job_id, thread
+            )
+        )
+        self.reference_generation_status_label.setText("Generating reference...")
+        self._sync_reference_generation_controls()
+        thread.start()
+
+    def _cancel_reference_generation(self, job_id: str) -> bool:
+        """Retire a worker without blocking the GUI or a new reference request."""
+
+        runtime = self._reference_generation_runtime
+        if runtime is None or runtime.job_id != str(job_id):
+            return False
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        self._reference_generation_runtime = None
+        self._retired_reference_generation_runtimes[runtime.job_id] = runtime
+        self.job_manager.set_cancel_callback(runtime.job_id, None)
+        self.job_manager.mark_cancelled(runtime.job_id)
+        self.reference_generation_status_label.setText(
+            "Reference generation cancelled."
+        )
+        self._sync_reference_generation_controls()
+        return True
+
+    def _handle_reference_generation_progress(
+        self,
+        job_id: str,
+        thread: _ReferenceGenerationThread,
+        stage: str,
+        progress: int,
+    ) -> None:
+        runtime = self._reference_generation_runtime
+        if (
+            runtime is None
+            or runtime.job_id != job_id
+            or runtime.thread is not thread
+        ):
+            return
+        self.job_manager.update_job(job_id, stage=stage, progress=progress)
+        self.reference_generation_status_label.setText(str(stage))
+
+    def _handle_reference_generation_finished(
+        self,
+        job_id: str,
+        thread: _ReferenceGenerationThread,
+    ) -> None:
+        """Automatically accept only results still belonging to the input."""
+
+        retired = self._retired_reference_generation_runtimes.pop(job_id, None)
+        if retired is not None:
+            thread.deleteLater()
+            return
+        runtime = self._reference_generation_runtime
+        if (
+            runtime is None
+            or runtime.job_id != job_id
+            or runtime.thread is not thread
+        ):
+            return
+        self._reference_generation_runtime = None
+        self.job_manager.set_cancel_callback(job_id, None)
+        try:
+            if (
+                self._is_shutdown
+                or runtime.cancel_requested
+                or thread.was_cancelled
+                or runtime.context_signature
+                != self._reference_generation_context_signature()
+            ):
+                self.job_manager.mark_cancelled(
+                    job_id, stage="Reference input changed; result discarded"
+                )
+                self.reference_generation_status_label.setText(
+                    "Reference input changed; the previous result was discarded."
+                )
+                return
+            if thread.error_message is not None or thread.result is None:
+                message = (
+                    thread.error_message
+                    or "The model did not return a usable image."
+                )
+                self.job_manager.fail_job(job_id, stage=message)
+                self.reference_generation_status_label.setText(
+                    f"Reference generation failed: {message}"
+                )
+                return
+            self._activate_temporary_object_reference(
+                thread.result,
+                source_label="Generated reference",
+                generated=True,
+            )
+            active_reference = (
+                self.object_workspace.get_temporary_object_reference()
+            )
+            if active_reference is None or not np.array_equal(
+                active_reference, thread.result
+            ):
+                self.job_manager.fail_job(
+                    job_id, stage="The generated reference could not be applied."
+                )
+                return
+            self._reference_generation_retry_source = (
+                _ReferenceGenerationRetrySource(
+                    source_bgra=runtime.source_bgra.copy(),
+                    context_signature=(
+                        self._reference_generation_context_signature()
+                    ),
+                )
+            )
+            self.job_manager.complete_job(job_id)
+            self.reference_generation_status_label.setText(
+                "Generated reference is active. Generate reference retries the original input; "
+                "move the video seekbar to return to the video."
+            )
+        finally:
+            thread.deleteLater()
+            self._sync_reference_generation_controls()
+
+    # ### Object generation controls ###
     def _build_object_controls(self) -> QWidget:
         objects = self.object_workspace
         section, layout = _build_controls_section("object")
@@ -1047,6 +1718,22 @@ class MergedGenerationWorkspace(QWidget):
         self.load_reference_image_button.clicked.connect(
             self._handle_load_reference_image_clicked
         )
+        self.generate_reference_button.clicked.connect(self._handle_generate_reference_clicked)
+        self.reference_generation_model_combo.currentIndexChanged.connect(
+            self._handle_reference_generation_preferences_changed
+        )
+        self.reference_generation_view_combo.currentIndexChanged.connect(
+            self._handle_reference_generation_preferences_changed
+        )
+        self.reference_generation_prompt_edit.textChanged.connect(
+            self._handle_reference_generation_preferences_changed
+        )
+        self.reference_generation_strength_spinbox.valueChanged.connect(
+            self._handle_reference_generation_preferences_changed
+        )
+        self.reference_generation_negative_prompt_edit.textChanged.connect(
+            self._handle_reference_generation_preferences_changed
+        )
         QApplication.clipboard().dataChanged.connect(
             self.sync_shared_controls
         )
@@ -1055,6 +1742,7 @@ class MergedGenerationWorkspace(QWidget):
         )
 
         self.video_view.strokes_changed.connect(surface._handle_video_strokes_changed)
+        self.video_view.strokes_changed.connect(self._invalidate_reference_generation_input)
         self.video_view.strokes_changed.connect(self.sync_shared_controls)
         self.video_view.frame_changed.connect(self._handle_video_frame_changed)
         objects.door_slot_editing_changed.connect(
@@ -1213,6 +1901,7 @@ class MergedGenerationWorkspace(QWidget):
         """Keep shared analysis controls out of the door-slot workflow."""
 
         self._door_slot_editing_active = bool(active)
+        self._cancel_reference_generation_if_context_changed()
         self._sync_opening_generation_sections()
         self.sync_shared_controls()
 
@@ -1236,6 +1925,7 @@ class MergedGenerationWorkspace(QWidget):
         """Refresh the texture route after trim selection changes."""
 
         del active
+        self._cancel_reference_generation_if_context_changed()
         self._sync_generation_texture_context()
 
     @Slot(object)
@@ -1311,6 +2001,7 @@ class MergedGenerationWorkspace(QWidget):
         """Keep whole-video analysis running while tracking the displayed frame."""
 
         self._restore_temporary_reference_after_same_frame_refresh()
+        self._cancel_reference_generation_if_context_changed()
         self._sync_object_reference_preview()
         self._sync_ceiling_height_analysis_source()
         self._sync_ceiling_height_dialog_frame()
@@ -1908,6 +2599,7 @@ class MergedGenerationWorkspace(QWidget):
             return
         try:
             probe_video(file_path)
+            self._invalidate_reference_generation_input()
             self._clear_temporary_object_reference_session()
             self.object_workspace.load_video(file_path)
             self.surface_workspace.load_video(file_path)
@@ -1989,9 +2681,12 @@ class MergedGenerationWorkspace(QWidget):
         reference_bgra: np.ndarray,
         *,
         source_label: str,
+        generated: bool = False,
     ) -> None:
         """Display and bind one temporary reference to both generators."""
 
+        if not generated:
+            self._invalidate_reference_generation_input()
         try:
             self.object_workspace.set_temporary_object_reference(
                 reference_bgra
@@ -2059,6 +2754,7 @@ class MergedGenerationWorkspace(QWidget):
             or int(current_object_frame_index) != safe_index
         )
         if object_frame_is_changing:
+            self._invalidate_reference_generation_input()
             objects.clear_door_slot_editing_target()
             self._clear_temporary_object_reference_session()
             objects.clear_temporary_object_reference_for_video_navigation()
@@ -2132,6 +2828,7 @@ class MergedGenerationWorkspace(QWidget):
         self._sync_ceiling_height_dialog_frame()
         self._sync_opening_generation_sections()
         self._sync_generation_texture_context()
+        self._sync_reference_generation_controls()
 
 
 # ### Reference image helpers ###

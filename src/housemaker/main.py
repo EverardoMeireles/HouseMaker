@@ -2836,6 +2836,12 @@ class BlueprintWorkspace(QWidget):
         self.settings_widget = SettingsWidget(
             application_settings=self._application_settings
         )
+        self.settings_widget.reference_view_presets_changed.connect(
+            self.merged_generation_workspace.set_reference_view_presets
+        )
+        self.merged_generation_workspace.set_reference_view_presets(
+            self.settings_widget.get_reference_view_presets()
+        )
         self.texture_atlas_workspace.selected_atlas_changed.connect(
             self._handle_selected_atlas_changed_for_automatic_assignment
         )

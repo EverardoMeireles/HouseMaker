@@ -5,9 +5,16 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from uuid import uuid4
 
-from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
-from PySide6.QtGui import QGuiApplication, QKeySequence, QScreen, QShowEvent
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QGuiApplication,
+    QHideEvent,
+    QKeySequence,
+    QScreen,
+    QShowEvent,
+)
 from PySide6.QtNetwork import (
     QNetworkAccessManager,
     QNetworkReply,
@@ -23,6 +30,10 @@ from PySide6.QtWidgets import (
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPlainTextEdit,
+    QPushButton,
     QScrollArea,
     QSlider,
     QSpinBox,
@@ -54,6 +65,12 @@ from housemaker.plan_correction_models import (
     PLAN_CORRECTION_MODEL_OPTIONS,
     PLAN_CORRECTION_MODELS,
     plan_correction_model_label,
+)
+from housemaker.reference_view_presets import (
+    DEFAULT_REFERENCE_VIEW_PRESETS,
+    ReferenceViewPreset,
+    read_reference_view_presets,
+    save_reference_view_presets,
 )
 from housemaker.wall_llm_verification_models import (
     DEFAULT_WALL_VERIFICATION_MODEL,
@@ -544,6 +561,7 @@ class SettingsWidget(QWidget):
     """Edits generation preferences in the application JSON settings file."""
 
     settings_changed = Signal()
+    reference_view_presets_changed = Signal(object)
 
     def __init__(
         self,
@@ -568,6 +586,15 @@ class SettingsWidget(QWidget):
         self._plan_pricing_response = bytearray()
         self._plan_pricing_request_failed = False
         self._plan_pricing_lookup_started = False
+        self._reference_view_presets: tuple[ReferenceViewPreset, ...] = ()
+        self._reference_view_edit_id: str | None = None
+        self._reference_view_is_loading = False
+        self._reference_view_save_timer = QTimer(self)
+        self._reference_view_save_timer.setSingleShot(True)
+        self._reference_view_save_timer.setInterval(300)
+        self._reference_view_save_timer.timeout.connect(
+            self._save_reference_view_edits
+        )
         environment_values = os.environ if environment is None else environment
         self._environment_meshy_api_key = str(
             environment_values.get(
@@ -679,6 +706,11 @@ class SettingsWidget(QWidget):
 
         return self._selected_scene_3d_display_screen_id()
 
+    def get_reference_view_presets(self) -> tuple[ReferenceViewPreset, ...]:
+        """Return the last successfully saved reference views."""
+
+        return self._reference_view_presets
+
     def get_generation_display_screen_id(self) -> str | None:
         """Return the selected Generation display without rereading disk."""
 
@@ -707,11 +739,19 @@ class SettingsWidget(QWidget):
         super().showEvent(event)
         self._start_plan_correction_pricing_lookup()
 
+    def hideEvent(self, event: QHideEvent) -> None:
+        """Flush valid view edits before switching back to Generation."""
+
+        self._save_reference_view_edits()
+        super().hideEvent(event)
+
     def dispose(self) -> None:
         """Disconnect application-wide display signals exactly once."""
 
         if self._is_disposed:
             return
+        self._reference_view_save_timer.stop()
+        self._save_reference_view_edits()
         self._is_disposed = True
         self._cancel_plan_correction_pricing_lookup()
         if (
@@ -791,6 +831,7 @@ class SettingsWidget(QWidget):
         sections_layout.addWidget(self.canvas_settings_group)
         sections_layout.addWidget(self.generation_shortcuts_group)
         sections_layout.addWidget(self.object_generation_settings_group)
+        self._build_reference_view_presets_ui(sections_layout)
         sections_layout.addWidget(self.atlas_automation_settings_group)
         sections_layout.addStretch(1)
         self.settings_scroll_area.setWidget(self.settings_content)
@@ -1397,6 +1438,279 @@ class SettingsWidget(QWidget):
 
         self._connect_screen_change_signals()
 
+    # ### Reference generation view editor ###
+    def _build_reference_view_presets_ui(
+        self,
+        sections_layout: QVBoxLayout,
+    ) -> None:
+        self.reference_view_presets_group = QGroupBox(
+            "Reference generation views"
+        )
+        self.reference_view_presets_group.setObjectName(
+            "reference_view_presets_group"
+        )
+        layout = QVBoxLayout(self.reference_view_presets_group)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        sections_layout.addWidget(self.reference_view_presets_group)
+
+        self.reference_view_preset_list = QListWidget()
+        self.reference_view_preset_list.setObjectName(
+            "reference_view_preset_list"
+        )
+        self.reference_view_preset_list.setMaximumHeight(170)
+        self.reference_view_preset_list.currentRowChanged.connect(
+            self._handle_reference_view_selection_changed
+        )
+        layout.addWidget(self.reference_view_preset_list)
+
+        form = QFormLayout()
+        self.reference_view_name_edit = QLineEdit()
+        self.reference_view_name_edit.setObjectName("reference_view_name_edit")
+        self.reference_view_name_edit.setMaxLength(80)
+        self.reference_view_name_edit.textChanged.connect(
+            self._handle_reference_view_edit_changed
+        )
+        form.addRow("View name", self.reference_view_name_edit)
+        self.reference_view_prompt_edit = QPlainTextEdit()
+        self.reference_view_prompt_edit.setObjectName(
+            "reference_view_prompt_edit"
+        )
+        self.reference_view_prompt_edit.setMinimumHeight(115)
+        self.reference_view_prompt_edit.setMaximumHeight(200)
+        self.reference_view_prompt_edit.textChanged.connect(
+            self._handle_reference_view_edit_changed
+        )
+        form.addRow("Prompt", self.reference_view_prompt_edit)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        self.add_reference_view_button = QPushButton("Add view")
+        self.add_reference_view_button.setObjectName("add_reference_view_button")
+        self.add_reference_view_button.clicked.connect(
+            self._handle_add_reference_view_clicked
+        )
+        self.remove_reference_view_button = QPushButton("Remove view")
+        self.remove_reference_view_button.setObjectName(
+            "remove_reference_view_button"
+        )
+        self.remove_reference_view_button.clicked.connect(
+            self._handle_remove_reference_view_clicked
+        )
+        self.save_reference_view_button = QPushButton("Save view")
+        self.save_reference_view_button.setObjectName("save_reference_view_button")
+        self.save_reference_view_button.clicked.connect(
+            self._save_reference_view_edits
+        )
+        buttons.addWidget(self.add_reference_view_button)
+        buttons.addWidget(self.remove_reference_view_button)
+        buttons.addWidget(self.save_reference_view_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.reference_view_preset_status_label = QLabel()
+        self.reference_view_preset_status_label.setObjectName(
+            "reference_view_preset_status_label"
+        )
+        self.reference_view_preset_status_label.setWordWrap(True)
+        layout.addWidget(self.reference_view_preset_status_label)
+
+    def _refresh_reference_view_preset_list(
+        self,
+        selected_id: str | None = None,
+    ) -> None:
+        blocker = QSignalBlocker(self.reference_view_preset_list)
+        self.reference_view_preset_list.clear()
+        selected_row = -1
+        for row, preset in enumerate(self._reference_view_presets):
+            item = QListWidgetItem(preset.name)
+            item.setData(Qt.ItemDataRole.UserRole, preset.preset_id)
+            self.reference_view_preset_list.addItem(item)
+            if preset.preset_id == selected_id:
+                selected_row = row
+        if selected_row < 0 and self._reference_view_presets:
+            selected_row = 0
+        self.reference_view_preset_list.setCurrentRow(selected_row)
+        del blocker
+        self._load_reference_view_editor(selected_row)
+
+    def _load_reference_view_editor(self, row: int) -> None:
+        self._reference_view_is_loading = True
+        selected = (
+            self._reference_view_presets[row]
+            if 0 <= row < len(self._reference_view_presets)
+            else None
+        )
+        self._reference_view_edit_id = (
+            selected.preset_id if selected is not None else None
+        )
+        self.reference_view_name_edit.setText(
+            selected.name if selected is not None else ""
+        )
+        self.reference_view_prompt_edit.setPlainText(
+            selected.prompt if selected is not None else ""
+        )
+        self.reference_view_name_edit.setEnabled(selected is not None)
+        self.reference_view_prompt_edit.setEnabled(selected is not None)
+        self.remove_reference_view_button.setEnabled(selected is not None)
+        self.save_reference_view_button.setEnabled(False)
+        self.reference_view_preset_status_label.setText(
+            "Valid edits save automatically."
+            if selected is not None
+            else "Add a view, or use (Write prompt) in Generation."
+        )
+        self._reference_view_is_loading = False
+
+    def _handle_reference_view_selection_changed(self, row: int) -> None:
+        self._reference_view_save_timer.stop()
+        if not self._flush_valid_reference_view_edits():
+            previous_row = next(
+                (
+                    index
+                    for index, preset in enumerate(self._reference_view_presets)
+                    if preset.preset_id == self._reference_view_edit_id
+                ),
+                -1,
+            )
+            blocker = QSignalBlocker(self.reference_view_preset_list)
+            self.reference_view_preset_list.setCurrentRow(previous_row)
+            del blocker
+            return
+        self._load_reference_view_editor(row)
+
+    def _reference_view_edited_presets(
+        self,
+    ) -> tuple[ReferenceViewPreset, ...] | None:
+        if self._reference_view_edit_id is None:
+            return None
+        name = self.reference_view_name_edit.text().strip()
+        prompt = self.reference_view_prompt_edit.toPlainText().strip()
+        error = ""
+        if not name or not prompt:
+            error = "A view name and prompt are required; saved values are unchanged."
+        elif name.casefold() == "(write prompt)":
+            error = "(Write prompt) is reserved for custom prompts; choose another view name."
+        elif len(name) > 80 or len(prompt) > 4000:
+            error = "Use at most 80 characters for the name and 4,000 for the prompt."
+        elif any(
+            preset.preset_id != self._reference_view_edit_id
+            and preset.name.casefold() == name.casefold()
+            for preset in self._reference_view_presets
+        ):
+            error = "Choose a unique view name; saved values are unchanged."
+        if error:
+            self.reference_view_preset_status_label.setText(error)
+            return None
+        return tuple(
+            ReferenceViewPreset(preset.preset_id, name, prompt)
+            if preset.preset_id == self._reference_view_edit_id
+            else preset
+            for preset in self._reference_view_presets
+        )
+
+    def _handle_reference_view_edit_changed(self, *_args: object) -> None:
+        if self._reference_view_is_loading or self._is_loading_settings:
+            return
+        self._reference_view_save_timer.stop()
+        edited_presets = self._reference_view_edited_presets()
+        changed = (
+            edited_presets is not None
+            and edited_presets != self._reference_view_presets
+        )
+        self.save_reference_view_button.setEnabled(changed)
+        if changed:
+            self.reference_view_preset_status_label.setText("Saving view…")
+            self._reference_view_save_timer.start()
+
+    def _persist_reference_view_presets(
+        self,
+        presets: tuple[ReferenceViewPreset, ...],
+    ) -> bool:
+        try:
+            saved = save_reference_view_presets(
+                self._application_settings,
+                presets,
+            )
+        except (TypeError, ValueError):
+            saved = False
+        if not saved:
+            self.reference_view_preset_status_label.setText(
+                "Could not save reference views. Check the settings file and retry."
+            )
+            return False
+        self._reference_view_presets = presets
+        self.reference_view_presets_changed.emit(presets)
+        return True
+
+    def _save_reference_view_edits(self) -> bool:
+        self._reference_view_save_timer.stop()
+        edited_presets = self._reference_view_edited_presets()
+        if edited_presets is None:
+            self.save_reference_view_button.setEnabled(False)
+            return False
+        if edited_presets == self._reference_view_presets:
+            self.save_reference_view_button.setEnabled(False)
+            return True
+        if not self._persist_reference_view_presets(edited_presets):
+            return False
+        for row, preset in enumerate(edited_presets):
+            if preset.preset_id == self._reference_view_edit_id:
+                self.reference_view_preset_list.item(row).setText(preset.name)
+                break
+        self.save_reference_view_button.setEnabled(False)
+        self.reference_view_preset_status_label.setText("View saved.")
+        return True
+
+    def _flush_valid_reference_view_edits(self) -> bool:
+        """Keep a valid unsaved draft selected if its settings write fails."""
+
+        self._reference_view_save_timer.stop()
+        if self._reference_view_edited_presets() is None:
+            return True
+        return self._save_reference_view_edits()
+
+    def _handle_add_reference_view_clicked(self) -> None:
+        if not self._flush_valid_reference_view_edits():
+            return
+        names = {preset.name.casefold() for preset in self._reference_view_presets}
+        number = 1
+        while f"new view {number}" in names:
+            number += 1
+        preset = ReferenceViewPreset(
+            uuid4().hex,
+            f"New view {number}",
+            next(
+                preset.prompt
+                for preset in DEFAULT_REFERENCE_VIEW_PRESETS
+                if preset.preset_id == "front"
+            ),
+        )
+        if self._persist_reference_view_presets(
+            self._reference_view_presets + (preset,)
+        ):
+            self._refresh_reference_view_preset_list(preset.preset_id)
+            self.reference_view_name_edit.setFocus()
+            self.reference_view_name_edit.selectAll()
+
+    def _handle_remove_reference_view_clicked(self) -> None:
+        self._reference_view_save_timer.stop()
+        row = self.reference_view_preset_list.currentRow()
+        if row < 0:
+            return
+        presets = tuple(
+            preset
+            for preset in self._reference_view_presets
+            if preset.preset_id != self._reference_view_edit_id
+        )
+        if self._persist_reference_view_presets(presets):
+            selected_id = (
+                presets[min(row, len(presets) - 1)].preset_id
+                if presets
+                else None
+            )
+            self._refresh_reference_view_preset_list(selected_id)
+
+    # ### General settings controls ###
     @staticmethod
     def _build_form_group(
         title: str,
@@ -1575,6 +1889,10 @@ class SettingsWidget(QWidget):
                 self._application_settings
             )
         )
+        self._reference_view_presets = read_reference_view_presets(
+            self._application_settings
+        )
+        self._refresh_reference_view_preset_list()
         self._is_loading_settings = False
 
     def _handle_secret_text_changed(self, _text: str) -> None:
