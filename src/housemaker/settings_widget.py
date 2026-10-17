@@ -114,6 +114,9 @@ MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY = (
 SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY = (
     "canvas/snap_middle_equal_angle_only"
 )
+CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY = (
+    "canvas/cut_connection_on_double_vertex_deletion"
+)
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_CLEAR_MASK_HOTKEY = "Ctrl+Shift+M"
 CLEAR_MASK_HOTKEY_OPTIONS = (
@@ -144,6 +147,7 @@ MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
+DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION = False
 DEFAULT_IGNORE_TOP_DOWN_CEILING = True
 DEFAULT_MAKE_FLOORS_DOUBLE_SIDED = False
 DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED = False
@@ -258,6 +262,9 @@ class GenerationServiceSettings:
     first_person_speed_meters_per_second: float = (
         DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
     )
+    cut_connection_on_double_vertex_deletion: bool = (
+        DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION
+    )
 
     def __post_init__(self) -> None:
         try:
@@ -294,6 +301,11 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Snap-to-middle equal-angle filtering must be enabled or "
                 "disabled."
+            )
+        if not isinstance(self.cut_connection_on_double_vertex_deletion, bool):
+            raise ValueError(
+                "Cut connection on double vertex deletion must be enabled "
+                "or disabled."
             )
         if not isinstance(self.ignore_top_down_ceiling, bool):
             raise ValueError(
@@ -597,6 +609,9 @@ class SettingsWidget(QWidget):
             ),
             snap_middle_equal_angle_only=(
                 self.snap_middle_equal_angle_only_checkbox.isChecked()
+            ),
+            cut_connection_on_double_vertex_deletion=(
+                self.cut_connection_on_double_vertex_deletion_checkbox.isChecked()
             ),
             first_person_navigation_mode=str(
                 self.first_person_navigation_combo.currentData()
@@ -1136,6 +1151,23 @@ class SettingsWidget(QWidget):
             self.snap_middle_equal_angle_only_checkbox,
         )
 
+        self.cut_connection_on_double_vertex_deletion_checkbox = QCheckBox()
+        self.cut_connection_on_double_vertex_deletion_checkbox.setObjectName(
+            "cut_connection_on_double_vertex_deletion_checkbox"
+        )
+        self.cut_connection_on_double_vertex_deletion_checkbox.setToolTip(
+            "When exactly two connected wall vertices are selected, Delete "
+            "cuts their connection first and keeps both vertices selected. "
+            "Press Delete again to remove the vertices."
+        )
+        self.cut_connection_on_double_vertex_deletion_checkbox.toggled.connect(
+            self._handle_cut_connection_on_double_vertex_deletion_changed
+        )
+        canvas_form.addRow(
+            "Cut connection on double vertex deletion",
+            self.cut_connection_on_double_vertex_deletion_checkbox,
+        )
+
         self.mesh_edit_update_delay_spinbox = QDoubleSpinBox()
         self.mesh_edit_update_delay_spinbox.setObjectName(
             "mesh_edit_update_delay_spinbox"
@@ -1412,6 +1444,11 @@ class SettingsWidget(QWidget):
         )
         self.snap_middle_equal_angle_only_checkbox.setChecked(
             read_snap_middle_equal_angle_only(self._application_settings)
+        )
+        self.cut_connection_on_double_vertex_deletion_checkbox.setChecked(
+            read_cut_connection_on_double_vertex_deletion(
+                self._application_settings
+            )
         )
         self.mesh_edit_update_delay_spinbox.setValue(
             read_mesh_edit_update_delay_seconds(
@@ -2036,6 +2073,20 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_cut_connection_on_double_vertex_deletion_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Persist whether two selected vertices are disconnected first."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
     def _handle_use_uv_raycast_for_object_generation_changed(
         self,
         enabled: bool,
@@ -2365,6 +2416,21 @@ def read_snap_middle_equal_angle_only(
     if isinstance(value, bool):
         return value
     return DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY
+
+
+# ### Canvas deletion setting helpers ###
+def read_cut_connection_on_double_vertex_deletion(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the two-vertex disconnect preference with a safe default."""
+
+    value = application_settings.get(
+        CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY,
+        DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION
 
 
 # ### Mesh edit preview setting helpers ###

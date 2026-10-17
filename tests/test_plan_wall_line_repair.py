@@ -204,7 +204,7 @@ class PlanWallLineRepairImageTests(unittest.TestCase):
         analysis = analyze_plan_wall_evidence(image)
 
         initial = reconstruct_plan_walls(
-            replace(analysis, structural_ink=None), _options()
+            replace(analysis, structural_ink=None, normalized_ink=None), _options()
         )
         repaired = reconstruct_plan_walls(analysis, _options())
 

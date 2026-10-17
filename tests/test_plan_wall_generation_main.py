@@ -291,6 +291,43 @@ class PlanWallGenerationMainTests(unittest.TestCase):
             f"{new_distance} px",
         )
 
+    def test_endpoint_alignment_controls_refresh_the_cached_preview(self) -> None:
+        labels = {
+            label.text()
+            for label in self.workspace.plan_wall_controls_group.findChildren(QLabel)
+        }
+        self.assertIn("Endpoint alignment tolerance", labels)
+        self.assertIn("Endpoint alignment search distance", labels)
+        tolerance_slider = self.workspace.wall_endpoint_alignment_tolerance_slider
+        search_slider = self.workspace.wall_endpoint_alignment_search_distance_slider
+        self.assertEqual((tolerance_slider.minimum(), tolerance_slider.maximum()), (0, 128))
+        self.assertEqual((search_slider.minimum(), search_slider.maximum()), (0, 8192))
+        self.assertEqual(tolerance_slider.value(), 16)
+        self.assertEqual(search_slider.value(), 1024)
+        self.assertIn("not the distance", tolerance_slider.toolTip())
+        self.assertIn("separation", search_slider.toolTip())
+
+        self._load_plan()
+        _thread, _job_id, analysis = self._finish_successful_detection()
+        tolerance_slider.setValue(24)
+        search_slider.setValue(1800)
+
+        self.assertTrue(self.workspace._plan_wall_preview_refresh_timer.isActive())
+        self.assertTrue(self.workspace._refresh_plan_wall_preview())
+        self.assertEqual(len(self.reconstruction_calls), 2)
+        self.assertIs(self.reconstruction_calls[1][0], analysis)
+        options = self.reconstruction_calls[1][1]
+        self.assertEqual(options.endpoint_alignment_tolerance_pixels, 24)
+        self.assertEqual(options.endpoint_alignment_search_distance_pixels, 1800)
+        self.assertEqual(
+            self.workspace.wall_endpoint_alignment_tolerance_value_label.text(), "24 px"
+        )
+        self.assertEqual(
+            self.workspace.wall_endpoint_alignment_search_distance_value_label.text(),
+            "1800 px",
+        )
+        self.assertEqual(len(_FakeWallDetectionThread.instances), 1)
+
     def test_confirm_commits_once_and_shared_undo_restores_baseline(self) -> None:
         self._load_plan()
         _add_existing_wall(self.workspace.current_level.vertex_data)

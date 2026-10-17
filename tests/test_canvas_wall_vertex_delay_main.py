@@ -397,6 +397,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
 
             moved_vertex = level.vertex_data.vertices[0]
             self.assertNotEqual((moved_vertex.x, moved_vertex.y), (10.0, 50.0))
+            self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
             self.assertFalse(timer.isActive())
             reconcile_assignments.assert_not_called()
             schedule_refresh.assert_not_called()
@@ -411,6 +412,62 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertTrue(timer.isActive())
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
+
+    def test_repeated_existing_vertex_drags_share_delay_after_last_release(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        self._install_levels([level])
+        canvas = self.workspace.canvas
+        timer = self.workspace._wall_vertex_update_timer
+        timer.setInterval(80)
+
+        with (
+            patch.object(
+                self.workspace,
+                "_reconcile_canvas_surface_edit_and_refresh",
+            ) as reconcile_and_refresh,
+            patch.object(
+                self.workspace,
+                "_active_viewer_preview_needs_refresh",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace,
+                "_refresh_viewer_preview",
+            ) as refresh_viewer,
+        ):
+            first_start = self._image_position(10.0, 50.0)
+            first_end = self._image_position(25.0, 30.0)
+            QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=first_start)
+            _send_drag_move(canvas, first_end)
+
+            # A refresh that was queued before the drag must not pick up the
+            # new live vertex coordinates before the edit has been released.
+            self.workspace._run_scheduled_viewer_preview_refresh()
+            refresh_viewer.assert_not_called()
+            QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=first_end)
+            self.assertTrue(timer.isActive())
+            QTest.qWait(25)
+
+            second_start = self._image_position(90.0, 50.0)
+            second_end = self._image_position(75.0, 65.0)
+            QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=second_start)
+            _send_drag_move(canvas, second_end)
+            self._assert_pointer_hold_defers_timer()
+            QTest.qWait(100)
+            reconcile_and_refresh.assert_not_called()
+
+            QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=second_end)
+            self.assertTrue(timer.isActive())
+            QTest.qWait(25)
+            reconcile_and_refresh.assert_not_called()
+            QTest.qWait(100)
+
+        reconcile_and_refresh.assert_called_once_with()
+        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertFalse(timer.isActive())
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 2)
 
     def test_delayed_vertex_move_preserves_window_size_and_undo_data(
         self,
@@ -493,6 +550,50 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         current_size = get_opening_physical_size(level, window.window_id)
         self.assertAlmostEqual(current_size[0], initial_size[0])
         self.assertAlmostEqual(current_size[1], initial_size[1])
+
+    def test_repeated_vertex_moves_preserve_window_size_through_each_undo(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        wall = next(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        level.windows = [
+            WindowData(
+                window_id="repeated-drag-window",
+                wall_surface_id=wall.surface_id,
+                start_ratio=0.25,
+                end_ratio=0.75,
+                bottom_ratio=0.2,
+                top_ratio=0.7,
+            )
+        ]
+        self._install_levels([level])
+        self.workspace._canvas_undo_stack.clear()
+        initial_size = get_opening_physical_size(level, level.windows[0].window_id)
+        canvas = self.workspace.canvas
+
+        previous_positions: list[float] = []
+        for end_x in (99.0, 80.0):
+            start_x = level.vertex_data.vertices[1].x
+            previous_positions.append(start_x)
+            start = self._image_position(start_x, 50.0)
+            end = self._image_position(end_x, 50.0)
+            QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+            _send_drag_move(canvas, end)
+            QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end)
+
+        self.workspace._commit_pending_wall_vertex_update()
+        for expected_x in reversed(previous_positions):
+            self.workspace._handle_canvas_undo_requested()
+            self.assertAlmostEqual(level.vertex_data.vertices[1].x, expected_x)
+            current_size = get_opening_physical_size(
+                level, level.windows[0].window_id
+            )
+            self.assertAlmostEqual(current_size[0], initial_size[0])
+            self.assertAlmostEqual(current_size[1], initial_size[1])
 
     def test_connecting_existing_vertices_waits_until_release_and_debounces(
         self,
@@ -1059,7 +1160,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertEqual(wall_timer.interval(), 2_400)
         self.assertTrue(wall_timer.isActive())
 
-    def test_surface_selection_commits_pending_vertex_update(self) -> None:
+    def test_surface_selection_preserves_pending_vertex_update(self) -> None:
         self.workspace.canvas._handle_new_vertex_click((30.0, 40.0))
         with patch.object(
             self.workspace,
@@ -1067,8 +1168,8 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         ) as reconcile_and_refresh:
             self.workspace._handle_canvas_surface_selection_changed(())
 
-        reconcile_and_refresh.assert_called_once_with()
-        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        reconcile_and_refresh.assert_not_called()
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
         self.assertFalse(self.workspace._wall_vertex_update_timer.isActive())
 
     def test_project_replacement_and_shutdown_cancel_pending_update(

@@ -78,6 +78,7 @@ from housemaker.surface_geometry import (
     build_wall_surface_id,
 )
 from housemaker.uv_layout import build_room_walls
+from housemaker.window_frame_bridge import build_window_frame_bridge_placement
 
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
@@ -195,6 +196,7 @@ PLAN_IMAGE_ERASE_SELECTION_OUTLINE_COLOR = QColor("#ffffff")
 PLAN_IMAGE_ERASE_SELECTION_OUTLINE_SHADOW_COLOR = QColor("#20242a")
 CANVAS_SNAPSHOT_ACTION_OPEN_SPACE = "open_space"
 CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION = "vertex_deletion"
+CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE = "connection_severance"
 CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS = "generated_walls"
 
 # ### Snapshot models ###
@@ -560,6 +562,7 @@ class BlueprintCanvas(QWidget):
     geometry_changed = Signal()
     wall_vertex_added = Signal()
     wall_vertices_deleted = Signal(object)
+    wall_connections_severed = Signal(object)
     wall_vertex_interaction_changed = Signal(bool)
     wall_vertex_chain_changed = Signal(bool)
     rooms_changed = Signal()
@@ -632,6 +635,7 @@ class BlueprintCanvas(QWidget):
         self._generated_wall_preview: GeneratedWallPreview | None = None
         self.active_vertex_id: int | None = None
         self._selected_vertex_ids: tuple[int, ...] = ()
+        self.cut_connection_on_double_vertex_deletion = False
         self._outer_wall_mark_vertex_ids: frozenset[int] = frozenset()
         self._outer_wall_reference_overlay = OuterWallReferenceOverlay()
         self._outer_wall_marking_active = False
@@ -662,6 +666,7 @@ class BlueprintCanvas(QWidget):
         self.pending_doorway_bridge_vertex_ids: tuple[int, int] | None = None
         self._window_placement_active = False
         self._pending_window_placement: WallWindowPlacement | None = None
+        self._pending_window_image_point: QPointF | None = None
         self.selected_window_id: str | None = None
         self.pressed_window_index: int | None = None
         self.drag_window_index: int | None = None
@@ -2127,11 +2132,16 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self.update()
 
+    def set_cut_connection_on_double_vertex_deletion(self, enabled: bool) -> None:
+        """Choose whether Delete first cuts a selected pair's wall connection."""
+
+        self.cut_connection_on_double_vertex_deletion = bool(enabled)
+
     # ### Window placement ###
     def start_window_placement(self) -> bool:
         """Arm one-click placement of a centered window on the nearest wall."""
 
-        if self.blueprint_image is None or not self._build_window_wall_frames():
+        if self.blueprint_image is None or len(self.vertex_data.vertices) < 2:
             return False
         self._cancel_window_pointer_state(restore_initial=True)
         self._set_selected_window_id(None)
@@ -2148,6 +2158,7 @@ class BlueprintCanvas(QWidget):
         self.selected_stair_index = None
         self.selected_stair_endpoint_name = None
         self._pending_window_placement = None
+        self._pending_window_image_point = None
         if not self._window_placement_active:
             self._window_placement_active = True
             self.window_placement_changed.emit(True)
@@ -2175,6 +2186,7 @@ class BlueprintCanvas(QWidget):
         was_active = self._window_placement_active
         self._window_placement_active = False
         self._pending_window_placement = None
+        self._pending_window_image_point = None
         if (
             not self._plan_image_erase_active
             and not self._open_space_placement_active
@@ -2370,8 +2382,13 @@ class BlueprintCanvas(QWidget):
         if (
             event.key() == Qt.Key.Key_Shift
             and not event.isAutoRepeat()
-            and self._refresh_pending_doorway_modifier_preview(
-                event.modifiers() | Qt.KeyboardModifier.ShiftModifier
+            and (
+                self._refresh_pending_window_modifier_preview(
+                    event.modifiers() | Qt.KeyboardModifier.ShiftModifier
+                )
+                or self._refresh_pending_doorway_modifier_preview(
+                    event.modifiers() | Qt.KeyboardModifier.ShiftModifier
+                )
             )
         ):
             event.accept()
@@ -2512,7 +2529,13 @@ class BlueprintCanvas(QWidget):
             return
 
         if event.key() == Qt.Key.Key_Delete:
-            self._delete_selected_vertices()
+            # A held Delete must not turn one connection cut into an accidental
+            # vertex deletion. A second deliberate press performs that action.
+            if (
+                not event.isAutoRepeat()
+                or not self.cut_connection_on_double_vertex_deletion
+            ):
+                self._delete_selected_vertices()
             event.accept()
             return
 
@@ -2522,8 +2545,13 @@ class BlueprintCanvas(QWidget):
         if (
             event.key() == Qt.Key.Key_Shift
             and not event.isAutoRepeat()
-            and self._refresh_pending_doorway_modifier_preview(
-                event.modifiers() & ~Qt.KeyboardModifier.ShiftModifier
+            and (
+                self._refresh_pending_window_modifier_preview(
+                    event.modifiers() & ~Qt.KeyboardModifier.ShiftModifier
+                )
+                or self._refresh_pending_doorway_modifier_preview(
+                    event.modifiers() & ~Qt.KeyboardModifier.ShiftModifier
+                )
             )
         ):
             event.accept()
@@ -2550,6 +2578,9 @@ class BlueprintCanvas(QWidget):
         """Prevent a held comparison from sticking after focus changes."""
 
         self.clear_level_comparison_keys()
+        self._refresh_pending_window_modifier_preview(
+            Qt.KeyboardModifier.NoModifier
+        )
         self._refresh_pending_doorway_modifier_preview(
             Qt.KeyboardModifier.NoModifier
         )
@@ -2701,7 +2732,7 @@ class BlueprintCanvas(QWidget):
         if self._window_placement_active:
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
-                self._update_pending_window(image_point)
+                self._update_pending_window(image_point, event.modifiers())
                 placement = self._pending_window_placement
                 if placement is not None:
                     self._finish_window_placement()
@@ -2976,8 +3007,9 @@ class BlueprintCanvas(QWidget):
             image_point = self._widget_to_image(event.position())
             if image_point is None:
                 self._pending_window_placement = None
+                self._pending_window_image_point = None
             else:
-                self._update_pending_window(image_point)
+                self._update_pending_window(image_point, event.modifiers())
             self.update()
             event.accept()
             return
@@ -3312,9 +3344,10 @@ class BlueprintCanvas(QWidget):
             self.update()
         if (
             self._window_placement_active
-            and self._pending_window_placement is not None
+            and self._pending_window_image_point is not None
         ):
             self._pending_window_placement = None
+            self._pending_window_image_point = None
             self.update()
         if self._open_space_placement_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -5637,9 +5670,14 @@ class BlueprintCanvas(QWidget):
             )
         )
 
-    def _update_pending_window(self, image_point: QPointF) -> None:
+    def _update_pending_window(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+    ) -> None:
         """Snap the default opening to the nearest semantic wall frame."""
 
+        self._pending_window_image_point = QPointF(image_point)
         level = self.level_context
         if level is None:
             self._pending_window_placement = None
@@ -5654,6 +5692,20 @@ class BlueprintCanvas(QWidget):
             return
 
         pointer = (float(image_point.x()), float(image_point.y()))
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            bridge = build_window_frame_bridge_placement(
+                level,
+                pointer,
+                self._screen_distance_to_image(
+                    DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN
+                ),
+                preferred_width_meters=DEFAULT_CANVAS_WINDOW_WIDTH_METERS,
+                height_meters=DEFAULT_CANVAS_WINDOW_HEIGHT_METERS,
+                wall_margin_meters=CANVAS_WINDOW_WALL_MARGIN_METERS,
+            )
+            if bridge is not None:
+                self._pending_window_placement = bridge
+                return
         selected_surface_id = self._selected_wall_surface_id
         nearest: tuple[
             tuple[float, int, str],
@@ -5733,7 +5785,32 @@ class BlueprintCanvas(QWidget):
         self,
         window: WindowData | WallWindowPlacement,
     ) -> WindowWallFrame | None:
+        vertex_ids = getattr(window, "bridge_vertex_ids", None)
+        if vertex_ids is not None and self.level_context is not None:
+            first = self.vertex_data.get_vertex(vertex_ids[0])
+            second = self.vertex_data.get_vertex(vertex_ids[1])
+            if first is not None and second is not None:
+                return WindowWallFrame(
+                    start_point=(first.x, first.y),
+                    end_point=(second.x, second.y),
+                    height_meters=float(self.level_context.height_meters),
+                )
         return self._build_window_wall_frames().get(window.wall_surface_id)
+
+    def _refresh_pending_window_modifier_preview(
+        self,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        """Update Shift snapping even if the pointer remains stationary."""
+
+        if (
+            not self._window_placement_active
+            or self._pending_window_image_point is None
+        ):
+            return False
+        self._update_pending_window(self._pending_window_image_point, modifiers)
+        self.update()
+        return True
 
     def _build_window_wall_frames(self) -> dict[str, WindowWallFrame]:
         """Resolve semantic wall IDs without reversing their ratio direction."""
@@ -7037,7 +7114,7 @@ class BlueprintCanvas(QWidget):
         return True
 
     def _delete_selected_vertices(self) -> None:
-        """Delete selected vertices and collapse safe straight wall joints."""
+        """Cut a selected pair's connection or delete the selected vertices."""
 
         existing_vertex_ids = {
             vertex.id for vertex in self.vertex_data.vertices
@@ -7049,6 +7126,14 @@ class BlueprintCanvas(QWidget):
         )
         if not deleted_vertex_ids:
             self.prune_missing_vertex_references()
+            return
+
+        if (
+            self.cut_connection_on_double_vertex_deletion
+            and len(deleted_vertex_ids) == 2
+            and self.vertex_data.has_edge(*deleted_vertex_ids)
+        ):
+            self._sever_wall_connection(deleted_vertex_ids)
             return
 
         self._push_undo_state(CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION)
@@ -7105,6 +7190,51 @@ class BlueprintCanvas(QWidget):
         self.update()
         self.wall_vertices_deleted.emit(deleted_vertex_ids)
         if doorways_changed:
+            self.doorways_changed.emit()
+        self.geometry_changed.emit()
+
+    def _sever_wall_connection(self, vertex_ids: tuple[int, int]) -> None:
+        """Remove one wall edge, keeping both endpoints selected for Delete."""
+
+        self._push_undo_state(CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE)
+        removed_doorway_indices = doorway_indices_on_removed_wall_edges(
+            self.vertex_data,
+            self.doorways,
+            (Edge(*vertex_ids),),
+            meters_per_pixel=self._get_level_meters_per_pixel(),
+        )
+        self.vertex_data.remove_edge(*vertex_ids)
+        rooms_changed = False
+        for room in tuple(self.rooms):
+            boundary_ids = set(room.vertex_ids)
+            if set(vertex_ids) <= boundary_ids and not any(
+                edge.start_vertex_id in boundary_ids
+                and edge.end_vertex_id in boundary_ids
+                for edge in self.vertex_data.edges
+            ):
+                # Legacy rooms infer a closed boundary when they have no
+                # explicit edges. Retire that metadata after its last cut,
+                # without deleting any of the room's vertices.
+                self.rooms.remove(room)
+                rooms_changed = True
+        if removed_doorway_indices:
+            self.doorways[:] = [
+                doorway
+                for index, doorway in enumerate(self.doorways)
+                if index not in removed_doorway_indices
+            ]
+            self._set_selected_doorway_index(None)
+            self._reset_doorway_pointer_state()
+
+        self._set_active_vertex_id(None)
+        self.preview_point = None
+        self.preview_guides = []
+        self._reset_pointer_state()
+        self.update()
+        if rooms_changed:
+            self.rooms_changed.emit()
+        self.wall_connections_severed.emit(vertex_ids)
+        if removed_doorway_indices:
             self.doorways_changed.emit()
         self.geometry_changed.emit()
 
@@ -8395,9 +8525,7 @@ class BlueprintCanvas(QWidget):
         placement = self._pending_window_placement
         if placement is None:
             return
-        frame = self._build_window_wall_frames().get(
-            placement.wall_surface_id
-        )
+        frame = self._get_window_wall_frame(placement)
         strip = self._get_window_widget_strip(placement, frame)
         if strip is None:
             return

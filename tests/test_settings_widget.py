@@ -37,11 +37,13 @@ from housemaker.settings_widget import (
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
     CLEAR_MASK_HOTKEY_OPTIONS,
     CLEAR_MASK_HOTKEY_SETTING_KEY,
+    CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY,
     DEFAULT_AUTOMATIC_ATLAS_CREATION,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
     DEFAULT_CLEAR_MASK_HOTKEY,
+    DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION,
     DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
@@ -91,6 +93,7 @@ from housemaker.settings_widget import (
     read_automatic_atlas_texture_sort_by_pbr,
     read_canvas_3d_navigation_toggle_hotkey,
     read_clear_mask_hotkey,
+    read_cut_connection_on_double_vertex_deletion,
     read_doors_and_windows_point_light_intensity,
     read_first_person_navigation_mode,
     read_first_person_speed,
@@ -164,6 +167,7 @@ class SettingsWidgetTests(unittest.TestCase):
                         widget.make_floors_double_sided_checkbox,
                         widget.make_ceilings_double_sided_checkbox,
                         widget.snap_middle_equal_angle_only_checkbox,
+                        widget.cut_connection_on_double_vertex_deletion_checkbox,
                         widget.mesh_edit_update_delay_spinbox,
                     ),
                 ),
@@ -748,6 +752,75 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertTrue(
                 read_snap_middle_equal_angle_only(application_settings)
             )
+
+    def test_cut_connection_setting_defaults_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            checkbox = widget.cut_connection_on_double_vertex_deletion_checkbox
+            changes: list[bool] = []
+            widget.settings_changed.connect(lambda: changes.append(True))
+
+            self.assertFalse(DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION)
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(
+                widget.get_settings().cut_connection_on_double_vertex_deletion
+            )
+            form = widget.canvas_settings_group.layout()
+            self.assertIsInstance(form, QFormLayout)
+            label = form.labelForField(checkbox)
+            self.assertIsInstance(label, QLabel)
+            self.assertEqual(
+                label.text(),
+                "Cut connection on double vertex deletion",
+            )
+
+            checkbox.setChecked(True)
+
+            self.assertIs(
+                store.get(CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY),
+                True,
+            )
+            self.assertTrue(
+                widget.get_settings().cut_connection_on_double_vertex_deletion
+            )
+            self.assertEqual(changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertTrue(
+                restored.get_settings().cut_connection_on_double_vertex_deletion
+            )
+            restored.cut_connection_on_double_vertex_deletion_checkbox.setChecked(
+                False
+            )
+            self.assertFalse(read_cut_connection_on_double_vertex_deletion(store))
+            widget.dispose()
+            restored.dispose()
+
+    def test_cut_connection_setting_rejects_malformed_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            for value in (1, 0, "true", "false", None, []):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Cut connection on double vertex deletion",
+                    ):
+                        GenerationServiceSettings(
+                            cut_connection_on_double_vertex_deletion=(
+                                value  # type: ignore[arg-type]
+                            )
+                        )
+                    store.set(
+                        CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY,
+                        value,
+                    )
+                    self.assertFalse(
+                        read_cut_connection_on_double_vertex_deletion(store)
+                    )
 
     def test_atlas_display_model_defaults_normalizes_and_validates(self) -> None:
         self.assertIsNone(GenerationServiceSettings().atlas_display_screen_id)

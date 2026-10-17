@@ -330,6 +330,12 @@ IMAGE CORRECTION
   other intentional openings too. Doorway gaps are not damage from folds or
   missing linework to repair. Check every opening against the source before
   returning the images; this rule takes priority over cleanup and alignment.
+- Preserve every window's original location, clear opening width, jamb positions,
+  wall thickness, and frame arrangement relative to surrounding geometry. Do not
+  enlarge, narrow, standardize, or redesign windows. Correct photographic
+  distortion without changing their architectural dimensions. Where details are
+  ambiguous, preserve the source geometry rather than inventing a cleaner
+  replacement.
 - Where present, remove purple/violet sloped-roof shading and annotations or
   outlines that describe ONLY the roof, not actual walls. Do not turn roof edges
   into wall boundaries, shrink the building footprint, or crop away the areas

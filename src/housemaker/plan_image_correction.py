@@ -74,6 +74,11 @@ Preserve exactly: every wall, doorway, window, stair, room boundary,
 non-measurement symbol, room or feature label, relative position, proportion, and
 the complete outer perimeter. Do not redesign, infer new architecture, omit
 architectural geometry, or change retained text.
+Preserve every window's original location, clear opening width, jamb positions,
+wall thickness, and frame arrangement relative to surrounding geometry. Do not
+enlarge, narrow, standardize, or redesign windows. Correct photographic distortion
+without changing their architectural dimensions. Where details are ambiguous,
+preserve the source geometry rather than inventing a cleaner replacement.
 Remove every measurement annotation from the output: dimension and measurement
 lines, extension or witness lines, their arrowheads or tick marks, and all numeric
 values or unit text belonging to those measurements. Preserve numbers only when
@@ -102,6 +107,11 @@ Preserve exactly: every wall, doorway, window, stair, room boundary, symbol,
 label, dimension line, extension or witness line, arrowhead, tick mark, numeric
 measurement, decimal separator, and unit mark. Copy printed measurement text
 verbatim; do not reinterpret, replace, round, invent, or delete any value.
+Preserve every window's original location, clear opening width, jamb positions,
+wall thickness, and frame arrangement relative to surrounding geometry. Do not
+enlarge, narrow, standardize, or redesign windows. Correct photographic distortion
+without changing their architectural dimensions. Where details are ambiguous,
+preserve the source geometry rather than inventing a cleaner replacement.
 Correct only the page photography: straighten overall rotation and perspective,
 gently correct fold-induced page deformation, remove fold creases, shadows, paper
 grain, stains, speckles, color casts, and photographic background. Keep straight

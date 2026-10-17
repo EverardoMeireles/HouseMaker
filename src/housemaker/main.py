@@ -110,6 +110,7 @@ from housemaker.automatic_wall_detection import (
     reconstruct_plan_walls,
 )
 from housemaker.blueprint_canvas import (
+    CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE,
     CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS,
     CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
     CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
@@ -310,6 +311,7 @@ from housemaker.models import (
     ArchitecturalTrimData,
     DoorwayData,
     DoorwayPreset,
+    Edge,
     EditableSurfaceMeshData,
     LevelData,
     SlopedCeilingData,
@@ -495,6 +497,7 @@ from housemaker.viewer import (
     build_scene_object_placement_group_candidate,
     build_texture_preview_bundle,
 )
+from housemaker.window_frame_bridge import add_window_frame_bridge
 
 # ### Constants ###
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
@@ -1378,6 +1381,8 @@ class _CanvasBlueprintUndoState:
         ...,
     ] = ()
     removed_window_placements: tuple[WindowPlacement, ...] = ()
+    window_dimensions: tuple[CanvasWindowDimensionSnapshot, ...] = ()
+    window_placements_before: tuple[WindowPlacement, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1516,6 +1521,8 @@ class _CanvasWindowAdditionUndoState:
     """Stable identity of one newly added Canvas wall window."""
 
     window_id: str
+    bridge_level_index: int | None = None
+    bridge_edge: Edge | None = None
 
 
 @dataclass(frozen=True)
@@ -2766,6 +2773,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.set_snap_middle_equal_angle_only(
             generation_settings.snap_middle_equal_angle_only
+        )
+        self.canvas.set_cut_connection_on_double_vertex_deletion(
+            generation_settings.cut_connection_on_double_vertex_deletion
         )
         self.doors_workspace.preview_viewer.set_point_light_intensity(
             generation_settings.doors_and_windows_point_light_intensity
@@ -4132,7 +4142,8 @@ class BlueprintWorkspace(QWidget):
         self.add_window_button.setCheckable(True)
         self.add_window_button.setToolTip(
             "Click a wall on the plan to add a purple, vertically centered "
-            "window frame."
+            "window frame. Hold Shift to bridge aligned, unconnected wall "
+            "vertices across a gap."
         )
         self.add_window_button.toggled.connect(
             self._handle_add_window_button_toggled
@@ -4453,6 +4464,54 @@ class BlueprintWorkspace(QWidget):
         plan_wall_controls_layout.addRow("Endpoint snap distance", endpoint_snap_field)
 
         (
+            endpoint_alignment_tolerance_field,
+            self.wall_endpoint_alignment_tolerance_slider,
+            self.wall_endpoint_alignment_tolerance_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=0,
+            maximum=128,
+            value=round(default_wall_options.endpoint_alignment_tolerance_pixels),
+            value_text=(
+                f"{round(default_wall_options.endpoint_alignment_tolerance_pixels)} px"
+            ),
+            tooltip=(
+                "Maximum extra distance a generated loose endpoint may extend "
+                "along its existing wall to align horizontally or vertically "
+                "with an opposite vertex. This limits the adjustment, not the "
+                "distance between the vertices. Existing vertices remain fixed; "
+                "0 disables this alignment step."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Endpoint alignment tolerance",
+            endpoint_alignment_tolerance_field,
+        )
+
+        (
+            endpoint_alignment_search_distance_field,
+            self.wall_endpoint_alignment_search_distance_slider,
+            self.wall_endpoint_alignment_search_distance_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=0,
+            maximum=8192,
+            value=round(default_wall_options.endpoint_alignment_search_distance_pixels),
+            value_text=(
+                f"{round(default_wall_options.endpoint_alignment_search_distance_pixels)} px"
+            ),
+            tooltip=(
+                "Maximum separation, in plan-image pixels, when searching for "
+                "an opposite vertex to align a generated loose endpoint with. "
+                "This controls how far candidates may be apart, while Endpoint "
+                "alignment tolerance limits the endpoint's actual extension. "
+                "0 disables this alignment step."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Endpoint alignment search distance",
+            endpoint_alignment_search_distance_field,
+        )
+
+        (
             maximum_vertex_distance_field,
             self.maximum_vertex_distance_slider,
             self.maximum_vertex_distance_value_label,
@@ -4621,6 +4680,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.wall_vertex_added.connect(self._handle_canvas_wall_vertex_added)
         self.canvas.wall_vertices_deleted.connect(
+            self._handle_canvas_wall_vertices_deleted
+        )
+        self.canvas.wall_connections_severed.connect(
             self._handle_canvas_wall_vertices_deleted
         )
         self.canvas.wall_vertex_interaction_changed.connect(
@@ -4995,18 +5057,31 @@ class BlueprintWorkspace(QWidget):
         windows_before_by_level_index = {
             level.index: self._copy_windows(level.windows) for level in self.levels
         }
+        bridge: tuple[LevelData, Edge] | None = None
         try:
+            if isinstance(raw_placement, WallWindowPlacement):
+                bridge = add_window_frame_bridge(self.levels, raw_placement)
             window = (
                 add_sloped_ceiling_window(self.levels, raw_placement)
                 if isinstance(raw_placement, SlopedCeilingWindowPlacement)
                 else add_wall_window(self.levels, raw_placement)
             )
-        except (TypeError, ValueError) as error:
+        except Exception as error:
+            if bridge is not None:
+                bridge[0].vertex_data.remove_edge(
+                    bridge[1].start_vertex_id, bridge[1].end_vertex_id
+                )
+            if not isinstance(error, (TypeError, ValueError)):
+                raise
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
         added_window = self._find_canvas_window(window.window_id)
         if added_window is None:
             self._rollback_canvas_window(window.window_id)
+            if bridge is not None:
+                bridge[0].vertex_data.remove_edge(
+                    bridge[1].start_vertex_id, bridge[1].end_vertex_id
+                )
             self._reset_viewer_window_snapshots()
             self.canvas.update()
             self.viewer.set_window_tools_status(
@@ -5026,11 +5101,17 @@ class BlueprintWorkspace(QWidget):
             stable_id=window.window_id,
         )
         self._refresh_pending_canvas_opening_state(reference)
+        if bridge is not None:
+            self._pending_doorway_bridge_topology_change = True
         self._doorway_mesh_update_timer.start()
 
         self._canvas_window_undo_ids.append(window.window_id)
         self._record_canvas_undo_state(
-            _CanvasWindowAdditionUndoState(window_id=window.window_id)
+            _CanvasWindowAdditionUndoState(
+                window_id=window.window_id,
+                bridge_level_index=None if bridge is None else bridge[0].index,
+                bridge_edge=None if bridge is None else bridge[1],
+            )
         )
         self._sync_canvas_window_undo_availability()
         self.viewer.set_window_tools_status(
@@ -5054,6 +5135,43 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_window_tools_status("No added window to undo.")
             return
         level, window_index, window = removed
+        addition_state = next(
+            (
+                state
+                for state in reversed(self._canvas_undo_stack)
+                if isinstance(state, _CanvasWindowAdditionUndoState)
+                and state.window_id == window_id
+            ),
+            None,
+        )
+        bridge_edge = (
+            addition_state.bridge_edge
+            if addition_state is not None
+            and addition_state.bridge_level_index == level.index
+            else None
+        )
+        if bridge_edge is not None:
+            level.vertex_data.remove_edge(
+                bridge_edge.start_vertex_id, bridge_edge.end_vertex_id
+            )
+
+        def restore_window_and_bridge() -> None:
+            if bridge_edge is not None:
+                level.vertex_data.add_edge(
+                    bridge_edge.start_vertex_id, bridge_edge.end_vertex_id
+                )
+            level.windows.insert(window_index, window)
+
+        # Shared Ctrl+Z cancels the opening timers before reaching this action.
+        # Keep older accepted openings in this rebuild so their pending edits
+        # cannot be stranded behind the former rendered snapshots.
+        for remaining_level in self.levels:
+            self._viewer_doorways_by_level_index[remaining_level.index] = (
+                self._copy_doorways(remaining_level.doorways)
+            )
+            self._viewer_windows_by_level_index[remaining_level.index] = (
+                self._copy_windows(remaining_level.windows)
+            )
         self._sync_viewer_window_snapshot(level)
         self._refresh_canvas_windows_for_level(level)
 
@@ -5062,14 +5180,14 @@ class BlueprintWorkspace(QWidget):
                 lambda: self._build_viewer_preview_model(None)
             )
         except Exception as error:
-            level.windows.insert(window_index, window)
+            restore_window_and_bridge()
             self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(f"Window could not be undone: {error}")
             return
         if validated_build is None:
-            level.windows.insert(window_index, window)
+            restore_window_and_bridge()
             self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
@@ -5085,7 +5203,7 @@ class BlueprintWorkspace(QWidget):
                 dependency_signature=dependency_signature,
             )
         except Exception as error:
-            level.windows.insert(window_index, window)
+            restore_window_and_bridge()
             self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._restore_canvas_window_preview_after_rollback()
@@ -5094,9 +5212,13 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._canvas_window_undo_ids.pop()
+        self._cancel_pending_doorway_mesh_update(clear_outline=True)
         if not self._is_restoring_canvas_undo:
             self._discard_removed_window_undo_states(window_id)
         self._reconcile_window_placements()
+        if bridge_edge is not None:
+            self._sync_canvas_outer_wall_marking()
+            self.canvas.update()
         self._sync_canvas_window_undo_availability()
         self.viewer.set_window_tools_status("Window undone.")
 
@@ -6786,7 +6908,6 @@ class BlueprintWorkspace(QWidget):
         self._sync_atlas_texture_selection_from_canvas_scene()
         active_surface_id = surface_ids[-1] if surface_ids else None
         self._sync_selected_canvas_wall_highlight(active_surface_id)
-        self._commit_pending_wall_vertex_update()
         pending_baseline = self._pending_canvas_surface_mesh_baseline
         if self._pending_canvas_surface_mesh_update:
             selected_wall_ids = self._get_canvas_wall_surface_ids(surface_ids)
@@ -7939,12 +8060,14 @@ class BlueprintWorkspace(QWidget):
             CanvasSnapshot,
         ):
             return
-        if (
-            self._pending_wall_vertex_mesh_update
-            and self.canvas.active_vertex_id is None
-            and raw_snapshot.action_kind != CANVAS_SNAPSHOT_ACTION_OPEN_SPACE
-        ):
-            self._commit_pending_wall_vertex_update()
+        joins_pending_wall_edit = self._pending_wall_vertex_mesh_update
+        if self._is_canvas_wall_vertex_interaction_active:
+            # A drag records its undo state before moving the first vertex.
+            # Reserve the pending rebuild now so unrelated scene refreshes
+            # cannot render live topology before release. Further edits share
+            # the same quiet period instead of publishing the preceding edit.
+            self._pending_wall_vertex_mesh_update = True
+            self._restart_pending_wall_vertex_update_if_idle()
         if not self._pending_wall_vertex_window_dimensions:
             self._pending_wall_vertex_window_dimensions = (
                 self._capture_canvas_window_dimension_snapshots(
@@ -7952,6 +8075,7 @@ class BlueprintWorkspace(QWidget):
                 )
             )
         tracks_surface_bindings = raw_snapshot.action_kind in {
+            CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE,
             CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
             CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
         }
@@ -7998,6 +8122,17 @@ class BlueprintWorkspace(QWidget):
                 sloped_ceilings_by_level=tuple(
                     (level.index, tuple(level.sloped_ceilings))
                     for level in self.levels
+                ),
+                window_dimensions=(
+                    self._pending_wall_vertex_window_dimensions
+                    if joins_pending_wall_edit
+                    else ()
+                ),
+                window_placements_before=(
+                    tuple(self.doors_workspace.data().window_placements)
+                    if raw_snapshot.action_kind
+                    == CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE
+                    else ()
                 ),
             )
         )
@@ -8997,6 +9132,7 @@ class BlueprintWorkspace(QWidget):
         level = self._get_level_by_index(state.level_index)
         if level is None:
             raise ValueError("The Canvas level in this undo step no longer exists.")
+        snapshot = self._filter_connection_severance_undo_windows(level, state.snapshot)
         restorable_assignment_ids = (
             self._find_restorable_blueprint_surface_binding_ids(state)
         )
@@ -9007,23 +9143,22 @@ class BlueprintWorkspace(QWidget):
             ) = state.level_offsets_meters
         if level is self.current_level:
             self.canvas.discard_undo_snapshot(state.snapshot)
-            self.canvas.restore_snapshot(state.snapshot)
+            self.canvas.restore_snapshot(snapshot)
             if state.level_offsets_meters is not None:
                 self._sync_level_controls()
         else:
-            level.vertex_data.copy_from(state.snapshot.vertex_data)
+            level.vertex_data.copy_from(snapshot.vertex_data)
             level.rooms.clear()
-            level.rooms.extend(copy.deepcopy(state.snapshot.rooms))
+            level.rooms.extend(copy.deepcopy(snapshot.rooms))
             level.doorways.clear()
-            level.doorways.extend(copy.deepcopy(state.snapshot.doorways))
+            level.doorways.extend(copy.deepcopy(snapshot.doorways))
             level.windows.clear()
-            level.windows.extend(state.snapshot.windows)
+            level.windows.extend(snapshot.windows)
             level.open_spaces.clear()
-            level.open_spaces.extend(state.snapshot.open_spaces)
+            level.open_spaces.extend(snapshot.open_spaces)
             self._reset_viewer_doorway_snapshots()
             self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
-        self._sync_viewer_window_snapshot(level)
         for level_index, architectural_trims in state.architectural_trims_by_level:
             trim_level = self._get_level_by_index(level_index)
             if trim_level is None:
@@ -9040,8 +9175,18 @@ class BlueprintWorkspace(QWidget):
             slope_level.sloped_ceilings = list(sloped_ceilings)
         if state.sloped_ceilings_by_level:
             self._reset_viewer_sloped_ceiling_snapshots()
+        self._preserve_canvas_window_dimension_snapshots(
+            state.window_dimensions,
+            require_every_window=False,
+        )
+        self._sync_viewer_window_snapshot(level)
         self.outer_wall_marks = state.outer_wall_marks
         self._sync_canvas_outer_wall_marking()
+        if snapshot.action_kind == CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE:
+            # Earlier cuts in this debounce burst must stay undone independently.
+            # Their frames can still be in a later snapshot until cleanup runs.
+            self._reconcile_window_placements()
+            self._restore_window_placements(state.window_placements_before)
         self._restore_window_placements(state.removed_window_placements)
         if state.architectural_trims_by_level or state.sloped_ceilings_by_level:
             self._reconcile_surface_assignments_with_scene()
@@ -9049,6 +9194,42 @@ class BlueprintWorkspace(QWidget):
         return self._restore_blueprint_surface_bindings(
             state,
             restorable_assignment_ids=restorable_assignment_ids,
+        )
+
+    def _filter_connection_severance_undo_windows(
+        self,
+        level: LevelData,
+        snapshot: CanvasSnapshot,
+    ) -> CanvasSnapshot:
+        """Restore only frames hosted by this cut's restored wall topology."""
+
+        if (
+            snapshot.action_kind != CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE
+            or not snapshot.windows
+        ):
+            return snapshot
+        topology_level = copy.copy(level)
+        topology_level.include_in_export = True
+        topology_level.vertex_data = snapshot.vertex_data
+        topology_level.rooms = snapshot.rooms
+        topology_level.doorways = snapshot.doorways
+        topology_level.windows = []
+        live_wall_ids = {
+            surface.surface_id
+            for surface in build_base_fixed_surfaces(
+                (topology_level,),
+                clip_open_spaces=False,
+                apply_sloped_ceilings=False,
+            )
+            if surface.surface_type == SURFACE_TYPE_WALL
+        }
+        return replace(
+            snapshot,
+            windows=[
+                window
+                for window in snapshot.windows
+                if window.wall_surface_id in live_wall_ids
+            ],
         )
 
     def _find_restorable_blueprint_surface_binding_ids(
@@ -11264,6 +11445,7 @@ class BlueprintWorkspace(QWidget):
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
+            or self._pending_doorway_bridge_topology_change
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
             or self._is_canvas_wall_vertex_interaction_active
@@ -20837,6 +21019,7 @@ class BlueprintWorkspace(QWidget):
             or bool(self._active_sloped_ceiling_edits)
             or self._pending_sloped_ceiling_undo_state is not None
             or self._pending_wall_vertex_mesh_update
+            or self._pending_doorway_bridge_topology_change
             or self._pending_stair_point_mesh_update
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
@@ -21000,6 +21183,7 @@ class BlueprintWorkspace(QWidget):
             or bool(self._active_sloped_ceiling_edits)
             or self._pending_sloped_ceiling_undo_state is not None
             or self._pending_wall_vertex_mesh_update
+            or self._pending_doorway_bridge_topology_change
             or self._pending_stair_point_mesh_update
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
@@ -21057,6 +21241,7 @@ class BlueprintWorkspace(QWidget):
             or bool(self._active_sloped_ceiling_edits)
             or self._pending_sloped_ceiling_undo_state is not None
             or self._pending_wall_vertex_mesh_update
+            or self._pending_doorway_bridge_topology_change
             or self._pending_stair_point_mesh_update
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
@@ -21105,6 +21290,7 @@ class BlueprintWorkspace(QWidget):
                 tours=self.tour_workspace.tours(),
                 doors=self.doors_workspace.data(),
                 directional_lights=self.directional_lights,
+                plan_wall_generation=self._build_plan_wall_detection_options(),
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -21200,6 +21386,8 @@ class BlueprintWorkspace(QWidget):
             self.maximum_vertex_distance_slider,
             self.minimum_wall_length_slider,
             self.wall_detection_confidence_slider,
+            self.wall_endpoint_alignment_tolerance_slider,
+            self.wall_endpoint_alignment_search_distance_slider,
         )
 
     def _build_plan_wall_detection_options(self) -> PlanWallDetectionOptions:
@@ -21227,7 +21415,41 @@ class BlueprintWorkspace(QWidget):
             confidence_threshold=(
                 self.wall_detection_confidence_slider.value() / 100.0
             ),
+            endpoint_alignment_tolerance_pixels=float(
+                self.wall_endpoint_alignment_tolerance_slider.value()
+            ),
+            endpoint_alignment_search_distance_pixels=float(
+                self.wall_endpoint_alignment_search_distance_slider.value()
+            ),
         )
+
+    def _restore_plan_wall_detection_options(
+        self,
+        options: PlanWallDetectionOptions | None,
+    ) -> None:
+        """Restore every project slider without starting intermediate previews."""
+
+        options = options or PlanWallDetectionOptions()
+        values = (
+            options.minimum_wall_separation_pixels,
+            options.maximum_wall_separation_pixels,
+            options.parallel_angle_tolerance_degrees,
+            options.minimum_parallel_overlap_ratio * 100,
+            options.maximum_gap_bridge_pixels,
+            options.endpoint_snap_distance_pixels,
+            options.maximum_vertex_distance_pixels,
+            options.minimum_wall_length_pixels,
+            options.confidence_threshold * 100,
+            options.endpoint_alignment_tolerance_pixels,
+            options.endpoint_alignment_search_distance_pixels,
+        )
+        self._is_syncing_plan_wall_controls = True
+        try:
+            for slider, value in zip(self._get_plan_wall_generation_sliders(), values):
+                slider.setValue(round(value))
+        finally:
+            self._is_syncing_plan_wall_controls = False
+        self._handle_plan_wall_slider_changed(0)
 
     def _handle_plan_wall_slider_changed(self, _value: int) -> None:
         """Refresh value labels and debounce one live Canvas reconstruction."""
@@ -21260,6 +21482,12 @@ class BlueprintWorkspace(QWidget):
             )
             self.wall_endpoint_snap_value_label.setText(
                 f"{self.wall_endpoint_snap_slider.value()} px"
+            )
+            self.wall_endpoint_alignment_tolerance_value_label.setText(
+                f"{self.wall_endpoint_alignment_tolerance_slider.value()} px"
+            )
+            self.wall_endpoint_alignment_search_distance_value_label.setText(
+                f"{self.wall_endpoint_alignment_search_distance_slider.value()} px"
             )
             self.maximum_vertex_distance_value_label.setText(
                 f"{self.maximum_vertex_distance_slider.value()} px"
@@ -29204,6 +29432,9 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_snap_middle_equal_angle_only(
             settings.snap_middle_equal_angle_only
         )
+        self.canvas.set_cut_connection_on_double_vertex_deletion(
+            settings.cut_connection_on_double_vertex_deletion
+        )
         self.doors_workspace.preview_viewer.set_point_light_intensity(
             settings.doors_and_windows_point_light_intensity
         )
@@ -29260,7 +29491,7 @@ class BlueprintWorkspace(QWidget):
         self,
         _vertex_ids: object,
     ) -> None:
-        """Stage vertex removal for one delayed, atomic 3D mesh rebuild."""
+        """Stage vertex or connection removal for one delayed 3D mesh rebuild."""
 
         self._pending_deleted_wall_cleanup = True
         self._pending_wall_vertex_mesh_update = True
@@ -29350,7 +29581,10 @@ class BlueprintWorkspace(QWidget):
             state = self._canvas_undo_stack[index]
             if not isinstance(state, _CanvasBlueprintUndoState):
                 continue
-            if state.snapshot.action_kind != CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION:
+            if state.snapshot.action_kind not in {
+                CANVAS_SNAPSHOT_ACTION_CONNECTION_SEVERANCE,
+                CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
+            }:
                 return
             placements_by_id = {
                 placement.placement_id: placement
@@ -29538,6 +29772,7 @@ class BlueprintWorkspace(QWidget):
             tours=project_data.tours,
             doors=project_data.doors,
             directional_lights=project_data.directional_lights,
+            plan_wall_generation=project_data.plan_wall_generation,
         )
 
     def _apply_project_state(
@@ -29554,6 +29789,7 @@ class BlueprintWorkspace(QWidget):
         tours: Sequence[TourData] | None = None,
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
+        plan_wall_generation: PlanWallDetectionOptions | None = None,
     ) -> None:
         """Install one project while coalescing expensive dependent refreshes."""
 
@@ -29578,6 +29814,7 @@ class BlueprintWorkspace(QWidget):
                 tours=tours,
                 doors=doors,
                 directional_lights=directional_lights,
+                plan_wall_generation=plan_wall_generation,
             )
             apply_completed = True
         finally:
@@ -29636,6 +29873,7 @@ class BlueprintWorkspace(QWidget):
         tours: Sequence[TourData] | None = None,
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
+        plan_wall_generation: PlanWallDetectionOptions | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -29652,6 +29890,7 @@ class BlueprintWorkspace(QWidget):
         # incoming project.
         self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_plan_wall_detections()
+        self._restore_plan_wall_detection_options(plan_wall_generation)
         self._cancel_progressive_texture_loads()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()

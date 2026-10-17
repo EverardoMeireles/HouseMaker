@@ -87,6 +87,7 @@ from housemaker.outer_wall_marking import (
 )
 from housemaker.plan_correction_exchange import ExternalPlanCorrection
 from housemaker.plan_metric_state import PlanMetricCalibration
+from housemaker.plan_wall_options import PlanWallDetectionOptions
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.tour_state import TourData, tours_from_payload, tours_to_dicts
@@ -117,6 +118,9 @@ class ProjectData:
     tours: tuple[TourData, ...] = ()
     doors: DoorLibraryData = field(default_factory=DoorLibraryData)
     directional_lights: tuple[DirectionalLightData, ...] = ()
+    plan_wall_generation: PlanWallDetectionOptions = field(
+        default_factory=PlanWallDetectionOptions
+    )
 
     def __post_init__(self) -> None:
         if not self.doorway_presets:
@@ -146,6 +150,7 @@ def save_project(
     tours: Iterable[TourData] | None = None,
     doors: DoorLibraryData | None = None,
     directional_lights: Iterable[DirectionalLightData] | None = None,
+    plan_wall_generation: PlanWallDetectionOptions | None = None,
 ) -> Path:
     export_path = Path(path)
     resolved_outer_wall_marks = reconcile_outer_wall_marks(
@@ -156,6 +161,9 @@ def save_project(
         "project_version": PROJECT_FILE_VERSION,
         "blueprint_path": None,
         "current_level_index": int(current_level_index),
+        "plan_wall_generation": (
+            plan_wall_generation or PlanWallDetectionOptions()
+        ).to_dict(),
         "image_library_paths": _serialize_image_library_paths(
             image_library_paths or []
         ),
@@ -440,6 +448,9 @@ def load_project(path: str | Path) -> ProjectData:
         tours=tours,
         doors=doors,
         directional_lights=directional_lights,
+        plan_wall_generation=PlanWallDetectionOptions.from_dict(
+            payload.get("plan_wall_generation")
+        ),
     )
 
 

@@ -190,6 +190,7 @@ class WallWindowPlacement:
     end_ratio: float
     bottom_ratio: float
     top_ratio: float
+    bridge_vertex_ids: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         validated = WindowData(
@@ -208,6 +209,20 @@ class WallWindowPlacement:
             "top_ratio",
         ):
             object.__setattr__(self, field_name, getattr(validated, field_name))
+        if self.bridge_vertex_ids is not None:
+            vertex_ids = tuple(self.bridge_vertex_ids)
+            if (
+                len(vertex_ids) != 2
+                or any(
+                    type(vertex_id) is not int or vertex_id <= 0
+                    for vertex_id in vertex_ids
+                )
+                or vertex_ids[0] == vertex_ids[1]
+            ):
+                raise ValueError(
+                    "A window bridge needs two distinct wall vertex IDs."
+                )
+            object.__setattr__(self, "bridge_vertex_ids", vertex_ids)
 
 
 # ### Public surface builders ###

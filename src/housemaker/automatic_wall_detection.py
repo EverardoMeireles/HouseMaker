@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from .models import Edge, Vertex, VertexData
+from .plan_wall_options import PlanWallDetectionError, PlanWallDetectionOptions
 from .plan_wall_pixel_tracing import PixelWallTracingCancelled, trace_plan_ink_paths
 
 # ### Detection constants ###
@@ -31,10 +32,6 @@ _REPAIR_MAXIMUM_SEARCH_STATES = 20_000
 
 
 # ### Public data models ###
-class PlanWallDetectionError(ValueError):
-    """A safe, user-displayable plan-wall detection failure."""
-
-
 class PlanWallDetectionCancelled(PlanWallDetectionError):
     """Raised when an asynchronous plan-wall analysis is cancelled."""
 
@@ -65,64 +62,6 @@ class PlanWallAnalysis:
         default=None, compare=False, repr=False
     )
     pixel_line_evidence: tuple[WallLineEvidence, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class PlanWallDetectionOptions:
-    """Fast reconstruction controls expressed in native image pixels."""
-
-    minimum_wall_separation_pixels: float = 6.0
-    maximum_wall_separation_pixels: float = 48.0
-    parallel_angle_tolerance_degrees: float = 7.5
-    minimum_parallel_overlap_ratio: float = 0.55
-    maximum_gap_bridge_pixels: float = 36.0
-    endpoint_snap_distance_pixels: float = 8.0
-    maximum_vertex_distance_pixels: float = 5.0
-    minimum_wall_length_pixels: float = 20.0
-    confidence_threshold: float = 0.45
-
-    def __post_init__(self) -> None:
-        numeric_values = (
-            self.minimum_wall_separation_pixels,
-            self.maximum_wall_separation_pixels,
-            self.parallel_angle_tolerance_degrees,
-            self.minimum_parallel_overlap_ratio,
-            self.maximum_gap_bridge_pixels,
-            self.endpoint_snap_distance_pixels,
-            self.maximum_vertex_distance_pixels,
-            self.minimum_wall_length_pixels,
-            self.confidence_threshold,
-        )
-        if not all(math.isfinite(value) for value in numeric_values):
-            raise PlanWallDetectionError("Wall reconstruction options must be finite.")
-        if self.minimum_wall_separation_pixels <= 0.0:
-            raise PlanWallDetectionError(
-                "Minimum parallel separation must be positive."
-            )
-        if self.maximum_wall_separation_pixels < self.minimum_wall_separation_pixels:
-            raise PlanWallDetectionError(
-                "Maximum parallel separation cannot be smaller than the minimum."
-            )
-        if not 0.0 < self.parallel_angle_tolerance_degrees < 45.0:
-            raise PlanWallDetectionError(
-                "Parallel angle tolerance must be between 0 and 45 degrees."
-            )
-        if not 0.0 < self.minimum_parallel_overlap_ratio <= 1.0:
-            raise PlanWallDetectionError(
-                "Minimum overlap ratio must be greater than 0 and at most 1."
-            )
-        if self.maximum_gap_bridge_pixels < 0.0:
-            raise PlanWallDetectionError("Maximum collinear gap cannot be negative.")
-        if self.endpoint_snap_distance_pixels < 0.0:
-            raise PlanWallDetectionError("Endpoint snap distance cannot be negative.")
-        if self.maximum_vertex_distance_pixels < 0.0:
-            raise PlanWallDetectionError("Maximum vertex distance cannot be negative.")
-        if self.minimum_wall_length_pixels <= 0.0:
-            raise PlanWallDetectionError("Minimum wall length must be positive.")
-        if not 0.0 <= self.confidence_threshold <= 1.0:
-            raise PlanWallDetectionError(
-                "Confidence threshold must be between 0 and 1."
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +293,35 @@ def reconstruct_plan_walls(
         analysis.image_height,
         resolved_options,
     )
+    aligned_pairs = _align_opposite_wall_endpoints(
+        analysis,
+        wall_face_pairs,
+        preliminary_graph,
+        result,
+        resolved_options,
+    )
+    if any(
+        aligned is not original
+        for aligned, original in zip(aligned_pairs, wall_face_pairs, strict=True)
+    ):
+        wall_face_pairs = aligned_pairs
+        preliminary_graph = result.clone()
+        _append_segments_to_graph(
+            preliminary_graph,
+            _node_segments(
+                _deduplicate_segments(
+                    [
+                        face
+                        for pair in wall_face_pairs
+                        for face in (pair.first, pair.second)
+                    ]
+                ),
+                resolved_options,
+            ),
+            analysis.image_width,
+            analysis.image_height,
+            resolved_options,
+        )
     # Repair before capping ends: an artificial cap would hide the dangling
     # vertices that identify incomplete wall continuations.
     repaired_segments = _repair_image_supported_wall_lines(
@@ -1604,6 +1572,250 @@ def _project_segment_onto_existing_wall(
     return _Segment(start=start, end=end, confidence=segment.confidence)
 
 
+# ### Opposite wall endpoint alignment ###
+def _align_opposite_wall_endpoints(
+    analysis: PlanWallAnalysis,
+    wall_face_pairs: Sequence[_WallFacePair],
+    topology: VertexData,
+    existing_graph: VertexData,
+    options: PlanWallDetectionOptions,
+) -> list[_WallFacePair]:
+    """Extend unfinished faces to nearby opposing wall-end coordinates.
+
+    The short extension limit is deliberately independent of the much longer
+    search span across a room. No segment is ever added between opposing tips:
+    subsequent image-supported repair alone decides whether a connection exists.
+    """
+
+    tolerance = options.endpoint_alignment_tolerance_pixels
+    search_distance = options.endpoint_alignment_search_distance_pixels
+    if tolerance <= 0.0 or search_distance <= 0.0 or not topology.vertices:
+        return list(wall_face_pairs)
+
+    vertices_by_id = {vertex.id: vertex for vertex in topology.vertices}
+    incident_edges: dict[int, list[Edge]] = {
+        vertex_id: [] for vertex_id in vertices_by_id
+    }
+    for edge in topology.edges:
+        incident_edges[edge.start_vertex_id].append(edge)
+        incident_edges[edge.end_vertex_id].append(edge)
+    existing_ids = {vertex.id for vertex in existing_graph.vertices}
+    immutable_segments = _existing_graph_segments(existing_graph)
+    obstruction_records = sorted(
+        (
+            (
+                edge,
+                _segment_from_vertices(
+                    vertices_by_id[edge.start_vertex_id],
+                    vertices_by_id[edge.end_vertex_id],
+                ),
+            )
+            for edge in topology.edges
+        ),
+        key=lambda record: _segment_sort_key(record[1]),
+    )
+    obstructions = [segment for _edge, segment in obstruction_records]
+    obstruction_bounds = _build_segment_bounds(obstructions)
+    vertices = list(topology.vertices)
+    points = np.asarray([(vertex.x, vertex.y) for vertex in vertices])
+    cosine_tolerance = math.cos(math.radians(options.parallel_angle_tolerance_degrees))
+    adjusted_pairs = list(wall_face_pairs)
+    accepted_extensions: list[_Segment] = []
+
+    ordered_pairs = sorted(
+        enumerate(wall_face_pairs),
+        key=lambda indexed_pair: sorted(
+            _segment_sort_key(face)
+            for face in (indexed_pair[1].first, indexed_pair[1].second)
+        ),
+    )
+    for pair_index, pair in ordered_pairs:
+        own_ids = {
+            vertex_id
+            for face in (pair.first, pair.second)
+            for endpoint in (face.start, face.end)
+            if (
+                vertex_id := _matching_topology_endpoint_id(
+                    endpoint,
+                    face,
+                    vertices_by_id,
+                    incident_edges,
+                    options,
+                )
+            )
+            is not None
+        }
+        adjusted_faces = [pair.first, pair.second]
+        for face_index, face in sorted(
+            enumerate((pair.first, pair.second)),
+            key=lambda indexed_face: _segment_sort_key(indexed_face[1]),
+        ):
+            face_points = [face.start.copy(), face.end.copy()]
+            for endpoint_index, endpoint in enumerate((face.start, face.end)):
+                vertex_id = _matching_topology_endpoint_id(
+                    endpoint,
+                    face,
+                    vertices_by_id,
+                    incident_edges,
+                    options,
+                )
+                if (
+                    vertex_id is None
+                    or vertex_id in existing_ids
+                    or len(incident_edges[vertex_id]) != 1
+                    or _point_is_covered_by_existing_wall(endpoint, immutable_segments)
+                ):
+                    continue
+                source_incident_edge = incident_edges[vertex_id][0]
+                outward = _unit_direction(face) * (-1.0 if endpoint_index == 0 else 1.0)
+                normal = np.asarray((-outward[1], outward[0]))
+                offsets = points - endpoint
+                extensions = offsets @ outward
+                spans = np.abs(offsets @ normal)
+                candidate_indices = np.flatnonzero(
+                    (extensions > _GEOMETRY_EPSILON)
+                    & (extensions <= tolerance + _GEOMETRY_EPSILON)
+                    & (
+                        spans
+                        >= np.maximum(
+                            options.minimum_wall_separation_pixels, 2.0 * extensions
+                        )
+                    )
+                    & (np.sum(offsets * offsets, axis=1) <= search_distance**2)
+                )
+                # Bound the expensive evidence/intersection checks per tip. The
+                # closest opposite wall is more relevant than one behind it.
+                candidate_indices = sorted(
+                    candidate_indices,
+                    key=lambda index: (
+                        float(spans[index]),
+                        float(extensions[index]),
+                        vertices[index].id,
+                    ),
+                )[:64]
+                candidates: list[tuple[float, float, np.ndarray, _Segment]] = []
+                for candidate_index in candidate_indices:
+                    target = vertices[candidate_index]
+                    if target.id in own_ids or not _opposite_endpoint_has_inward_wall(
+                        target.id,
+                        outward,
+                        vertices_by_id,
+                        incident_edges,
+                        cosine_tolerance,
+                    ):
+                        continue
+                    movement = float(extensions[candidate_index])
+                    point = np.round(
+                        endpoint + outward * movement, decimals=_POINT_KEY_PRECISION
+                    )
+                    if not (
+                        0.0 <= point[0] <= analysis.image_width - 1.0
+                        and 0.0 <= point[1] <= analysis.image_height - 1.0
+                    ):
+                        continue
+                    extension = _Segment(endpoint, point, face.confidence)
+                    # Alignment compensates for detector-shortened line ends;
+                    # the small extension may intentionally lie beyond the ink.
+                    # Only a later, separate connection repair needs continuous
+                    # ink across the much longer gap between opposing vertices.
+                    # The graph rounds detector coordinates: its own incident
+                    # edge can overlap this extension by a fraction of a pixel.
+                    # Exempt that exact edge, never unrelated nearby geometry.
+                    nearby_obstructions = [
+                        obstructions[int(index)]
+                        for index in _overlapping_bounds_indices(
+                            extension, obstruction_bounds, 0.25
+                        )
+                        if obstruction_records[int(index)][0] is not source_incident_edge
+                    ]
+                    if _alignment_extension_crosses_geometry(
+                        extension,
+                        (*nearby_obstructions, *accepted_extensions),
+                    ):
+                        continue
+                    candidates.append(
+                        (float(spans[candidate_index]), movement, point, extension)
+                    )
+
+                if not candidates:
+                    continue
+                best = candidates[0]
+                # Two faces at the same end coordinate support the same target,
+                # not an ambiguity. Different nearly-equidistant end coordinates
+                # are unsafe: leave them for manual editing instead of guessing.
+                comparable_span = best[0] + max(2.0, best[0] * 0.1)
+                if any(
+                    candidate[0] <= comparable_span
+                    and abs(candidate[1] - best[1]) > 0.5
+                    for candidate in candidates[1:]
+                ):
+                    continue
+                face_points[endpoint_index] = best[2]
+                accepted_extensions.append(best[3])
+            if all(
+                np.array_equal(before, after)
+                for before, after in zip(
+                    (face.start, face.end),
+                    face_points,
+                    strict=True,
+                )
+            ):
+                adjusted_faces[face_index] = face
+            else:
+                start, end = _canonical_endpoints(*face_points)
+                adjusted_faces[face_index] = _Segment(start, end, face.confidence)
+        if adjusted_faces[0] is not pair.first or adjusted_faces[1] is not pair.second:
+            adjusted_pairs[pair_index] = _WallFacePair(*adjusted_faces)
+    return adjusted_pairs
+
+
+def _alignment_extension_crosses_geometry(
+    extension: _Segment,
+    obstructions: Sequence[_Segment],
+) -> bool:
+    """Do not extend through a crossing or past an overlapping wall segment."""
+
+    if _connector_crosses_unrelated_geometry(extension, obstructions):
+        return True
+    direction = _unit_direction(extension)
+    start, end = _projection_interval(extension, direction)
+    for obstruction in obstructions:
+        if not _segments_are_collinear(extension, obstruction):
+            continue
+        other_start, other_end = _projection_interval(obstruction, direction)
+        if min(end, other_end) - max(start, other_start) > _GEOMETRY_EPSILON:
+            return True
+    return False
+
+
+def _opposite_endpoint_has_inward_wall(
+    vertex_id: int,
+    source_outward: np.ndarray,
+    vertices_by_id: dict[int, Vertex],
+    incident_edges: dict[int, list[Edge]],
+    cosine_tolerance: float,
+) -> bool:
+    """Require an opposite wall running inward from the proposed anchor."""
+
+    vertex = vertices_by_id[vertex_id]
+    point = np.asarray((vertex.x, vertex.y))
+    for edge in incident_edges[vertex_id]:
+        other_id = (
+            edge.end_vertex_id
+            if edge.start_vertex_id == vertex_id
+            else edge.start_vertex_id
+        )
+        other = vertices_by_id[other_id]
+        inward = np.asarray((other.x, other.y)) - point
+        length = float(np.linalg.norm(inward))
+        if (
+            length > _GEOMETRY_EPSILON
+            and float(np.dot(inward / length, -source_outward)) >= cosine_tolerance
+        ):
+            return True
+    return False
+
+
 # ### Wall-pair endpoint closure ###
 def _close_wall_face_pair_ends(
     wall_face_pairs: Sequence[_WallFacePair],
@@ -2345,6 +2557,15 @@ def _resolve_vertex_representatives(
                     distance = math.dist(point, representative.point)
                     if distance > distance_limit:
                         continue
+                    if (
+                        representative.existing_vertex_id is None
+                        and _incidents_have_distinct_axis_support(
+                            point_incidents,
+                            representative.incident_segments,
+                            generated_distance,
+                        )
+                    ):
+                        continue
                     if _incidents_span_wall_face_separation(
                         point_incidents,
                         representative.incident_segments,
@@ -2397,7 +2618,10 @@ def _refine_generated_vertex_representatives(
     for representative in representatives:
         if representative.existing_vertex_id is not None:
             continue
-        refined = _best_fit_representative_point(representative)
+        refined = _best_fit_representative_point(
+            representative,
+            maximum_adjustment,
+        )
         if refined is None:
             continue
         if math.dist(refined, representative.point) > maximum_adjustment:
@@ -2412,8 +2636,9 @@ def _refine_generated_vertex_representatives(
 
 def _best_fit_representative_point(
     representative: _VertexRepresentative,
+    minimum_axis_support_length: float,
 ) -> np.ndarray | None:
-    """Return the stable least-squares intersection of supporting lines."""
+    """Fit line intersections without bending substantial exact axis supports."""
 
     segments = _deduplicate_segments(representative.incident_segments)
     if not segments or not representative.source_points:
@@ -2421,6 +2646,7 @@ def _best_fit_representative_point(
 
     normal_matrix = np.zeros((2, 2), dtype=np.float64)
     projected_points = np.zeros(2, dtype=np.float64)
+    axis_coordinates: list[list[float]] = [[], []]
     for segment in segments:
         if segment.length <= _GEOMETRY_EPSILON:
             continue
@@ -2430,6 +2656,11 @@ def _best_fit_representative_point(
         weight = segment.length * max(segment.confidence, _GEOMETRY_EPSILON)
         normal_matrix += weight * projection
         projected_points += weight * (projection @ segment.start)
+        if segment.length > minimum_axis_support_length:
+            if _is_vertical(segment):
+                axis_coordinates[0].append(float(segment.start[0]))
+            elif _is_horizontal(segment):
+                axis_coordinates[1].append(float(segment.start[1]))
 
     if not np.any(normal_matrix):
         return None
@@ -2444,6 +2675,21 @@ def _best_fit_representative_point(
     except np.linalg.LinAlgError:
         return None
     refined = centroid + correction
+    fixed_axes = {
+        axis: values[0]
+        for axis, values in enumerate(axis_coordinates)
+        if values and max(values) - min(values) <= _GEOMETRY_EPSILON
+    }
+    for axis, coordinate in fixed_axes.items():
+        refined[axis] = coordinate
+    if len(fixed_axes) == 1:
+        fixed_axis, coordinate = next(iter(fixed_axes.items()))
+        free_axis = 1 - fixed_axis
+        if normal_matrix[free_axis, free_axis] > _GEOMETRY_EPSILON:
+            refined[free_axis] = (
+                projected_points[free_axis]
+                - normal_matrix[free_axis, fixed_axis] * coordinate
+            ) / normal_matrix[free_axis, free_axis]
     if not np.all(np.isfinite(refined)):
         return None
     return np.round(refined, decimals=_POINT_KEY_PRECISION)
@@ -2490,6 +2736,60 @@ def _vertex_grid_cell(point: np.ndarray, cell_size: float) -> tuple[int, int]:
         math.floor(float(point[0]) / cell_size),
         math.floor(float(point[1]) / cell_size),
     )
+
+
+def _incidents_have_distinct_axis_support(
+    first: Sequence[_Segment],
+    second: Sequence[_Segment],
+    minimum_length: float,
+) -> bool:
+    """Preserve short rectangular steps between substantial straight walls.
+
+    Merging the two ends of a small step averages different wall coordinates
+    and bends both walls. The wall-thickness check below intentionally only
+    protects larger separations, so these smaller real corners need their own
+    constraint. Short fragments can still collapse, and collinear gap endpoints
+    remain free to merge.
+    """
+
+    for first_segment in first:
+        if first_segment.length <= minimum_length:
+            continue
+        axis = (
+            0 if _is_vertical(first_segment)
+            else 1 if _is_horizontal(first_segment)
+            else None
+        )
+        if axis is None:
+            continue
+        for second_segment in second:
+            if second_segment.length <= minimum_length:
+                continue
+            same_axis = (
+                _is_vertical(second_segment)
+                if axis == 0 else _is_horizontal(second_segment)
+            )
+            if not same_axis or abs(
+                float(first_segment.start[axis] - second_segment.start[axis])
+            ) <= _GEOMETRY_EPSILON:
+                continue
+            tangent_axis = 1 - axis
+            first_interval = sorted((
+                float(first_segment.start[tangent_axis]),
+                float(first_segment.end[tangent_axis]),
+            ))
+            second_interval = sorted((
+                float(second_segment.start[tangent_axis]),
+                float(second_segment.end[tangent_axis]),
+            ))
+            overlap = min(first_interval[1], second_interval[1]) - max(
+                first_interval[0], second_interval[0]
+            )
+            # Nearby duplicate detections of the same stroke overlap. A step
+            # instead joins consecutive spans at different line coordinates.
+            if overlap <= minimum_length:
+                return True
+    return False
 
 
 def _incidents_span_wall_face_separation(
@@ -2702,7 +3002,10 @@ def _repair_supported_wall_guides(
         return []
     graph_segments = _existing_graph_segments(graph)
     pieces = _node_segments([*guides, *graph_segments], repair_options)
-    network = graph.clone()
+    # Generated wall endpoints are provisional, not authored anchors. Resolve
+    # their intersections with the guides together: snapping a straight guide
+    # independently onto two rounded generated tips can bend it off its ink.
+    network = immutable_graph.clone()
     _append_segments_to_graph(
         network,
         pieces,
@@ -2714,12 +3017,23 @@ def _repair_supported_wall_guides(
         vertex.id: np.asarray((vertex.x, vertex.y), dtype=np.float64)
         for vertex in network.vertices
     }
+    graph_segments, graph_incidents = _repair_rebased_graph_geometry(graph, network)
+    sources = sorted(
+        vertex_id for vertex_id, items in graph_incidents.items() if len(items) == 1
+    )
+    baseline_bounds = _build_segment_bounds(graph_segments)
     adjacency: dict[int, list[tuple[int, _Segment]]] = {}
-    for edge in network.edges[len(graph.edges) :]:
+    for edge in network.edges:
         start_id, end_id = edge.start_vertex_id, edge.end_vertex_id
         segment = _segment_from_vertices(
             network.get_vertex(start_id), network.get_vertex(end_id)
         )
+        if any(
+            _repair_point_on_segment(segment.start, graph_segments[int(index)])
+            and _repair_point_on_segment(segment.end, graph_segments[int(index)])
+            for index in _overlapping_bounds_indices(segment, baseline_bounds, 1e-4)
+        ):
+            continue
         if not _repair_line_has_ink(segment, ink):
             continue
         adjacency.setdefault(start_id, []).append((end_id, segment))
@@ -2788,6 +3102,47 @@ def _repair_supported_wall_guides(
         if not changed:
             break
     return sorted(accepted.values(), key=_segment_sort_key)
+
+
+def _repair_rebased_graph_geometry(
+    graph: VertexData,
+    network: VertexData,
+) -> tuple[list[_Segment], dict[int, list[_Segment]]]:
+    """Locate provisional wall anchors in the jointly resolved repair network."""
+
+    if not network.vertices:
+        return [], {}
+    vertices = list(network.vertices)
+    vertices_by_id = {vertex.id: vertex for vertex in vertices}
+    coordinates = np.asarray([(vertex.x, vertex.y) for vertex in vertices])
+    remapped_ids: dict[int, int] = {}
+    for vertex in graph.vertices:
+        retained = vertices_by_id.get(vertex.id)
+        if retained is not None and (retained.x, retained.y) == (vertex.x, vertex.y):
+            # Coincident authored vertices remain separate immutable anchors.
+            remapped_ids[vertex.id] = vertex.id
+            continue
+        nearest = int(
+            np.argmin(np.sum((coordinates - (vertex.x, vertex.y)) ** 2, axis=1))
+        )
+        remapped_ids[vertex.id] = vertices[nearest].id
+    segments: list[_Segment] = []
+    incidents: dict[int, list[_Segment]] = {}
+    seen_edges: set[tuple[int, int]] = set()
+    for edge in graph.edges:
+        first_id = remapped_ids[edge.start_vertex_id]
+        second_id = remapped_ids[edge.end_vertex_id]
+        key = tuple(sorted((first_id, second_id)))
+        if first_id == second_id or key in seen_edges:
+            continue
+        seen_edges.add(key)
+        segment = _segment_from_vertices(
+            network.get_vertex(first_id), network.get_vertex(second_id)
+        )
+        segments.append(segment)
+        incidents.setdefault(first_id, []).append(segment)
+        incidents.setdefault(second_id, []).append(segment)
+    return segments, incidents
 
 
 def _repair_graph_incidents(graph: VertexData) -> dict[int, list[_Segment]]:
