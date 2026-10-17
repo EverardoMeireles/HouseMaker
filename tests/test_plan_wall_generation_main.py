@@ -187,6 +187,15 @@ class PlanWallGenerationMainTests(unittest.TestCase):
             added_edge_count=1,
         )
 
+    def _reconstruct_unchanged_walls(
+        self,
+        _analysis: PlanWallAnalysis,
+        _options: PlanWallDetectionOptions,
+        *,
+        existing_vertex_data: VertexData,
+    ) -> PlanWallDetectionResult:
+        return PlanWallDetectionResult(existing_vertex_data.clone(), 0)
+
     def test_generate_button_follows_source_and_async_worker_state(self) -> None:
         self.assertEqual(self.workspace.generate_walls_button.text(), "Generate walls")
         self.assertFalse(self.workspace.generate_walls_button.isEnabled())
@@ -382,6 +391,98 @@ class PlanWallGenerationMainTests(unittest.TestCase):
             baseline_offsets,
         )
         self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+
+    def test_unchanged_preview_can_be_confirmed_without_editing_existing_walls(
+        self,
+    ) -> None:
+        self._load_plan()
+        level = self.workspace.current_level
+        _add_existing_wall(level.vertex_data)
+        level.scale = 1.75
+        level.offset_x_meters = 2.5
+        level.offset_y_meters = -3.0
+        graph = level.vertex_data
+        baseline = graph.to_dict()
+        revision = graph.revision
+        undo_count = len(self.workspace._canvas_undo_stack)
+        self.reconstruct_walls.side_effect = self._reconstruct_unchanged_walls
+
+        self._finish_successful_detection()
+
+        self.assertEqual(self.workspace.generate_walls_button.text(), "Confirm walls")
+        self.assertTrue(self.workspace.generate_walls_button.isEnabled())
+        self.assertTrue(self.workspace._plan_wall_preview_is_valid)
+        self.assertIsNotNone(self.workspace.canvas.get_generated_wall_preview())
+        self.assertIn(
+            "no new", self.workspace.plan_wall_generation_status_label.text().lower()
+        )
+        geometry_events: list[bool] = []
+        self.workspace.canvas.geometry_changed.connect(
+            lambda: geometry_events.append(True)
+        )
+
+        with (
+            patch.object(self.workspace.canvas, "commit_generated_wall_preview") as commit,
+            patch.object(self.workspace, "_schedule_viewer_preview_refresh") as rebuild,
+        ):
+            self.workspace._handle_generate_walls_clicked()
+
+        commit.assert_not_called()
+        rebuild.assert_not_called()
+        self.assertIs(level.vertex_data, graph)
+        self.assertEqual(graph.to_dict(), baseline)
+        self.assertEqual(graph.revision, revision)
+        self.assertEqual((level.offset_x_meters, level.offset_y_meters), (2.5, -3.0))
+        self.assertEqual(level.scale, 1.75)
+        self.assertEqual(geometry_events, [])
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+        self.assertIsNone(self.workspace.canvas.get_generated_wall_preview())
+        self.assertIsNone(self.workspace._plan_wall_preview_session)
+        self.assertFalse(self.workspace.plan_wall_controls_group.isEnabled())
+        self.assertEqual(self.workspace.generate_walls_button.text(), "Generate walls")
+        self.assertTrue(self.workspace.generate_walls_button.isEnabled())
+
+    def test_empty_unchanged_preview_can_be_confirmed_without_geometry_or_undo(
+        self,
+    ) -> None:
+        self._load_plan()
+        graph = self.workspace.current_level.vertex_data
+        baseline = graph.to_dict()
+        revision = graph.revision
+        undo_count = len(self.workspace._canvas_undo_stack)
+        self.reconstruct_walls.side_effect = self._reconstruct_unchanged_walls
+        self._finish_successful_detection()
+
+        self.assertTrue(self.workspace.generate_walls_button.isEnabled())
+
+        with (
+            patch.object(self.workspace.canvas, "commit_generated_wall_preview") as commit,
+            patch.object(self.workspace, "_schedule_viewer_preview_refresh") as rebuild,
+        ):
+            self.workspace._handle_generate_walls_clicked()
+
+        commit.assert_not_called()
+        rebuild.assert_not_called()
+        self.assertEqual(graph.to_dict(), baseline)
+        self.assertEqual(graph.revision, revision)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+        self.assertIsNone(self.workspace._plan_wall_preview_session)
+        self.assertEqual(self.workspace.generate_walls_button.text(), "Generate walls")
+
+    def test_slider_refresh_keeps_unchanged_preview_confirmable(self) -> None:
+        self._load_plan()
+        _add_existing_wall(self.workspace.current_level.vertex_data)
+        self.reconstruct_walls.side_effect = self._reconstruct_unchanged_walls
+        self._finish_successful_detection()
+        self.workspace.maximum_wall_separation_slider.setValue(
+            self.workspace.maximum_wall_separation_slider.value() + 7
+        )
+
+        self.assertTrue(self.workspace._plan_wall_preview_refresh_timer.isActive())
+        self.assertTrue(self.workspace._refresh_plan_wall_preview())
+
+        self.assertTrue(self.workspace.generate_walls_button.isEnabled())
+        self.assertEqual(self.workspace.generate_walls_button.text(), "Confirm walls")
 
     def test_stale_topology_rejects_finished_analysis(self) -> None:
         self._load_plan()

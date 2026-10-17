@@ -47,6 +47,7 @@ from housemaker.settings_widget import (
     DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
     DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
+    DEFAULT_INCLUDE_LLM_WALL_VERIFICATION,
     DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED,
     DEFAULT_MAKE_FLOORS_DOUBLE_SIDED,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
@@ -61,6 +62,7 @@ from housemaker.settings_widget import (
     GENERATION_DISPLAY_SCREEN_SETTING_KEY,
     HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
     IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+    INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY,
     MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY,
     MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY,
     MAX_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
@@ -83,6 +85,7 @@ from housemaker.settings_widget import (
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
     USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
+    WALL_VERIFICATION_MODEL_SETTING_KEY,
     Fullscreen3DViewerScreenOption,
     GenerationServiceSettings,
     SettingsWidget,
@@ -100,6 +103,7 @@ from housemaker.settings_widget import (
     read_generation_display_screen_id,
     read_hide_stair_mesh_when_previewing,
     read_ignore_top_down_ceiling,
+    read_include_llm_wall_verification,
     read_make_ceilings_double_sided,
     read_make_floors_double_sided,
     read_mesh_edit_update_delay_seconds,
@@ -109,6 +113,11 @@ from housemaker.settings_widget import (
     read_unused_face_removal,
     read_use_half_mesh_texture_prefix,
     read_use_uv_raycast_for_object_generation,
+    read_wall_verification_model,
+)
+from housemaker.wall_llm_verification_models import (
+    DEFAULT_WALL_VERIFICATION_MODEL,
+    WALL_VERIFICATION_MODEL_OPTIONS,
 )
 
 # ### Module state ###
@@ -168,6 +177,8 @@ class SettingsWidgetTests(unittest.TestCase):
                         widget.make_ceilings_double_sided_checkbox,
                         widget.snap_middle_equal_angle_only_checkbox,
                         widget.cut_connection_on_double_vertex_deletion_checkbox,
+                        widget.include_llm_wall_verification_checkbox,
+                        widget.wall_verification_model_combo,
                         widget.mesh_edit_update_delay_spinbox,
                     ),
                 ),
@@ -821,6 +832,127 @@ class SettingsWidgetTests(unittest.TestCase):
                     self.assertFalse(
                         read_cut_connection_on_double_vertex_deletion(store)
                     )
+
+    def test_wall_verification_defaults_and_enables_model_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            checkbox = widget.include_llm_wall_verification_checkbox
+            combo = widget.wall_verification_model_combo
+            changes: list[bool] = []
+            widget.settings_changed.connect(lambda: changes.append(True))
+
+            self.assertFalse(DEFAULT_INCLUDE_LLM_WALL_VERIFICATION)
+            self.assertFalse(GenerationServiceSettings().include_llm_wall_verification)
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(combo.isEnabled())
+            self.assertFalse(widget.wall_verification_model_label.isEnabled())
+            self.assertEqual(
+                widget.get_settings().wall_verification_model,
+                DEFAULT_WALL_VERIFICATION_MODEL,
+            )
+            form = widget.canvas_settings_group.layout()
+            label = form.labelForField(widget.wall_llm_verification_control)
+            self.assertEqual(
+                label.text(),
+                "Include LLM verification for wall generation",
+            )
+            self.assertEqual(
+                widget.wall_verification_model_label.text(),
+                "LLM verification model",
+            )
+            self.assertEqual(
+                tuple(
+                    (combo.itemText(index), combo.itemData(index))
+                    for index in range(combo.count())
+                ),
+                WALL_VERIFICATION_MODEL_OPTIONS,
+            )
+
+            checkbox.setChecked(True)
+
+            self.assertTrue(combo.isEnabled())
+            self.assertTrue(widget.wall_verification_model_label.isEnabled())
+            self.assertTrue(widget.get_settings().include_llm_wall_verification)
+            self.assertIs(store.get(INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY), True)
+            self.assertEqual(changes, [True])
+            checkbox.setChecked(False)
+            self.assertFalse(combo.isEnabled())
+            self.assertFalse(widget.wall_verification_model_label.isEnabled())
+            self.assertEqual(changes, [True, True])
+            widget.dispose()
+
+    def test_wall_verification_settings_persist_and_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            changes: list[bool] = []
+            widget.settings_changed.connect(lambda: changes.append(True))
+            widget.include_llm_wall_verification_checkbox.setChecked(True)
+            widget.wall_verification_model_combo.setCurrentIndex(
+                widget.wall_verification_model_combo.findData(
+                    "qwen3-vl-8b-local"
+                )
+            )
+            self.assertEqual(changes, [True, True])
+            self.assertEqual(
+                store.get(WALL_VERIFICATION_MODEL_SETTING_KEY),
+                "qwen3-vl-8b-local",
+            )
+            self.assertEqual(
+                widget.get_settings().wall_verification_model,
+                "qwen3-vl-8b-local",
+            )
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertTrue(restored.include_llm_wall_verification_checkbox.isChecked())
+            self.assertTrue(restored.wall_verification_model_combo.isEnabled())
+            self.assertEqual(
+                restored.get_settings().wall_verification_model,
+                "qwen3-vl-8b-local",
+            )
+            restored.include_llm_wall_verification_checkbox.setChecked(False)
+            self.assertEqual(
+                restored.get_settings().wall_verification_model,
+                "qwen3-vl-8b-local",
+            )
+            self.assertFalse(read_include_llm_wall_verification(store))
+            widget.dispose()
+            restored.dispose()
+
+    def test_wall_verification_settings_reject_malformed_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            for value in (1, 0, "true", None, []):
+                with self.subTest(enabled=value):
+                    with self.assertRaisesRegex(ValueError, "LLM wall verification"):
+                        GenerationServiceSettings(
+                            include_llm_wall_verification=value
+                        )
+                    store.set(INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY, value)
+                    self.assertFalse(read_include_llm_wall_verification(store))
+            for value in (True, 1, "unknown-model", None, []):
+                with self.subTest(model=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "Unknown LLM wall verification model"
+                    ):
+                        GenerationServiceSettings(wall_verification_model=value)
+                    store.set(WALL_VERIFICATION_MODEL_SETTING_KEY, value)
+                    self.assertEqual(
+                        read_wall_verification_model(store),
+                        DEFAULT_WALL_VERIFICATION_MODEL,
+                    )
+            widget = SettingsWidget(application_settings=store, environment={})
+            self.assertFalse(widget.get_settings().include_llm_wall_verification)
+            self.assertFalse(widget.wall_verification_model_combo.isEnabled())
+            self.assertEqual(
+                widget.get_settings().wall_verification_model,
+                DEFAULT_WALL_VERIFICATION_MODEL,
+            )
+            widget.dispose()
 
     def test_atlas_display_model_defaults_normalizes_and_validates(self) -> None:
         self.assertIsNone(GenerationServiceSettings().atlas_display_screen_id)

@@ -11,6 +11,7 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import trimesh
@@ -58,6 +59,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+if TYPE_CHECKING:
+    from housemaker.wall_llm_verification import WallVerificationResult
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.architectural_surface_edits import (
@@ -851,6 +855,81 @@ class _PlanWallPreviewSession:
     baseline_vertex_data: VertexData
     existing_edge_keys: frozenset[tuple[int, int]]
     analysis: PlanWallAnalysis
+
+
+# ### Optional LLM wall-verification jobs ###
+class _WallVerificationThread(QThread):
+    """Review an immutable confirmed wall layout without blocking the GUI."""
+
+    def __init__(
+        self,
+        image_path: Path,
+        vertex_data: VertexData,
+        *,
+        api_key: str,
+        model: str,
+        excluded_polygons: tuple[tuple[tuple[float, float], ...], ...],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._image_path = image_path
+        self._vertex_data = vertex_data.clone()
+        self._api_key = api_key
+        self._model = model
+        self._excluded_polygons = excluded_polygons
+        self.result: WallVerificationResult | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            # Vision dependencies stay out of the application's startup path.
+            from housemaker.wall_llm_verification import verify_plan_walls
+
+            result = verify_plan_walls(
+                self._image_path,
+                self._vertex_data,
+                api_key=self._api_key,
+                model=self._model,
+                excluded_polygons=self._excluded_polygons,
+                cancellation_check=self.isInterruptionRequested,
+            )
+        except Exception as error:  # noqa: BLE001 - worker boundary.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        finally:
+            self._api_key = ""
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.result = result
+
+
+@dataclass
+class _WallVerificationRuntime:
+    """Track a cancellable review until its worker has actually retired."""
+
+    level_index: int
+    source_revision: tuple[object, ...]
+    context_signature: tuple[object, ...]
+    baseline_vertex_data: VertexData
+    job_id: str
+    thread: _WallVerificationThread
+    cancel_requested: bool = False
+
+
+@dataclass(frozen=True)
+class _WallVerificationPreview:
+    """Validated additions tied to exactly one confirmed layout and image."""
+
+    level_index: int
+    source_revision: tuple[object, ...]
+    context_signature: tuple[object, ...]
+    baseline_vertex_data: VertexData
+    result: WallVerificationResult
 
 
 # ### Atlas texture-source jobs ###
@@ -2120,6 +2199,15 @@ class BlueprintWorkspace(QWidget):
         self._progressive_texture_load_request_id = 0
         self._plan_wall_preview_session: _PlanWallPreviewSession | None = None
         self._plan_wall_preview_is_valid = False
+        self._wall_verification_runtimes: dict[str, _WallVerificationRuntime] = {}
+        self._wall_verification_active_job_id: str | None = None
+        self._wall_verification_preview: _WallVerificationPreview | None = None
+        self._wall_verification_instruction_phase = 0
+        self._wall_verification_instruction_timer = QTimer(self)
+        self._wall_verification_instruction_timer.setInterval(80)
+        self._wall_verification_instruction_timer.timeout.connect(
+            self._animate_wall_verification_instructions
+        )
         self._is_syncing_plan_wall_controls = False
         self._plan_wall_preview_refresh_timer = QTimer(self)
         self._plan_wall_preview_refresh_timer.setSingleShot(True)
@@ -4589,7 +4677,12 @@ class BlueprintWorkspace(QWidget):
 
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
-        levels_layout.addWidget(self.blueprint_name_label)
+        levels_layout.insertWidget(1, self.blueprint_name_label)
+
+        self.wall_verification_instructions_label = QLabel()
+        self.wall_verification_instructions_label.setWordWrap(True)
+        levels_layout.addWidget(self.wall_verification_instructions_label)
+        self._update_wall_verification_instructions()
 
         self.levels_list = QListWidget()
         self.levels_list.currentRowChanged.connect(self._handle_level_list_row_changed)
@@ -4677,6 +4770,12 @@ class BlueprintWorkspace(QWidget):
 
         self.canvas.geometry_changed.connect(
             self._handle_canvas_surface_geometry_changed
+        )
+        self.canvas.wall_verification_dismiss_requested.connect(
+            self._dismiss_wall_verification
+        )
+        self.canvas.wall_verification_selection_changed.connect(
+            self._update_plan_wall_generation_controls_state
         )
         self.canvas.wall_vertex_added.connect(self._handle_canvas_wall_vertex_added)
         self.canvas.wall_vertices_deleted.connect(
@@ -21513,6 +21612,11 @@ class BlueprintWorkspace(QWidget):
     def _handle_generate_walls_clicked(self) -> None:
         """Start image analysis or confirm the current generated-wall preview."""
 
+        if self._wall_verification_active_job_id is not None:
+            return
+        if self._wall_verification_preview is not None:
+            self._accept_wall_verification_proposals()
+            return
         session = self._plan_wall_preview_session
         if session is not None and session.level_index == self.current_level.index:
             self._confirm_generated_walls()
@@ -21717,20 +21821,21 @@ class BlueprintWorkspace(QWidget):
             )
             self._update_plan_wall_generation_controls_state()
             return False
-        self._plan_wall_preview_is_valid = added_count > 0
-        if self._plan_wall_preview_is_valid:
+        # An unchanged, validated layout can still proceed to LLM verification.
+        self._plan_wall_preview_is_valid = True
+        if added_count > 0:
             self.plan_wall_generation_status_label.setText(
                 f"{added_count} generated wall faces. Adjust the sliders or confirm."
             )
         else:
             self.plan_wall_generation_status_label.setText(
-                "No wall pairs match the current controls. Adjust the sliders."
+                "No new walls found. Adjust the sliders or confirm to continue."
             )
         self._update_plan_wall_generation_controls_state()
         return True
 
     def _confirm_generated_walls(self) -> None:
-        """Commit the latest preview and build its 3D walls exactly once."""
+        """Confirm a valid preview, rebuilding only when it adds new walls."""
 
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
@@ -21744,8 +21849,11 @@ class BlueprintWorkspace(QWidget):
             return
         level = self.current_level
         preview = self.canvas.get_generated_wall_preview()
+        if preview is None:
+            return
+        has_new_walls = len(preview.edges) > len(session.baseline_vertex_data.edges)
         offset_compensation = (0.0, 0.0)
-        if preview is not None and session.baseline_vertex_data.vertices:
+        if has_new_walls and session.baseline_vertex_data.vertices:
             previous_pivot_x, previous_pivot_y = get_level_world_pivot(level)
             preview_level = copy.copy(level)
             preview_level.vertex_data = preview.to_vertex_data()
@@ -21761,26 +21869,235 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_doorway_mesh_update()
         self._plan_wall_preview_session = None
         self._plan_wall_preview_is_valid = False
-        if not self.canvas.commit_generated_wall_preview():
-            self._update_plan_wall_generation_controls_state()
+        if has_new_walls:
+            if not self.canvas.commit_generated_wall_preview():
+                self._update_plan_wall_generation_controls_state()
+                return
+            level.offset_x_meters += offset_compensation[0]
+            level.offset_y_meters += offset_compensation[1]
+            self._sync_level_controls()
+            self.plan_wall_generation_status_label.setText("Generated walls confirmed.")
+            self.viewer.set_surface_tools_status(
+                "Generated walls confirmed. Press Ctrl+Z to undo."
+            )
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+        else:
+            # Keep the graph and undo history untouched for a no-op confirmation.
+            self.canvas.clear_generated_wall_preview()
+            message = "Walls confirmed. No new walls were added."
+            self.plan_wall_generation_status_label.setText(message)
+            self.viewer.set_surface_tools_status(message)
+        self._update_plan_wall_generation_controls_state()
+        self._update_image_correction_button_state()
+        if self._generation_settings.include_llm_wall_verification:
+            self._start_wall_verification()
+
+    # ### Optional wall verification and acceptance ###
+    def _start_wall_verification(self) -> None:
+        """Review only the confirmed layout, using the selected vision model."""
+
+        if self._is_shutdown or self._wall_verification_active_job_id is not None:
             return
-        level.offset_x_meters += offset_compensation[0]
-        level.offset_y_meters += offset_compensation[1]
-        self._sync_level_controls()
-        self.plan_wall_generation_status_label.setText("Generated walls confirmed.")
-        self.viewer.set_surface_tools_status(
-            "Generated walls confirmed. Press Ctrl+Z to undo."
+        level = self.current_level
+        if not level.image_path:
+            return
+        settings = self._generation_settings
+        baseline = level.vertex_data.clone()
+        thread = _WallVerificationThread(
+            Path(level.image_path),
+            baseline,
+            api_key=settings.openai_api_key,
+            model=settings.wall_verification_model,
+            excluded_polygons=self._wall_verification_excluded_polygons(),
+            parent=self,
         )
-        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        job = self.job_manager.create_job(
+            kind="Wall verification",
+            requested_name="",
+            default_name=f"Verify {level.display_name} walls",
+            stage="Reviewing confirmed walls with the selected LLM",
+        )
+        runtime = _WallVerificationRuntime(
+            level_index=level.index,
+            source_revision=_build_local_file_revision(level.image_path),
+            context_signature=self._wall_verification_context_signature(level),
+            baseline_vertex_data=baseline,
+            job_id=job.job_id,
+            thread=thread,
+        )
+        self._wall_verification_runtimes[job.job_id] = runtime
+        self._wall_verification_active_job_id = job.job_id
+        self.job_manager.set_cancel_callback(job.job_id, self._dismiss_wall_verification)
+        thread.finished.connect(
+            partial(self._handle_wall_verification_finished, job.job_id, thread)
+        )
+        self.canvas.set_wall_verification_pending(True)
+        self.plan_wall_generation_status_label.setText(
+            "Walls confirmed. LLM verification running; right-click to cancel."
+        )
+        self._update_plan_wall_generation_controls_state()
+        self._update_image_correction_button_state()
+        thread.start()
+
+    def _handle_wall_verification_finished(
+        self,
+        job_id: str,
+        thread: _WallVerificationThread,
+    ) -> None:
+        """Show additions in red only while the reviewed inputs still match."""
+
+        runtime = self._wall_verification_runtimes.pop(job_id, None)
+        try:
+            if runtime is None or runtime.thread is not thread:
+                return
+            self.job_manager.set_cancel_callback(job_id, None)
+            if self._is_shutdown or runtime.cancel_requested or thread.was_cancelled:
+                self.job_manager.mark_cancelled(job_id)
+                return
+            if job_id != self._wall_verification_active_job_id:
+                self.job_manager.mark_cancelled(job_id)
+                return
+            self._wall_verification_active_job_id = None
+            self.canvas.set_wall_verification_pending(False)
+            if not self._wall_verification_context_is_current(runtime):
+                message = "LLM suggestions discarded because the plan, walls, or openings changed."
+                self.plan_wall_generation_status_label.setText(message)
+                self.job_manager.fail_job(job_id, f"Not applied: {message}")
+                return
+            if thread.error_message is not None or thread.result is None:
+                message = thread.error_message or "The model returned no usable wall verification."
+                self.job_manager.fail_job(job_id, f"Failed: {message}")
+                self.plan_wall_generation_status_label.setText(
+                    f"LLM verification failed: {message}"
+                )
+                QMessageBox.critical(
+                    self, "Wall verification failed",
+                    message + "\n\nYour confirmed walls were kept.",
+                )
+                return
+            result = thread.result
+            rejected_count = len(result.rejected_reasons)
+            if not result.proposals:
+                message = "LLM verification found no safe missing-wall additions."
+                if rejected_count:
+                    message += f" {rejected_count} invalid or uncertain proposals rejected."
+                self.plan_wall_generation_status_label.setText(message)
+                self.plan_wall_generation_status_label.setToolTip(
+                    "\n".join(result.rejected_reasons)
+                )
+                self.job_manager.complete_job(job_id, message)
+                return
+            self._wall_verification_preview = _WallVerificationPreview(
+                level_index=runtime.level_index,
+                source_revision=runtime.source_revision,
+                context_signature=runtime.context_signature,
+                baseline_vertex_data=runtime.baseline_vertex_data,
+                result=result,
+            )
+            self.canvas.set_wall_verification_preview(result.proposals)
+            self.plan_wall_generation_status_label.setText(
+                f"{len(result.proposals)} red wall additions proposed; {rejected_count} rejected. "
+                "Click red points or lines to include/exclude them."
+            )
+            self.plan_wall_generation_status_label.setToolTip(
+                result.summary + "\n" + "\n".join(result.rejected_reasons)
+            )
+            self.job_manager.complete_job(job_id, "LLM wall proposals ready for review")
+        finally:
+            if self._wall_verification_active_job_id == job_id:
+                self._wall_verification_active_job_id = None
+                self.canvas.set_wall_verification_pending(False)
+            thread.deleteLater()
+            self._update_plan_wall_generation_controls_state()
+            self._update_image_correction_button_state()
+
+    def _dismiss_wall_verification(
+        self,
+        *,
+        update_controls: bool = True,
+        message: str | None = "LLM suggestions dismissed. Confirmed walls were kept.",
+    ) -> bool:
+        """Cancel just the optional review, leaving confirmed geometry untouched."""
+
+        job_id = self._wall_verification_active_job_id
+        had_review = job_id is not None or self._wall_verification_preview is not None
+        self._wall_verification_active_job_id = None
+        self._wall_verification_preview = None
+        if job_id is not None:
+            runtime = self._wall_verification_runtimes.get(job_id)
+            if runtime is not None:
+                runtime.cancel_requested = True
+                runtime.thread.requestInterruption()
+            self.job_manager.set_cancel_callback(job_id, None)
+            self.job_manager.mark_cancelled(job_id)
+        if hasattr(self, "canvas"):
+            self.canvas.clear_wall_verification_preview()
+        if had_review and message is not None:
+            self.plan_wall_generation_status_label.setText(message)
+        if update_controls and hasattr(self, "generate_walls_button"):
+            self._update_plan_wall_generation_controls_state()
+            self._update_image_correction_button_state()
+        return had_review
+
+    def _accept_wall_verification_proposals(self) -> None:
+        """Apply selected additions as one undoable normal wall-geometry change."""
+
+        from housemaker.wall_llm_verification import apply_wall_proposals
+
+        session = self._wall_verification_preview
+        if session is None:
+            return
+        if not self._wall_verification_context_is_current(session):
+            self._invalidate_stale_wall_verification()
+            return
+        selected_ids = self.canvas.selected_wall_verification_proposal_ids()
+        if not selected_ids:
+            return
+        try:
+            candidate = apply_wall_proposals(
+                session.baseline_vertex_data, session.result.proposals, selected_ids
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            QMessageBox.critical(self, "Wall proposals could not be applied", str(error))
+            return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_doorway_mesh_update()
+        if not self._wall_verification_context_is_current(session):
+            self._invalidate_stale_wall_verification()
+            return
+        level = self.current_level
+        previous_pivot_x, previous_pivot_y = get_level_world_pivot(level)
+        candidate_level = copy.copy(level)
+        candidate_level.vertex_data = candidate
+        next_pivot_x, next_pivot_y = get_level_world_pivot(candidate_level)
+        self._wall_verification_preview = None
+        self.canvas.clear_wall_verification_preview()
+        self.canvas.set_generated_wall_preview(
+            candidate, _get_vertex_data_edge_keys(level.vertex_data)
+        )
+        if self.canvas.commit_generated_wall_preview():
+            level.offset_x_meters += (1.0 - level.scale) * (previous_pivot_x - next_pivot_x)
+            level.offset_y_meters += (1.0 - level.scale) * (previous_pivot_y - next_pivot_y)
+            self._sync_level_controls()
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            self.plan_wall_generation_status_label.setText(
+                f"Accepted {len(selected_ids)} LLM wall additions. Press Ctrl+Z to undo."
+            )
         self._update_plan_wall_generation_controls_state()
         self._update_image_correction_button_state()
 
+    # ### Wall-preview cancellation and control state ###
     def _clear_plan_wall_preview(self, *, update_controls: bool = True) -> None:
         """Discard cached wall evidence and its non-destructive Canvas overlay."""
 
         self._plan_wall_preview_refresh_timer.stop()
         self._plan_wall_preview_session = None
         self._plan_wall_preview_is_valid = False
+        self._dismiss_wall_verification(update_controls=False, message=None)
         if hasattr(self, "canvas"):
             self.canvas.clear_generated_wall_preview()
         if hasattr(self, "plan_wall_generation_status_label"):
@@ -21815,6 +22132,15 @@ class BlueprintWorkspace(QWidget):
                 runtime.thread.wait(PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS)
             runtime.thread.deleteLater()
         self._plan_wall_detection_runtimes.clear()
+        for runtime in tuple(self._wall_verification_runtimes.values()):
+            runtime.cancel_requested = True
+            runtime.thread.requestInterruption()
+            self.job_manager.mark_cancelled(runtime.job_id)
+            while runtime.thread.isRunning():
+                runtime.thread.wait(PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS)
+            runtime.thread.deleteLater()
+        self._wall_verification_runtimes.clear()
+        self._wall_verification_instruction_timer.stop()
         if hasattr(self, "generate_walls_button"):
             self._update_plan_wall_generation_controls_state()
 
@@ -21837,6 +22163,24 @@ class BlueprintWorkspace(QWidget):
         has_preview = session is not None and session.level_index == level.index
         source_revision = _build_local_file_revision(level.image_path)
         has_source = _local_file_revision_has_file(source_revision)
+        if self._wall_verification_active_job_id is not None:
+            self.generate_walls_button.setEnabled(False)
+            self.generate_walls_button.setText("Verifying walls...")
+            self.plan_wall_controls_group.setEnabled(False)
+            self._update_plan_image_erase_button_state()
+            self._update_wall_verification_instructions()
+            return
+        if self._wall_verification_preview is not None:
+            self.generate_walls_button.setText("Accept LLM proposed changes")
+            self.generate_walls_button.setEnabled(
+                not self._is_shutdown
+                and bool(self.canvas.selected_wall_verification_proposal_ids())
+            )
+            self.plan_wall_controls_group.setEnabled(False)
+            self._update_plan_image_erase_button_state()
+            self._update_wall_verification_instructions()
+            return
+        self._update_wall_verification_instructions()
         if runtime is not None:
             self.generate_walls_button.setEnabled(False)
             self.generate_walls_button.setText("Generating walls...")
@@ -21860,6 +22204,164 @@ class BlueprintWorkspace(QWidget):
         self.plan_wall_controls_group.setEnabled(not self._is_shutdown and has_preview)
         self._update_plan_image_erase_button_state()
 
+    # ### LLM wall-verification context and protected openings ###
+    def _wall_verification_context_signature(
+        self,
+        level: LevelData,
+    ) -> tuple[object, ...]:
+        """Capture every input that can invalidate proposed wall additions."""
+
+        return (
+            _build_vertex_data_signature(level.vertex_data),
+            repr((level.doorways, level.windows, level.open_spaces)),
+            repr(self.stairs),
+            level.meters_per_pixel,
+            level.scale,
+            level.offset_x_meters,
+            level.offset_y_meters,
+        )
+
+    def _wall_verification_context_is_current(
+        self,
+        state: _WallVerificationRuntime | _WallVerificationPreview,
+    ) -> bool:
+        """Never attach an asynchronous review to a different plan or layout."""
+
+        try:
+            level = self.current_level
+        except IndexError:
+            return False
+        return (
+            level.index == state.level_index
+            and _build_local_file_revision(level.image_path) == state.source_revision
+            and self._wall_verification_context_signature(level)
+            == state.context_signature
+        )
+
+    def _wall_verification_excluded_polygons(
+        self,
+    ) -> tuple[tuple[tuple[float, float], ...], ...]:
+        """Protect authored doorways, window frames, and open spaces in the plan."""
+
+        level = self.current_level
+        polygons = [
+            tuple(self.canvas._get_doorway_corners(doorway))
+            for doorway in level.doorways
+        ]
+        polygons.extend(
+            (
+                (opening.minimum_x, opening.minimum_y),
+                (opening.maximum_x, opening.minimum_y),
+                (opening.maximum_x, opening.maximum_y),
+                (opening.minimum_x, opening.maximum_y),
+            )
+            for opening in level.open_spaces
+        )
+        for target in self._canvas_opening_targets_by_key.values():
+            if (
+                target.reference.kind != CANVAS_OPENING_WINDOW
+                or target.reference.level_index != level.index
+            ):
+                continue
+            start_world = target.local_to_world(target.bounds.start_ratio, 0.5)
+            end_world = target.local_to_world(target.bounds.end_ratio, 0.5)
+            start = level_world_to_image_xy(level, start_world[0], start_world[1])
+            end = level_world_to_image_xy(level, end_world[0], end_world[1])
+            delta_x = end[0] - start[0]
+            delta_y = end[1] - start[1]
+            length = math.hypot(delta_x, delta_y)
+            if length <= 1e-9:
+                continue
+            normal_x = -delta_y / length * 2.0
+            normal_y = delta_x / length * 2.0
+            polygons.append(
+                (
+                    (start[0] + normal_x, start[1] + normal_y),
+                    (end[0] + normal_x, end[1] + normal_y),
+                    (end[0] - normal_x, end[1] - normal_y),
+                    (start[0] - normal_x, start[1] - normal_y),
+                )
+            )
+        return tuple(polygons)
+
+    def _invalidate_stale_wall_verification(self) -> None:
+        """Dismiss suggestions as soon as the user changes their source context."""
+
+        state = self._wall_verification_preview
+        if state is None and self._wall_verification_active_job_id is not None:
+            state = self._wall_verification_runtimes.get(
+                self._wall_verification_active_job_id
+            )
+        if state is not None and not self._wall_verification_context_is_current(state):
+            self._dismiss_wall_verification(
+                message=(
+                    "LLM suggestions discarded because the plan, walls, "
+                    "or openings changed."
+                )
+            )
+
+    # ### Blinking wall-verification instructions ###
+    def _update_wall_verification_instructions(self) -> None:
+        """Explain the current review stage directly above the level list."""
+
+        if not hasattr(self, "wall_verification_instructions_label"):
+            return
+        verification_enabled = self._generation_settings.include_llm_wall_verification
+        pending = (
+            verification_enabled
+            and self._wall_verification_active_job_id is not None
+        )
+        preview = (
+            verification_enabled
+            and self._wall_verification_preview is not None
+        )
+        label = self.wall_verification_instructions_label
+        if pending:
+            text = "Wait for LLM wall verification"
+        elif preview:
+            text = (
+                "Red vertices and lines are LLM suggestions, not built walls. "
+                "Click a red line or point to include or exclude it, then click "
+                "Accept LLM proposed changes. Right-click to dismiss all suggestions."
+            )
+        elif not self.current_level.vertex_data.vertices:
+            text = (
+                "Click 'Generate walls', adjust the green preview, then click "
+                "'Confirm walls'"
+            )
+        else:
+            text = ""
+        visible = bool(text)
+        label.setText(text)
+        label.setVisible(visible)
+        timer = self._wall_verification_instruction_timer
+        if visible and not self._is_shutdown:
+            if not timer.isActive():
+                self._wall_verification_instruction_phase = 0
+                self._animate_wall_verification_instructions()
+                timer.start()
+        else:
+            timer.stop()
+
+    def _animate_wall_verification_instructions(self) -> None:
+        """Pulse only the instruction label, without invalidating the 3D scene."""
+
+        label = self.wall_verification_instructions_label
+        if self._is_shutdown or label.isHidden():
+            self._wall_verification_instruction_timer.stop()
+            return
+        phase = self._wall_verification_instruction_phase % 24
+        blend = (1.0 - math.cos(phase * math.tau / 24.0)) * 0.5
+        remaining = round(255.0 * (1.0 - blend))
+        palette = label.palette()
+        palette.setColor(
+            QPalette.ColorRole.WindowText,
+            QColor(255, remaining, remaining),
+        )
+        label.setPalette(palette)
+        self._wall_verification_instruction_phase = (phase + 1) % 24
+
+    # ### Plan-image loading ###
     def _handle_load_image_clicked(self) -> None:
         file_path = self._get_image_file_path()
         if not file_path:
@@ -22955,11 +23457,16 @@ class BlueprintWorkspace(QWidget):
         )
         wall_runtime_is_active = bool(self._plan_wall_detection_runtimes)
         has_wall_preview = self._plan_wall_preview_session is not None
+        has_wall_verification = (
+            self._wall_verification_active_job_id is not None
+            or self._wall_verification_preview is not None
+        )
         self.image_correction_button.setEnabled(
             not self._is_shutdown
             and not batch_is_active
             and not wall_runtime_is_active
             and not has_wall_preview
+            and not has_wall_verification
         )
         self.image_correction_button.setText(
             "Correcting..." if batch_is_active else "Image correction"
@@ -23691,6 +24198,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_open_spaces_changed(self) -> None:
         """Keep hole UI current and retire unrelated delayed mesh work."""
 
+        self._invalidate_stale_wall_verification()
         if (
             self._pending_wall_vertex_mesh_update
             and not self._pending_open_space_corner_mesh_update
@@ -28821,6 +29329,7 @@ class BlueprintWorkspace(QWidget):
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
         self.current_level.doorways = self.canvas.doorways
+        self._invalidate_stale_wall_verification()
         if self._pending_wall_vertex_mesh_update:
             self._pending_wall_vertex_doorway_level_indices.add(
                 self.current_level.index
@@ -28902,6 +29411,7 @@ class BlueprintWorkspace(QWidget):
         """Show a live doorway outline and debounce the wall mesh rebuild."""
 
         self.current_level.doorways = self.canvas.doorways
+        self._invalidate_stale_wall_verification()
         level = self.current_level
         committed_doorways = self._viewer_doorways_by_level_index.get(level.index)
         if committed_doorways is None:
@@ -29413,6 +29923,9 @@ class BlueprintWorkspace(QWidget):
         previous_settings = self._generation_settings
         settings = self.settings_widget.get_settings()
         self._generation_settings = settings
+        if not settings.include_llm_wall_verification:
+            self._dismiss_wall_verification()
+        self._update_wall_verification_instructions()
         self._set_mesh_edit_update_delay_seconds(
             settings.mesh_edit_update_delay_seconds
         )
@@ -29460,6 +29973,8 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_surface_geometry_changed(self) -> None:
         """Delay active wall edits and reconcile other Canvas geometry."""
 
+        self._invalidate_stale_wall_verification()
+        self._update_wall_verification_instructions()
         session = self._plan_wall_preview_session
         if (
             session is not None

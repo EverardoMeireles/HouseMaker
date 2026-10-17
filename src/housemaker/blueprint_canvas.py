@@ -10,6 +10,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import combinations, pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal, Slot
@@ -80,6 +81,9 @@ from housemaker.surface_geometry import (
 from housemaker.uv_layout import build_room_walls
 from housemaker.window_frame_bridge import build_window_frame_bridge_placement
 
+if TYPE_CHECKING:
+    from housemaker.wall_llm_verification import WallAdditionProposal
+
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
 CANVAS_PANEL_COLOR = QColor("#252a31")
@@ -91,6 +95,12 @@ GENERATED_WALL_PREVIEW_EDGE_COLOR = QColor("#2ee59d")
 GENERATED_WALL_PREVIEW_VERTEX_COLOR = QColor("#b7ffe4")
 GENERATED_WALL_PREVIEW_EDGE_WIDTH_SCREEN = 3.0
 GENERATED_WALL_PREVIEW_VERTEX_RADIUS_SCREEN = 4.5
+WALL_VERIFICATION_EDGE_COLOR = QColor("#ff4545")
+WALL_VERIFICATION_VERTEX_COLOR = QColor("#ffb4b4")
+WALL_VERIFICATION_EXCLUDED_COLOR = QColor("#9b5555")
+WALL_VERIFICATION_EDGE_WIDTH_SCREEN = 3.0
+WALL_VERIFICATION_VERTEX_RADIUS_SCREEN = 4.5
+WALL_VERIFICATION_HIT_RADIUS_SCREEN = 9.0
 GUIDE_COLOR = QColor("#39d98a")
 VERTEX_FILL_COLOR = QColor("#ffffff")
 ACTIVE_VERTEX_FILL_COLOR = QColor("#ff7f50")
@@ -610,6 +620,8 @@ class BlueprintCanvas(QWidget):
     placed_object_transform_committed = Signal(str, float, float, float)
     outer_wall_mark_vertex_toggled = Signal(int)
     outer_wall_mark_cancel_requested = Signal()
+    wall_verification_dismiss_requested = Signal()
+    wall_verification_selection_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -633,6 +645,9 @@ class BlueprintCanvas(QWidget):
         ) = None
         self._held_level_comparison_keys: list[int] = []
         self._generated_wall_preview: GeneratedWallPreview | None = None
+        self._wall_verification_preview: tuple[WallAdditionProposal, ...] = ()
+        self._selected_wall_verification_ids: frozenset[str] = frozenset()
+        self._wall_verification_pending = False
         self.active_vertex_id: int | None = None
         self._selected_vertex_ids: tuple[int, ...] = ()
         self.cut_connection_on_double_vertex_deletion = False
@@ -1197,6 +1212,126 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    # ### LLM wall-verification preview ###
+    def set_wall_verification_preview(
+        self,
+        proposals: tuple[WallAdditionProposal, ...],
+    ) -> None:
+        """Show selectable wall additions without touching the level graph."""
+
+        candidates = tuple(proposals)
+        proposal_ids = [proposal.proposal_id for proposal in candidates]
+        if len(set(proposal_ids)) != len(proposal_ids):
+            raise ValueError("Wall proposals must have unique IDs.")
+        if any(
+            not math.isfinite(coordinate)
+            for proposal in candidates
+            for vertex in (proposal.start, proposal.end)
+            for coordinate in (vertex.x, vertex.y)
+        ):
+            raise ValueError("Wall proposal coordinates must be finite.")
+
+        self._reset_vertex_selection_gesture()
+        self._reset_pointer_state()
+        self.preview_point = None
+        self.preview_guides = []
+        self._wall_verification_pending = False
+        self._wall_verification_preview = candidates
+        self._selected_wall_verification_ids = frozenset(proposal_ids)
+        self.wall_verification_selection_changed.emit()
+        self.update()
+
+    def clear_wall_verification_preview(self) -> bool:
+        """Discard the review overlay and any pending review interaction."""
+
+        if (
+            not self._wall_verification_preview
+            and not self._wall_verification_pending
+        ):
+            return False
+        self._wall_verification_preview = ()
+        self._selected_wall_verification_ids = frozenset()
+        self._wall_verification_pending = False
+        self.wall_verification_selection_changed.emit()
+        self.update()
+        return True
+
+    def selected_wall_verification_proposal_ids(self) -> frozenset[str]:
+        """Return only the additions currently included by the user."""
+
+        return self._selected_wall_verification_ids
+
+    def set_wall_verification_pending(self, pending: bool) -> None:
+        """Allow right-click dismissal while the background review runs."""
+
+        self._wall_verification_pending = bool(pending)
+
+    def _request_wall_verification_dismissal(self) -> bool:
+        if (
+            not self._wall_verification_preview
+            and not self._wall_verification_pending
+        ):
+            return False
+        self.wall_verification_dismiss_requested.emit()
+        return True
+
+    def _toggle_wall_verification_proposals_at(self, widget_point: QPointF) -> None:
+        """Prefer vertices to edges, using a zoom-independent hit radius."""
+
+        closest_vertex_point: tuple[float, float] | None = None
+        closest_distance = WALL_VERIFICATION_HIT_RADIUS_SCREEN
+        for proposal in self._wall_verification_preview:
+            for vertex in (proposal.start, proposal.end):
+                vertex_widget = self._image_to_widget(vertex.x, vertex.y)
+                distance = math.hypot(
+                    widget_point.x() - vertex_widget.x(),
+                    widget_point.y() - vertex_widget.y(),
+                )
+                if distance <= closest_distance:
+                    closest_vertex_point = (vertex.x, vertex.y)
+                    closest_distance = distance
+
+        toggled_ids: set[str] = set()
+        if closest_vertex_point is not None:
+            toggled_ids = {
+                proposal.proposal_id
+                for proposal in self._wall_verification_preview
+                if any(
+                    (vertex.x, vertex.y) == closest_vertex_point
+                    for vertex in (proposal.start, proposal.end)
+                )
+            }
+        else:
+            closest_distance = WALL_VERIFICATION_HIT_RADIUS_SCREEN
+            for proposal in self._wall_verification_preview:
+                projection = _project_point_onto_widget_segment(
+                    widget_point,
+                    self._image_to_widget(proposal.start.x, proposal.start.y),
+                    self._image_to_widget(proposal.end.x, proposal.end.y),
+                )
+                if projection is None:
+                    continue
+                projected_point, _ = projection
+                distance = math.hypot(
+                    widget_point.x() - projected_point.x(),
+                    widget_point.y() - projected_point.y(),
+                )
+                if distance <= closest_distance:
+                    closest_distance = distance
+                    toggled_ids = {proposal.proposal_id}
+
+        if not toggled_ids:
+            return
+        selected_ids = set(self._selected_wall_verification_ids)
+        if toggled_ids <= selected_ids:
+            selected_ids.difference_update(toggled_ids)
+        else:
+            selected_ids.update(toggled_ids)
+        self._selected_wall_verification_ids = frozenset(selected_ids)
+        self.wall_verification_selection_changed.emit()
+        self.update()
+
+    # ### Comparison image cache ###
     def _load_level_comparison_image(self, image_path: str) -> QImage:
         """Reuse a decoded adjacent plan until its file revision changes."""
 
@@ -1535,6 +1670,7 @@ class BlueprintCanvas(QWidget):
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
         if not _blueprint_revision_has_file(next_revision):
+            self.clear_wall_verification_preview()
             self.blueprint_image = None
             self._blueprint_image_revision = next_revision
             self.update()
@@ -1546,6 +1682,7 @@ class BlueprintCanvas(QWidget):
         revision_after = _build_blueprint_image_revision(self.blueprint_path)
         if next_revision != revision_after:
             return False
+        self.clear_wall_verification_preview()
         self.blueprint_image = blueprint_image
         self._blueprint_image_revision = revision_after
         self.update()
@@ -1568,6 +1705,7 @@ class BlueprintCanvas(QWidget):
 
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
+        self.clear_wall_verification_preview()
         self.blueprint_image = blueprint_image
         self.blueprint_path = normalized_path
         self._blueprint_image_revision = revision_after
@@ -2266,6 +2404,7 @@ class BlueprintCanvas(QWidget):
         )
         self._level_comparison_overlay = None
         self._generated_wall_preview = None
+        self.clear_wall_verification_preview()
         self._outer_wall_mark_vertex_ids = frozenset()
         self._outer_wall_reference_overlay = OuterWallReferenceOverlay()
         self._outer_wall_marking_active = False
@@ -2365,6 +2504,17 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._request_wall_verification_dismissal()
+        ):
+            event.accept()
+            return
+
+        if self._wall_verification_preview and event.key() == Qt.Key.Key_Delete:
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Escape
             and self._cancel_outer_wall_marking()
@@ -2611,6 +2761,21 @@ class BlueprintCanvas(QWidget):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         self.setFocus(Qt.FocusReason.MouseFocusReason)
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._request_wall_verification_dismissal()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._wall_verification_preview
+        ):
+            self._toggle_wall_verification_proposals_at(event.position())
+            event.accept()
+            return
 
         if (
             event.button() == Qt.MouseButton.RightButton
@@ -2994,6 +3159,10 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if self._wall_verification_preview:
+            event.accept()
+            return
+
         if self._directional_light_placement_active:
             image_point = self._widget_to_image(event.position())
             self._directional_light_hover_image_point = (
@@ -3219,6 +3388,13 @@ class BlueprintCanvas(QWidget):
 
             if (
                 event.button() == Qt.MouseButton.LeftButton
+                and self._wall_verification_preview
+            ):
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
                 and self._plan_image_erase_active
             ):
                 if self._plan_image_erase_selection_start is not None:
@@ -3406,6 +3582,7 @@ class BlueprintCanvas(QWidget):
         self._paint_outer_wall_reference_points(painter)
         self._paint_vertex_selection_marquee(painter)
         self._paint_plan_image_erase_selection(painter)
+        self._paint_wall_verification_preview(painter)
 
     def _paint_vertex_selection_marquee(self, painter: QPainter) -> None:
         """Draw the active vertex-selection rectangle above the Canvas scene."""
@@ -8437,6 +8614,59 @@ class BlueprintCanvas(QWidget):
                 self._image_to_widget(vertex.x, vertex.y),
                 GENERATED_WALL_PREVIEW_VERTEX_RADIUS_SCREEN,
                 GENERATED_WALL_PREVIEW_VERTEX_RADIUS_SCREEN,
+            )
+        painter.restore()
+
+    # ### LLM wall-verification preview painting ###
+    def _paint_wall_verification_preview(self, painter: QPainter) -> None:
+        """Draw pending additions last, so authored walls cannot hide them."""
+
+        if not self._wall_verification_preview:
+            return
+
+        vertex_states: dict[tuple[float, float], bool] = {}
+        selected_ids = self._selected_wall_verification_ids
+        painter.save()
+        for selected in (False, True):
+            edge_pen = QPen(
+                WALL_VERIFICATION_EDGE_COLOR
+                if selected
+                else WALL_VERIFICATION_EXCLUDED_COLOR,
+                WALL_VERIFICATION_EDGE_WIDTH_SCREEN,
+            )
+            edge_pen.setCosmetic(True)
+            edge_pen.setStyle(
+                Qt.PenStyle.DashLine if selected else Qt.PenStyle.DotLine
+            )
+            edge_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(edge_pen)
+            for proposal in self._wall_verification_preview:
+                if (proposal.proposal_id in selected_ids) != selected:
+                    continue
+                painter.drawLine(
+                    self._image_to_widget(proposal.start.x, proposal.start.y),
+                    self._image_to_widget(proposal.end.x, proposal.end.y),
+                )
+                for vertex in (proposal.start, proposal.end):
+                    point = (vertex.x, vertex.y)
+                    vertex_states[point] = vertex_states.get(point, False) or selected
+
+        for (image_x, image_y), selected in vertex_states.items():
+            color = (
+                WALL_VERIFICATION_EDGE_COLOR
+                if selected
+                else WALL_VERIFICATION_EXCLUDED_COLOR
+            )
+            vertex_pen = QPen(color, 1.5)
+            vertex_pen.setCosmetic(True)
+            painter.setPen(vertex_pen)
+            painter.setBrush(
+                WALL_VERIFICATION_VERTEX_COLOR if selected else color
+            )
+            painter.drawEllipse(
+                self._image_to_widget(image_x, image_y),
+                WALL_VERIFICATION_VERTEX_RADIUS_SCREEN,
+                WALL_VERIFICATION_VERTEX_RADIUS_SCREEN,
             )
         painter.restore()
 

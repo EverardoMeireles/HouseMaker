@@ -502,6 +502,10 @@ def extract_local_qwen_result(payload: object) -> object:
             "The local Qwen model completed without an estimate."
         )
     choice = choices[0]
+    if isinstance(choice, Mapping) and choice.get("finish_reason") == "length":
+        raise QwenCeilingHeightError(
+            "The local Qwen analysis reached its output-token limit; the result is incomplete."
+        )
     message = choice.get("message") if isinstance(choice, Mapping) else None
     content = message.get("content") if isinstance(message, Mapping) else None
     if not isinstance(content, str) or not content.strip():

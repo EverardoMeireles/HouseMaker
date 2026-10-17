@@ -55,6 +55,11 @@ from housemaker.plan_correction_models import (
     PLAN_CORRECTION_MODELS,
     plan_correction_model_label,
 )
+from housemaker.wall_llm_verification_models import (
+    DEFAULT_WALL_VERIFICATION_MODEL,
+    WALL_VERIFICATION_MODEL_OPTIONS,
+    WALL_VERIFICATION_MODELS,
+)
 
 # ### Constants ###
 MESHY_API_KEY_ENVIRONMENT_VARIABLE = "MESHY_API_KEY"
@@ -117,6 +122,10 @@ SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY = (
 CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION_SETTING_KEY = (
     "canvas/cut_connection_on_double_vertex_deletion"
 )
+INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY = (
+    "canvas/include_llm_wall_verification"
+)
+WALL_VERIFICATION_MODEL_SETTING_KEY = "canvas/wall_verification_model"
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_CLEAR_MASK_HOTKEY = "Ctrl+Shift+M"
 CLEAR_MASK_HOTKEY_OPTIONS = (
@@ -148,6 +157,7 @@ MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
 DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION = False
+DEFAULT_INCLUDE_LLM_WALL_VERIFICATION = False
 DEFAULT_IGNORE_TOP_DOWN_CEILING = True
 DEFAULT_MAKE_FLOORS_DOUBLE_SIDED = False
 DEFAULT_MAKE_CEILINGS_DOUBLE_SIDED = False
@@ -265,6 +275,10 @@ class GenerationServiceSettings:
     cut_connection_on_double_vertex_deletion: bool = (
         DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION
     )
+    include_llm_wall_verification: bool = (
+        DEFAULT_INCLUDE_LLM_WALL_VERIFICATION
+    )
+    wall_verification_model: str = DEFAULT_WALL_VERIFICATION_MODEL
 
     def __post_init__(self) -> None:
         try:
@@ -306,6 +320,18 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Cut connection on double vertex deletion must be enabled "
                 "or disabled."
+            )
+        if not isinstance(self.include_llm_wall_verification, bool):
+            raise ValueError(
+                "LLM wall verification must be enabled or disabled."
+            )
+        if (
+            not isinstance(self.wall_verification_model, str)
+            or self.wall_verification_model not in WALL_VERIFICATION_MODELS
+        ):
+            raise ValueError(
+                "Unknown LLM wall verification model: "
+                f"{self.wall_verification_model!r}."
             )
         if not isinstance(self.ignore_top_down_ceiling, bool):
             raise ValueError(
@@ -612,6 +638,12 @@ class SettingsWidget(QWidget):
             ),
             cut_connection_on_double_vertex_deletion=(
                 self.cut_connection_on_double_vertex_deletion_checkbox.isChecked()
+            ),
+            include_llm_wall_verification=(
+                self.include_llm_wall_verification_checkbox.isChecked()
+            ),
+            wall_verification_model=str(
+                self.wall_verification_model_combo.currentData()
             ),
             first_person_navigation_mode=str(
                 self.first_person_navigation_combo.currentData()
@@ -1168,6 +1200,56 @@ class SettingsWidget(QWidget):
             self.cut_connection_on_double_vertex_deletion_checkbox,
         )
 
+        # ### Optional wall-generation review controls ###
+        self.wall_llm_verification_control = QWidget()
+        wall_verification_layout = QHBoxLayout(
+            self.wall_llm_verification_control
+        )
+        wall_verification_layout.setContentsMargins(0, 0, 0, 0)
+        self.include_llm_wall_verification_checkbox = QCheckBox()
+        self.include_llm_wall_verification_checkbox.setObjectName(
+            "include_llm_wall_verification_checkbox"
+        )
+        self.include_llm_wall_verification_checkbox.setToolTip(
+            "After Confirm walls, review the plan and existing walls with "
+            "the selected model. Preview suggested additions in red, then "
+            "accept them or right-click to dismiss them. Existing walls "
+            "are not moved or deleted."
+        )
+        self.wall_verification_model_label = QLabel("LLM verification model")
+        self.wall_verification_model_combo = QComboBox()
+        self.wall_verification_model_combo.setObjectName(
+            "wall_verification_model_combo"
+        )
+        self.wall_verification_model_combo.setToolTip(
+            "GPT models use the configured OpenAI API key and may incur "
+            "API charges. Local Qwen uses the installed Qwen3-VL model."
+        )
+        for model_label, model_id in WALL_VERIFICATION_MODEL_OPTIONS:
+            self.wall_verification_model_combo.addItem(model_label, model_id)
+        self.wall_verification_model_label.setBuddy(
+            self.wall_verification_model_combo
+        )
+        self.wall_verification_model_label.setEnabled(False)
+        self.wall_verification_model_combo.setEnabled(False)
+        wall_verification_layout.addWidget(
+            self.include_llm_wall_verification_checkbox
+        )
+        wall_verification_layout.addWidget(self.wall_verification_model_label)
+        wall_verification_layout.addWidget(
+            self.wall_verification_model_combo, 1
+        )
+        self.include_llm_wall_verification_checkbox.toggled.connect(
+            self._handle_include_llm_wall_verification_changed
+        )
+        self.wall_verification_model_combo.currentIndexChanged.connect(
+            self._handle_wall_verification_model_changed
+        )
+        canvas_form.addRow(
+            "Include LLM verification for wall generation",
+            self.wall_llm_verification_control,
+        )
+
         self.mesh_edit_update_delay_spinbox = QDoubleSpinBox()
         self.mesh_edit_update_delay_spinbox.setObjectName(
             "mesh_edit_update_delay_spinbox"
@@ -1449,6 +1531,26 @@ class SettingsWidget(QWidget):
             read_cut_connection_on_double_vertex_deletion(
                 self._application_settings
             )
+        )
+        self.wall_verification_model_combo.setCurrentIndex(
+            max(
+                0,
+                self.wall_verification_model_combo.findData(
+                    read_wall_verification_model(self._application_settings)
+                ),
+            )
+        )
+        wall_verification_enabled = read_include_llm_wall_verification(
+            self._application_settings
+        )
+        self.include_llm_wall_verification_checkbox.setChecked(
+            wall_verification_enabled
+        )
+        self.wall_verification_model_label.setEnabled(
+            wall_verification_enabled
+        )
+        self.wall_verification_model_combo.setEnabled(
+            wall_verification_enabled
         )
         self.mesh_edit_update_delay_spinbox.setValue(
             read_mesh_edit_update_delay_seconds(
@@ -2087,6 +2189,34 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    # ### Wall-generation review settings ###
+    def _handle_include_llm_wall_verification_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Enable model selection and persist the optional review pass."""
+
+        self.wall_verification_model_label.setEnabled(enabled)
+        self.wall_verification_model_combo.setEnabled(enabled)
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
+    def _handle_wall_verification_model_changed(self, _index: int) -> None:
+        """Remember the semantic model without changing image correction."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            WALL_VERIFICATION_MODEL_SETTING_KEY,
+            str(self.wall_verification_model_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
     def _handle_use_uv_raycast_for_object_generation_changed(
         self,
         enabled: bool,
@@ -2431,6 +2561,35 @@ def read_cut_connection_on_double_vertex_deletion(
     if isinstance(value, bool):
         return value
     return DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION
+
+
+# ### Wall-generation review setting helpers ###
+def read_include_llm_wall_verification(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Treat malformed stored review preferences as disabled."""
+
+    value = application_settings.get(
+        INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY,
+        DEFAULT_INCLUDE_LLM_WALL_VERIFICATION,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_INCLUDE_LLM_WALL_VERIFICATION
+
+
+def read_wall_verification_model(
+    application_settings: ApplicationSettingsStore,
+) -> str:
+    """Restore a supported semantic model, with the default as fallback."""
+
+    value = application_settings.get(
+        WALL_VERIFICATION_MODEL_SETTING_KEY,
+        DEFAULT_WALL_VERIFICATION_MODEL,
+    )
+    if isinstance(value, str) and value in WALL_VERIFICATION_MODELS:
+        return value
+    return DEFAULT_WALL_VERIFICATION_MODEL
 
 
 # ### Mesh edit preview setting helpers ###
