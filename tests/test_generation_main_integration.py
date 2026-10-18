@@ -16,16 +16,25 @@ from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QImage, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
 from housemaker.ceiling_height_estimation import (
+    CEILING_HEIGHT_MODEL_OPTIONS,
     CeilingHeightAnalysisResult,
     CeilingHeightLevelEstimate,
     CeilingHeightVideoEstimate,
+)
+from housemaker.door_state import (
+    DOOR_SLOT_BODY,
+    DOOR_SLOT_KNOB,
+    DoorDefinition,
+    DoorLibraryData,
+    DoorSlotData,
+    WindowDefinition,
 )
 from housemaker.first_person_navigation import (
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
@@ -39,6 +48,10 @@ from housemaker.object_texture_variants import (
     PBR_MAP_ROUGHNESS,
 )
 from housemaker.project_io import ProjectData
+from housemaker.reference_generation_models import (
+    DEFAULT_REFERENCE_GENERATION_MODEL,
+    REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+)
 from housemaker.settings_widget import GenerationServiceSettings
 
 # ### Module state ###
@@ -143,7 +156,56 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 
-    def test_workspace_tabs_and_full_width_side_panel_behavior(self) -> None:
+    def test_reference_model_settings_update_generation_controls(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        settings = self.workspace.settings_widget
+        combo = settings.reference_generation_model_combo
+        self.assertTrue(settings.isAncestorOf(combo))
+        self.assertFalse(merged.isAncestorOf(combo))
+
+        for model, stable_diffusion in (
+            (REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION, True),
+            (DEFAULT_REFERENCE_GENERATION_MODEL, False),
+        ):
+            with self.subTest(model=model):
+                combo.setCurrentIndex(combo.findData(model))
+                _qt_application.processEvents()
+                self.assertEqual(merged._reference_generation_model, model)
+                self.assertEqual(settings.get_settings().reference_generation_model, model)
+                self.assertEqual(
+                    merged.reference_generation_strength_control.isHidden(),
+                    not stable_diffusion,
+                )
+                self.assertEqual(
+                    merged.reference_generation_negative_prompt_control.isHidden(),
+                    not stable_diffusion,
+                )
+
+    def test_ceiling_height_model_settings_update_analysis_dialog(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        settings = self.workspace.settings_widget
+        combo = settings.ceiling_height_estimation_model_combo
+        dialog = merged._ensure_ceiling_height_analysis_dialog()
+
+        self.assertTrue(settings.isAncestorOf(combo))
+        self.assertFalse(dialog.isAncestorOf(combo))
+        self.assertFalse(hasattr(dialog, "model_combo"))
+        self.assertEqual(
+            dialog.selected_model,
+            settings.get_settings().ceiling_height_estimation_model,
+        )
+
+        for _label, model in CEILING_HEIGHT_MODEL_OPTIONS:
+            with self.subTest(model=model):
+                combo.setCurrentIndex(combo.findData(model))
+                _qt_application.processEvents()
+                self.assertEqual(dialog.selected_model, model)
+                self.assertEqual(
+                    settings.get_settings().ceiling_height_estimation_model,
+                    model,
+                )
+
+    def test_workspace_tabs_and_canvas_panel_visibility(self) -> None:
         tab_names = [
             self.workspace.workspace_tabs.tabText(tab_index)
             for tab_index in range(self.workspace.workspace_tabs.count())
@@ -162,7 +224,21 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             ],
         )
 
-        expected_side_panel_visibility = {
+        self.assertEqual(self.workspace.workspace_splitter.count(), 3)
+        self.assertIs(
+            self.workspace.workspace_splitter.widget(0),
+            self.workspace.left_panel,
+        )
+        self.assertIs(
+            self.workspace.workspace_splitter.widget(1),
+            self.workspace.workspace_tabs,
+        )
+        self.assertIs(
+            self.workspace.workspace_splitter.widget(2),
+            self.workspace.side_panel,
+        )
+
+        expected_panel_visibility = {
             "Canvas": True,
             "3D scene": True,
             "Atlas": False,
@@ -171,7 +247,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "Tour": False,
             "Settings": False,
         }
-        for tab_name, should_be_visible in expected_side_panel_visibility.items():
+        for tab_name, should_be_visible in expected_panel_visibility.items():
             with self.subTest(tab=tab_name):
                 tab_index = tab_names.index(tab_name)
                 self.workspace.workspace_tabs.setCurrentIndex(tab_index)
@@ -180,8 +256,12 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                     self.workspace.side_panel.isVisible(),
                     should_be_visible,
                 )
+                self.assertEqual(
+                    self.workspace.left_panel.isVisible(),
+                    should_be_visible,
+                )
 
-    def test_canvas_side_panel_stays_inside_the_window_after_tab_round_trip(
+    def test_canvas_panels_stay_inside_window_after_tab_round_trip(
         self,
     ) -> None:
         requested_width = 1400
@@ -189,6 +269,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
 
         for full_width_workspace in (
+            self.workspace.scene_3d_workspace,
             self.workspace.texture_atlas_workspace,
             self.workspace.merged_generation_workspace,
             self.workspace.doors_workspace,
@@ -215,17 +296,33 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 _qt_application.processEvents()
 
                 splitter_rect = self.workspace.workspace_splitter.rect()
-                side_panel_geometry = self.workspace.side_panel.geometry()
                 self.assertEqual(self.workspace.width(), requested_width)
-                self.assertTrue(self.workspace.side_panel.isVisible())
-                self.assertGreater(side_panel_geometry.width(), 0)
-                self.assertGreaterEqual(
-                    side_panel_geometry.left(),
-                    splitter_rect.left(),
-                )
+                for panel in (
+                    self.workspace.left_panel,
+                    self.workspace.side_panel,
+                ):
+                    with self.subTest(panel=panel):
+                        panel_geometry = panel.geometry()
+                        self.assertTrue(panel.isVisible())
+                        self.assertGreater(panel_geometry.width(), 0)
+                        self.assertGreaterEqual(
+                            panel_geometry.left(), splitter_rect.left()
+                        )
+                        self.assertLessEqual(
+                            panel_geometry.right(), splitter_rect.right()
+                        )
+                tabs_geometry = self.workspace.workspace_tabs.geometry()
+                self.assertGreater(self.workspace.canvas.width(), 0)
                 self.assertLessEqual(
-                    side_panel_geometry.right(),
-                    splitter_rect.right(),
+                    self.workspace.canvas.width(), tabs_geometry.width()
+                )
+                self.assertLess(
+                    self.workspace.left_panel.geometry().right(),
+                    tabs_geometry.left(),
+                )
+                self.assertLess(
+                    tabs_geometry.right(),
+                    self.workspace.side_panel.geometry().left(),
                 )
 
     def test_generation_uses_only_the_compact_generated_object_view(self) -> None:
@@ -352,8 +449,21 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             original_height,
         )
 
-    def test_ceiling_height_start_level_tracks_canvas_selection(self) -> None:
+    def test_ceiling_height_level_to_mark_tracks_image_backed_canvas_selection(
+        self,
+    ) -> None:
         merged = self.workspace.merged_generation_workspace
+        plan_path = Path(self._temporary_directory.name) / "ceiling-plan.png"
+        plan_image = QImage(80, 80, QImage.Format.Format_RGB32)
+        plan_image.fill(Qt.GlobalColor.white)
+        self.assertTrue(plan_image.save(str(plan_path)))
+        image_level_indices = (GROUND_LEVEL_INDEX, GROUND_LEVEL_INDEX + 1)
+        for level in self.workspace.levels:
+            if level.index in image_level_indices:
+                level.image_path = str(plan_path)
+        merged.set_ceiling_height_levels(
+            self.workspace.levels, self.workspace.current_level.index
+        )
         dialog = merged._ensure_ceiling_height_analysis_dialog()
         target_position = next(
             position
@@ -362,12 +472,20 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(dialog.selected_level_index, GROUND_LEVEL_INDEX)
+        self.assertEqual(
+            {
+                dialog.level_to_mark_combo.itemData(index)
+                for index in range(dialog.level_to_mark_combo.count())
+            },
+            set(image_level_indices),
+        )
+        self.assertFalse(hasattr(dialog, "current_level_combo"))
 
         self.workspace._handle_level_selection_changed(target_position)
 
         self.assertEqual(dialog.selected_level_index, GROUND_LEVEL_INDEX + 1)
         self.assertEqual(
-            dialog.current_level_combo.currentText(),
+            dialog.level_to_mark_combo.currentText(),
             self.workspace.current_level.display_name,
         )
 
@@ -379,6 +497,9 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         roughness = self.workspace.generation.pbr_map_checkboxes[
             PBR_MAP_ROUGHNESS
         ]
+
+        for checkbox in self.workspace.generation.pbr_map_checkboxes.values():
+            checkbox.setChecked(False)
 
         normal.setChecked(True)
 
@@ -474,8 +595,6 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(shared_column)
         for shared_control in (
             merged.load_video_button,
-            merged.infer_ceiling_height_button,
-            merged.ceiling_height_result_label,
             merged.pbr_map_control,
             merged.mask_mode_control,
             merged.clear_mask_button,
@@ -488,6 +607,17 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 )
             ):
                 self.assertTrue(shared_column.isAncestorOf(shared_control))
+
+        for room_analysis_control in (
+            merged.infer_ceiling_height_button,
+            merged.ceiling_height_result_label,
+        ):
+            with self.subTest(room_control=room_analysis_control.objectName()):
+                self.assertFalse(shared_fields.isAncestorOf(room_analysis_control))
+                self.assertFalse(merged.isAncestorOf(room_analysis_control))
+                self.assertTrue(
+                    self.workspace.side_panel.isAncestorOf(room_analysis_control)
+                )
 
         forbidden_attributes = (
             "delete_generated_object_button",
@@ -916,6 +1046,92 @@ class GenerationMainIntegrationTests(unittest.TestCase):
 
         load_project_mock.assert_called_once_with(load_path)
         self.assertEqual(self.workspace.generation.get_data(), generation)
+
+    def test_restored_opening_profile_stays_hidden_until_slot_generation(
+        self,
+    ) -> None:
+        merged = self.workspace.merged_generation_workspace
+        doors = self.workspace.doors_workspace
+
+        for asset_kind in ("door", "window"):
+            with self.subTest(asset_kind=asset_kind):
+                asset_id = f"{asset_kind}-1"
+                slots = (
+                    DoorSlotData(
+                        slot_id=DOOR_SLOT_BODY,
+                        source_object_id=f"{asset_id}-body",
+                        joined=True,
+                    ),
+                    DoorSlotData(
+                        slot_id=DOOR_SLOT_KNOB,
+                        source_object_id=f"{asset_id}-handle",
+                    ),
+                )
+                if asset_kind == "door":
+                    library = DoorLibraryData(
+                        doors=[
+                            DoorDefinition(
+                                door_id=asset_id,
+                                name="Restored door",
+                                source_doorway_id="doorway-1",
+                                width_meters=0.9,
+                                height_meters=2.1,
+                                slots=slots,
+                            )
+                        ]
+                    )
+                else:
+                    library = DoorLibraryData(
+                        windows=[
+                            WindowDefinition(
+                                window_id=asset_id,
+                                name="Restored window",
+                                source_window_frame_id="frame-1",
+                                width_meters=1.2,
+                                height_meters=1.0,
+                                slots=slots,
+                            )
+                        ]
+                    )
+
+                self.workspace._apply_project_state(
+                    levels=create_default_levels(),
+                    current_level_index=GROUND_LEVEL_INDEX,
+                    doors=library,
+                )
+                _qt_application.processEvents()
+
+                self.assertEqual(doors.selected_asset_kind(), asset_kind)
+                target = self.workspace.generation._door_slot_editing_target
+                self.assertIsNotNone(target)
+                assert target is not None
+                self.assertFalse(target.generation_ready)
+                self.assertTrue(merged.opening_profile_options_section.isHidden())
+                self.assertFalse(merged.division_options_section.isHidden())
+
+                doors.asset_slot_edit_requested.emit(
+                    asset_kind,
+                    asset_id,
+                    DOOR_SLOT_BODY,
+                )
+                _qt_application.processEvents()
+
+                target = self.workspace.generation._door_slot_editing_target
+                self.assertIsNotNone(target)
+                assert target is not None
+                self.assertTrue(target.generation_ready)
+                self.assertFalse(merged.opening_profile_options_section.isHidden())
+                self.assertIs(self.workspace.workspace_tabs.currentWidget(), merged)
+
+                self.assertTrue(
+                    doors.select_asset_part(
+                        asset_kind,
+                        asset_id,
+                        slot_id=DOOR_SLOT_KNOB,
+                    )
+                )
+                self.assertTrue(merged.opening_profile_options_section.isHidden())
+                self.assertFalse(merged.division_options_section.isHidden())
 
     def test_load_during_generation_is_rejected_without_partial_state(self) -> None:
         current_generation = _generation_data()

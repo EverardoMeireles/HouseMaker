@@ -19,6 +19,7 @@ from housemaker.ceiling_height_estimation import (
     CeilingHeightLevelEstimate,
     aggregate_ceiling_height_estimates,
     aggregate_level_ceiling_height_estimates,
+    aggregate_marked_level_ceiling_height_estimates,
     build_ceiling_height_plan_image_data_uri,
     build_ceiling_height_prompt,
     build_ceiling_height_request_body,
@@ -463,6 +464,74 @@ class CeilingHeightVideoAnalysisTests(unittest.TestCase):
         )
 
 
+# ### Explicit marked-level aggregation tests ###
+class MarkedLevelCeilingHeightTests(unittest.TestCase):
+    def test_multiple_marks_are_combined_only_for_their_assigned_levels(self) -> None:
+        result = aggregate_marked_level_ceiling_height_estimates(
+            (
+                (2, 30, _estimate(3.0)),
+                (1, 0, _estimate(2.4)),
+                (1, 10, _estimate(2.5)),
+                (2, 40, _estimate(3.1)),
+                (1, 60, _estimate(2.6)),
+                (1, 70, _estimate(5.5)),
+                (2, 50, _insufficient()),
+            ),
+            levels=((0, "Unmarked cellar"), (1, "Ground"), (2, "Story 1")),
+        )
+
+        self.assertEqual(result.sampled_frame_indices, (0, 10, 30, 40, 50, 60, 70))
+        self.assertEqual(tuple(item.level_index for item in result.level_estimates), (1, 2))
+        ground, story = result.level_estimates
+        self.assertEqual(ground.analysis.average_height_m, 2.5)
+        self.assertEqual(ground.analysis.outlier_frame_indices, (70,))
+        self.assertEqual(story.analysis.average_height_m, 3.05)
+        self.assertEqual(story.analysis.insufficient_frame_indices, (50,))
+        self.assertEqual(result.transition_frame_indices, ())
+        self.assertEqual(result.unassigned_frame_indices, ())
+
+    def test_movement_never_changes_explicit_level_assignment(self) -> None:
+        result = aggregate_marked_level_ceiling_height_estimates(
+            (
+                (1, 0, _movement("arrived_up", height=2.5)),
+                (1, 15, _movement("ascending", height=2.6)),
+            ),
+            levels=((1, "Ground"), (2, "Unmarked story")),
+        )
+
+        self.assertEqual(len(result.level_estimates), 1)
+        self.assertEqual(result.level_estimates[0].level_index, 1)
+        self.assertEqual(result.level_estimates[0].analysis.average_height_m, 2.55)
+
+    def test_one_sample_does_not_establish_a_level_consensus(self) -> None:
+        result = aggregate_marked_level_ceiling_height_estimates(
+            ((1, 7, _estimate(2.4)),),
+            levels=((1, "Ground"),),
+        )
+
+        self.assertFalse(result.has_consensus)
+        self.assertEqual(result.level_estimates[0].analysis.retained_frame_indices, (7,))
+
+    def test_empty_marks_do_not_create_results_for_unmarked_levels(self) -> None:
+        result = aggregate_marked_level_ceiling_height_estimates(
+            (), levels=((1, "Ground"),)
+        )
+
+        self.assertEqual(result.level_estimates, ())
+        self.assertEqual(result.sampled_frame_indices, ())
+
+    def test_unknown_levels_and_duplicate_frames_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no longer available"):
+            aggregate_marked_level_ceiling_height_estimates(
+                ((2, 0, _estimate(2.5)),), levels=((1, "Ground"),)
+            )
+        with self.assertRaisesRegex(ValueError, "unique"):
+            aggregate_marked_level_ceiling_height_estimates(
+                ((1, 0, _estimate(2.5)), (2, 0, _estimate(3.0))),
+                levels=((1, "Ground"), (2, "Story")),
+            )
+
+
 # ### Request tests ###
 class CeilingHeightRequestTests(unittest.TestCase):
     def test_model_options_include_supported_vision_models(self) -> None:
@@ -519,6 +588,33 @@ class CeilingHeightRequestTests(unittest.TestCase):
                 **arguments,
             )
         )
+
+    def test_cost_override_uses_marked_sample_count_instead_of_whole_video(self) -> None:
+        arguments = {
+            "model": "gpt-5.6-luna",
+            "frame_count": 350,
+            "interval": 15,
+            "frame_width": 1_920,
+            "frame_height": 1_080,
+        }
+        full_cost = estimate_ceiling_height_api_cost_usd(**arguments)
+        marked_cost = estimate_ceiling_height_api_cost_usd(**arguments, sample_count=4)
+        matching_count_cost = estimate_ceiling_height_api_cost_usd(
+            **{**arguments, "frame_count": 46}
+        )
+
+        self.assertIsNotNone(full_cost)
+        self.assertIsNotNone(marked_cost)
+        assert full_cost is not None and marked_cost is not None
+        self.assertLess(marked_cost, full_cost)
+        self.assertEqual(marked_cost, matching_count_cost)
+        self.assertEqual(
+            estimate_ceiling_height_api_cost_usd(**arguments, sample_count=0), 0.0
+        )
+        with self.assertRaises(ValueError):
+            estimate_ceiling_height_api_cost_usd(**arguments, sample_count=-1)
+        with self.assertRaises(TypeError):
+            estimate_ceiling_height_api_cost_usd(**arguments, sample_count=True)
 
     def test_request_uses_vision_input_and_strict_structured_output(self) -> None:
         body = build_ceiling_height_request_body(

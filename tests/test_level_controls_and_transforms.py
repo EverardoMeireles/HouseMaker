@@ -642,8 +642,6 @@ class LevelControlsTests(unittest.TestCase):
         _qt_application.processEvents()
 
         controls = (
-            workspace.load_image_button,
-            workspace.blueprint_name_label,
             workspace.levels_list,
             workspace.include_yes_radio,
         )
@@ -657,14 +655,35 @@ class LevelControlsTests(unittest.TestCase):
             workspace.include_yes_radio.parentWidget(),
             workspace.include_no_radio.parentWidget(),
         )
-        self.assertLess(
-            workspace.levels_group.mapTo(workspace, QPoint()).y(),
-            workspace.save_button.mapTo(workspace, QPoint()).y(),
+        self.assertTrue(workspace.levels_group.isAncestorOf(workspace.levels_list))
+        self.assertTrue(
+            workspace.levels_group.isAncestorOf(workspace.include_yes_radio)
         )
+        self.assertTrue(workspace.side_panel.isAncestorOf(workspace.levels_group))
+        for control, expected_panel, other_panel in (
+            (
+                workspace.load_image_button,
+                workspace.side_panel,
+                workspace.left_panel,
+            ),
+            (
+                workspace.blueprint_name_label,
+                workspace.side_panel,
+                workspace.left_panel,
+            ),
+            (
+                workspace.save_button,
+                workspace.side_panel,
+                workspace.left_panel,
+            ),
+        ):
+            with self.subTest(control=control):
+                self.assertTrue(expected_panel.isAncestorOf(control))
+                self.assertFalse(other_panel.isAncestorOf(control))
 
         workspace.close()
 
-    def test_wheel_over_general_inputs_scrolls_without_changing_values(
+    def test_wheel_over_level_inputs_scrolls_right_panel_without_changing_values(
         self,
     ) -> None:
         from housemaker.main import BlueprintWorkspace
@@ -675,9 +694,11 @@ class LevelControlsTests(unittest.TestCase):
         workspace.show()
         _qt_application.processEvents()
 
-        generals_tab = workspace.side_tabs.widget(0)
-        self.assertIsInstance(generals_tab, QScrollArea)
-        scroll_bar = generals_tab.verticalScrollBar()
+        self.assertIsInstance(workspace.canvas_right_scroll_area, QScrollArea)
+        scroll_bar = workspace.canvas_right_scroll_area.verticalScrollBar()
+        left_scroll_bar = (
+            workspace.canvas_left_scroll_area.verticalScrollBar()
+        )
         self.assertGreater(scroll_bar.maximum(), 0)
 
         controls = (
@@ -693,6 +714,7 @@ class LevelControlsTests(unittest.TestCase):
         for control_name, control in controls:
             with self.subTest(control=control_name):
                 scroll_bar.setValue(0)
+                left_scroll_bar.setValue(0)
                 _qt_application.processEvents()
                 original_value = control.value()
 
@@ -701,6 +723,7 @@ class LevelControlsTests(unittest.TestCase):
 
                 self.assertEqual(control.value(), original_value)
                 self.assertGreater(scroll_bar.value(), 0)
+                self.assertEqual(left_scroll_bar.value(), 0)
 
         scroll_bar.setValue(0)
         height_value = workspace.height_level_spinbox.value()

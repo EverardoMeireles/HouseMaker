@@ -11,11 +11,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QHideEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFormLayout
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.reference_generation_models import (
+    DEFAULT_REFERENCE_GENERATION_MODEL,
+    REFERENCE_GENERATION_MODEL_OPTIONS,
+    REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+    REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+)
 from housemaker.reference_view_presets import (
     DEFAULT_REFERENCE_VIEW_PRESETS,
     REFERENCE_VIEW_PRESETS_SETTINGS_KEY,
@@ -23,11 +30,20 @@ from housemaker.reference_view_presets import (
     read_reference_view_presets,
     save_reference_view_presets,
 )
-from housemaker.settings_widget import SettingsWidget
+from housemaker.settings_widget import SettingsWidget, read_reference_generation_model
 
 # ### Qt application ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
+
+
+# ### Widget cleanup ###
+def _dispose_test_settings(widget: SettingsWidget) -> None:
+    widget.dispose()
+    widget.close()
+    widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    _qt_application.processEvents()
 
 
 # ### Settings editor tests ###
@@ -42,8 +58,91 @@ class ReferenceViewPresetsSettingsTests(unittest.TestCase):
 
     def _build_widget(self) -> SettingsWidget:
         widget = SettingsWidget(application_settings=self.store, environment={})
-        self.addCleanup(widget.dispose)
+        self.addCleanup(_dispose_test_settings, widget)
         return widget
+
+    def test_reference_model_selector_is_above_views_and_lists_all_providers(self) -> None:
+        combo = self.widget.reference_generation_model_combo
+        group = self.widget.reference_view_presets_group
+        self.assertTrue(group.isAncestorOf(combo))
+        self.assertEqual(
+            tuple(
+                (combo.itemText(index), combo.itemData(index))
+                for index in range(combo.count())
+            ),
+            REFERENCE_GENERATION_MODEL_OPTIONS,
+        )
+        self.assertEqual(combo.currentData(), DEFAULT_REFERENCE_GENERATION_MODEL)
+        self.assertEqual(
+            self.widget.get_settings().reference_generation_model,
+            DEFAULT_REFERENCE_GENERATION_MODEL,
+        )
+        model_form = group.layout().itemAt(0).layout()
+        self.assertIsInstance(model_form, QFormLayout)
+        assert isinstance(model_form, QFormLayout)
+        self.assertEqual(
+            model_form.labelForField(combo).text(), "Reference generation model"
+        )
+        self.assertIs(
+            group.layout().itemAt(1).widget(), self.widget.reference_view_preset_list
+        )
+
+    def test_reference_model_selection_persists_using_the_existing_key(self) -> None:
+        changes: list[bool] = []
+        view_changes: list[object] = []
+        self.widget.settings_changed.connect(lambda: changes.append(True))
+        self.widget.reference_view_presets_changed.connect(view_changes.append)
+        combo = self.widget.reference_generation_model_combo
+
+        combo.setCurrentIndex(
+            combo.findData(REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION)
+        )
+
+        self.assertEqual(
+            self.store.get(REFERENCE_GENERATION_MODEL_SETTINGS_KEY),
+            REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        )
+        self.assertEqual(
+            self.widget.get_settings().reference_generation_model,
+            REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        )
+        self.assertEqual(changes, [True])
+        self.assertEqual(view_changes, [])
+        restored = self._build_widget()
+        self.assertEqual(
+            restored.reference_generation_model_combo.currentData(),
+            REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        )
+
+    def test_previous_generation_model_preference_is_loaded_from_disk(self) -> None:
+        self.store.set(
+            REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+            REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        )
+        restored = SettingsWidget(
+            application_settings=ApplicationSettingsStore(self.store.path),
+            environment={},
+        )
+        self.addCleanup(_dispose_test_settings, restored)
+
+        self.assertEqual(
+            restored.reference_generation_model_combo.currentData(),
+            REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        )
+
+    def test_invalid_reference_model_preference_falls_back_to_the_default(self) -> None:
+        for invalid_model in ("removed-provider", 7, None):
+            with self.subTest(model=invalid_model):
+                self.store.set(REFERENCE_GENERATION_MODEL_SETTINGS_KEY, invalid_model)
+                self.assertEqual(
+                    read_reference_generation_model(self.store),
+                    DEFAULT_REFERENCE_GENERATION_MODEL,
+                )
+                restored = self._build_widget()
+                self.assertEqual(
+                    restored.reference_generation_model_combo.currentData(),
+                    DEFAULT_REFERENCE_GENERATION_MODEL,
+                )
 
     def test_six_defaults_load_in_an_editable_settings_section(self) -> None:
         self.assertEqual(

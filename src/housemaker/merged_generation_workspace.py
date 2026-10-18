@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QImage, QKeySequence, QShortcut
+from PySide6.QtGui import QImage, QImageReader, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -48,19 +48,22 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.ceiling_height_dialog import CeilingHeightAnalysisDialog
 from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_JOB_KIND,
-    MAX_UNCERTAIN_MOVEMENT_GAPS,
+    CEILING_HEIGHT_MODEL_OPTIONS,
     CeilingHeightAnalysisResult,
     CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
     CeilingHeightEstimationError,
     CeilingHeightEstimator,
-    aggregate_level_ceiling_height_estimates,
+    aggregate_marked_level_ceiling_height_estimates,
     build_ceiling_height_plan_image_data_uri,
     ceiling_height_model_requires_api_key,
     estimate_ceiling_height_api_cost_usd,
     format_ceiling_height_api_cost,
     open_ceiling_height_estimator,
-    sample_entire_video_frame_indices,
+)
+from housemaker.ceiling_height_ranges import (
+    CeilingHeightVideoRange,
+    sample_marked_video_frames,
 )
 from housemaker.door_state import is_door_body_slot
 from housemaker.generation_jobs import (
@@ -81,17 +84,20 @@ from housemaker.plan_metric_state import (
     build_ceiling_height_plan_context,
 )
 from housemaker.reference_generation_models import (
-    DEFAULT_REFERENCE_GENERATION_MODEL,
     DEFAULT_REFERENCE_NEGATIVE_PROMPT,
-    REFERENCE_GENERATION_MODEL_OPTIONS,
     REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+    REFERENCE_GENERATION_MODELS,
 )
 from housemaker.reference_view_presets import (
     DEFAULT_REFERENCE_VIEW_PRESETS,
     ReferenceViewPreset,
     read_reference_view_presets,
 )
-from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
+from housemaker.settings_widget import (
+    DEFAULT_CLEAR_MASK_HOTKEY,
+    read_ceiling_height_estimation_model,
+    read_reference_generation_model,
+)
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import SurfaceTextureGenerationWorkspace
 from housemaker.video_source import (
@@ -121,7 +127,6 @@ GENERATION_ACTION_GEOMETRY = "generate_geometry"
 GENERATION_ACTION_OBJECT_TEXTURE = "generate_object_texture"
 GENERATION_ACTION_SURFACE_TEXTURE = "generate_surface_texture"
 REFERENCE_GENERATION_JOB_KIND = "Reference generation"
-REFERENCE_GENERATION_MODEL_SETTINGS_KEY = "generation/reference_generation_model"
 REFERENCE_GENERATION_PROMPT_SETTINGS_KEY = "generation/reference_generation_prompt"
 REFERENCE_GENERATION_VIEW_SETTINGS_KEY = "generation/reference_generation_view"
 REFERENCE_GENERATION_CUSTOM_VIEW_ID = ""
@@ -150,26 +155,26 @@ class _CeilingHeightInferenceThread(QThread):
     def __init__(
         self,
         video_path: str,
-        frame_indices: tuple[int, ...],
+        frame_samples: tuple[tuple[int, int], ...],
         api_key: str,
         model: str,
         estimator: CeilingHeightEstimator | None,
         level_options: tuple[tuple[int, str], ...],
         level_plan_contexts: tuple[tuple[int, str], ...],
-        starting_level_index: int,
+        marked_ranges: tuple[CeilingHeightVideoRange, ...],
         level_plan_sources: tuple[_CeilingHeightPlanSource, ...] = (),
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._video_path = str(video_path)
-        self._frame_indices = tuple(int(index) for index in frame_indices)
+        self._frame_samples = tuple(frame_samples)
         self._api_key = str(api_key)
         self._model = str(model)
         self._estimator = estimator
         self._level_options = tuple(level_options)
         self._level_plan_contexts = tuple(level_plan_contexts)
         self._level_plan_sources = tuple(level_plan_sources)
-        self._starting_level_index = int(starting_level_index)
+        self._marked_ranges = tuple(marked_ranges)
         self.result: CeilingHeightAnalysisResult | None = None
         self.error_message: str | None = None
         self.was_cancelled = False
@@ -177,15 +182,10 @@ class _CeilingHeightInferenceThread(QThread):
     def run(self) -> None:  # type: ignore[override]
         try:
             try:
-                frame_estimates: list[tuple[int, CeilingHeightEstimate]] = []
+                frame_estimates: list[tuple[int, int, CeilingHeightEstimate]] = []
                 previous_frame: np.ndarray | None = None
+                previous_range_index: int | None = None
                 consecutive_failures = 0
-                level_indices = tuple(
-                    level_index for level_index, _level_name in self._level_options
-                )
-                current_level_position = level_indices.index(
-                    self._starting_level_index
-                )
                 plan_context_by_level = dict(self._level_plan_contexts)
                 plan_image_by_level: dict[int, str] = {}
                 for source in self._level_plan_sources:
@@ -200,10 +200,6 @@ class _CeilingHeightInferenceThread(QThread):
                         )
                     except CeilingHeightEstimationError:
                         continue
-                pending_movement_direction = 0
-                pending_movement_votes = 0
-                pending_movement_uncertain_gaps = 0
-                arrival_latched = False
                 with open_ceiling_height_estimator(
                     model=self._model,
                     api_key=self._api_key,
@@ -212,30 +208,28 @@ class _CeilingHeightInferenceThread(QThread):
                 ) as estimator, VideoFrameSource(
                     self._video_path
                 ) as video_source:
-                    total = len(self._frame_indices)
-                    for completed, frame_index in enumerate(
-                        self._frame_indices,
+                    total = len(self._frame_samples)
+                    for completed, (frame_index, level_index) in enumerate(
+                        self._frame_samples,
                         start=1,
                     ):
                         if self.isInterruptionRequested():
                             raise CeilingHeightEstimationCancelled("Cancelled")
                         current_frame = video_source.get_frame(frame_index)
+                        range_index = next(
+                            index
+                            for index, marked_range in enumerate(self._marked_ranges)
+                            if marked_range.level_index == level_index
+                            and marked_range.start_frame
+                            <= frame_index
+                            <= marked_range.end_frame
+                        )
+                        if range_index != previous_range_index:
+                            previous_frame = None
                         try:
-                            current_level_index = level_indices[
-                                current_level_position
-                            ]
-                            plan_image_data_uri = (
-                                None
-                                if pending_movement_direction
-                                else plan_image_by_level.get(
-                                    current_level_index
-                                )
-                            )
+                            plan_image_data_uri = plan_image_by_level.get(level_index)
                             plan_context = (
-                                plan_context_by_level.get(
-                                    current_level_index,
-                                    "",
-                                )
+                                plan_context_by_level.get(level_index, "")
                                 if plan_image_data_uri is not None
                                 else ""
                             )
@@ -268,38 +262,22 @@ class _CeilingHeightInferenceThread(QThread):
                             )
                         else:
                             consecutive_failures = 0
-                        (
-                            current_level_position,
-                            pending_movement_direction,
-                            pending_movement_votes,
-                            pending_movement_uncertain_gaps,
-                            arrival_latched,
-                        ) = _advance_ceiling_height_plan_context(
-                            estimate,
-                            current_position=current_level_position,
-                            level_count=len(level_indices),
-                            pending_direction=pending_movement_direction,
-                            pending_votes=pending_movement_votes,
-                            pending_uncertain_gaps=(
-                                pending_movement_uncertain_gaps
-                            ),
-                            arrival_latched=arrival_latched,
-                        )
                         frame_estimates.append(
                             (
+                                level_index,
                                 frame_index,
                                 estimate,
                             )
                         )
                         previous_frame = current_frame
+                        previous_range_index = range_index
                         self.progress_changed.emit(
                             completed,
                             total,
                             frame_index,
                         )
-                result = aggregate_level_ceiling_height_estimates(
+                result = aggregate_marked_level_ceiling_height_estimates(
                     frame_estimates,
-                    starting_level_index=self._starting_level_index,
                     levels=self._level_options,
                 )
             except CeilingHeightEstimationCancelled:
@@ -335,7 +313,8 @@ class _CeilingHeightInferenceRuntime:
     level_signature: tuple[tuple[int, str], ...]
     plan_context_signature: tuple[tuple[int, str], ...]
     plan_source_signature: tuple[_CeilingHeightPlanSource, ...]
-    starting_level_index: int
+    marked_ranges: tuple[CeilingHeightVideoRange, ...]
+    context_revision: int
     job_id: str
     thread: _CeilingHeightInferenceThread
     cancel_requested: bool = False
@@ -379,69 +358,6 @@ def _invoke_bound_ceiling_height_estimator(
     if supports_plan_image:
         arguments["plan_image_data_uri"] = plan_image_data_uri
     return estimator(frame_bgr, **arguments)  # type: ignore[operator]
-
-
-def _advance_ceiling_height_plan_context(
-    estimate: CeilingHeightEstimate,
-    *,
-    current_position: int,
-    level_count: int,
-    pending_direction: int,
-    pending_votes: int,
-    pending_uncertain_gaps: int,
-    arrival_latched: bool,
-) -> tuple[int, int, int, int, bool]:
-    """Track the most likely level for the next sampled frame."""
-
-    movement = estimate.level_movement
-    reliable = estimate.movement_confidence in {"medium", "high"}
-    if movement in {"arrived_up", "arrived_down"}:
-        if arrival_latched:
-            return current_position, 0, 0, 0, True
-        direction = 1 if movement == "arrived_up" else -1
-        arrival_is_reliable = reliable or (
-            pending_direction == direction and pending_votes >= 2
-        )
-        if not arrival_is_reliable:
-            return current_position, 0, 0, 0, False
-        next_position = min(
-            max(current_position + direction, 0),
-            level_count - 1,
-        )
-        return next_position, 0, 0, 0, next_position != current_position
-    if reliable and movement in {"ascending", "descending"}:
-        direction = 1 if movement == "ascending" else -1
-        if estimate.movement_confidence == "high":
-            votes = 2
-        else:
-            votes = pending_votes + 1 if pending_direction == direction else 1
-        return current_position, direction, votes, 0, False
-    if movement == "stable" and pending_votes >= 2 and pending_direction:
-        next_position = min(
-            max(current_position + pending_direction, 0),
-            level_count - 1,
-        )
-        return next_position, 0, 0, 0, next_position != current_position
-    if movement == "stable":
-        return current_position, 0, 0, 0, False
-    if movement == "uncertain" and pending_direction:
-        uncertain_gaps = pending_uncertain_gaps + 1
-        if uncertain_gaps > MAX_UNCERTAIN_MOVEMENT_GAPS:
-            return current_position, 0, 0, 0, arrival_latched
-        return (
-            current_position,
-            pending_direction,
-            pending_votes,
-            uncertain_gaps,
-            arrival_latched,
-        )
-    return (
-        current_position,
-        pending_direction,
-        pending_votes,
-        pending_uncertain_gaps,
-        arrival_latched,
-    )
 
 
 def _largest_ceiling_height_plan_reference_size(
@@ -611,6 +527,8 @@ class MergedGenerationWorkspace(QWidget):
         self._ceiling_height_runtime: _CeilingHeightInferenceRuntime | None = None
         self._ceiling_height_dialog: CeilingHeightAnalysisDialog | None = None
         self._ceiling_height_video_path = ""
+        self._ceiling_height_context_revision = 0
+        self._ceiling_height_level_images: tuple[tuple[int, str], ...] = ()
         self._ceiling_height_level_options: tuple[tuple[int, str], ...] = ()
         self._ceiling_height_level_plan_contexts: tuple[tuple[int, str], ...] = ()
         self._ceiling_height_level_plan_sources: tuple[
@@ -620,7 +538,6 @@ class MergedGenerationWorkspace(QWidget):
         self._temporary_object_reference_session: (
             _TemporaryObjectReferenceSession | None
         ) = None
-        self._door_slot_editing_active = False
         self._door_slot_generation_name = ""
         self._door_slot_generation_blink_visible = True
         self._generation_action_job_ids: dict[str, tuple[str, ...]] = {}
@@ -638,6 +555,12 @@ class MergedGenerationWorkspace(QWidget):
             _ReferenceGenerationRetrySource | None
         ) = None
         self._reference_generation_input_revision = 0
+        self._reference_generation_model = read_reference_generation_model(
+            application_settings
+        )
+        self._ceiling_height_estimation_model = read_ceiling_height_estimation_model(
+            application_settings
+        )
         self._reference_view_presets = read_reference_view_presets(application_settings)
 
         self.surface_workspace.setParent(self)
@@ -839,9 +762,6 @@ class MergedGenerationWorkspace(QWidget):
         root_layout.addWidget(self.seekbar)
 
         self.shared_controls = self._build_shared_controls()
-        self.reference_generation_section = (
-            self._build_reference_generation_controls()
-        )
         self.object_controls = self._build_object_controls()
         self.controls_row = QWidget()
         self.controls_row.setObjectName("merged_generation_controls_row")
@@ -853,8 +773,7 @@ class MergedGenerationWorkspace(QWidget):
             GENERATION_CONTROLS_PADDING,
         )
         controls_row_layout.setSpacing(WORKFLOW_SECTION_SPACING)
-        controls_row_layout.addWidget(self.shared_controls, 1)
-        controls_row_layout.addWidget(self.reference_generation_section, 1)
+        controls_row_layout.addWidget(self.shared_controls, 2)
         controls_row_layout.addWidget(self.object_controls, 2)
         self.controls_scroll = QScrollArea()
         self.controls_scroll.setObjectName("merged_generation_controls_scroll")
@@ -915,6 +834,11 @@ class MergedGenerationWorkspace(QWidget):
         reference_media_layout.addWidget(self.paste_inpaint_button)
         reference_media_layout.addWidget(self.load_reference_image_button)
         shared_layout.addWidget(reference_media_actions)
+
+        self.reference_generation_section = (
+            self._build_reference_generation_controls()
+        )
+        shared_layout.addWidget(self.reference_generation_section)
 
         self.ceiling_height_section, ceiling_height_layout = (
             _build_boxed_section(
@@ -983,31 +907,6 @@ class MergedGenerationWorkspace(QWidget):
         section, layout = _build_boxed_section(
             "Reference generation",
             "merged_generation_reference_generation_section",
-        )
-        self.reference_generation_model_combo = QComboBox()
-        self.reference_generation_model_combo.setObjectName(
-            "reference_generation_model_combo"
-        )
-        self.reference_generation_model_combo.setToolTip(
-            "OpenAI models use the API key in Settings. Qwen and Stable "
-            "Diffusion run locally. Stable Diffusion downloads its model "
-            "(about 7 GB) on first use."
-        )
-        for label, model in REFERENCE_GENERATION_MODEL_OPTIONS:
-            self.reference_generation_model_combo.addItem(label, model)
-        saved_model = self._reference_generation_preference(
-            REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
-            DEFAULT_REFERENCE_GENERATION_MODEL,
-        )
-        model_index = self.reference_generation_model_combo.findData(
-            str(saved_model)
-        )
-        self.reference_generation_model_combo.setCurrentIndex(max(model_index, 0))
-        layout.addWidget(
-            _build_labeled_inline_control(
-                "Reference generation model",
-                self.reference_generation_model_combo,
-            )
         )
         self.reference_generation_view_combo = QComboBox()
         self.reference_generation_view_combo.setObjectName(
@@ -1179,7 +1078,7 @@ class MergedGenerationWorkspace(QWidget):
         """Do not let the old frontal default contradict a different saved view."""
 
         if (
-            self.reference_generation_model_combo.currentData()
+            self._reference_generation_model
             != REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
             or self.reference_generation_negative_prompt_edit.text()
             != DEFAULT_REFERENCE_NEGATIVE_PROMPT
@@ -1206,6 +1105,16 @@ class MergedGenerationWorkspace(QWidget):
             )
 
     # ### Reference generation preferences and state ###
+    def set_reference_generation_model(self, model: str) -> None:
+        """Apply the Settings provider to future requests and local controls."""
+
+        if not isinstance(model, str) or model not in REFERENCE_GENERATION_MODELS:
+            raise ValueError(f"Unknown reference generation model: {model!r}.")
+        if model == self._reference_generation_model:
+            return
+        self._reference_generation_model = model
+        self._sync_reference_generation_controls()
+
     def _reference_generation_preference(
         self, key: str, default: object
     ) -> object:
@@ -1223,10 +1132,6 @@ class MergedGenerationWorkspace(QWidget):
         self._make_default_reference_negative_prompt_view_compatible()
         if self._application_settings is not None:
             for key, value in (
-                (
-                    REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
-                    self.reference_generation_model_combo.currentData(),
-                ),
                 (
                     REFERENCE_GENERATION_PROMPT_SETTINGS_KEY,
                     self.reference_generation_prompt_edit.text(),
@@ -1269,7 +1174,6 @@ class MergedGenerationWorkspace(QWidget):
             )
         )
         settings_available = not running and not self._is_shutdown
-        self.reference_generation_model_combo.setEnabled(settings_available)
         self.reference_generation_view_combo.setEnabled(settings_available)
         self.reference_generation_prompt_control.setVisible(
             self.reference_generation_view_combo.currentData()
@@ -1279,7 +1183,7 @@ class MergedGenerationWorkspace(QWidget):
         self.reference_generation_strength_spinbox.setEnabled(settings_available)
         self.reference_generation_negative_prompt_edit.setEnabled(settings_available)
         is_stable_diffusion = (
-            self.reference_generation_model_combo.currentData()
+            self._reference_generation_model
             == REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
         )
         self.reference_generation_strength_control.setVisible(
@@ -1370,7 +1274,7 @@ class MergedGenerationWorkspace(QWidget):
         retry_source = self._reference_generation_retry_source
         if retry_source is not None and retry_source.context_signature == signature:
             source = retry_source.source_bgra.copy()
-        model = str(self.reference_generation_model_combo.currentData())
+        model = self._reference_generation_model
         api_key = (
             self.object_workspace.get_runtime_settings().openai_api_key.strip()
         )
@@ -1642,8 +1546,8 @@ class MergedGenerationWorkspace(QWidget):
             self.opening_profile_options_section
         )
         generation_settings_layout.addStretch(1)
-        generation_settings_layout.addWidget(objects.meshy_target_polycount_control)
         creation_layout.addWidget(generation_settings)
+        creation_layout.addWidget(objects.meshy_target_polycount_control)
 
         self.texture_provider_control = _build_labeled_inline_control(
             "Texture provider",
@@ -1658,8 +1562,8 @@ class MergedGenerationWorkspace(QWidget):
         primary_actions.setObjectName("merged_generation_primary_object_actions")
         primary_actions_layout = QHBoxLayout(primary_actions)
         primary_actions_layout.setContentsMargins(0, 0, 0, 0)
-        primary_actions_layout.setSpacing(0)
-        primary_actions_layout.addWidget(objects.generate_geometry_button)
+        primary_actions_layout.setSpacing(6)
+        primary_actions_layout.addWidget(objects.generate_geometry_button, 1)
         self.generate_texture_stack = QStackedWidget()
         self.generate_texture_stack.setObjectName(
             "merged_generation_texture_action_stack"
@@ -1670,7 +1574,7 @@ class MergedGenerationWorkspace(QWidget):
         self.generate_texture_stack.addWidget(
             self.surface_workspace.generate_button
         )
-        primary_actions_layout.addWidget(self.generate_texture_stack)
+        primary_actions_layout.addWidget(self.generate_texture_stack, 1)
         creation_layout.addWidget(primary_actions)
 
         generation_actions = QWidget()
@@ -1682,6 +1586,28 @@ class MergedGenerationWorkspace(QWidget):
         self.place_object_button = objects.place_button
         generation_actions_layout.addWidget(self.place_object_button, 1)
         creation_layout.addWidget(generation_actions)
+
+        # Both rows share two equal-width columns, including the alternate
+        # surface-texture action and each action's temporary Cancel state.
+        action_buttons = (
+            objects.generate_geometry_button,
+            objects.generate_texture_button,
+            self.surface_workspace.generate_button,
+            objects.generate_button,
+            self.place_object_button,
+        )
+        action_button_height = max(
+            max(button.minimumHeight(), button.sizeHint().height())
+            for button in action_buttons
+        )
+        for button in action_buttons:
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            button.setFixedHeight(action_button_height)
+        self.generate_texture_stack.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self.generate_texture_stack.setFixedHeight(action_button_height)
+
         primary_layout.addWidget(self.object_creation_section)
         primary_layout.addWidget(objects.model_statistics_label)
         primary_layout.addStretch(1)
@@ -1719,9 +1645,6 @@ class MergedGenerationWorkspace(QWidget):
             self._handle_load_reference_image_clicked
         )
         self.generate_reference_button.clicked.connect(self._handle_generate_reference_clicked)
-        self.reference_generation_model_combo.currentIndexChanged.connect(
-            self._handle_reference_generation_preferences_changed
-        )
         self.reference_generation_view_combo.currentIndexChanged.connect(
             self._handle_reference_generation_preferences_changed
         )
@@ -1898,22 +1821,26 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot(bool)
     def _handle_door_slot_editing_changed(self, active: bool) -> None:
-        """Keep shared analysis controls out of the door-slot workflow."""
+        """Refresh opening-only generation controls after a slot change."""
 
-        self._door_slot_editing_active = bool(active)
+        del active
         self._cancel_reference_generation_if_context_changed()
         self._sync_opening_generation_sections()
         self.sync_shared_controls()
 
     def _sync_opening_generation_sections(self) -> None:
-        """Show opening-only options solely for the slot that can use them."""
+        """Ignore passive library selections until slot generation is opened."""
 
         target = self.object_workspace._door_slot_editing_target
         body_slot_is_active = bool(
-            target is not None and is_door_body_slot(target.slot_id)
+            target is not None
+            and target.generation_ready
+            and is_door_body_slot(target.slot_id)
         )
         non_body_slot_is_active = bool(
-            target is not None and not body_slot_is_active
+            target is not None
+            and target.generation_ready
+            and not body_slot_is_active
         )
         self.division_options_section.setVisible(
             not non_body_slot_is_active
@@ -1998,40 +1925,25 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_video_frame_changed(self) -> None:
-        """Keep whole-video analysis running while tracking the displayed frame."""
+        """Leave marked analysis independent of Generation's seek position."""
 
         self._restore_temporary_reference_after_same_frame_refresh()
         self._cancel_reference_generation_if_context_changed()
         self._sync_object_reference_preview()
         self._sync_ceiling_height_analysis_source()
-        self._sync_ceiling_height_dialog_frame()
         self.current_video_frame_changed.emit()
         self.sync_shared_controls()
 
     @Slot()
     def _show_ceiling_height_analysis_dialog(self) -> None:
-        """Show persistent controls while leaving Generation seeking usable."""
+        """Open the independent player, defaulting to Generation's video."""
 
         if self._is_shutdown:
             return
         self._sync_ceiling_height_analysis_source()
-        video_source = self._current_video_source()
-        if video_source is None:
-            self.ceiling_height_result_label.setText(
-                "Ceiling height: Load a video first."
-            )
-            return
-
         dialog = self._ensure_ceiling_height_analysis_dialog()
-        metadata = video_source.metadata
-        dialog.set_video_metadata(
-            metadata.frame_count,
-            fps=metadata.fps,
-            width=metadata.width,
-            height=metadata.height,
-        )
+        self._sync_ceiling_height_analysis_source()
         self._sync_ceiling_height_dialog_levels()
-        self._sync_ceiling_height_dialog_frame()
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -2044,7 +1956,7 @@ class MergedGenerationWorkspace(QWidget):
             return dialog
         dialog = CeilingHeightAnalysisDialog(
             application_settings=self._application_settings,
-            parent=self,
+            parent=self.infer_ceiling_height_button.window(),
         )
         dialog.analysis_requested.connect(
             self._start_ceiling_height_inference
@@ -2053,46 +1965,55 @@ class MergedGenerationWorkspace(QWidget):
             self._cancel_active_ceiling_height_inference
         )
         self._ceiling_height_dialog = dialog
+        dialog.set_model(self._ceiling_height_estimation_model)
+        dialog.source_changed.connect(self._handle_ceiling_height_analysis_input_changed)
+        dialog.ranges_changed.connect(self._handle_ceiling_height_analysis_input_changed)
         self._sync_ceiling_height_dialog_levels()
+        self._sync_ceiling_height_analysis_source()
         return dialog
 
-    @Slot(str, int, int)
+    @Slot(str, int, object)
     def _start_ceiling_height_inference(
         self,
         model: str,
         frame_interval: int,
-        starting_level_index: int,
+        marked_ranges: object,
     ) -> None:
-        """Analyze the complete video as one level-aware background job."""
+        """Analyze only marked sections, keeping their explicit level labels."""
 
         if self._is_shutdown or self._ceiling_height_runtime is not None:
             return
         dialog = self._ensure_ceiling_height_analysis_dialog()
-        video_source = self._current_video_source()
-        if video_source is None:
+        if not dialog.video_path:
             dialog.set_result("Load a video before starting analysis.", is_error=True)
             return
         level_options = self._ceiling_height_level_options
+        known_levels = dict(level_options)
         level_plan_contexts = self._ceiling_height_level_plan_contexts
         level_plan_sources = self._ceiling_height_level_plan_sources
-        if starting_level_index not in dict(level_options):
-            dialog.set_result(
-                "Choose a valid starting level before analysis.",
-                is_error=True,
-            )
-            return
-        metadata = video_source.metadata
         try:
-            frame_indices = sample_entire_video_frame_indices(
-                metadata.frame_count,
+            metadata = probe_video(dialog.video_path)
+            ranges = tuple(marked_ranges)  # type: ignore[arg-type]
+            frame_samples = sample_marked_video_frames(
+                ranges,
                 frame_interval,
+                metadata.frame_count,
             )
-        except ValueError as error:
+            if any(level_index not in known_levels for _, level_index in frame_samples):
+                raise ValueError("Mark only levels that have a loaded plan image.")
+        except (OSError, TypeError, ValueError) as error:
             dialog.set_result(str(error), is_error=True)
             return
-        if not frame_indices:
-            dialog.set_result("The loaded video contains no frames.", is_error=True)
+        if not frame_samples:
+            dialog.set_result("Mark at least one video section before analysis.", is_error=True)
             return
+        frame_indices = tuple(frame_index for frame_index, _ in frame_samples)
+        marked_level_indices = {level_index for _, level_index in frame_samples}
+        marked_plan_sources = tuple(
+            source
+            for source in level_plan_sources
+            if source.level_index in marked_level_indices
+        )
         plan_reference_size = _largest_ceiling_height_plan_reference_size(
             level_plan_sources
         )
@@ -2103,6 +2024,7 @@ class MergedGenerationWorkspace(QWidget):
             frame_width=metadata.width,
             frame_height=metadata.height,
             plan_reference_size=plan_reference_size,
+            sample_count=len(frame_samples),
         )
         if len(frame_indices) > 120:
             request_description = (
@@ -2114,7 +2036,7 @@ class MergedGenerationWorkspace(QWidget):
                 dialog,
                 "Analyse many video frames?",
                 (
-                    f"The complete video will run {len(frame_indices):,} "
+                    f"The marked sections will run {len(frame_indices):,} "
                     f"{request_description}"
                     f"{_format_cost_confirmation_suffix(estimated_cost)}. "
                     "Continue?"
@@ -2138,23 +2060,23 @@ class MergedGenerationWorkspace(QWidget):
             )
             return
 
-        video_path = str(video_source.metadata.path)
+        video_path = str(metadata.path)
         thread = _CeilingHeightInferenceThread(
             video_path,
-            frame_indices,
+            frame_samples,
             api_key,
             model,
             self._ceiling_height_estimator,
             level_options,
             level_plan_contexts,
-            starting_level_index,
-            level_plan_sources=level_plan_sources,
+            ranges,
+            level_plan_sources=marked_plan_sources,
             parent=self,
         )
         initial_stage = (
             "Loading local Qwen model"
             if uses_local_model
-            else f"Analysing 0 of {len(frame_indices)} video frames"
+            else f"Analysing 0 of {len(frame_indices):,} frame intervals"
         )
         job = self.job_manager.create_job(
             kind=CEILING_HEIGHT_JOB_KIND,
@@ -2168,7 +2090,8 @@ class MergedGenerationWorkspace(QWidget):
             level_signature=level_options,
             plan_context_signature=level_plan_contexts,
             plan_source_signature=level_plan_sources,
-            starting_level_index=starting_level_index,
+            marked_ranges=ranges,
+            context_revision=self._ceiling_height_context_revision,
             job_id=job.job_id,
             thread=thread,
         )
@@ -2237,8 +2160,9 @@ class MergedGenerationWorkspace(QWidget):
         self.job_manager.update_job(
             job_id,
             stage=(
-                f"Analysing frame {int(current_frame) + 1:,} "
-                f"({int(completed_frames):,}/{int(total_frames):,})"
+                f"Analysed {int(completed_frames):,} of "
+                f"{int(total_frames):,} frame intervals "
+                f"(video frame {int(current_frame) + 1:,})"
             ),
             progress=progress,
         )
@@ -2265,7 +2189,7 @@ class MergedGenerationWorkspace(QWidget):
             ):
                 return
             self.job_manager.set_cancel_callback(job_id, None)
-            current_source = self._current_video_source()
+            dialog = self._ceiling_height_dialog
             levels_are_stale = (
                 self._ceiling_height_level_options
                 != runtime.level_signature
@@ -2275,8 +2199,10 @@ class MergedGenerationWorkspace(QWidget):
                 != runtime.plan_source_signature
             )
             is_stale = bool(
-                current_source is None
-                or str(current_source.metadata.path) != runtime.video_path
+                dialog is None
+                or dialog.video_path != runtime.video_path
+                or dialog.marked_ranges != runtime.marked_ranges
+                or runtime.context_revision != self._ceiling_height_context_revision
                 or levels_are_stale
             )
             if (
@@ -2336,15 +2262,16 @@ class MergedGenerationWorkspace(QWidget):
                 QTimer.singleShot(
                     0,
                     partial(
-                        self.ceiling_height_estimate_changed.emit,
+                        self._deliver_ceiling_height_result,
                         analysis,
+                        runtime.context_revision,
                     ),
                 )
             else:
                 result_text = (
                     "No reliable ceiling-height result was found for any "
                     f"detected level. Analysed {analysis.analyzed_count} "
-                    "sampled frames"
+                    "frame intervals"
                     f"{_format_unassigned_frame_suffix(analysis)}."
                 )
                 self.ceiling_height_result_label.setText(result_text)
@@ -2366,14 +2293,54 @@ class MergedGenerationWorkspace(QWidget):
             thread.deleteLater()
 
     # ### Ceiling-height analysis state ###
+    def reset_ceiling_height_analysis(self) -> None:
+        """Do not carry old-project marks or delayed results into a new project."""
+
+        self._ceiling_height_context_revision += 1
+        self._cancel_active_ceiling_height_inference()
+        if self._ceiling_height_dialog is not None:
+            self._ceiling_height_dialog.set_marked_ranges(())
+        self.ceiling_height_result_label.setText(CEILING_HEIGHT_NOT_ESTIMATED_TEXT)
+
+    def _deliver_ceiling_height_result(
+        self, result: CeilingHeightAnalysisResult, context_revision: int
+    ) -> None:
+        if (
+            not self._is_shutdown
+            and context_revision == self._ceiling_height_context_revision
+        ):
+            self.ceiling_height_estimate_changed.emit(result)
+
+    def set_ceiling_height_estimation_model(self, model: str) -> None:
+        """Apply Settings to future analyses without changing a running job."""
+
+        if model not in {value for _label, value in CEILING_HEIGHT_MODEL_OPTIONS}:
+            raise ValueError(f"Unknown ceiling height estimation model: {model!r}.")
+        self._ceiling_height_estimation_model = model
+        if self._ceiling_height_dialog is not None:
+            self._ceiling_height_dialog.set_model(model)
+
     def set_ceiling_height_levels(
         self,
         levels: Iterable[LevelData],
         current_level_index: int,
     ) -> None:
-        """Publish the project levels available to whole-video analysis."""
+        """Publish only levels with readable plan images, not stale file paths."""
 
-        levels = tuple(levels)
+        previous_signature = (
+            self._ceiling_height_level_images,
+            self._ceiling_height_level_options,
+            self._ceiling_height_level_plan_contexts,
+            self._ceiling_height_level_plan_sources,
+        )
+        levels = tuple(
+            level
+            for level in levels
+            if level.image_path and QImageReader(str(level.image_path)).canRead()
+        )
+        self._ceiling_height_level_images = tuple(
+            sorted((int(level.index), str(level.image_path)) for level in levels)
+        )
         options = tuple(
             sorted(
                 (
@@ -2411,6 +2378,14 @@ class MergedGenerationWorkspace(QWidget):
                 and level.image_path is not None
             )
         )
+        if previous_signature != (
+            self._ceiling_height_level_images,
+            self._ceiling_height_level_options,
+            self._ceiling_height_level_plan_contexts,
+            self._ceiling_height_level_plan_sources,
+        ):
+            self._ceiling_height_context_revision += 1
+            self._cancel_active_ceiling_height_inference()
         self._ceiling_height_current_level_index = int(current_level_index)
         self._sync_ceiling_height_dialog_levels()
 
@@ -2435,39 +2410,45 @@ class MergedGenerationWorkspace(QWidget):
         )
 
     def _sync_ceiling_height_analysis_source(self) -> None:
+        """Adopt Generation's source without replacing a custom analysis video."""
+
         video_source = self._current_video_source()
         next_path = (
             "" if video_source is None else str(video_source.metadata.path)
         )
-        if next_path != self._ceiling_height_video_path:
-            runtime = self._ceiling_height_runtime
-            if runtime is not None and runtime.video_path != next_path:
-                runtime.cancel_requested = True
-                if not self.job_manager.cancel_job(runtime.job_id):
-                    runtime.thread.requestInterruption()
-            self._ceiling_height_video_path = next_path
-            self.ceiling_height_result_label.setText(
-                CEILING_HEIGHT_NOT_ESTIMATED_TEXT
-            )
+        previous_path = self._ceiling_height_video_path
+        self._ceiling_height_video_path = next_path
         dialog = self._ceiling_height_dialog
+        if dialog is None or not next_path:
+            return
+        if dialog.video_path and not (
+            next_path != previous_path and dialog.video_path == previous_path
+        ):
+            return
+        try:
+            dialog.set_video_path(
+                next_path,
+                current_frame=self._current_video_frame_index() or 0,
+            )
+        except (OSError, ValueError) as error:
+            dialog.set_result(str(error), is_error=True)
+
+    def _handle_ceiling_height_analysis_input_changed(self, *_arguments: object) -> None:
+        """Cancel stale work if its own source or explicit level ranges change."""
+
+        dialog = self._ceiling_height_dialog
+        runtime = self._ceiling_height_runtime
         if dialog is None:
             return
-        if video_source is None:
-            dialog.set_video_metadata(0)
-            return
-        metadata = video_source.metadata
-        dialog.set_video_metadata(
-            metadata.frame_count,
-            fps=metadata.fps,
-            width=metadata.width,
-            height=metadata.height,
-        )
-
-    def _sync_ceiling_height_dialog_frame(self) -> None:
-        if self._ceiling_height_dialog is not None:
-            self._ceiling_height_dialog.set_current_frame(
-                self._current_video_frame_index()
-            )
+        self._ceiling_height_context_revision += 1
+        self.ceiling_height_result_label.setText(CEILING_HEIGHT_NOT_ESTIMATED_TEXT)
+        if runtime is not None and (
+            dialog.video_path != runtime.video_path
+            or dialog.marked_ranges != runtime.marked_ranges
+        ):
+            runtime.cancel_requested = True
+            if not self.job_manager.cancel_job(runtime.job_id):
+                runtime.thread.requestInterruption()
 
     def _sync_ceiling_height_dialog_levels(self) -> None:
         if self._ceiling_height_dialog is None:
@@ -2820,12 +2801,9 @@ class MergedGenerationWorkspace(QWidget):
         self.video_view.set_interaction_enabled(inpainting_is_available)
         self.infer_ceiling_height_button.setEnabled(
             not self._is_shutdown
-            and not self._door_slot_editing_active
-            and has_video
         )
         self.infer_ceiling_height_button.setText("Infer ceiling height")
         self._sync_ceiling_height_analysis_source()
-        self._sync_ceiling_height_dialog_frame()
         self._sync_opening_generation_sections()
         self._sync_generation_texture_context()
         self._sync_reference_generation_controls()

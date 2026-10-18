@@ -2714,9 +2714,35 @@ class GenerationWorkspaceTests(unittest.TestCase):
             assert item is not None
             self.assertIs(item.widget(), checkbox)
             self.assertEqual(checkbox.text(), expected_label)
-            self.assertFalse(checkbox.isChecked())
+            self.assertTrue(checkbox.isChecked())
+        self.assertEqual(self.workspace._get_enabled_pbr_maps(), PBR_MAP_TYPES)
+        self.assertTrue(
+            all(self.workspace.result_view.get_pbr_maps_enabled().values())
+        )
+
+    def test_pbr_map_selection_survives_settings_and_project_refresh(self) -> None:
+        self.workspace.pbr_map_checkboxes[PBR_MAP_NORMAL].setChecked(False)
+        self.workspace.pbr_map_checkboxes[PBR_MAP_METALLIC].setChecked(False)
+
+        self.workspace.set_runtime_settings(GenerationServiceSettings())
+        self.workspace.set_data(self.workspace.get_data())
+
+        self.assertEqual(
+            self.workspace._get_enabled_pbr_maps(),
+            (PBR_MAP_ROUGHNESS,),
+        )
+        self.assertEqual(
+            self.workspace.result_view.get_pbr_maps_enabled(),
+            {
+                PBR_MAP_NORMAL: False,
+                PBR_MAP_ROUGHNESS: True,
+                PBR_MAP_METALLIC: False,
+            },
+        )
 
     def test_pbr_toggle_updates_viewer_without_reloading_its_model(self) -> None:
+        for checkbox in self.workspace.pbr_map_checkboxes.values():
+            checkbox.setChecked(False)
         model = _test_textured_model((70, 100, 130, 255))
         viewer = self.workspace.result_view
         viewer.set_model(model)
@@ -2758,6 +2784,8 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.workspace.set_runtime_settings(
             GenerationServiceSettings(meshy_api_key="meshy-key")
         )
+        for checkbox in self.workspace.pbr_map_checkboxes.values():
+            checkbox.setChecked(False)
         roughness_checkbox = self.workspace.pbr_map_checkboxes[
             PBR_MAP_ROUGHNESS
         ]

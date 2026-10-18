@@ -1434,23 +1434,44 @@ class CanvasUndoMainTests(unittest.TestCase):
             self.workspace.viewer.surface_tools_status_label.text(),
         )
 
-    def test_ctrl_z_from_canvas_side_panel_uses_shared_history(self) -> None:
-        original_height = self.level.height_meters
-        self.workspace.height_level_spinbox.setValue(original_height + 1.0)
-        self.assertEqual(self.level.height_meters, original_height + 1.0)
+    def test_ctrl_z_from_both_canvas_panels_uses_shared_history(self) -> None:
         self.workspace.show()
-        self.workspace.save_button.setFocus()
         _qt_application.processEvents()
+        for panel, scroll_area, control in (
+            (
+                self.workspace.left_panel,
+                self.workspace.canvas_left_scroll_area,
+                self.workspace.add_stairs_button,
+            ),
+            (
+                self.workspace.side_panel,
+                self.workspace.canvas_right_scroll_area,
+                self.workspace.save_button,
+            ),
+        ):
+            with self.subTest(panel=panel.objectName()):
+                self.assertTrue(panel.isAncestorOf(control))
+                original_height = self.level.height_meters
+                self.workspace.height_level_spinbox.setValue(
+                    original_height + 1.0
+                )
+                self.assertEqual(
+                    self.level.height_meters,
+                    original_height + 1.0,
+                )
+                scroll_area.ensureWidgetVisible(control)
+                control.setFocus()
+                _qt_application.processEvents()
 
-        QTest.keyClick(
-            self.workspace.save_button,
-            Qt.Key.Key_Z,
-            Qt.KeyboardModifier.ControlModifier,
-        )
-        _qt_application.processEvents()
+                QTest.keyClick(
+                    control,
+                    Qt.Key.Key_Z,
+                    Qt.KeyboardModifier.ControlModifier,
+                )
+                _qt_application.processEvents()
 
-        self.assertEqual(self.level.height_meters, original_height)
-        self.assertEqual(self.workspace._canvas_undo_stack, [])
+                self.assertEqual(self.level.height_meters, original_height)
+                self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_replacing_blueprint_image_starts_a_new_undo_history(self) -> None:
         self._place_wall_vertex((0.4, 0.0, 0.8))

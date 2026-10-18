@@ -19,7 +19,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import trimesh
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
@@ -27,10 +27,12 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_JOB_KIND,
+    CeilingHeightAnalysisResult,
     CeilingHeightEstimate,
     CeilingHeightEstimationCancelled,
     CeilingHeightEstimationError,
 )
+from housemaker.ceiling_height_ranges import CeilingHeightVideoRange
 from housemaker.door_state import DOOR_SLOT_BODY, DOOR_SLOT_KNOB
 from housemaker.generation_jobs import JOB_STATUS_CANCELLING, GenerationJobManager
 from housemaker.generation_state import (
@@ -51,6 +53,7 @@ from housemaker.merged_generation_workspace import (
     _invoke_bound_ceiling_height_estimator,
 )
 from housemaker.models import LevelData
+from housemaker.object_texture_variants import PBR_MAP_TYPES
 from housemaker.plan_metric_state import (
     PlanMeasurementEvidence,
     PlanMetricCalibration,
@@ -73,6 +76,12 @@ _qt_application.setQuitOnLastWindowClosed(False)
 
 
 # ### Fixtures ###
+def _write_test_plan(path: Path) -> str:
+    if not cv2.imwrite(str(path), np.full((16, 16, 3), 255, dtype=np.uint8)):
+        raise RuntimeError("The test plan image could not be written.")
+    return str(path)
+
+
 def _stroke(x_position: float) -> MaskStroke:
     return MaskStroke(
         MASK_MODE_PAINT,
@@ -153,13 +162,14 @@ def _plan_metric_calibration(
     )
 
 
-def _calibrated_ceiling_levels() -> tuple[LevelData, ...]:
+def _calibrated_ceiling_levels(root: Path) -> tuple[LevelData, ...]:
     """Return three levels with distinguishable horizontal plan evidence."""
 
     return (
         LevelData(
             index=1,
             name="Underground 1",
+            image_path=_write_test_plan(root / "underground-plan.png"),
             plan_metric_calibration=_plan_metric_calibration(
                 "Underground span",
                 3.2,
@@ -168,6 +178,7 @@ def _calibrated_ceiling_levels() -> tuple[LevelData, ...]:
         LevelData(
             index=2,
             name="Ground",
+            image_path=_write_test_plan(root / "ground-plan.png"),
             plan_metric_calibration=_plan_metric_calibration(
                 "Ground span",
                 6.1,
@@ -176,6 +187,7 @@ def _calibrated_ceiling_levels() -> tuple[LevelData, ...]:
         LevelData(
             index=3,
             name="Story 1",
+            image_path=_write_test_plan(root / "story-plan.png"),
             plan_metric_calibration=_plan_metric_calibration(
                 "Story span",
                 3.9,
@@ -289,9 +301,18 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.workspace.set_ceiling_height_levels(
             (
-                LevelData(index=1, name="Underground 1"),
-                LevelData(index=2, name="Ground"),
-                LevelData(index=3, name="Story 1"),
+                LevelData(
+                    index=1, name="Underground 1",
+                    image_path=_write_test_plan(root / "underground.png"),
+                ),
+                LevelData(
+                    index=2, name="Ground",
+                    image_path=_write_test_plan(root / "ground.png"),
+                ),
+                LevelData(
+                    index=3, name="Story 1",
+                    image_path=_write_test_plan(root / "story.png"),
+                ),
             ),
             current_level_index=2,
         )
@@ -379,7 +400,48 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertIsNotNone(primary_actions)
         assert primary_actions is not None
-        self.assertEqual(primary_actions.layout().spacing(), 0)
+        generation_actions = self.workspace.findChild(
+            QWidget,
+            "merged_generation_object_generation_actions",
+        )
+        self.assertIsNotNone(generation_actions)
+        assert generation_actions is not None
+        self.assertEqual(
+            primary_actions.layout().spacing(),
+            generation_actions.layout().spacing(),
+        )
+
+    def test_all_shared_pbr_maps_are_enabled_by_default(self) -> None:
+        self.assertEqual(set(self.workspace.pbr_map_checkboxes), set(PBR_MAP_TYPES))
+        for map_type in PBR_MAP_TYPES:
+            with self.subTest(map_type=map_type):
+                self.assertTrue(self.objects.pbr_map_checkboxes[map_type].isChecked())
+                self.assertTrue(self.surfaces.pbr_map_checkboxes[map_type].isChecked())
+
+    def test_generation_action_buttons_have_equal_rendered_sizes(self) -> None:
+        self.workspace.resize(1_600, 1_000)
+        self.workspace.show()
+
+        for texture_button in (
+            self.objects.generate_texture_button,
+            self.surfaces.generate_button,
+        ):
+            self.workspace.generate_texture_stack.setCurrentWidget(texture_button)
+            for label in ("Generate geometry", "Cancel"):
+                with self.subTest(texture_button=texture_button, label=label):
+                    self.objects.generate_geometry_button.setText(label)
+                    _qt_application.processEvents()
+                    buttons = (
+                        self.objects.generate_geometry_button,
+                        texture_button,
+                        self.objects.generate_button,
+                        self.objects.place_button,
+                    )
+                    widths = [button.width() for button in buttons]
+                    heights = [button.height() for button in buttons]
+                    self.assertGreater(min(widths), 0)
+                    self.assertLessEqual(max(widths) - min(widths), 1)
+                    self.assertEqual(len(set(heights)), 1)
 
     def test_door_slot_generation_indicator_blinks_beside_heading(self) -> None:
         self.objects.door_slot_generation_status_changed.emit(
@@ -431,7 +493,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
 
     def test_ceiling_height_levels_build_metric_context_per_level(self) -> None:
         self.workspace.set_ceiling_height_levels(
-            iter(_calibrated_ceiling_levels()),
+            iter(_calibrated_ceiling_levels(Path(self.temporary_directory.name))),
             current_level_index=2,
         )
 
@@ -445,12 +507,77 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             self.assertIn("horizontal plan distances only", context)
             self.assertIn("never a ceiling-height measurement", context)
 
-    def test_whole_video_inference_routes_context_after_level_movement(
+    def test_ceiling_height_marking_lists_only_levels_with_loaded_plan_images(self) -> None:
+        root = Path(self.temporary_directory.name)
+        corrupt_path = root / "not-an-image.png"
+        corrupt_path.write_bytes(b"This file is not a plan image.")
+        self.workspace.set_ceiling_height_levels(
+            (
+                LevelData(index=1, name="No image"),
+                LevelData(index=2, name="Ground", image_path=str(root / "ground.png")),
+                LevelData(index=3, name="Story", image_path=str(root / "story.png")),
+                LevelData(index=4, name="Missing image", image_path=str(root / "missing.png")),
+                LevelData(index=5, name="Unreadable image", image_path=str(corrupt_path)),
+                LevelData(index=6, name="Directory", image_path=str(root)),
+                LevelData(index=7, name="Empty path", image_path=""),
+            ),
+            current_level_index=2,
+        )
+        self.workspace.infer_ceiling_height_button.click()
+        dialog = self.workspace._ceiling_height_dialog
+        assert dialog is not None
+
+        self.assertEqual(
+            tuple(
+                dialog.level_to_mark_combo.itemData(index)
+                for index in range(dialog.level_to_mark_combo.count())
+            ),
+            (3, 2),
+        )
+        self.assertEqual(
+            tuple(index for _, index in dialog.range_timeline._levels), (3, 2)
+        )
+        self.assertEqual(dialog.video_path, "")
+        self.assertTrue(dialog.load_video_button.isEnabled())
+        self.assertFalse(dialog.analysis_button.isEnabled())
+
+    def test_ceiling_height_marking_removes_ranges_when_plan_image_disappears(self) -> None:
+        root = Path(self.temporary_directory.name)
+        levels = (
+            LevelData(index=2, name="Ground", image_path=str(root / "ground.png")),
+            LevelData(index=3, name="Story", image_path=str(root / "story.png")),
+        )
+        self.workspace.set_ceiling_height_levels(levels, current_level_index=2)
+        dialog = self.workspace._ensure_ceiling_height_analysis_dialog()
+        dialog.set_video_metadata(60)
+        dialog.set_marked_ranges((
+            CeilingHeightVideoRange(2, 0, 15),
+            CeilingHeightVideoRange(3, 30, 45),
+        ))
+
+        (root / "ground.png").unlink()
+        self.workspace.set_ceiling_height_levels(levels, current_level_index=2)
+
+        self.assertEqual(dialog.level_to_mark_combo.count(), 1)
+        self.assertEqual(dialog.selected_level_index, 3)
+        self.assertEqual(tuple(index for _, index in dialog.range_timeline._levels), (3,))
+        self.assertEqual(dialog.marked_ranges, (CeilingHeightVideoRange(3, 30, 45),))
+
+        (root / "story.png").unlink()
+        self.workspace.set_ceiling_height_levels(levels, current_level_index=2)
+
+        self.assertEqual(dialog.level_to_mark_combo.count(), 0)
+        self.assertEqual(dialog.range_timeline._levels, ())
+        self.assertEqual(dialog.marked_ranges, ())
+        self.assertFalse(dialog.mark_begin_button.isEnabled())
+        self.assertFalse(dialog.mark_end_button.isEnabled())
+
+    def test_marked_video_inference_routes_context_and_resets_frame_pairs(
         self,
     ) -> None:
-        levels = _calibrated_ceiling_levels()
+        levels = _calibrated_ceiling_levels(Path(self.temporary_directory.name))
         for level in levels:
-            level.image_path = str(
+            level.image_path = _write_test_plan(
                 Path(self.temporary_directory.name)
                 / f"level-{level.index}.png"
             )
@@ -464,6 +591,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             ("stable", "high"),
         )
         captured_contexts: list[str] = []
+        captured_previous_frames: list[np.ndarray | None] = []
 
         @contextmanager
         def estimator_provider(**_kwargs):
@@ -474,7 +602,8 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
                 plan_context: str = "",
                 cancellation_check=None,
             ) -> CeilingHeightEstimate:
-                del previous_frame_bgr, cancellation_check
+                del cancellation_check
+                captured_previous_frames.append(previous_frame_bgr)
                 call_index = len(captured_contexts)
                 captured_contexts.append(plan_context)
                 movement, confidence = movements[call_index]
@@ -492,16 +621,21 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             yield estimator
 
         video_path = Path(self.temporary_directory.name) / "context-video.avi"
-        _write_test_video(video_path, frame_count=len(movements))
+        _write_test_video(video_path, frame_count=8)
+        marked_ranges = (
+            CeilingHeightVideoRange(2, 0, 1),
+            CeilingHeightVideoRange(3, 2, 3),
+            CeilingHeightVideoRange(2, 6, 7),
+        )
         thread = _CeilingHeightInferenceThread(
             str(video_path),
-            tuple(range(len(movements))),
+            ((0, 2), (1, 2), (2, 3), (3, 3), (6, 2), (7, 2)),
             "sk-test",
             "gpt-5.6-luna",
             None,
             self.workspace._ceiling_height_level_options,
             self.workspace._ceiling_height_level_plan_contexts,
-            2,
+            marked_ranges,
             level_plan_sources=(
                 self.workspace._ceiling_height_level_plan_sources
             ),
@@ -530,6 +664,105 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertIn("Story span: 3.9 m", captured_contexts[3])
         self.assertIn("Ground span: 6.1 m", captured_contexts[4])
         self.assertIn("Ground span: 6.1 m", captured_contexts[5])
+        self.assertEqual(
+            tuple(frame is None for frame in captured_previous_frames),
+            (True, False, True, False, True, False),
+        )
+        assert thread.result is not None
+        self.assertEqual(thread.result.sampled_frame_indices, (0, 1, 2, 3, 6, 7))
+        self.assertEqual(
+            tuple(item.level_index for item in thread.result.level_estimates), (2, 3)
+        )
+        self.assertEqual(thread.result.transition_frame_indices, ())
+
+    def test_uncalibrated_plan_path_change_invalidates_and_cancels_height_analysis(
+        self,
+    ) -> None:
+        root = Path(self.temporary_directory.name)
+        level = LevelData(
+            index=2, name="Ground",
+            image_path=_write_test_plan(root / "original-plan.png"),
+        )
+        replacement_path = _write_test_plan(root / "replacement-plan.png")
+        self.workspace.set_ceiling_height_levels((level,), current_level_index=2)
+        initial_revision = self.workspace._ceiling_height_context_revision
+        original_options = self.workspace._ceiling_height_level_options
+        original_contexts = self.workspace._ceiling_height_level_plan_contexts
+
+        with patch.object(
+            self.workspace, "_cancel_active_ceiling_height_inference"
+        ) as cancel:
+            self.workspace.set_ceiling_height_levels(
+                (replace(level, image_path=replacement_path),),
+                current_level_index=2,
+            )
+
+        cancel.assert_called_once_with()
+        self.assertGreater(self.workspace._ceiling_height_context_revision, initial_revision)
+        self.assertEqual(self.workspace._ceiling_height_level_options, original_options)
+        self.assertEqual(self.workspace._ceiling_height_level_plan_contexts, original_contexts)
+        self.assertEqual(self.workspace._ceiling_height_level_plan_sources, ())
+        unchanged_revision = self.workspace._ceiling_height_context_revision
+        with patch.object(
+            self.workspace, "_cancel_active_ceiling_height_inference"
+        ) as cancel:
+            self.workspace.set_ceiling_height_levels(
+                (replace(level, image_path=replacement_path),),
+                current_level_index=2,
+            )
+        cancel.assert_not_called()
+        self.assertEqual(self.workspace._ceiling_height_context_revision, unchanged_revision)
+
+    def test_queued_height_result_is_discarded_after_project_reset(self) -> None:
+        dialog = self.workspace._ensure_ceiling_height_analysis_dialog()
+        dialog.set_video_metadata(8, width=64, height=48)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 4),))
+        result = CeilingHeightAnalysisResult((), (), (), ())
+        revision = self.workspace._ceiling_height_context_revision
+        completed = QSignalSpy(self.workspace.ceiling_height_estimate_changed)
+        QTimer.singleShot(
+            0, lambda: self.workspace._deliver_ceiling_height_result(result, revision)
+        )
+
+        with patch.object(
+            self.workspace, "_cancel_active_ceiling_height_inference"
+        ) as cancel:
+            self.workspace.reset_ceiling_height_analysis()
+        _qt_application.processEvents()
+
+        cancel.assert_called_once_with()
+        self.assertEqual(completed.count(), 0)
+        self.assertEqual(dialog.marked_ranges, ())
+        self.assertGreater(self.workspace._ceiling_height_context_revision, revision)
+
+    def test_queued_height_result_is_discarded_after_marked_ranges_change(self) -> None:
+        dialog = self.workspace._ensure_ceiling_height_analysis_dialog()
+        dialog.set_video_metadata(8, width=64, height=48)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 4),))
+        result = CeilingHeightAnalysisResult((), (), (), ())
+        revision = self.workspace._ceiling_height_context_revision
+        completed = QSignalSpy(self.workspace.ceiling_height_estimate_changed)
+        QTimer.singleShot(
+            0, lambda: self.workspace._deliver_ceiling_height_result(result, revision)
+        )
+
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 6),))
+        _qt_application.processEvents()
+
+        self.assertEqual(completed.count(), 0)
+        self.assertGreater(self.workspace._ceiling_height_context_revision, revision)
+
+    def test_queued_height_result_is_delivered_for_current_context(self) -> None:
+        result = CeilingHeightAnalysisResult((), (), (), ())
+        revision = self.workspace._ceiling_height_context_revision
+        completed = QSignalSpy(self.workspace.ceiling_height_estimate_changed)
+        QTimer.singleShot(
+            0, lambda: self.workspace._deliver_ceiling_height_result(result, revision)
+        )
+
+        self.assertTrue(_wait_until(lambda: completed.count() == 1))
+
+        self.assertIs(completed.at(0)[0], result)
 
     def test_metric_context_keeps_legacy_bound_estimator_compatible(
         self,
@@ -567,19 +800,17 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(captured_previous_frames), 1)
         self.assertIs(captured_previous_frames[0], previous_frame)
 
-    def test_ceiling_height_control_analyzes_complete_video_with_frame_pairs(
+    def test_ceiling_height_control_analyzes_only_marked_level_sections(
         self,
     ) -> None:
         provider_calls: list[tuple[str, str]] = []
         captured_pairs: list[tuple[float | None, float]] = []
         movements = (
             ("stable", "low", 2.6),
-            ("stable", "low", 2.6),
-            ("stable", "low", 2.6),
-            ("ascending", "medium", 2.8),
-            ("ascending", "medium", 2.8),
+            ("arrived_up", "high", 2.6),
+            ("ascending", "medium", 2.6),
             ("stable", "low", 3.0),
-            ("stable", "low", 3.0),
+            ("arrived_down", "medium", 3.0),
             ("stable", "low", 3.0),
         )
 
@@ -632,7 +863,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         video_path = Path(self.temporary_directory.name) / "height-video.avi"
         _write_test_video(video_path, frame_count=14)
 
-        self.assertFalse(self.workspace.infer_ceiling_height_button.isEnabled())
+        self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
         self.objects.load_video(str(video_path))
         self.surfaces.load_video(str(video_path))
         self.workspace.sync_shared_controls()
@@ -645,17 +876,23 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         dialog = self.workspace._ceiling_height_dialog
         self.assertIsNotNone(dialog)
         assert dialog is not None
-        self.assertFalse(hasattr(dialog, "mark_start_button"))
-        self.assertFalse(hasattr(dialog, "mark_end_button"))
-        self.assertEqual(dialog.current_level_combo.currentData(), 2)
+        self.assertTrue(hasattr(dialog, "mark_begin_button"))
+        self.assertTrue(hasattr(dialog, "mark_end_button"))
+        self.assertFalse(hasattr(dialog, "current_level_combo"))
+        self.assertFalse(hasattr(dialog, "model_combo"))
+        self.assertEqual(dialog.level_to_mark_combo.currentData(), 2)
+        self.assertEqual(dialog.video_path, str(video_path.resolve()))
         self.assertEqual(
             tuple(
-                dialog.current_level_combo.itemText(index)
-                for index in range(dialog.current_level_combo.count())
+                dialog.level_to_mark_combo.itemText(index)
+                for index in range(dialog.level_to_mark_combo.count())
             ),
             ("L3 Story 1", "L2 Ground", "L1 Underground 1"),
         )
         dialog.frame_interval_spinbox.setValue(2)
+        dialog.set_marked_ranges(
+            (CeilingHeightVideoRange(2, 0, 4), CeilingHeightVideoRange(3, 10, 13))
+        )
         with patch(
             "housemaker.merged_generation_workspace."
             "open_ceiling_height_estimator",
@@ -668,6 +905,9 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(captured_pairs), len(movements))
         self.assertIsNone(captured_pairs[0][0])
         for pair_index in range(1, len(captured_pairs)):
+            if pair_index == 3:
+                self.assertIsNone(captured_pairs[pair_index][0])
+                continue
             self.assertAlmostEqual(
                 captured_pairs[pair_index][0],
                 captured_pairs[pair_index - 1][1],
@@ -684,13 +924,63 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         result = completed.at(0)[0]
         self.assertEqual(
             result.sampled_frame_indices,
-            (0, 2, 4, 6, 8, 10, 12, 13),
+            (0, 2, 4, 10, 12, 13),
         )
-        self.assertEqual(result.transition_frame_indices, (6, 8))
+        self.assertEqual(result.transition_frame_indices, ())
+        self.assertEqual(tuple(item.level_index for item in result.level_estimates), (2, 3))
         self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
         job = self.job_manager.jobs()[-1]
         self.assertEqual(job.kind, CEILING_HEIGHT_JOB_KIND)
         self.assertEqual(job.status, "completed")
+
+    def test_custom_analysis_video_works_without_a_generation_video(self) -> None:
+        captured_means: list[float] = []
+
+        def estimator(
+            frame_bgr: np.ndarray,
+            *,
+            api_key: str,
+            model: str,
+            cancellation_check=None,
+        ) -> CeilingHeightEstimate:
+            del api_key, model, cancellation_check
+            captured_means.append(float(frame_bgr.mean()))
+            return CeilingHeightEstimate(
+                status="estimated",
+                estimate_m=2.8,
+                minimum_m=2.6,
+                maximum_m=3.0,
+                confidence="medium",
+                basis="Visible architectural boundaries agree.",
+            )
+
+        self.workspace._ceiling_height_estimator = estimator
+        self.workspace.set_ceiling_height_estimation_model(LOCAL_QWEN_CEILING_HEIGHT_MODEL)
+        video_path = Path(self.temporary_directory.name) / "independent-analysis.avi"
+        _write_test_video(video_path, frame_count=8)
+        self.assertIsNone(self.objects._video_source)
+        self.assertIsNone(self.surfaces._video_source)
+        self.workspace.infer_ceiling_height_button.click()
+        dialog = self.workspace._ceiling_height_dialog
+        assert dialog is not None
+        dialog.set_video_path(video_path)
+        dialog.frame_interval_spinbox.setValue(2)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(3, 3, 5),))
+        completed = QSignalSpy(self.workspace.ceiling_height_estimate_changed)
+
+        dialog.analysis_button.click()
+
+        self.assertTrue(_wait_until(lambda: completed.count() == 1))
+        self.assertEqual(len(captured_means), 2)
+        self.assertAlmostEqual(captured_means[0], 90, delta=1)
+        self.assertAlmostEqual(captured_means[1], 130, delta=1)
+        result = completed.at(0)[0]
+        self.assertEqual(result.sampled_frame_indices, (3, 5))
+        self.assertEqual(tuple(item.level_index for item in result.level_estimates), (3,))
+        self.assertEqual(result.level_estimates[0].analysis.average_height_m, 2.8)
+        self.assertIsNone(self.objects._video_source)
+        self.assertIsNone(self.surfaces._video_source)
+        self.assertEqual(self.job_manager.jobs()[-1].status, "completed")
 
     def test_frame_change_does_not_cancel_pending_video_height_analysis(
         self,
@@ -737,6 +1027,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         dialog = self.workspace._ceiling_height_dialog
         assert dialog is not None
         dialog.frame_interval_spinbox.setValue(2)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 2),))
         dialog.analysis_button.click()
         self.assertTrue(started.wait(1.0))
         self.workspace.seekbar.setValue(1)
@@ -798,12 +1089,14 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         dialog = self.workspace._ceiling_height_dialog
         assert dialog is not None
         dialog.frame_interval_spinbox.setValue(1)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 3),))
         dialog.analysis_button.click()
 
         self.assertTrue(_wait_until(lambda: completed.count() == 1))
         self.assertEqual(call_count, 4)
         result = completed.at(0)[0]
-        self.assertEqual(result.unassigned_frame_indices, (0,))
+        self.assertEqual(result.unassigned_frame_indices, ())
+        self.assertEqual(result.level_estimates[0].analysis.insufficient_frame_indices, (0,))
         self.assertIn(
             "L2 Ground: 2.70 m",
             self.workspace.ceiling_height_result_label.text(),
@@ -848,12 +1141,9 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         dialog = self.workspace._ceiling_height_dialog
         self.assertIsNotNone(dialog)
         assert dialog is not None
-        model_index = dialog.model_combo.findData(
-            LOCAL_QWEN_CEILING_HEIGHT_MODEL
-        )
-        self.assertGreaterEqual(model_index, 0)
-        dialog.model_combo.setCurrentIndex(model_index)
+        self.workspace.set_ceiling_height_estimation_model(LOCAL_QWEN_CEILING_HEIGHT_MODEL)
         dialog.frame_interval_spinbox.setValue(2)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 2),))
         dialog.analysis_button.click()
 
         self.assertTrue(_wait_until(lambda: completed.count() == 1))
@@ -864,7 +1154,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(self.job_manager.jobs()[-1].status, "completed")
 
-    def test_paid_whole_video_analysis_displays_and_confirms_total_cost(
+    def test_paid_marked_video_analysis_displays_model_and_confirms_total_cost(
         self,
     ) -> None:
         video_path = Path(self.temporary_directory.name) / "paid-height.avi"
@@ -877,11 +1167,12 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(dialog)
         assert dialog is not None
         dialog.frame_interval_spinbox.setValue(1)
+        dialog.set_marked_ranges((CeilingHeightVideoRange(2, 0, 120),))
 
         button_text = dialog.analysis_button.text()
         self.assertRegex(
             button_text,
-            r"Analyse video's ceiling height \(estimated .+\)",
+            r"Analyse video's ceiling height \(gpt-5\.6-luna; estimated cost .+\)",
         )
         with patch.object(
             QMessageBox,
@@ -953,6 +1244,50 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             controls_layout.getContentsMargins(),
             (GENERATION_CONTROLS_PADDING,) * 4,
         )
+
+    def test_reference_generation_is_directly_below_reference_media_buttons(self) -> None:
+        shared_column = self.workspace.findChild(
+            QWidget,
+            "merged_generation_shared_primary_column",
+        )
+        media_actions = self.workspace.findChild(
+            QWidget,
+            "merged_generation_reference_media_actions",
+        )
+        self.assertIsNotNone(shared_column)
+        self.assertIsNotNone(media_actions)
+        assert shared_column is not None and media_actions is not None
+        shared_layout = shared_column.layout()
+        self.assertIsNotNone(shared_layout)
+        assert shared_layout is not None
+
+        self.assertTrue(
+            shared_column.isAncestorOf(self.workspace.reference_generation_section)
+        )
+        media_index = shared_layout.indexOf(media_actions)
+        reference_index = shared_layout.indexOf(
+            self.workspace.reference_generation_section
+        )
+        self.assertGreaterEqual(media_index, 0)
+        self.assertEqual(reference_index, media_index + 1)
+        self.assertEqual(
+            shared_layout.indexOf(self.workspace.ceiling_height_section),
+            reference_index + 1,
+        )
+        for button in (
+            self.workspace.load_video_button,
+            self.workspace.copy_inpaint_button,
+            self.workspace.paste_inpaint_button,
+            self.workspace.load_reference_image_button,
+        ):
+            self.assertTrue(media_actions.isAncestorOf(button))
+
+        controls_layout = self.workspace.controls_row.layout()
+        self.assertIsNotNone(controls_layout)
+        assert controls_layout is not None
+        self.assertEqual(controls_layout.count(), 2)
+        self.assertIs(controls_layout.itemAt(0).widget(), self.workspace.shared_controls)
+        self.assertIs(controls_layout.itemAt(1).widget(), self.workspace.object_controls)
 
     def test_object_controls_house_projection_allocation_in_second_column(
         self,
@@ -1078,9 +1413,9 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         settings_layout = generation_settings.layout()
         self.assertIs(settings_layout.itemAt(0).widget(), division_options)
         self.assertIs(settings_layout.itemAt(1).widget(), profile_options)
-        self.assertIs(
-            settings_layout.itemAt(3).widget(),
-            self.objects.meshy_target_polycount_control,
+        self.assertEqual(
+            settings_layout.indexOf(self.objects.meshy_target_polycount_control),
+            -1,
         )
         self.assertTrue(
             division_options.isAncestorOf(
@@ -1176,10 +1511,14 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertIs(creation_layout.itemAt(1).widget(), generation_settings)
         self.assertIs(
             creation_layout.itemAt(2).widget(),
+            self.objects.meshy_target_polycount_control,
+        )
+        self.assertIs(
+            creation_layout.itemAt(3).widget(),
             self.workspace.texture_provider_control,
         )
-        self.assertIs(creation_layout.itemAt(3).widget(), primary_actions)
-        self.assertIs(creation_layout.itemAt(4).widget(), generation_actions)
+        self.assertIs(creation_layout.itemAt(4).widget(), primary_actions)
+        self.assertIs(creation_layout.itemAt(5).widget(), generation_actions)
 
     def test_surface_controls_are_folded_into_contextual_object_actions(
         self,
@@ -1268,36 +1607,81 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             -1,
         )
 
+    def test_passive_opening_slot_selection_keeps_normal_generation_sections(
+        self,
+    ) -> None:
+        video_path = Path(self.temporary_directory.name) / "source.avi"
+        _write_test_video(video_path)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        division = self.workspace.division_options_section
+        profile = self.workspace.opening_profile_options_section
+
+        for asset_kind in ("door", "window"):
+            for slot_id in (DOOR_SLOT_BODY, DOOR_SLOT_KNOB):
+                with self.subTest(asset_kind=asset_kind, slot_id=slot_id):
+                    self.assertTrue(
+                        self.objects.set_door_slot_editing_target(
+                            door_id=f"{asset_kind}-1",
+                            slot_id=slot_id,
+                            object_id=f"{asset_kind}-{slot_id}",
+                            object_name=slot_id.title(),
+                            slot_display_name=slot_id.title(),
+                            asset_kind=asset_kind,
+                            generation_ready=False,
+                        )
+                    )
+                    target = self.objects._door_slot_editing_target
+                    self.assertIsNotNone(target)
+                    assert target is not None
+                    self.assertFalse(target.generation_ready)
+                    self.assertFalse(division.isHidden())
+                    self.assertTrue(profile.isHidden())
+                    self.assertTrue(
+                        self.workspace.infer_ceiling_height_button.isEnabled()
+                    )
+
     def test_opening_generation_sections_follow_the_active_slot(self) -> None:
+        video_path = Path(self.temporary_directory.name) / "source.avi"
+        _write_test_video(video_path)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
         division = self.workspace.division_options_section
         profile = self.workspace.opening_profile_options_section
 
         self.assertFalse(division.isHidden())
         self.assertTrue(profile.isHidden())
 
-        self.assertTrue(
-            self.objects.set_door_slot_editing_target(
-                door_id="door-1",
-                slot_id=DOOR_SLOT_BODY,
-                object_id="door-body",
-                object_name="Body",
-                slot_display_name="Body",
-            )
-        )
-        self.assertFalse(division.isHidden())
-        self.assertFalse(profile.isHidden())
-
-        self.assertTrue(
-            self.objects.set_door_slot_editing_target(
-                door_id="door-1",
-                slot_id=DOOR_SLOT_KNOB,
-                object_id="door-handle",
-                object_name="Handle",
-                slot_display_name="Handle",
-            )
-        )
-        self.assertTrue(division.isHidden())
-        self.assertTrue(profile.isHidden())
+        for asset_kind in ("door", "window"):
+            with self.subTest(asset_kind=asset_kind):
+                for slot_id, generation_ready in (
+                    (DOOR_SLOT_BODY, True),
+                    (DOOR_SLOT_KNOB, True),
+                    (DOOR_SLOT_BODY, False),
+                ):
+                    self.assertTrue(
+                        self.objects.set_door_slot_editing_target(
+                            door_id=f"{asset_kind}-1",
+                            slot_id=slot_id,
+                            object_id=f"{asset_kind}-{slot_id}",
+                            object_name=slot_id.title(),
+                            slot_display_name=slot_id.title(),
+                            asset_kind=asset_kind,
+                            generation_ready=generation_ready,
+                        )
+                    )
+                    self.assertEqual(
+                        division.isHidden(),
+                        generation_ready and slot_id == DOOR_SLOT_KNOB,
+                    )
+                    self.assertEqual(
+                        profile.isHidden(),
+                        not (generation_ready and slot_id == DOOR_SLOT_BODY),
+                    )
+                    self.assertEqual(
+                        self.workspace.infer_ceiling_height_button.isEnabled(),
+                        True,
+                    )
 
         self.objects.clear_door_slot_editing_target()
         self.assertFalse(division.isHidden())
@@ -1452,6 +1836,24 @@ class GenerationActionCancellationUiTests(unittest.TestCase):
         self.objects.generate_geometry_button.setEnabled(True)
         self.objects.generate_texture_button.setEnabled(True)
         self.objects.generate_button.setEnabled(True)
+
+    def test_running_action_keeps_all_four_buttons_equally_sized(self) -> None:
+        self.workspace.resize(1_600, 1_000)
+        self.workspace.show()
+        self._enable_object_actions()
+        self.objects.generate_geometry_button.click()
+        _qt_application.processEvents()
+
+        self.assertEqual(self.objects.generate_geometry_button.text(), "Cancel")
+        buttons = (
+            self.objects.generate_geometry_button,
+            self.objects.generate_texture_button,
+            self.objects.generate_button,
+            self.objects.place_button,
+        )
+        widths = [button.width() for button in buttons]
+        self.assertLessEqual(max(widths) - min(widths), 1)
+        self.assertEqual(len({button.height() for button in buttons}), 1)
 
     def test_object_action_buttons_cancel_only_their_own_launch(self) -> None:
         self._enable_object_actions()

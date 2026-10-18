@@ -369,7 +369,7 @@ class DoorMainIntegrationTests(unittest.TestCase):
         self.assertFalse(
             self.workspace.generation.object_3d_panel.projection_camera_controls.isEnabled()
         )
-        self.assertFalse(
+        self.assertTrue(
             self.workspace.merged_generation_workspace.infer_ceiling_height_button.isEnabled()
         )
 

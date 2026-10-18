@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -536,6 +537,7 @@ DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
     )
 )
 LEVEL_POSITION_ITEM_ROLE = int(Qt.ItemDataRole.UserRole)
+CANVAS_LEVEL_LIST_VISIBLE_ROWS = 8
 DOOR_LIBRARY_ITEM_ID_ROLE = int(Qt.ItemDataRole.UserRole)
 GROUND_LEVEL_BACKGROUND_BLEND = 0.12
 LEVEL_SCALE_SLIDER_FACTOR = 1000
@@ -1762,7 +1764,7 @@ def _surface_assignment_target_signature(
 
 
 # ### Event filters ###
-class RightPanelValueInputWheelFilter(QObject):
+class CanvasPanelValueInputWheelFilter(QObject):
     """Scrolls a containing panel when its value inputs receive wheel events."""
 
     def __init__(self, scroll_area: QScrollArea) -> None:
@@ -2352,7 +2354,7 @@ class BlueprintWorkspace(QWidget):
         field = QWidget()
         field_layout = QHBoxLayout(field)
         field_layout.setContentsMargins(0, 0, 0, 0)
-        field_layout.setSpacing(10)
+        field_layout.setSpacing(4)
 
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(minimum, maximum)
@@ -2499,6 +2501,30 @@ class BlueprintWorkspace(QWidget):
         slider.blockSignals(was_blocked)
         value_label.setText(self._format_canvas_offset_pixels(next_value))
         self.canvas.set_canvas_level_offsets(next_x, next_y)
+
+    # ### Canvas control panel builders ###
+    @staticmethod
+    def _build_canvas_controls_panel(
+        object_name: str,
+    ) -> tuple[QWidget, QScrollArea, QWidget, QVBoxLayout]:
+        """Keep each tool column scrollable without constraining the canvas."""
+
+        panel = QWidget()
+        panel.setObjectName(object_name)
+        panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName(f"{object_name}_scroll_area")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(10, 12, 10, 10)
+        controls_layout.setSpacing(12)
+        scroll_area.setWidget(controls)
+        panel_layout.addWidget(scroll_area)
+        return panel, scroll_area, controls, controls_layout
 
     # ### Main workspace UI ###
     def _build_ui(self) -> None:
@@ -2876,6 +2902,12 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.set_runtime_settings(generation_settings)
         self.surface_texture_generation.set_runtime_settings(generation_settings)
+        self.merged_generation_workspace.set_reference_generation_model(
+            generation_settings.reference_generation_model
+        )
+        self.merged_generation_workspace.set_ceiling_height_estimation_model(
+            generation_settings.ceiling_height_estimation_model
+        )
         self.merged_generation_workspace.set_clear_mask_hotkey(
             generation_settings.clear_mask_hotkey
         )
@@ -3196,40 +3228,32 @@ class BlueprintWorkspace(QWidget):
         )
         self.workspace_splitter.addWidget(self.workspace_tabs)
 
-        self.side_panel = QWidget()
-        # The side-tab hint includes its widest hidden page. Let the splitter
-        # use the available width instead of treating that hint as a minimum.
-        side_panel_policy = self.side_panel.sizePolicy()
-        side_panel_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
-        self.side_panel.setSizePolicy(side_panel_policy)
+        (
+            self.left_panel,
+            self.canvas_left_scroll_area,
+            self.canvas_left_controls,
+            left_side_layout,
+        ) = self._build_canvas_controls_panel("canvas_left_panel")
+        (
+            self.side_panel,
+            self.canvas_right_scroll_area,
+            self.canvas_right_controls,
+            right_side_layout,
+        ) = self._build_canvas_controls_panel("canvas_right_panel")
         self.canvas_side_panel_undo_shortcut = QShortcut(
             QKeySequence.StandardKey.Undo,
             self.side_panel,
         )
-        self.canvas_side_panel_undo_shortcut.setContext(
-            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        self.canvas_left_panel_undo_shortcut = QShortcut(
+            QKeySequence.StandardKey.Undo,
+            self.left_panel,
         )
-        self.canvas_side_panel_undo_shortcut.activated.connect(
-            self._handle_canvas_undo_requested
-        )
-        side_layout = QVBoxLayout(self.side_panel)
-        side_layout.setContentsMargins(16, 16, 16, 16)
-        side_layout.setSpacing(12)
-
-        self.side_tabs = QTabWidget()
-        side_layout.addWidget(self.side_tabs, 1)
-
-        generals_tab = QScrollArea()
-        generals_tab.setWidgetResizable(True)
-        generals_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        generals_content = QWidget()
-        generals_layout = QVBoxLayout(generals_content)
-        generals_layout.setContentsMargins(10, 12, 10, 10)
-        generals_layout.setSpacing(12)
-        generals_tab.setWidget(generals_content)
-        self.side_tabs.addTab(generals_tab, "Generals")
-        side_layout = generals_layout
+        for shortcut in (
+            self.canvas_side_panel_undo_shortcut,
+            self.canvas_left_panel_undo_shortcut,
+        ):
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self._handle_canvas_undo_requested)
 
         self.level_dimensions_group = QGroupBox("Level dimensions")
         level_dimensions_layout = QFormLayout(self.level_dimensions_group)
@@ -3269,7 +3293,17 @@ class BlueprintWorkspace(QWidget):
             "Floor thickness",
             self.floor_thickness_spinbox,
         )
-        side_layout.addWidget(self.level_dimensions_group)
+        right_side_layout.addWidget(self.level_dimensions_group)
+        # Room analysis belongs beside the level dimensions it can update.
+        right_side_layout.addWidget(
+            self.merged_generation_workspace.ceiling_height_section
+        )
+        # Reclaim the Generation control space after reparenting Room analysis.
+        merged_controls = self.merged_generation_workspace
+        merged_controls.controls_scroll.setMinimumHeight(
+            merged_controls.controls_row.sizeHint().height()
+            + merged_controls.controls_scroll.horizontalScrollBar().sizeHint().height()
+        )
 
         self.open_spaces_group = QGroupBox("Open spaces")
         open_spaces_layout = QVBoxLayout(self.open_spaces_group)
@@ -3287,13 +3321,16 @@ class BlueprintWorkspace(QWidget):
         )
         self.add_open_space_button.clicked.connect(self._handle_add_open_space_clicked)
         open_spaces_layout.addWidget(self.add_open_space_button)
-        side_layout.addWidget(self.open_spaces_group)
+        left_side_layout.addWidget(self.open_spaces_group)
 
         self.level_transform_group = QGroupBox("Level transform")
         level_transform_layout = QFormLayout(self.level_transform_group)
         level_transform_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
+        level_transform_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        level_transform_layout.setContentsMargins(4, 6, 4, 6)
+        level_transform_layout.setVerticalSpacing(4)
 
         (
             level_scale_field,
@@ -3323,7 +3360,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_level_transform_button_pressed,
             self._handle_level_transform_button_released,
         )
-        level_transform_layout.addRow("Level scale", level_scale_field)
+        level_transform_layout.addRow("Scale", level_scale_field)
 
         (
             level_x_offset_field,
@@ -3384,7 +3421,6 @@ class BlueprintWorkspace(QWidget):
             self._handle_level_transform_button_released,
         )
         level_transform_layout.addRow("Y offset", level_y_offset_field)
-        side_layout.addWidget(self.level_transform_group)
 
         for slider in (
             self.level_scale_slider,
@@ -3417,6 +3453,9 @@ class BlueprintWorkspace(QWidget):
         canvas_transform_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
+        canvas_transform_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        canvas_transform_layout.setContentsMargins(4, 6, 4, 6)
+        canvas_transform_layout.setVerticalSpacing(4)
 
         (
             canvas_level_scale_field,
@@ -3447,7 +3486,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_transform_button_released,
         )
         canvas_transform_layout.addRow(
-            "Canvas level scale",
+            "Scale",
             canvas_level_scale_field,
         )
 
@@ -3484,7 +3523,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_transform_button_released,
         )
         canvas_transform_layout.addRow(
-            "Canvas X offset",
+            "X offset",
             canvas_x_offset_field,
         )
 
@@ -3521,10 +3560,52 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_transform_button_released,
         )
         canvas_transform_layout.addRow(
-            "Canvas Y offset",
+            "Y offset",
             canvas_y_offset_field,
         )
-        side_layout.addWidget(self.canvas_transform_group)
+        self.transform_controls_row = QWidget()
+        self.transform_controls_row.setObjectName("canvas_transform_controls_row")
+        transform_controls_layout = QHBoxLayout(self.transform_controls_row)
+        transform_controls_layout.setContentsMargins(0, 0, 0, 0)
+        transform_controls_layout.setSpacing(8)
+        transform_controls_layout.addWidget(self.level_transform_group, 1)
+        transform_controls_layout.addWidget(self.canvas_transform_group, 1)
+        transform_column_width = max(
+            self.level_transform_group.minimumSizeHint().width(),
+            self.canvas_transform_group.minimumSizeHint().width(),
+        )
+        self.transform_controls_row.setMinimumWidth(
+            2 * transform_column_width + transform_controls_layout.spacing()
+        )
+        self.transform_controls_scroll_area = QScrollArea()
+        self.transform_controls_scroll_area.setObjectName("canvas_transform_controls_scroll_area")
+        self.transform_controls_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.transform_controls_scroll_area.setWidgetResizable(True)
+        self.transform_controls_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.transform_controls_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.transform_controls_scroll_area.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self.transform_controls_scroll_area.setWidget(self.transform_controls_row)
+        self.transform_controls_scroll_area.setFixedHeight(
+            self.transform_controls_row.sizeHint().height()
+            + 2 * self.transform_controls_scroll_area.frameWidth()
+            + self.transform_controls_scroll_area.horizontalScrollBar().sizeHint().height()
+        )
+        right_side_layout.addWidget(self.transform_controls_scroll_area)
+        self._transform_scroll_width_filter = ViewportWidthRowFilter(
+            self.canvas_right_scroll_area.viewport(),
+            (self.transform_controls_scroll_area,),
+            horizontal_inset=10,
+        )
+        self.canvas_right_scroll_area.viewport().installEventFilter(
+            self._transform_scroll_width_filter
+        )
+        self._transform_scroll_width_filter.sync_widths()
 
         for slider in (
             self.canvas_level_scale_slider,
@@ -4113,10 +4194,10 @@ class BlueprintWorkspace(QWidget):
             QSizePolicy.Policy.Preferred,
         )
         self.stairs_scroll_area.setWidget(self.stairs_group)
-        side_layout.addWidget(self.stairs_scroll_area)
+        left_side_layout.addWidget(self.stairs_scroll_area)
 
         def sync_stairs_scroll_height() -> None:
-            # Only the outer Generals page should scroll vertically. Refresh
+            # Only the outer Canvas control panel should scroll vertically. Refresh
             # once more after Qt settles a responsive layout change.
             editor_height = self.stairs_group.sizeHint().height()
             if self.stairs_group.maximumHeight() != editor_height:
@@ -4140,12 +4221,14 @@ class BlueprintWorkspace(QWidget):
         )
 
         self._stairs_scroll_width_filter = ViewportWidthRowFilter(
-            generals_tab.viewport(),
+            self.canvas_left_scroll_area.viewport(),
             (self.stairs_scroll_area,),
             horizontal_inset=10,
             on_width_changed=sync_stair_rows_to_viewport,
         )
-        generals_tab.viewport().installEventFilter(self._stairs_scroll_width_filter)
+        self.canvas_left_scroll_area.viewport().installEventFilter(
+            self._stairs_scroll_width_filter
+        )
         self._stairs_scroll_width_filter.sync_widths()
 
         self.doorways_group = QGroupBox("Doorways")
@@ -4194,7 +4277,7 @@ class BlueprintWorkspace(QWidget):
         self.doorway_preset_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.doorway_preset_list.setMinimumHeight(112)
+        self.doorway_preset_list.setFixedHeight(56)
         self.doorway_preset_list.currentRowChanged.connect(
             self._handle_doorway_preset_selection_changed
         )
@@ -4225,7 +4308,7 @@ class BlueprintWorkspace(QWidget):
         )
         doorway_buttons_layout.addWidget(self.place_doorway_button)
         doorways_layout.addLayout(doorway_buttons_layout)
-        side_layout.addWidget(self.doorways_group)
+        left_side_layout.addWidget(self.doorways_group)
 
         self.windows_group = QGroupBox("Window frames")
         windows_layout = QVBoxLayout(self.windows_group)
@@ -4249,7 +4332,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas_window_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.canvas_window_list.setMinimumHeight(96)
+        self.canvas_window_list.setFixedHeight(48)
         self.canvas_window_list.currentItemChanged.connect(
             self._handle_canvas_window_asset_selection_changed
         )
@@ -4272,7 +4355,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_place_selected_window_clicked
         )
         windows_layout.addWidget(self.place_selected_window_button)
-        side_layout.addWidget(self.windows_group)
+        left_side_layout.addWidget(self.windows_group)
 
         self.doors_group = QGroupBox("Doors")
         doors_layout = QVBoxLayout(self.doors_group)
@@ -4282,7 +4365,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas_door_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.canvas_door_list.setMinimumHeight(96)
+        self.canvas_door_list.setFixedHeight(48)
         self.canvas_door_list.currentItemChanged.connect(
             self._handle_canvas_door_selection_changed
         )
@@ -4303,7 +4386,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_place_selected_door_clicked
         )
         doors_layout.addWidget(self.place_selected_door_button)
-        side_layout.addWidget(self.doors_group)
+        left_side_layout.addWidget(self.doors_group)
 
         self.add_directional_light_button = QPushButton("Add directional light")
         self.add_directional_light_button.setObjectName(
@@ -4315,7 +4398,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_add_directional_light_clicked
         )
         self._refresh_directional_light_button_tooltip()
-        side_layout.addWidget(self.add_directional_light_button)
+        left_side_layout.addWidget(self.add_directional_light_button)
 
         self.outer_wall_marking_group = QGroupBox("Outer wall marking")
         outer_wall_marking_layout = QHBoxLayout(self.outer_wall_marking_group)
@@ -4358,7 +4441,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_outer_wall_edit_clicked
         )
         outer_wall_marking_layout.addWidget(self.outer_wall_edit_button)
-        side_layout.addWidget(self.outer_wall_marking_group)
+        right_side_layout.addWidget(self.outer_wall_marking_group)
 
         self.levels_group = QGroupBox("Levels")
         levels_layout = QVBoxLayout(self.levels_group)
@@ -4676,6 +4759,18 @@ class BlueprintWorkspace(QWidget):
         self.plan_wall_generation_status_label.setWordWrap(True)
         plan_wall_controls_layout.addRow(self.plan_wall_generation_status_label)
         self.plan_wall_controls_group.setEnabled(False)
+        self.plan_wall_controls_group.hide()
+        self.toggle_plan_wall_controls_button = QPushButton("Show automatic wall placement")
+        self.toggle_plan_wall_controls_button.setObjectName("toggle_plan_wall_controls_button")
+        self.toggle_plan_wall_controls_button.setCheckable(True)
+        self.toggle_plan_wall_controls_button.setChecked(False)
+        self.toggle_plan_wall_controls_button.setToolTip(
+            "Show or hide the wall-generation sliders without changing their values."
+        )
+        self.toggle_plan_wall_controls_button.toggled.connect(
+            self._handle_plan_wall_controls_visibility_changed
+        )
+        levels_layout.addWidget(self.toggle_plan_wall_controls_button)
         levels_layout.addWidget(self.plan_wall_controls_group)
 
         for slider in self._get_plan_wall_generation_sliders():
@@ -4691,8 +4786,10 @@ class BlueprintWorkspace(QWidget):
         self._update_wall_verification_instructions()
 
         self.levels_list = QListWidget()
+        self.levels_list.setUniformItemSizes(True)
+        self.levels_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.levels_list.currentRowChanged.connect(self._handle_level_list_row_changed)
-        levels_layout.addWidget(self.levels_list, 1)
+        levels_layout.addWidget(self.levels_list)
 
         level_options_layout = QFormLayout()
         level_options_layout.setContentsMargins(0, 0, 0, 0)
@@ -4714,7 +4811,7 @@ class BlueprintWorkspace(QWidget):
         include_layout.addStretch(1)
         level_options_layout.addRow("Include", include_widget)
         levels_layout.addLayout(level_options_layout)
-        side_layout.addWidget(self.levels_group, 1)
+        right_side_layout.addWidget(self.levels_group)
 
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(10)
@@ -4735,7 +4832,9 @@ class BlueprintWorkspace(QWidget):
         self.export_button.clicked.connect(self._handle_glb_export_clicked)
         buttons_layout.addWidget(self.export_button, 1)
 
-        side_layout.addLayout(buttons_layout)
+        right_side_layout.addLayout(buttons_layout)
+        left_side_layout.addStretch(1)
+        right_side_layout.addStretch(1)
 
         self._refresh_doorway_preset_list(selected_index=0)
         self._refresh_canvas_door_list()
@@ -4744,35 +4843,38 @@ class BlueprintWorkspace(QWidget):
         self._update_plan_wall_generation_controls_state()
         self._update_plan_image_erase_button_state()
 
-        self._generals_value_input_wheel_filter = RightPanelValueInputWheelFilter(
-            generals_tab
-        )
-        for spinbox in generals_content.findChildren(QAbstractSpinBox):
-            spinbox.installEventFilter(self._generals_value_input_wheel_filter)
-            spinbox.lineEdit().installEventFilter(
-                self._generals_value_input_wheel_filter
-            )
-        for combo in (
+        self._canvas_panel_value_input_wheel_filters = []
+        protected_value_controls = (
             self.stair_type_combo,
             self.stair_tread_edge_combo,
             self.stair_starting_step_combo,
             self.stair_stringer_placement_combo,
-        ):
-            combo.installEventFilter(self._generals_value_input_wheel_filter)
-        for slider in (
             self.level_scale_slider,
             self.level_x_offset_slider,
             self.level_y_offset_slider,
             self.canvas_level_scale_slider,
             self.canvas_x_offset_slider,
             self.canvas_y_offset_slider,
+        )
+        for scroll_area, controls in (
+            (self.canvas_left_scroll_area, self.canvas_left_controls),
+            (self.canvas_right_scroll_area, self.canvas_right_controls),
         ):
-            slider.installEventFilter(self._generals_value_input_wheel_filter)
+            wheel_filter = CanvasPanelValueInputWheelFilter(scroll_area)
+            self._canvas_panel_value_input_wheel_filters.append(wheel_filter)
+            for spinbox in controls.findChildren(QAbstractSpinBox):
+                spinbox.installEventFilter(wheel_filter)
+                spinbox.lineEdit().installEventFilter(wheel_filter)
+            for control in protected_value_controls:
+                if controls.isAncestorOf(control):
+                    control.installEventFilter(wheel_filter)
 
+        self.workspace_splitter.insertWidget(0, self.left_panel)
         self.workspace_splitter.addWidget(self.side_panel)
-        self.workspace_splitter.setStretchFactor(0, 9)
-        self.workspace_splitter.setStretchFactor(1, 1)
-        self.workspace_splitter.setSizes([1060, 540])
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 8)
+        self.workspace_splitter.setStretchFactor(2, 1)
+        self.workspace_splitter.setSizes([410, 650, 540])
 
         self.canvas.geometry_changed.connect(
             self._handle_canvas_surface_geometry_changed
@@ -13242,6 +13344,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         self.side_panel.setVisible(not is_full_width_workspace)
+        self.left_panel.setVisible(not is_full_width_workspace)
         if selected_widget is self.merged_generation_workspace:
             self.merged_generation_workspace.refresh_file_backed_previews()
         elif selected_widget is self.scene_3d_workspace:
@@ -22097,6 +22200,15 @@ class BlueprintWorkspace(QWidget):
         self._update_image_correction_button_state()
 
     # ### Wall-preview cancellation and control state ###
+    @Slot(bool)
+    def _handle_plan_wall_controls_visibility_changed(self, visible: bool) -> None:
+        """Collapse only the wall controls, leaving their values and jobs intact."""
+
+        self.plan_wall_controls_group.setVisible(visible)
+        self.toggle_plan_wall_controls_button.setText(
+            "Hide automatic wall placement" if visible else "Show automatic wall placement"
+        )
+
     def _clear_plan_wall_preview(self, *, update_controls: bool = True) -> None:
         """Discard cached wall evidence and its non-destructive Canvas overlay."""
 
@@ -23499,6 +23611,13 @@ class BlueprintWorkspace(QWidget):
         for level_position in ordered_positions:
             level = self.levels[level_position]
             self.levels_list.addItem(self._build_level_item(level, level_position))
+        row_height = self.levels_list.sizeHintForRow(0)
+        if row_height < 1:
+            row_height = self.levels_list.fontMetrics().height() + 2
+        self.levels_list.setFixedHeight(
+            CANVAS_LEVEL_LIST_VISIBLE_ROWS * row_height
+            + 2 * self.levels_list.frameWidth()
+        )
         self.levels_list.setCurrentRow(
             self._level_list_row_for_position(self.current_level_index)
         )
@@ -29959,6 +30078,12 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.set_runtime_settings(settings)
         self.surface_texture_generation.set_runtime_settings(settings)
+        self.merged_generation_workspace.set_reference_generation_model(
+            settings.reference_generation_model
+        )
+        self.merged_generation_workspace.set_ceiling_height_estimation_model(
+            settings.ceiling_height_estimation_model
+        )
         self.merged_generation_workspace.set_clear_mask_hotkey(
             settings.clear_mask_hotkey
         )
@@ -30316,6 +30441,7 @@ class BlueprintWorkspace(QWidget):
 
         if self._is_applying_project_state:
             raise RuntimeError("A project is already being applied.")
+        self.merged_generation_workspace.reset_ceiling_height_analysis()
         self._is_applying_project_state = True
         self._project_apply_base_surfaces = None
         self._project_apply_base_surfaces_by_id = None

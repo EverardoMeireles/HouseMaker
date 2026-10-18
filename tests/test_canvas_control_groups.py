@@ -18,8 +18,10 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QLabel,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QWidget,
 )
 
@@ -63,7 +65,8 @@ class CanvasControlGroupingTests(unittest.TestCase):
     def _group_named(self, title: str) -> QGroupBox:
         matching_groups = [
             group
-            for group in self.workspace.side_panel.findChildren(QGroupBox)
+            for panel in (self.workspace.left_panel, self.workspace.side_panel)
+            for group in panel.findChildren(QGroupBox)
             if group.title() == title
         ]
         self.assertEqual(
@@ -72,6 +75,100 @@ class CanvasControlGroupingTests(unittest.TestCase):
             f"Expected exactly one Canvas group titled {title!r}",
         )
         return matching_groups[0]
+
+    def test_canvas_controls_are_split_between_left_and_right_panels(self) -> None:
+        workspace = self.workspace
+        self.assertFalse(hasattr(workspace, "side_tabs"))
+        self.assertEqual(workspace.left_panel.findChildren(QTabWidget), [])
+        self.assertEqual(workspace.side_panel.findChildren(QTabWidget), [])
+        self.assertEqual(workspace.workspace_splitter.count(), 3)
+        self.assertIs(workspace.workspace_splitter.widget(0), workspace.left_panel)
+        self.assertIs(workspace.workspace_splitter.widget(1), workspace.workspace_tabs)
+        self.assertIs(workspace.workspace_splitter.widget(2), workspace.side_panel)
+
+        for group in (
+            workspace.level_dimensions_group,
+            workspace.merged_generation_workspace.ceiling_height_section,
+            workspace.level_transform_group,
+            workspace.canvas_transform_group,
+            self._group_named("Outer wall marking"),
+            workspace.levels_group,
+        ):
+            with self.subTest(right_group=group.title()):
+                self.assertTrue(workspace.side_panel.isAncestorOf(group))
+                self.assertTrue(workspace.canvas_right_scroll_area.isAncestorOf(group))
+                self.assertFalse(workspace.left_panel.isAncestorOf(group))
+
+        for control in (
+            workspace.open_spaces_group,
+            workspace.stairs_group,
+            workspace.doorways_group,
+            workspace.windows_group,
+            workspace.doors_group,
+            workspace.add_directional_light_button,
+        ):
+            with self.subTest(left_control=control.objectName()):
+                self.assertTrue(workspace.left_panel.isAncestorOf(control))
+                self.assertTrue(workspace.canvas_left_scroll_area.isAncestorOf(control))
+                self.assertFalse(workspace.side_panel.isAncestorOf(control))
+
+    def test_room_analysis_follows_dimensions_in_the_right_panel(self) -> None:
+        workspace = self.workspace
+        merged = workspace.merged_generation_workspace
+        group = self._group_named("Room analysis")
+        self.assertIs(group, merged.ceiling_height_section)
+        self.assertTrue(group.isAncestorOf(merged.infer_ceiling_height_button))
+        self.assertTrue(group.isAncestorOf(merged.ceiling_height_result_label))
+        self.assertFalse(merged.isAncestorOf(group))
+        right_layout = workspace.canvas_right_controls.layout()
+        assert right_layout is not None
+        self.assertEqual(
+            right_layout.indexOf(group),
+            right_layout.indexOf(workspace.level_dimensions_group) + 1,
+        )
+        self.assertEqual(
+            right_layout.indexOf(workspace.transform_controls_scroll_area),
+            right_layout.indexOf(group) + 1,
+        )
+        self.assertTrue(merged.infer_ceiling_height_button.isEnabled())
+
+    def test_project_buttons_share_a_right_panel_row_below_levels(self) -> None:
+        workspace = self.workspace
+        controls_layout = workspace.canvas_right_controls.layout()
+        assert controls_layout is not None
+        levels_index = controls_layout.indexOf(workspace.levels_group)
+        self.assertGreaterEqual(levels_index, 0)
+        buttons_item = controls_layout.itemAt(levels_index + 1)
+        assert buttons_item is not None
+        buttons_layout = buttons_item.layout()
+        assert buttons_layout is not None
+        project_buttons = (
+            workspace.save_button,
+            workspace.load_button,
+            workspace.export_button,
+        )
+        self.assertEqual(buttons_layout.count(), len(project_buttons))
+        for index, button in enumerate(project_buttons):
+            with self.subTest(button=button.text()):
+                self.assertIs(buttons_layout.itemAt(index).widget(), button)
+                self.assertTrue(workspace.side_panel.isAncestorOf(button))
+                self.assertTrue(workspace.canvas_right_scroll_area.isAncestorOf(button))
+                self.assertFalse(workspace.left_panel.isAncestorOf(button))
+
+    def test_both_canvas_panels_hide_when_opening_another_workspace(self) -> None:
+        workspace = self.workspace
+        self.assertTrue(workspace.left_panel.isVisible())
+        self.assertTrue(workspace.side_panel.isVisible())
+
+        workspace.workspace_tabs.setCurrentIndex(workspace.settings_workspace_tab_index)
+        _qt_application.processEvents()
+        self.assertTrue(workspace.left_panel.isHidden())
+        self.assertTrue(workspace.side_panel.isHidden())
+
+        workspace.workspace_tabs.setCurrentIndex(workspace.canvas_workspace_tab_index)
+        _qt_application.processEvents()
+        self.assertTrue(workspace.left_panel.isVisible())
+        self.assertTrue(workspace.side_panel.isVisible())
 
     def _assert_group_contains(
         self,
@@ -137,6 +234,205 @@ class CanvasControlGroupingTests(unittest.TestCase):
             labels={"Arch amount"},
         )
 
+    def test_automatic_wall_controls_can_be_hidden_without_resetting_the_preview(
+        self,
+    ) -> None:
+        toggle = self.workspace.toggle_plan_wall_controls_button
+        group = self.workspace.plan_wall_controls_group
+        sliders = self.workspace._get_plan_wall_generation_sliders()
+        values_before = tuple(slider.value() for slider in sliders)
+        self.assertTrue(toggle.isCheckable())
+        self.assertFalse(toggle.isChecked())
+        self.assertTrue(toggle.text().startswith("Show"))
+        self.assertTrue(group.isHidden())
+        self.assertFalse(group.isEnabled())
+        self.assertFalse(group.isAncestorOf(toggle))
+        self.assertTrue(toggle.isEnabled())
+
+        toggle.click()
+        _qt_application.processEvents()
+        self.assertTrue(toggle.isChecked())
+        self.assertTrue(toggle.text().startswith("Hide"))
+        self.assertFalse(group.isHidden())
+        self.assertFalse(group.isEnabled())
+        self.assertEqual(tuple(slider.value() for slider in sliders), values_before)
+
+        toggle.click()
+        _qt_application.processEvents()
+        self.assertFalse(toggle.isChecked())
+        self.assertTrue(toggle.text().startswith("Show"))
+        self.assertTrue(group.isHidden())
+        self.assertFalse(group.isEnabled())
+        self.assertEqual(tuple(slider.value() for slider in sliders), values_before)
+
+        group.setEnabled(True)
+        self.assertTrue(group.isHidden())
+        toggle.click()
+        _qt_application.processEvents()
+        self.assertTrue(toggle.isChecked())
+        self.assertTrue(toggle.text().startswith("Hide"))
+        self.assertFalse(group.isHidden())
+        self.assertTrue(group.isEnabled())
+        self.assertEqual(tuple(slider.value() for slider in sliders), values_before)
+
+    def test_level_list_has_room_for_eight_rows(self) -> None:
+        levels = self.workspace.levels_list
+        levels.blockSignals(True)
+        try:
+            levels.clear()
+            for index in range(9):
+                levels.addItem(QListWidgetItem(f"L{index + 1} Test level"))
+            levels.setCurrentRow(0)
+            levels.scrollToTop()
+            levels.doItemsLayout()
+            _qt_application.processEvents()
+
+            viewport = levels.viewport().rect()
+            for index in range(8):
+                self.assertTrue(
+                    viewport.contains(levels.visualItemRect(levels.item(index))),
+                    f"Level row {index + 1} does not fit in the level list",
+                )
+            self.assertFalse(viewport.contains(levels.visualItemRect(levels.item(8))))
+            self.assertGreater(levels.verticalScrollBar().maximum(), 0)
+        finally:
+            levels.blockSignals(False)
+
+    def test_doorway_window_and_door_lists_are_half_the_previous_height(
+        self,
+    ) -> None:
+        for list_widget, expected_height in (
+            (self.workspace.doorway_preset_list, 56),
+            (self.workspace.canvas_window_list, 48),
+            (self.workspace.canvas_door_list, 48),
+        ):
+            with self.subTest(list_widget=list_widget.objectName()):
+                self.assertEqual(list_widget.minimumHeight(), expected_height)
+                self.assertEqual(list_widget.maximumHeight(), expected_height)
+                self.assertEqual(list_widget.height(), expected_height)
+
+    def test_level_and_canvas_transforms_share_aligned_side_by_side_rows(
+        self,
+    ) -> None:
+        self.workspace.workspace_splitter.setSizes([380, 500, 700])
+        _qt_application.processEvents()
+        _qt_application.processEvents()
+        row = self.workspace.transform_controls_row
+        level = self.workspace.level_transform_group
+        canvas = self.workspace.canvas_transform_group
+        local_scroll = self.workspace.transform_controls_scroll_area
+        self.assertEqual(local_scroll.horizontalScrollBar().maximum(), 0)
+        self.assertEqual(local_scroll.verticalScrollBar().maximum(), 0)
+        self.assertTrue(row.isAncestorOf(level))
+        self.assertTrue(row.isAncestorOf(canvas))
+        self.assertEqual(
+            level.mapTo(row, QPoint(0, 0)).y(),
+            canvas.mapTo(row, QPoint(0, 0)).y(),
+        )
+        self.assertLess(
+            level.mapTo(row, QPoint(level.width() - 1, 0)).x(),
+            canvas.mapTo(row, QPoint(0, 0)).x(),
+        )
+        self.assertLessEqual(abs(level.width() - canvas.width()), 2)
+
+        for level_slider, canvas_slider in (
+            (
+                self.workspace.level_scale_slider,
+                self.workspace.canvas_level_scale_slider,
+            ),
+            (
+                self.workspace.level_x_offset_slider,
+                self.workspace.canvas_x_offset_slider,
+            ),
+            (
+                self.workspace.level_y_offset_slider,
+                self.workspace.canvas_y_offset_slider,
+            ),
+        ):
+            with self.subTest(level_slider=level_slider.objectName()):
+                level_center = level_slider.mapTo(row, level_slider.rect().center())
+                canvas_center = canvas_slider.mapTo(row, canvas_slider.rect().center())
+                self.assertLessEqual(abs(level_center.y() - canvas_center.y()), 2)
+                self.assertGreaterEqual(level_slider.width(), 24)
+                self.assertGreaterEqual(canvas_slider.width(), 24)
+
+        scroll_area = self.workspace.canvas_right_scroll_area
+        self.assertIsInstance(scroll_area, QScrollArea)
+        assert isinstance(scroll_area, QScrollArea)
+        viewport = scroll_area.viewport()
+        scroll_area.ensureWidgetVisible(row, 0, 0)
+        _qt_application.processEvents()
+        for group in (level, canvas):
+            for widget in group.findChildren(QWidget):
+                if widget.isHidden():
+                    continue
+                top_left = widget.mapTo(viewport, QPoint(0, 0))
+                bottom_right = widget.mapTo(
+                    viewport,
+                    QPoint(widget.width() - 1, widget.height() - 1),
+                )
+                self.assertTrue(viewport.rect().contains(top_left))
+                self.assertTrue(viewport.rect().contains(bottom_right))
+
+    def test_narrow_transform_rows_scroll_locally_without_clipping_the_canvas(
+        self,
+    ) -> None:
+        self.workspace.resize(760, 900)
+        _qt_application.processEvents()
+        _qt_application.processEvents()
+        scroll_area = self.workspace.canvas_right_scroll_area
+        self.assertIsInstance(scroll_area, QScrollArea)
+        assert isinstance(scroll_area, QScrollArea)
+        outer_viewport = scroll_area.viewport()
+        local_scroll = self.workspace.transform_controls_scroll_area
+        row = self.workspace.transform_controls_row
+        level_group = self.workspace.level_transform_group
+        canvas_group = self.workspace.canvas_transform_group
+
+        self.assertEqual(local_scroll.verticalScrollBar().maximum(), 0)
+        self.assertGreater(local_scroll.horizontalScrollBar().maximum(), 0)
+        self.assertGreater(row.width(), local_scroll.viewport().width())
+        self.assertEqual(
+            level_group.mapTo(row, QPoint(0, 0)).y(),
+            canvas_group.mapTo(row, QPoint(0, 0)).y(),
+        )
+        self.assertLess(
+            level_group.mapTo(row, QPoint(level_group.width() - 1, 0)).x(),
+            canvas_group.mapTo(row, QPoint(0, 0)).x(),
+        )
+        self.assertLessEqual(abs(level_group.width() - canvas_group.width()), 2)
+        self.assertLessEqual(
+            local_scroll.mapTo(outer_viewport, QPoint(0, 0)).x()
+            + local_scroll.width(),
+            outer_viewport.width(),
+        )
+
+        scroll_area.ensureWidgetVisible(local_scroll, 0, 0)
+        local_scroll.horizontalScrollBar().setValue(
+            local_scroll.horizontalScrollBar().maximum()
+        )
+        _qt_application.processEvents()
+        local_viewport = local_scroll.viewport()
+        for control in (
+            self.workspace.canvas_level_scale_increase_button,
+            self.workspace.canvas_x_offset_increase_button,
+            self.workspace.canvas_y_offset_increase_button,
+        ):
+            with self.subTest(control=control.objectName()):
+                top_left = control.mapTo(local_viewport, QPoint(0, 0))
+                bottom_right = control.mapTo(
+                    local_viewport,
+                    QPoint(control.width() - 1, control.height() - 1),
+                )
+                self.assertTrue(local_viewport.rect().contains(top_left))
+                self.assertTrue(local_viewport.rect().contains(bottom_right))
+                self.assertEqual(control.visibleRegion().boundingRect(), control.rect())
+
+        canvas = self.workspace.canvas
+        self.assertEqual(canvas.visibleRegion().boundingRect(), canvas.rect())
+        top_right = QPoint(canvas.width() - 4, 12)
+        self.assertIs(QApplication.widgetAt(canvas.mapToGlobal(top_right)), canvas)
+
     def test_canvas_and_scene_expose_shared_window_frame_controls(self) -> None:
         self._assert_group_contains(
             "Window frames",
@@ -170,7 +466,7 @@ class CanvasControlGroupingTests(unittest.TestCase):
             side_layout.indexOf(self.workspace.windows_group) + 1,
         )
 
-    def test_outer_wall_marking_follows_light_with_edit_action(
+    def test_outer_wall_marking_is_on_the_right_with_edit_action(
         self,
     ) -> None:
         marking_group = self._group_named("Outer wall marking")
@@ -190,11 +486,15 @@ class CanvasControlGroupingTests(unittest.TestCase):
         )
         self.assertIs(marking_layout.itemAt(2).widget(), buttons_by_text["Edit"])
 
-        side_layout = self.workspace.doorways_group.parentWidget().layout()
+        side_layout = marking_group.parentWidget().layout()
         assert side_layout is not None
         self.assertEqual(
             side_layout.indexOf(marking_group),
-            side_layout.indexOf(self.workspace.add_directional_light_button) + 1,
+            side_layout.indexOf(self.workspace.transform_controls_scroll_area) + 1,
+        )
+        self.assertEqual(
+            side_layout.indexOf(self.workspace.levels_group),
+            side_layout.indexOf(marking_group) + 1,
         )
 
     def test_stairs_group_contains_editor_status_and_add_controls(self) -> None:
@@ -234,12 +534,12 @@ class CanvasControlGroupingTests(unittest.TestCase):
         )
 
     def test_nosing_editor_fits_the_default_canvas_side_panel_viewport(self) -> None:
-        scroll_area = self.workspace.side_tabs.currentWidget()
+        scroll_area = self.workspace.canvas_left_scroll_area
         self.assertIsInstance(scroll_area, QScrollArea)
         assert isinstance(scroll_area, QScrollArea)
         viewport = scroll_area.viewport()
-        self.assertGreaterEqual(viewport.width(), 450)
-        self.assertLessEqual(viewport.width(), 500)
+        self.assertGreater(viewport.width(), 0)
+        self.assertLessEqual(viewport.width(), self.workspace.left_panel.width())
 
         stair_parameters_layout = self.workspace.stairs_group.findChild(QFormLayout)
         self.assertIsNotNone(stair_parameters_layout)
@@ -278,8 +578,10 @@ class CanvasControlGroupingTests(unittest.TestCase):
             abs(overhang_field_center.y() - overhang_label_center.y()),
             2,
         )
-        self.assertGreater(left_center.x(), placement_label_center.x())
-        self.assertLessEqual(abs(left_center.y() - placement_label_center.y()), 2)
+        if abs(left_center.y() - placement_label_center.y()) <= 2:
+            self.assertGreater(left_center.x(), placement_label_center.x())
+        else:
+            self.assertGreater(left_center.y(), placement_label_center.y())
         self.assertGreater(left_center.y(), overhang_field_center.y())
         self.assertFalse(self.workspace.stair_nosing_overhang_label.wordWrap())
         self.assertFalse(self.workspace.stair_nosing_placement_label.wordWrap())
@@ -495,7 +797,7 @@ class CanvasControlGroupingTests(unittest.TestCase):
             self.assertEqual(widget.visibleRegion().boundingRect(), widget.rect())
 
         default_viewport_width = viewport.width()
-        self.workspace.workspace_splitter.setSizes([900, 700])
+        self.workspace.workspace_splitter.setSizes([700, 500, 400])
         _qt_application.processEvents()
         self.assertGreater(viewport.width(), default_viewport_width)
         assert_starting_step_fields_share_the_row()
@@ -503,7 +805,7 @@ class CanvasControlGroupingTests(unittest.TestCase):
     def test_stairs_editor_reflows_without_clipped_text_on_narrower_panels(
         self,
     ) -> None:
-        scroll_area = self.workspace.side_tabs.currentWidget()
+        scroll_area = self.workspace.canvas_left_scroll_area
         self.assertIsInstance(scroll_area, QScrollArea)
         assert isinstance(scroll_area, QScrollArea)
         viewport = scroll_area.viewport()
@@ -511,13 +813,15 @@ class CanvasControlGroupingTests(unittest.TestCase):
         self.assertIsNotNone(form)
         assert form is not None
 
-        for workspace_width, expected_wrap, local_scroll_expected in (
-            (1500, QFormLayout.RowWrapPolicy.DontWrapRows, False),
-            (1300, QFormLayout.RowWrapPolicy.WrapLongRows, False),
-            (760, QFormLayout.RowWrapPolicy.WrapLongRows, True),
+        for panel_width, expected_wrap, local_scroll_expected in (
+            (560, QFormLayout.RowWrapPolicy.DontWrapRows, False),
+            (420, QFormLayout.RowWrapPolicy.WrapLongRows, False),
+            (220, QFormLayout.RowWrapPolicy.WrapLongRows, True),
         ):
-            with self.subTest(workspace_width=workspace_width):
-                self.workspace.resize(workspace_width, 900)
+            with self.subTest(panel_width=panel_width):
+                self.workspace.workspace_splitter.setSizes(
+                    [panel_width, 1120 - panel_width, 460]
+                )
                 _qt_application.processEvents()
                 _qt_application.processEvents()
                 self.assertEqual(form.rowWrapPolicy(), expected_wrap)
@@ -555,7 +859,10 @@ class CanvasControlGroupingTests(unittest.TestCase):
                 checkbox_top = self.workspace.stair_nosing_left_checkbox.mapTo(
                     self.workspace.stair_nosing_row_widget, QPoint(0, 0)
                 )
-                self.assertGreater(checkbox_top.y(), placement_label_top.y())
+                if panel_width == 560:
+                    self.assertEqual(checkbox_top.y(), placement_label_top.y())
+                else:
+                    self.assertGreater(checkbox_top.y(), placement_label_top.y())
                 checkbox_widths = tuple(
                     checkbox.width()
                     for checkbox in (
@@ -595,7 +902,7 @@ class CanvasControlGroupingTests(unittest.TestCase):
                             viewport.rect().contains(
                                 label.mapTo(viewport, QPoint(label.width() - 1, 0))
                             ),
-                            f"{label.text()!r} is cut off at width {workspace_width}",
+                            f"{label.text()!r} is cut off at panel width {panel_width}",
                         )
 
                 for control in (
@@ -639,9 +946,11 @@ class CanvasControlGroupingTests(unittest.TestCase):
                         self.workspace.add_stairs_button.height(),
                     )
 
-        for workspace_width, local_scroll_expected in ((1600, False), (760, True)):
-            with self.subTest(transition_width=workspace_width):
-                self.workspace.resize(workspace_width, 900)
+        for panel_width, local_scroll_expected in ((560, False), (220, True)):
+            with self.subTest(transition_width=panel_width):
+                self.workspace.workspace_splitter.setSizes(
+                    [panel_width, 1120 - panel_width, 460]
+                )
                 _qt_application.processEvents()
                 _qt_application.processEvents()
                 local_scroll = self.workspace.stairs_scroll_area

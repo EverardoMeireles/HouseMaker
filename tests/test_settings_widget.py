@@ -21,6 +21,11 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.ceiling_height_estimation import (
+    CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY,
+    CEILING_HEIGHT_INFERENCE_MODEL,
+    CEILING_HEIGHT_MODEL_OPTIONS,
+)
 from housemaker.first_person_navigation import (
     DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
@@ -95,6 +100,7 @@ from housemaker.settings_widget import (
     read_automatic_atlas_texture_resolution,
     read_automatic_atlas_texture_sort_by_pbr,
     read_canvas_3d_navigation_toggle_hotkey,
+    read_ceiling_height_estimation_model,
     read_clear_mask_hotkey,
     read_cut_connection_on_double_vertex_deletion,
     read_doors_and_windows_point_light_intensity,
@@ -133,6 +139,129 @@ class SettingsWidgetTests(unittest.TestCase):
             GenerationServiceSettings().meshy_target_polycount,
             2_000,
         )
+
+    def test_ceiling_height_model_defaults_and_options_include_local_qwen(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            self.assertEqual(
+                widget.get_settings().ceiling_height_estimation_model,
+                CEILING_HEIGHT_INFERENCE_MODEL,
+            )
+            self.assertEqual(
+                GenerationServiceSettings().ceiling_height_estimation_model,
+                CEILING_HEIGHT_INFERENCE_MODEL,
+            )
+            combo = widget.ceiling_height_estimation_model_combo
+            self.assertEqual(
+                tuple(
+                    (combo.itemText(index), combo.itemData(index))
+                    for index in range(combo.count())
+                ),
+                CEILING_HEIGHT_MODEL_OPTIONS,
+            )
+            self.assertTrue(
+                any("Local" in label for label, _model in CEILING_HEIGHT_MODEL_OPTIONS)
+            )
+            form = widget.room_analysis_settings_group.layout()
+            self.assertIsInstance(form, QFormLayout)
+            assert isinstance(form, QFormLayout)
+            self.assertEqual(
+                form.labelForField(combo).text(),
+                "Ceiling height estimation model",
+            )
+            widget.dispose()
+
+    def test_ceiling_height_model_restores_old_dialog_selection_without_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            model = CEILING_HEIGHT_MODEL_OPTIONS[-1][1]
+            store.set("generation/ceiling_height_estimation_model", model)
+            with patch.object(store, "set", wraps=store.set) as setting_writer:
+                widget = SettingsWidget(application_settings=store, environment={})
+                self.assertEqual(
+                    widget.get_settings().ceiling_height_estimation_model,
+                    model,
+                )
+                self.assertNotIn(
+                    CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY,
+                    [call.args[0] for call in setting_writer.call_args_list],
+                )
+            widget.dispose()
+
+    def test_ceiling_height_model_changes_persist_and_emit_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            emitted: list[bool] = []
+            widget.settings_changed.connect(lambda: emitted.append(True))
+            combo = widget.ceiling_height_estimation_model_combo
+            for index, (_label, model) in enumerate(CEILING_HEIGHT_MODEL_OPTIONS[1:], 1):
+                combo.setCurrentIndex(index)
+                self.assertEqual(
+                    store.get(CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY),
+                    model,
+                )
+                self.assertEqual(
+                    widget.get_settings().ceiling_height_estimation_model,
+                    model,
+                )
+            self.assertEqual(emitted, [True] * (combo.count() - 1))
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().ceiling_height_estimation_model,
+                CEILING_HEIGHT_MODEL_OPTIONS[-1][1],
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_ceiling_height_model_rejects_invalid_values_and_restores_safely(
+        self,
+    ) -> None:
+        self.assertEqual(
+            read_ceiling_height_estimation_model(None),
+            CEILING_HEIGHT_INFERENCE_MODEL,
+        )
+        for invalid in ("unknown", "", None, True, 1, [], {}):
+            with self.subTest(value=invalid):
+                with self.assertRaisesRegex(
+                    ValueError, "Unknown ceiling height estimation model"
+                ):
+                    GenerationServiceSettings(
+                        ceiling_height_estimation_model=invalid  # type: ignore[arg-type]
+                    )
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    store = _build_test_settings(temporary_directory)
+                    store.set(CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY, invalid)
+                    self.assertEqual(
+                        read_ceiling_height_estimation_model(store),
+                        CEILING_HEIGHT_INFERENCE_MODEL,
+                    )
+                    widget = SettingsWidget(
+                        application_settings=store, environment={}
+                    )
+                    self.assertEqual(
+                        widget.get_settings().ceiling_height_estimation_model,
+                        CEILING_HEIGHT_INFERENCE_MODEL,
+                    )
+                    widget.dispose()
+
+    def test_ceiling_height_model_accepts_each_supported_option(self) -> None:
+        for _label, model in CEILING_HEIGHT_MODEL_OPTIONS:
+            with self.subTest(model=model):
+                self.assertEqual(
+                    GenerationServiceSettings(
+                        ceiling_height_estimation_model=model
+                    ).ceiling_height_estimation_model,
+                    model,
+                )
 
     def test_controls_are_organized_into_clear_settings_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -186,6 +315,11 @@ class SettingsWidgetTests(unittest.TestCase):
                     widget.generation_shortcuts_group,
                     "Generation shortcuts",
                     (widget.clear_mask_hotkey_combo,),
+                ),
+                (
+                    widget.room_analysis_settings_group,
+                    "Room analysis",
+                    (widget.ceiling_height_estimation_model_combo,),
                 ),
                 (
                     widget.object_generation_settings_group,

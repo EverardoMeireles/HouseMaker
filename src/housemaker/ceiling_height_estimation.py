@@ -33,6 +33,7 @@ from housemaker.video_source import normalize_video_frame
 
 # ### Constants ###
 CEILING_HEIGHT_INFERENCE_MODEL = "gpt-5.6-luna"
+CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY = "generation/ceiling_height_estimation_model"
 CEILING_HEIGHT_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
     ("GPT-5.6 Luna", "gpt-5.6-luna"),
     ("GPT-5.6 Terra", "gpt-5.6-terra"),
@@ -430,6 +431,7 @@ def estimate_ceiling_height_api_cost_usd(
     frame_width: int,
     frame_height: int,
     plan_reference_size: tuple[int, int] | None = None,
+    sample_count: int | None = None,
 ) -> float | None:
     """Return a conservative paired-frame API cost estimate, when paid."""
 
@@ -438,9 +440,14 @@ def estimate_ceiling_height_api_cost_usd(
         return None
     if frame_width < 1 or frame_height < 1:
         raise ValueError("Video dimensions must be positive.")
-    sample_count = len(
-        sample_entire_video_frame_indices(frame_count, interval)
-    )
+    if sample_count is None:
+        sample_count = len(
+            sample_entire_video_frame_indices(frame_count, interval)
+        )
+    elif isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        raise TypeError("The analysis sample count must be an integer.")
+    elif sample_count < 0:
+        raise ValueError("The analysis sample count cannot be negative.")
     if sample_count == 0:
         return 0.0
 
@@ -741,27 +748,11 @@ def aggregate_level_ceiling_height_estimates(
 
     names_by_index = dict(level_options)
 
-    def aggregate_level_samples(
-        samples: Iterable[tuple[int, CeilingHeightEstimate]],
-    ) -> CeilingHeightVideoEstimate:
-        analysis = aggregate_ceiling_height_estimates(samples)
-        if (
-            not analysis.has_consensus
-            or analysis.retained_count >= MINIMUM_VIDEO_CONSENSUS_ESTIMATES
-        ):
-            return analysis
-        return CeilingHeightVideoEstimate(
-            average_height_m=None,
-            retained_frame_indices=analysis.retained_frame_indices,
-            outlier_frame_indices=analysis.outlier_frame_indices,
-            insufficient_frame_indices=analysis.insufficient_frame_indices,
-        )
-
     level_estimates = tuple(
         CeilingHeightLevelEstimate(
             level_index=level_index,
             level_name=names_by_index[level_index],
-            analysis=aggregate_level_samples(
+            analysis=_aggregate_video_level_estimates(
                 attributed.get(level_index, ())
             ),
         )
@@ -774,6 +765,48 @@ def aggregate_level_ceiling_height_estimates(
         ),
         transition_frame_indices=tuple(transition_frames),
         unassigned_frame_indices=tuple(unassigned_frames),
+    )
+
+
+def aggregate_marked_level_ceiling_height_estimates(
+    samples: Iterable[tuple[int, int, CeilingHeightEstimate]],
+    *,
+    levels: Iterable[tuple[int, str]],
+) -> CeilingHeightAnalysisResult:
+    """Aggregate explicitly marked levels without inferring level transitions."""
+
+    level_options = _normalize_level_options(levels)
+    names_by_index = dict(level_options)
+    attributed: dict[int, list[tuple[int, CeilingHeightEstimate]]] = {}
+    frame_estimates: list[tuple[int, CeilingHeightEstimate]] = []
+    for item in samples:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise ValueError(
+                "Each marked estimate must contain a level, frame and estimate."
+            )
+        level_index, frame_index, estimate = item
+        if isinstance(level_index, bool) or not isinstance(level_index, int):
+            raise TypeError("Ceiling-height level indices must be integers.")
+        if level_index not in names_by_index:
+            raise ValueError("A marked video level is no longer available.")
+        frame_estimates.append((frame_index, estimate))
+        attributed.setdefault(level_index, []).append((frame_index, estimate))
+    _validate_video_frame_estimates(tuple(frame_estimates))
+
+    level_estimates: list[CeilingHeightLevelEstimate] = []
+    for level_index, level_name in level_options:
+        if level_index not in attributed:
+            continue
+        level_samples = sorted(attributed[level_index], key=lambda item: item[0])
+        analysis = _aggregate_video_level_estimates(level_samples)
+        level_estimates.append(
+            CeilingHeightLevelEstimate(level_index, level_name, analysis)
+        )
+    return CeilingHeightAnalysisResult(
+        level_estimates=tuple(level_estimates),
+        sampled_frame_indices=tuple(sorted(frame for frame, _ in frame_estimates)),
+        transition_frame_indices=(),
+        unassigned_frame_indices=(),
     )
 
 
@@ -995,6 +1028,25 @@ def format_ceiling_height_estimate(estimate: CeilingHeightEstimate) -> str:
 
 
 # ### Video aggregation helpers ###
+def _aggregate_video_level_estimates(
+    samples: Iterable[tuple[int, CeilingHeightEstimate]],
+) -> CeilingHeightVideoEstimate:
+    """Require repeated height evidence for a level, including short marks."""
+
+    analysis = aggregate_ceiling_height_estimates(samples)
+    if (
+        not analysis.has_consensus
+        or analysis.retained_count >= MINIMUM_VIDEO_CONSENSUS_ESTIMATES
+    ):
+        return analysis
+    return CeilingHeightVideoEstimate(
+        average_height_m=None,
+        retained_frame_indices=analysis.retained_frame_indices,
+        outlier_frame_indices=analysis.outlier_frame_indices,
+        insufficient_frame_indices=analysis.insufficient_frame_indices,
+    )
+
+
 def _normalize_level_options(
     levels: Iterable[tuple[int, str]],
 ) -> tuple[tuple[int, str], ...]:

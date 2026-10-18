@@ -7,7 +7,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QTabWidget
 
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.main import BlueprintWorkspace
@@ -33,23 +33,23 @@ class CanvasFeatureRemovalTests(unittest.TestCase):
         self.widgets.append(widget)
         return widget
 
-    def test_canvas_general_tab_omits_retired_sections(self) -> None:
+    def test_canvas_panels_omit_retired_sections_and_general_tab(self) -> None:
         workspace = self._track_widget(BlueprintWorkspace())
         self.assertIsInstance(workspace, BlueprintWorkspace)
 
-        general_tab = workspace.side_tabs.widget(0)
-        self.assertIsNotNone(general_tab)
-        general_labels = {
-            label.text() for label in general_tab.findChildren(QLabel)
+        panel_labels = {
+            label.text()
+            for panel in (workspace.left_panel, workspace.side_panel)
+            for label in panel.findChildren(QLabel)
         }
-        self.assertNotIn("Initial first person camera", general_labels)
-        self.assertNotIn("Rooms", general_labels)
-        self.assertNotIn("Blueprint scale", general_labels)
-        self.assertNotIn("Blueprint X offset", general_labels)
-        self.assertNotIn("Blueprint Y offset", general_labels)
-        self.assertIn("Floor thickness", general_labels)
+        self.assertNotIn("Initial first person camera", panel_labels)
+        self.assertNotIn("Rooms", panel_labels)
+        self.assertNotIn("Blueprint scale", panel_labels)
+        self.assertNotIn("Blueprint X offset", panel_labels)
+        self.assertNotIn("Blueprint Y offset", panel_labels)
+        self.assertIn("Floor thickness", panel_labels)
         self.assertFalse(
-            any(text.startswith("Floor contour:") for text in general_labels)
+            any(text.startswith("Floor contour:") for text in panel_labels)
         )
         self.assertTrue(hasattr(workspace, "floor_thickness_spinbox"))
 
@@ -77,13 +77,10 @@ class CanvasFeatureRemovalTests(unittest.TestCase):
             with self.subTest(removed_attribute=removed_attribute):
                 self.assertFalse(hasattr(workspace, removed_attribute))
 
-        self.assertEqual(
-            [
-                workspace.side_tabs.tabText(index)
-                for index in range(workspace.side_tabs.count())
-            ],
-            ["Generals"],
-        )
+        self.assertFalse(hasattr(workspace, "side_tabs"))
+        for panel in (workspace.left_panel, workspace.side_panel):
+            with self.subTest(panel=panel):
+                self.assertEqual(panel.findChildren(QTabWidget), [])
         for removed_attribute in (
             "uvs_tab",
             "uv_canvas",

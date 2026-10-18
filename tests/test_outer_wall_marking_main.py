@@ -161,6 +161,9 @@ class OuterWallMarkingMainTests(unittest.TestCase):
         ]
         self.assertEqual(len(groups), 1)
         self.marking_group = groups[0]
+        self.assertFalse(
+            self.workspace.left_panel.isAncestorOf(self.marking_group)
+        )
 
     def tearDown(self) -> None:
         self.workspace.shutdown()

@@ -42,6 +42,11 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.ceiling_height_estimation import (
+    CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY,
+    CEILING_HEIGHT_INFERENCE_MODEL,
+    CEILING_HEIGHT_MODEL_OPTIONS,
+)
 from housemaker.first_person_navigation import (
     DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
@@ -65,6 +70,12 @@ from housemaker.plan_correction_models import (
     PLAN_CORRECTION_MODEL_OPTIONS,
     PLAN_CORRECTION_MODELS,
     plan_correction_model_label,
+)
+from housemaker.reference_generation_models import (
+    DEFAULT_REFERENCE_GENERATION_MODEL,
+    REFERENCE_GENERATION_MODEL_OPTIONS,
+    REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+    REFERENCE_GENERATION_MODELS,
 )
 from housemaker.reference_view_presets import (
     DEFAULT_REFERENCE_VIEW_PRESETS,
@@ -143,6 +154,9 @@ INCLUDE_LLM_WALL_VERIFICATION_SETTING_KEY = (
     "canvas/include_llm_wall_verification"
 )
 WALL_VERIFICATION_MODEL_SETTING_KEY = "canvas/wall_verification_model"
+CEILING_HEIGHT_ESTIMATION_MODELS = frozenset(
+    model_id for _label, model_id in CEILING_HEIGHT_MODEL_OPTIONS
+)
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_CLEAR_MASK_HOTKEY = "Ctrl+Shift+M"
 CLEAR_MASK_HOTKEY_OPTIONS = (
@@ -296,6 +310,8 @@ class GenerationServiceSettings:
         DEFAULT_INCLUDE_LLM_WALL_VERIFICATION
     )
     wall_verification_model: str = DEFAULT_WALL_VERIFICATION_MODEL
+    reference_generation_model: str = DEFAULT_REFERENCE_GENERATION_MODEL
+    ceiling_height_estimation_model: str = CEILING_HEIGHT_INFERENCE_MODEL
 
     def __post_init__(self) -> None:
         try:
@@ -438,6 +454,23 @@ class GenerationServiceSettings:
         if not isinstance(self.make_walls_continuous, bool):
             raise ValueError(
                 "Make walls continuous must be enabled or disabled."
+            )
+        if (
+            not isinstance(self.reference_generation_model, str)
+            or self.reference_generation_model not in REFERENCE_GENERATION_MODELS
+        ):
+            raise ValueError(
+                "Unknown reference generation model: "
+                f"{self.reference_generation_model!r}."
+            )
+        if (
+            not isinstance(self.ceiling_height_estimation_model, str)
+            or self.ceiling_height_estimation_model
+            not in CEILING_HEIGHT_ESTIMATION_MODELS
+        ):
+            raise ValueError(
+                "Unknown ceiling height estimation model: "
+                f"{self.ceiling_height_estimation_model!r}."
             )
         normalized_point_light_intensity = (
             _normalize_doors_and_windows_point_light_intensity(
@@ -693,6 +726,12 @@ class SettingsWidget(QWidget):
             plan_correction_model=str(
                 self.plan_correction_model_combo.currentData()
             ),
+            reference_generation_model=str(
+                self.reference_generation_model_combo.currentData()
+            ),
+            ceiling_height_estimation_model=str(
+                self.ceiling_height_estimation_model_combo.currentData()
+            ),
             make_walls_continuous=(
                 self.make_walls_continuous_checkbox.isChecked()
             ),
@@ -806,6 +845,12 @@ class SettingsWidget(QWidget):
             "Canvas",
             "canvas_settings_group",
         )
+        self.room_analysis_settings_group, room_analysis_form = (
+            self._build_form_group(
+                "Room analysis",
+                "room_analysis_settings_group",
+            )
+        )
         self.generation_shortcuts_group, generation_shortcuts_form = (
             self._build_form_group(
                 "Generation shortcuts",
@@ -829,6 +874,7 @@ class SettingsWidget(QWidget):
         sections_layout.addWidget(self.api_credentials_group)
         sections_layout.addWidget(self.display_settings_group)
         sections_layout.addWidget(self.canvas_settings_group)
+        sections_layout.addWidget(self.room_analysis_settings_group)
         sections_layout.addWidget(self.generation_shortcuts_group)
         sections_layout.addWidget(self.object_generation_settings_group)
         self._build_reference_view_presets_ui(sections_layout)
@@ -914,6 +960,25 @@ class SettingsWidget(QWidget):
         canvas_form.addRow(
             "Make walls continuous",
             self.make_walls_continuous_checkbox,
+        )
+
+        self.ceiling_height_estimation_model_combo = QComboBox()
+        self.ceiling_height_estimation_model_combo.setObjectName(
+            "ceiling_height_estimation_model_combo"
+        )
+        self.ceiling_height_estimation_model_combo.setToolTip(
+            "Choose the model used to estimate ceiling heights from marked "
+            "video ranges. GPT models use the configured OpenAI API key; "
+            "Qwen runs locally."
+        )
+        for label, model_id in CEILING_HEIGHT_MODEL_OPTIONS:
+            self.ceiling_height_estimation_model_combo.addItem(label, model_id)
+        self.ceiling_height_estimation_model_combo.currentIndexChanged.connect(
+            self._handle_ceiling_height_estimation_model_changed
+        )
+        room_analysis_form.addRow(
+            "Ceiling height estimation model",
+            self.ceiling_height_estimation_model_combo,
         )
 
         self.scene_3d_display_screen_combo = QComboBox()
@@ -1454,6 +1519,27 @@ class SettingsWidget(QWidget):
         layout.setSpacing(10)
         sections_layout.addWidget(self.reference_view_presets_group)
 
+        model_form = QFormLayout()
+        self.reference_generation_model_combo = QComboBox()
+        self.reference_generation_model_combo.setObjectName(
+            "reference_generation_model_combo"
+        )
+        self.reference_generation_model_combo.setToolTip(
+            "Choose the model used to generate object reference images. "
+            "OpenAI models use the configured API key; Qwen and Stable "
+            "Diffusion run locally. Stable Diffusion downloads its model "
+            "(about 7 GB) on first use. Changes apply to the next request."
+        )
+        for label, model in REFERENCE_GENERATION_MODEL_OPTIONS:
+            self.reference_generation_model_combo.addItem(label, model)
+        self.reference_generation_model_combo.currentIndexChanged.connect(
+            self._handle_reference_generation_model_changed
+        )
+        model_form.addRow(
+            "Reference generation model", self.reference_generation_model_combo
+        )
+        layout.addLayout(model_form)
+
         self.reference_view_preset_list = QListWidget()
         self.reference_view_preset_list.setObjectName(
             "reference_view_preset_list"
@@ -1764,6 +1850,16 @@ class SettingsWidget(QWidget):
                 ),
             )
         )
+        self.reference_generation_model_combo.setCurrentIndex(
+            self.reference_generation_model_combo.findData(
+                read_reference_generation_model(self._application_settings)
+            )
+        )
+        self.ceiling_height_estimation_model_combo.setCurrentIndex(
+            self.ceiling_height_estimation_model_combo.findData(
+                read_ceiling_height_estimation_model(self._application_settings)
+            )
+        )
         self.make_walls_continuous_checkbox.setChecked(
             read_make_walls_continuous(self._application_settings)
         )
@@ -1917,6 +2013,28 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             PLAN_CORRECTION_MODEL_SETTING_KEY,
             str(self.plan_correction_model_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_reference_generation_model_changed(self, _index: int) -> None:
+        """Persist the reference image provider for future generation jobs."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+            str(self.reference_generation_model_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_ceiling_height_estimation_model_changed(self, _index: int) -> None:
+        """Persist the ceiling-height model without starting an analysis."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY,
+            str(self.ceiling_height_estimation_model_combo.currentData()),
         )
         self.settings_changed.emit()
 
@@ -3055,6 +3173,44 @@ def read_clear_mask_hotkey(
         hotkey
         if isinstance(hotkey, str) and hotkey in CLEAR_MASK_HOTKEY_VALUES
         else DEFAULT_CLEAR_MASK_HOTKEY
+    )
+
+
+# ### Room analysis setting helpers ###
+def read_ceiling_height_estimation_model(
+    application_settings: ApplicationSettingsStore | None,
+) -> str:
+    """Read a valid model, retaining preferences saved by the old dialog."""
+
+    if application_settings is None:
+        return CEILING_HEIGHT_INFERENCE_MODEL
+    model = application_settings.get(
+        CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY,
+        CEILING_HEIGHT_INFERENCE_MODEL,
+    )
+    return (
+        model
+        if isinstance(model, str) and model in CEILING_HEIGHT_ESTIMATION_MODELS
+        else CEILING_HEIGHT_INFERENCE_MODEL
+    )
+
+
+# ### Reference generation setting helpers ###
+def read_reference_generation_model(
+    application_settings: ApplicationSettingsStore | None,
+) -> str:
+    """Read the reference provider while preserving the existing saved key."""
+
+    if application_settings is None:
+        return DEFAULT_REFERENCE_GENERATION_MODEL
+    model = application_settings.get(
+        REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
+        DEFAULT_REFERENCE_GENERATION_MODEL,
+    )
+    return (
+        model
+        if isinstance(model, str) and model in REFERENCE_GENERATION_MODELS
+        else DEFAULT_REFERENCE_GENERATION_MODEL
     )
 
 

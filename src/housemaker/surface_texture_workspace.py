@@ -834,6 +834,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         ) = None
         self._build_ui()
         if self.surface_view is not None:
+            self.surface_view.set_pbr_maps_enabled(self._get_enabled_pbr_maps())
             self.surface_view.set_first_person_movement_mode(
                 self._settings.first_person_navigation_mode
             )
@@ -3414,6 +3415,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             checkbox.setObjectName(
                 f"surface_pbr_{map_type}_checkbox"
             )
+            checkbox.setChecked(True)
             checkbox.setToolTip(
                 "Request Meshy's aligned Surface PBR family and dynamically "
                 f"apply the {ATLAS_MAP_LABELS[map_type].lower()} map in the "

@@ -17,9 +17,9 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, Signal
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QComboBox
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.generation_jobs import GenerationJobManager
@@ -29,7 +29,6 @@ from housemaker.generation_workspace import (
     _ArchitecturalTrimEditingTarget,
 )
 from housemaker.merged_generation_workspace import (
-    REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
     REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY,
     REFERENCE_GENERATION_PROMPT_SETTINGS_KEY,
     REFERENCE_GENERATION_STRENGTH_SETTINGS_KEY,
@@ -40,6 +39,7 @@ from housemaker.merged_generation_workspace import (
 from housemaker.reference_generation_models import (
     DEFAULT_REFERENCE_NEGATIVE_PROMPT,
     REFERENCE_GENERATION_MODEL_OPTIONS,
+    REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
     REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
 )
 from housemaker.reference_view_presets import (
@@ -56,10 +56,11 @@ _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
 
 
-class _ControlledReferenceThread(QThread):
+class _ControlledReferenceThread(QObject):
     """Complete provider work explicitly without a network, model or real thread."""
 
     progress_changed = Signal(str, int)
+    finished = Signal()
     created: ClassVar[list[_ControlledReferenceThread]] = []
 
     def __init__(
@@ -92,6 +93,12 @@ class _ControlledReferenceThread(QThread):
     def requestInterruption(self):
         self.interrupted = True
 
+    def isRunning(self):
+        return False
+
+    def wait(self, *_args):
+        return True
+
     def complete(self, image=None, error=None):
         self.result = image
         self.error_message = error
@@ -102,6 +109,16 @@ def _opaque_reference(value: int = 70) -> np.ndarray:
     image = np.full((32, 48, 4), value, dtype=np.uint8)
     image[:, :, 3] = 255
     return image
+
+
+def _delete_test_widgets(*widgets) -> None:
+    """Destroy Qt ownership trees before their Python wrappers are collected."""
+
+    for widget in widgets:
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    _qt_application.processEvents()
 
 
 # ### Reference generation workspace tests ###
@@ -126,6 +143,12 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.job_manager,
             application_settings=self.settings,
         )
+        self.settings_widget = SettingsWidget(
+            application_settings=self.settings, environment={}
+        )
+        self.settings_widget.settings_changed.connect(
+            self._apply_reference_generation_model
+        )
         _ControlledReferenceThread.created = []
         self.thread_patch = patch(
             "housemaker.merged_generation_workspace._ReferenceGenerationThread",
@@ -134,13 +157,22 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         self.thread_patch.start()
 
     def tearDown(self):
+        self.settings_widget.settings_changed.disconnect(
+            self._apply_reference_generation_model
+        )
+        self.settings_widget.dispose()
         self.workspace.shutdown()
         self.objects.shutdown()
         self.surfaces.shutdown()
-        self.workspace.close()
+        _ControlledReferenceThread.created.clear()
+        _delete_test_widgets(self.settings_widget, self.workspace)
         self.thread_patch.stop()
-        _qt_application.processEvents()
         self.temporary_directory.cleanup()
+
+    def _apply_reference_generation_model(self):
+        self.workspace.set_reference_generation_model(
+            self.settings_widget.get_settings().reference_generation_model
+        )
 
     def _load_video(self):
         video_path = self.root / "reference.avi"
@@ -194,13 +226,19 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             workspace.shutdown()
             objects.shutdown()
             surfaces.shutdown()
-            workspace.close()
+            _delete_test_widgets(workspace)
 
-    def test_controls_include_all_models_and_only_show_strength_for_sdxl(self):
-        combo = self.workspace.reference_generation_model_combo
+    def test_settings_model_selection_updates_sdxl_controls_without_generation_selector(
+        self,
+    ):
+        combo = self.settings_widget.reference_generation_model_combo
         self.assertEqual(
             tuple((combo.itemText(i), combo.itemData(i)) for i in range(combo.count())),
             REFERENCE_GENERATION_MODEL_OPTIONS,
+        )
+        self.assertFalse(hasattr(self.workspace, "reference_generation_model_combo"))
+        self.assertIsNone(
+            self.workspace.findChild(QComboBox, "reference_generation_model_combo")
         )
         self.assertTrue(self.workspace.reference_generation_strength_control.isHidden())
         self.assertTrue(
@@ -225,6 +263,15 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.reference_generation_strength_spinbox.value(), 0.45
         )
 
+        thread = self._start(_opaque_reference())
+        self.assertEqual(thread.model, REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION)
+        thread.complete(_opaque_reference(190))
+        combo.setCurrentIndex(0)
+        self.assertTrue(self.workspace.reference_generation_strength_control.isHidden())
+        self.assertTrue(
+            self.workspace.reference_generation_negative_prompt_control.isHidden()
+        )
+
     def test_view_dropdown_contains_six_defaults_and_write_prompt(self):
         combo = self.workspace.reference_generation_view_combo
         items = tuple(
@@ -245,6 +292,23 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(combo.currentData(), "elevated-three-quarter")
         self.assertTrue(self.workspace.reference_generation_prompt_control.isHidden())
+
+    def test_settings_model_change_preserves_running_request_and_updates_the_next(self):
+        combo = self.settings_widget.reference_generation_model_combo
+        original_model = combo.currentData()
+        thread = self._start(_opaque_reference())
+
+        combo.setCurrentIndex(
+            combo.findData(REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION)
+        )
+
+        self.assertEqual(thread.model, original_model)
+        self.assertIsNotNone(self.workspace._reference_generation_runtime)
+        self.assertFalse(self.workspace.reference_generation_strength_spinbox.isEnabled())
+        thread.complete(_opaque_reference(190))
+        self.assertTrue(self.workspace.reference_generation_strength_spinbox.isEnabled())
+        second = self._start()
+        self.assertEqual(second.model, REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION)
 
     def test_custom_prompt_only_appears_for_write_prompt_and_is_retained(self):
         combo = self.workspace.reference_generation_view_combo
@@ -404,8 +468,11 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.assertFalse(self.workspace.reference_generation_prompt_control.isHidden())
             self.assertFalse(self.workspace.generate_reference_button.isEnabled())
         finally:
+            settings_widget.reference_view_presets_changed.disconnect(
+                self.workspace.set_reference_view_presets
+            )
             settings_widget.dispose()
-            settings_widget.close()
+            _delete_test_widgets(settings_widget)
 
     def test_removed_selected_preset_falls_back_to_custom_without_erasing_text(self):
         self.workspace.reference_generation_prompt_edit.setText("My retained prompt")
@@ -463,7 +530,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
 
     def test_reference_options_are_persisted_separately_from_meshy_prompt(self):
         self.workspace.ai_prompt_edit.setText("Meshy prompt")
-        combo = self.workspace.reference_generation_model_combo
+        combo = self.settings_widget.reference_generation_model_combo
         combo.setCurrentIndex(
             combo.findData(REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION)
         )
@@ -518,7 +585,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         )
         try:
             self.assertEqual(
-                other.reference_generation_model_combo.currentData(),
+                other._reference_generation_model,
                 REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
             )
             self.assertEqual(
@@ -527,6 +594,10 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(other.reference_generation_view_combo.currentData(), "")
             self.assertFalse(other.reference_generation_prompt_control.isHidden())
             self.assertEqual(other.reference_generation_strength_spinbox.value(), 0.6)
+            self.assertFalse(other.reference_generation_strength_control.isHidden())
+            self.assertFalse(
+                other.reference_generation_negative_prompt_control.isHidden()
+            )
             self.assertEqual(
                 other.reference_generation_negative_prompt_edit.text(),
                 "blurry, wall, floor",
@@ -535,7 +606,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             other.shutdown()
             other_objects.shutdown()
             other_surfaces.shutdown()
-            other.close()
+            _delete_test_widgets(other)
 
     def test_explicit_empty_negative_prompt_is_persisted_and_restored(self):
         self.workspace.reference_generation_negative_prompt_edit.clear()
@@ -561,7 +632,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             other.shutdown()
             other_objects.shutdown()
             other_surfaces.shutdown()
-            other.close()
+            _delete_test_widgets(other)
 
     def test_negative_prompt_is_a_request_snapshot_and_disabled_while_running(self):
         self.workspace.reference_generation_negative_prompt_edit.setText("side view")
@@ -583,7 +654,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(thread.negative_prompt, "")
 
     def test_sdxl_nonfront_preset_does_not_use_front_only_default_negatives(self):
-        models = self.workspace.reference_generation_model_combo
+        models = self.settings_widget.reference_generation_model_combo
         models.setCurrentIndex(models.findData(REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION))
         views = self.workspace.reference_generation_view_combo
         views.setCurrentIndex(views.findData("three-quarter"))
@@ -601,7 +672,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         )
 
     def test_sdxl_elevated_default_avoids_front_only_negatives_and_front_retains_them(self):
-        models = self.workspace.reference_generation_model_combo
+        models = self.settings_widget.reference_generation_model_combo
         models.setCurrentIndex(models.findData(REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION))
         views = self.workspace.reference_generation_view_combo
         self.assertEqual(views.currentData(), "elevated-three-quarter")
@@ -620,7 +691,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         )
 
     def test_switching_views_preserves_a_custom_negative_prompt(self):
-        models = self.workspace.reference_generation_model_combo
+        models = self.settings_widget.reference_generation_model_combo
         models.setCurrentIndex(models.findData(REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION))
         negative_prompt = "side view, unique user-selected exclusions"
         self.workspace.reference_generation_negative_prompt_edit.setText(negative_prompt)

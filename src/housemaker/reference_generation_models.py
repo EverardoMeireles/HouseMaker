@@ -7,6 +7,7 @@ from housemaker.plan_correction_models import (
 )
 
 # ### Model identifiers ###
+REFERENCE_GENERATION_MODEL_SETTINGS_KEY = "generation/reference_generation_model"
 REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION = "stable-diffusion-xl-img2img"
 REFERENCE_GENERATION_MODEL_OPTIONS = (
     *PLAN_CORRECTION_MODEL_OPTIONS,

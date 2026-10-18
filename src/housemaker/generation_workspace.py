@@ -8856,6 +8856,7 @@ class GenerationWorkspace(QWidget):
         for index, map_type in enumerate(PBR_MAP_TYPES):
             checkbox = QCheckBox(pbr_labels[map_type])
             checkbox.setObjectName(f"pbr_{map_type}_checkbox")
+            checkbox.setChecked(True)
             checkbox.setToolTip(
                 f"Request Meshy PBR maps and dynamically apply the "
                 f"{pbr_labels[map_type].lower()} map in the 3D preview."
@@ -8863,6 +8864,7 @@ class GenerationWorkspace(QWidget):
             checkbox.toggled.connect(self._handle_pbr_map_toggled)
             self.pbr_map_checkboxes[map_type] = checkbox
             pbr_map_layout.addWidget(checkbox, 0, index)
+        self.result_view.set_pbr_maps_enabled(self._get_enabled_pbr_maps())
         buttons_layout.addWidget(self.pbr_map_control)
 
         self.wireframe_checkbox = QCheckBox("Wireframe")

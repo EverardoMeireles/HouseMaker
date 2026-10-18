@@ -707,6 +707,14 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
                 layout.itemAt(index).widget(),
                 self.workspace.pbr_map_checkboxes[map_type],
             )
+            self.assertTrue(self.workspace.pbr_map_checkboxes[map_type].isChecked())
+        self.assertEqual(self.workspace._get_enabled_pbr_maps(), PBR_MAP_TYPES)
+        self.assertTrue(
+            all(self.workspace.surface_view.get_pbr_maps_enabled().values())
+        )
+
+        for checkbox in self.workspace.pbr_map_checkboxes.values():
+            checkbox.setChecked(False)
 
         with patch.object(
             self.workspace.surface_view,
@@ -718,6 +726,26 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             self.workspace._get_enabled_pbr_maps(),
             (PBR_MAP_NORMAL,),
+        )
+
+    def test_pbr_map_selection_survives_settings_and_project_refresh(self) -> None:
+        self.workspace.pbr_map_checkboxes[PBR_MAP_NORMAL].setChecked(False)
+        self.workspace.pbr_map_checkboxes[PBR_MAP_METALLIC].setChecked(False)
+
+        self.workspace.set_runtime_settings(GenerationServiceSettings())
+        self.workspace.set_data(self.workspace.get_data())
+
+        self.assertEqual(
+            self.workspace._get_enabled_pbr_maps(),
+            (PBR_MAP_ROUGHNESS,),
+        )
+        self.assertEqual(
+            self.workspace.surface_view.get_pbr_maps_enabled(),
+            {
+                PBR_MAP_NORMAL: False,
+                PBR_MAP_ROUGHNESS: True,
+                PBR_MAP_METALLIC: False,
+            },
         )
 
     def test_generated_pbr_family_is_persisted_applied_and_deleted(self) -> None:
