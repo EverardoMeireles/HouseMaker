@@ -21,7 +21,8 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_MAX_POLLS = 360
 DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT = 2_000
 MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT = 100
-MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT = 15_000
+MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT = 30_000
+SMART_TOPOLOGY_AI_MODEL = "meshy-t2.5"
 MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_GLB_DOWNLOAD_BYTES = 128 * 1024 * 1024
 TERMINAL_TASK_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELED"})
@@ -89,7 +90,7 @@ def build_image_to_3d_request_body(
     enable_pbr: bool = False,
     texture_prompt: str = "",
 ) -> dict[str, Any]:
-    """Build a Smart Topology Meshy Image-to-3D request."""
+    """Build a Meshy Smart Topology T2.5 Image-to-3D request."""
 
     normalized_image = _normalize_binary_payload(
         image_png,
@@ -112,7 +113,7 @@ def build_image_to_3d_request_body(
     body: dict[str, Any] = {
         "image_url": _build_data_uri("image/png", normalized_image),
         "model_type": "smart-topology",
-        "ai_model": "meshy-t2",
+        "ai_model": SMART_TOPOLOGY_AI_MODEL,
         "should_texture": should_texture,
         "target_polycount": normalized_polycount,
         "moderation": False,
@@ -202,7 +203,7 @@ def _normalize_retexture_reference_images(
 
 
 def _normalize_smart_topology_target_polycount(target_polycount: int) -> int:
-    """Validate Meshy's current Smart Topology T2 face-count range."""
+    """Validate Meshy's Smart Topology T2.5 face-count range."""
 
     if isinstance(target_polycount, bool) or not isinstance(target_polycount, int):
         raise ValueError("Meshy target polycount must be an integer.")

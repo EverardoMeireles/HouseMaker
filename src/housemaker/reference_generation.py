@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from functools import partial
 from io import BytesIO
 
@@ -31,6 +32,22 @@ MAX_REFERENCE_BYTES = 64 * 1024 * 1024
 MAX_REFERENCE_PROMPT_CHARACTERS = 4000
 CancellationCheck = Callable[[], bool]
 ProgressCallback = Callable[[str, int], None]
+
+
+# ### Optional furniture-emptying instructions ###
+REMOVE_OBJECTS_FROM_FURNITURE_PROMPT = (
+    "Show only the furniture itself, completely empty and free of loose contents. "
+    "Remove all objects placed on its surfaces or stored in its visible shelves, "
+    "compartments and display areas, including books, ornaments, containers, "
+    "tableware, electronics, plants, papers, clothing and draped coverings. "
+    "Leave every visible storage area empty. Preserve the furniture's original "
+    "shape, proportions, materials, colors and integral structural and functional "
+    "parts, including its frame, shelves, doors, drawers, legs, handles and "
+    "upholstery. Do not open closed doors or drawers. Reconstruct newly revealed "
+    "furniture surfaces naturally using the original materials. Do not add "
+    "replacement objects or decorations. Removing loose contents takes priority "
+    "over general instructions to preserve image details."
+)
 
 
 # ### Public errors ###
@@ -177,6 +194,8 @@ def generate_object_reference(
     negative_prompt: str = DEFAULT_REFERENCE_NEGATIVE_PROMPT,
     progress_callback: ProgressCallback | None = None,
     cancellation_check: CancellationCheck | None = None,
+    image_editor: Callable | None = None,
+    sdxl_generator: Callable | None = None,
 ) -> np.ndarray:
     """Generate one complete image and apply no state changes or silent fallbacks."""
 
@@ -198,7 +217,8 @@ def generate_object_reference(
         )
 
         try:
-            generated = generate_stable_diffusion_reference(
+            generate = sdxl_generator or generate_stable_diffusion_reference
+            generated = generate(
                 prepared_image,
                 prompt=prepared_prompt,
                 output_size=REFERENCE_IMAGE_SIZE,
@@ -225,9 +245,11 @@ def generate_object_reference(
         try:
             if progress_callback is not None:
                 progress_callback("Generating the new object reference", 15)
-            editor = _create_reference_image_editor(model)
-            generated = _invoke_editor_cancellably(
-                editor,
+            editor = image_editor or _create_reference_image_editor(model)
+            # Resident editors already poll cancellation. Wait for their native
+            # request to unwind before closing the session or loading symmetry.
+            invoke = editor if image_editor is not None else partial(_invoke_editor_cancellably, editor)
+            generated = invoke(
                 prepared_image,
                 api_key=str(api_key).strip(),
                 prompt=prepared_prompt,
@@ -246,3 +268,34 @@ def generate_object_reference(
     if progress_callback is not None:
         progress_callback("Reference ready", 100)
     return result
+
+
+# ### Resident local reference sessions ###
+@contextmanager
+def open_object_reference_session(
+    model: str,
+    *,
+    cancellation_check: CancellationCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
+):
+    """Keep exactly one local image model resident until the render phase ends."""
+
+    from housemaker.local_reference_image_session import (
+        QwenReferenceImageSession,
+        StableDiffusionReferenceSession,
+    )
+
+    if model == PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1:
+        backend = QwenReferenceImageSession(
+            cancellation_check=cancellation_check, progress_callback=progress_callback,
+        )
+        argument = "image_editor"
+    elif model == REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION:
+        backend = StableDiffusionReferenceSession(
+            cancellation_check=cancellation_check, progress_callback=progress_callback,
+        )
+        argument = "sdxl_generator"
+    else:
+        raise ReferenceGenerationError("Resident reference sessions require a local image model.")
+    with backend:
+        yield partial(generate_object_reference, model=model, **{argument: backend})

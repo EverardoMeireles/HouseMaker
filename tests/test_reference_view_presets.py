@@ -19,10 +19,10 @@ from housemaker.reference_view_presets import (
 
 # ### Preset model tests ###
 class ReferenceViewPresetTests(unittest.TestCase):
-    def test_defaults_have_six_unique_views_and_complete_generic_prompts(self) -> None:
-        self.assertEqual(len(DEFAULT_REFERENCE_VIEW_PRESETS), 6)
+    def test_defaults_have_four_unique_views_and_complete_generic_prompts(self) -> None:
+        self.assertEqual(len(DEFAULT_REFERENCE_VIEW_PRESETS), 4)
         self.assertEqual(
-            len({preset.preset_id for preset in DEFAULT_REFERENCE_VIEW_PRESETS}), 6
+            len({preset.preset_id for preset in DEFAULT_REFERENCE_VIEW_PRESETS}), 4
         )
         for preset in DEFAULT_REFERENCE_VIEW_PRESETS:
             with self.subTest(view=preset.name):
@@ -43,14 +43,10 @@ class ReferenceViewPresetTests(unittest.TestCase):
                 "elevated-three-quarter",
                 "front",
                 "three-quarter",
-                "side",
-                "top",
                 "low-three-quarter",
             ],
         )
-        self.assertIn("side/profile view", DEFAULT_REFERENCE_VIEW_PRESETS[3].prompt)
-        self.assertIn("vertically downward", DEFAULT_REFERENCE_VIEW_PRESETS[4].prompt)
-        self.assertIn("underside", DEFAULT_REFERENCE_VIEW_PRESETS[5].prompt)
+        self.assertIn("underside", DEFAULT_REFERENCE_VIEW_PRESETS[3].prompt)
 
     def test_presets_and_defaults_cannot_be_mutated(self) -> None:
         self.assertIsInstance(DEFAULT_REFERENCE_VIEW_PRESETS, tuple)
@@ -138,6 +134,39 @@ class ReferenceViewPresetPersistenceTests(unittest.TestCase):
         self.assertTrue(save_reference_view_presets(self.store, []))
         self.assertEqual(read_reference_view_presets(self.store), ())
         self.assertEqual(self.store.get(REFERENCE_VIEW_PRESETS_SETTINGS_KEY), [])
+
+    def test_old_saved_defaults_remove_side_and_top_without_rewriting_settings(self) -> None:
+        legacy_presets = (
+            *DEFAULT_REFERENCE_VIEW_PRESETS[:3],
+            ReferenceViewPreset("side", "Side/profile", "A straight side view."),
+            ReferenceViewPreset("top", "Top-down", "A vertically downward view."),
+            DEFAULT_REFERENCE_VIEW_PRESETS[3],
+        )
+        self.assertTrue(save_reference_view_presets(self.store, legacy_presets))
+        previous_contents = self.store.path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            read_reference_view_presets(self.store), DEFAULT_REFERENCE_VIEW_PRESETS
+        )
+        self.assertEqual(
+            self.store.path.read_text(encoding="utf-8"), previous_contents
+        )
+
+    def test_retired_ids_do_not_remove_renamed_or_custom_views(self) -> None:
+        renamed_front = ReferenceViewPreset("front", "My frontal view", "Edited prompt.")
+        custom_side = ReferenceViewPreset("custom-side", "Side/profile", "My side view.")
+        custom_top = ReferenceViewPreset("custom-top", "Top-down", "My overhead view.")
+        retired_side = ReferenceViewPreset("side", "Old built-in side", "Old side prompt.")
+        retired_top = ReferenceViewPreset("top", "Old built-in top", "Old top prompt.")
+        self.assertTrue(save_reference_view_presets(
+            self.store,
+            (retired_side, renamed_front, custom_side, retired_top, custom_top),
+        ))
+
+        self.assertEqual(
+            read_reference_view_presets(self.store),
+            (renamed_front, custom_side, custom_top),
+        )
 
     def test_saved_views_move_elevated_first_without_losing_custom_edits(self) -> None:
         custom = ReferenceViewPreset("custom", "My custom view", "My custom prompt.")

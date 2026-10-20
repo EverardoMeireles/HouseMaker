@@ -1508,17 +1508,18 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
                 self.workspace.door_slot_generation_indicator
             )
         )
-        self.assertIs(creation_layout.itemAt(1).widget(), generation_settings)
+        self.assertIs(creation_layout.itemAt(1).widget(), self.workspace.inpaint_navigation_control)
+        self.assertIs(creation_layout.itemAt(2).widget(), generation_settings)
         self.assertIs(
-            creation_layout.itemAt(2).widget(),
+            creation_layout.itemAt(3).widget(),
             self.objects.meshy_target_polycount_control,
         )
         self.assertIs(
-            creation_layout.itemAt(3).widget(),
+            creation_layout.itemAt(4).widget(),
             self.workspace.texture_provider_control,
         )
-        self.assertIs(creation_layout.itemAt(4).widget(), primary_actions)
-        self.assertIs(creation_layout.itemAt(5).widget(), generation_actions)
+        self.assertIs(creation_layout.itemAt(5).widget(), primary_actions)
+        self.assertIs(creation_layout.itemAt(6).widget(), generation_actions)
 
     def test_surface_controls_are_folded_into_contextual_object_actions(
         self,

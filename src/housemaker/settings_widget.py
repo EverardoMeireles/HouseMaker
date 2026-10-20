@@ -77,6 +77,10 @@ from housemaker.reference_generation_models import (
     REFERENCE_GENERATION_MODEL_SETTINGS_KEY,
     REFERENCE_GENERATION_MODELS,
 )
+from housemaker.reference_symmetry_inference import (
+    DEFAULT_SYMMETRY_INFERENCE_MODEL,
+    SYMMETRY_INFERENCE_MODEL_OPTIONS,
+)
 from housemaker.reference_view_presets import (
     DEFAULT_REFERENCE_VIEW_PRESETS,
     ReferenceViewPreset,
@@ -118,6 +122,10 @@ CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
 CLEAR_MASK_HOTKEY_SETTING_KEY = "generation/clear_mask_hotkey"
+ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY = (
+    "generation/enable_object_symmetry_inference"
+)
+SYMMETRY_INFERENCE_MODEL_SETTING_KEY = "generation/symmetry_inference_model"
 FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
@@ -172,6 +180,10 @@ CLEAR_MASK_HOTKEY_VALUES = frozenset(
     hotkey for _label, hotkey in CLEAR_MASK_HOTKEY_OPTIONS
 )
 DEFAULT_UNUSED_FACE_REMOVAL = False
+DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE = False
+SYMMETRY_INFERENCE_MODELS = frozenset(
+    model_id for _label, model_id in SYMMETRY_INFERENCE_MODEL_OPTIONS
+)
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
 DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY = 1.0
@@ -198,14 +210,14 @@ MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
 MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
 MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
-MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
+MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 30_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 2_000
 SURFACE_TEXTURE_PROVIDER_MESHY = "meshy"
 SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI = "gpt-4o-mini"
 SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA = "gpt-5.6-luna"
 SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA = "gpt-5.6-terra"
 SURFACE_TEXTURE_PROVIDER_OPTIONS = (
-    ("Meshy", SURFACE_TEXTURE_PROVIDER_MESHY),
+    ("Meshy t2.5", SURFACE_TEXTURE_PROVIDER_MESHY),
     ("GPT-4o-mini", SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI),
     ("GPT-5.6 Luna", SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA),
     ("GPT-5.6 Terra", SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA),
@@ -312,6 +324,10 @@ class GenerationServiceSettings:
     wall_verification_model: str = DEFAULT_WALL_VERIFICATION_MODEL
     reference_generation_model: str = DEFAULT_REFERENCE_GENERATION_MODEL
     ceiling_height_estimation_model: str = CEILING_HEIGHT_INFERENCE_MODEL
+    enable_object_symmetry_inference: bool = (
+        DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE
+    )
+    symmetry_inference_model: str = DEFAULT_SYMMETRY_INFERENCE_MODEL
 
     def __post_init__(self) -> None:
         try:
@@ -462,6 +478,18 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Unknown reference generation model: "
                 f"{self.reference_generation_model!r}."
+            )
+        if not isinstance(self.enable_object_symmetry_inference, bool):
+            raise ValueError(
+                "Object symmetry inference must be enabled or disabled."
+            )
+        if (
+            not isinstance(self.symmetry_inference_model, str)
+            or self.symmetry_inference_model not in SYMMETRY_INFERENCE_MODELS
+        ):
+            raise ValueError(
+                "Unknown symmetric division inference model: "
+                f"{self.symmetry_inference_model!r}."
             )
         if (
             not isinstance(self.ceiling_height_estimation_model, str)
@@ -728,6 +756,12 @@ class SettingsWidget(QWidget):
             ),
             reference_generation_model=str(
                 self.reference_generation_model_combo.currentData()
+            ),
+            enable_object_symmetry_inference=(
+                self.enable_object_symmetry_inference_checkbox.isChecked()
+            ),
+            symmetry_inference_model=str(
+                self.symmetry_inference_model_combo.currentData()
             ),
             ceiling_height_estimation_model=str(
                 self.ceiling_height_estimation_model_combo.currentData()
@@ -1538,6 +1572,43 @@ class SettingsWidget(QWidget):
         model_form.addRow(
             "Reference generation model", self.reference_generation_model_combo
         )
+        self.enable_object_symmetry_inference_checkbox = QCheckBox(
+            "Enable object symmetry inference"
+        )
+        self.enable_object_symmetry_inference_checkbox.setObjectName(
+            "enable_object_symmetry_inference_checkbox"
+        )
+        self.enable_object_symmetry_inference_checkbox.setToolTip(
+            "After generating an object reference, infer whether its geometry "
+            "can use Symmetric division. Uncheck to leave the manual "
+            "Symmetric division choice unchanged."
+        )
+        self.enable_object_symmetry_inference_checkbox.toggled.connect(
+            self._handle_enable_object_symmetry_inference_changed
+        )
+        model_form.addRow(self.enable_object_symmetry_inference_checkbox)
+        self.symmetry_inference_model_combo = QComboBox()
+        self.symmetry_inference_model_combo.setObjectName(
+            "symmetry_inference_model_combo"
+        )
+        self.symmetry_inference_model_combo.setToolTip(
+            "Choose the model used to infer Symmetric division after reference "
+            "generation. Local Qwen and Reflect3D run on this PC; GPT-5.6 "
+            "Luna uses the configured OpenAI API key. Changes apply to the "
+            "next generation job."
+        )
+        for label, model in SYMMETRY_INFERENCE_MODEL_OPTIONS:
+            self.symmetry_inference_model_combo.addItem(label, model)
+        self.symmetry_inference_model_combo.currentIndexChanged.connect(
+            self._handle_symmetry_inference_model_changed
+        )
+        self.symmetry_inference_model_label = QLabel(
+            "Symmetric division inference model"
+        )
+        model_form.addRow(
+            self.symmetry_inference_model_label,
+            self.symmetry_inference_model_combo,
+        )
         layout.addLayout(model_form)
 
         self.reference_view_preset_list = QListWidget()
@@ -1855,6 +1926,19 @@ class SettingsWidget(QWidget):
                 read_reference_generation_model(self._application_settings)
             )
         )
+        self.symmetry_inference_model_combo.setCurrentIndex(
+            self.symmetry_inference_model_combo.findData(
+                read_symmetry_inference_model(self._application_settings)
+            )
+        )
+        symmetry_inference_enabled = read_enable_object_symmetry_inference(
+            self._application_settings
+        )
+        self.enable_object_symmetry_inference_checkbox.setChecked(
+            symmetry_inference_enabled
+        )
+        self.symmetry_inference_model_combo.setEnabled(symmetry_inference_enabled)
+        self.symmetry_inference_model_label.setEnabled(symmetry_inference_enabled)
         self.ceiling_height_estimation_model_combo.setCurrentIndex(
             self.ceiling_height_estimation_model_combo.findData(
                 read_ceiling_height_estimation_model(self._application_settings)
@@ -2035,6 +2119,33 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY,
             str(self.ceiling_height_estimation_model_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_enable_object_symmetry_inference_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Enable automatic symmetry checks without losing the chosen model."""
+
+        self.symmetry_inference_model_combo.setEnabled(enabled)
+        self.symmetry_inference_model_label.setEnabled(enabled)
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
+    def _handle_symmetry_inference_model_changed(self, _index: int) -> None:
+        """Persist the symmetry backend for future reference generation jobs."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            SYMMETRY_INFERENCE_MODEL_SETTING_KEY,
+            str(self.symmetry_inference_model_combo.currentData()),
         )
         self.settings_changed.emit()
 
@@ -3211,6 +3322,42 @@ def read_reference_generation_model(
         model
         if isinstance(model, str) and model in REFERENCE_GENERATION_MODELS
         else DEFAULT_REFERENCE_GENERATION_MODEL
+    )
+
+
+def read_enable_object_symmetry_inference(
+    application_settings: ApplicationSettingsStore | None,
+) -> bool:
+    """Read automatic object symmetry checking, defaulting to opt-in."""
+
+    if application_settings is None:
+        return DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE
+    enabled = application_settings.get(
+        ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY,
+        DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE,
+    )
+    return (
+        enabled
+        if isinstance(enabled, bool)
+        else DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE
+    )
+
+
+def read_symmetry_inference_model(
+    application_settings: ApplicationSettingsStore | None,
+) -> str:
+    """Read a supported reference-symmetry model with a safe local default."""
+
+    if application_settings is None:
+        return DEFAULT_SYMMETRY_INFERENCE_MODEL
+    model = application_settings.get(
+        SYMMETRY_INFERENCE_MODEL_SETTING_KEY,
+        DEFAULT_SYMMETRY_INFERENCE_MODEL,
+    )
+    return (
+        model
+        if isinstance(model, str) and model in SYMMETRY_INFERENCE_MODELS
+        else DEFAULT_SYMMETRY_INFERENCE_MODEL
     )
 
 

@@ -33,6 +33,12 @@ from housemaker.first_person_navigation import (
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
     FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
 )
+from housemaker.reference_symmetry_inference import (
+    DEFAULT_SYMMETRY_INFERENCE_MODEL,
+    SYMMETRY_INFERENCE_MODEL_OPTIONS,
+    SYMMETRY_MODEL_QWEN,
+    SYMMETRY_MODEL_REFLECT3D,
+)
 from housemaker.settings_widget import (
     ATLAS_DISPLAY_SCREEN_SETTING_KEY,
     AUTOMATIC_ATLAS_CREATION_SETTING_KEY,
@@ -50,6 +56,7 @@ from housemaker.settings_widget import (
     DEFAULT_CLEAR_MASK_HOTKEY,
     DEFAULT_CUT_CONNECTION_ON_DOUBLE_VERTEX_DELETION,
     DEFAULT_DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY,
+    DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE,
     DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
     DEFAULT_INCLUDE_LLM_WALL_VERIFICATION,
@@ -61,6 +68,7 @@ from housemaker.settings_widget import (
     DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
     DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
+    ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
     FIRST_PERSON_SPEED_SETTING_KEY,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
@@ -86,7 +94,10 @@ from housemaker.settings_widget import (
     SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
     SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
+    SURFACE_TEXTURE_PROVIDER_MESHY,
+    SURFACE_TEXTURE_PROVIDER_OPTIONS,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
+    SYMMETRY_INFERENCE_MODEL_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
     USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
@@ -104,6 +115,7 @@ from housemaker.settings_widget import (
     read_clear_mask_hotkey,
     read_cut_connection_on_double_vertex_deletion,
     read_doors_and_windows_point_light_intensity,
+    read_enable_object_symmetry_inference,
     read_first_person_navigation_mode,
     read_first_person_speed,
     read_generation_display_screen_id,
@@ -116,6 +128,7 @@ from housemaker.settings_widget import (
     read_minimum_face_visibility_percentage,
     read_scene_3d_display_screen_id,
     read_snap_middle_equal_angle_only,
+    read_symmetry_inference_model,
     read_unused_face_removal,
     read_use_half_mesh_texture_prefix,
     read_use_uv_raycast_for_object_generation,
@@ -133,6 +146,179 @@ _qt_application.setQuitOnLastWindowClosed(False)
 
 # ### Test cases ###
 class SettingsWidgetTests(unittest.TestCase):
+    # ### Object symmetry inference settings ###
+    def test_object_symmetry_inference_defaults_and_settings_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            checkbox = widget.enable_object_symmetry_inference_checkbox
+            combo = widget.symmetry_inference_model_combo
+            defaults = GenerationServiceSettings()
+
+            self.assertFalse(DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE)
+            self.assertFalse(defaults.enable_object_symmetry_inference)
+            self.assertEqual(
+                defaults.symmetry_inference_model,
+                DEFAULT_SYMMETRY_INFERENCE_MODEL,
+            )
+            self.assertEqual(checkbox.text(), "Enable object symmetry inference")
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(combo.isEnabled())
+            self.assertFalse(widget.symmetry_inference_model_label.isEnabled())
+            self.assertEqual(combo.currentData(), SYMMETRY_MODEL_REFLECT3D)
+            self.assertEqual(
+                tuple(
+                    (combo.itemText(index), combo.itemData(index))
+                    for index in range(combo.count())
+                ),
+                SYMMETRY_INFERENCE_MODEL_OPTIONS,
+            )
+            self.assertEqual(
+                widget.symmetry_inference_model_label.text(),
+                "Symmetric division inference model",
+            )
+            self.assertTrue(widget.reference_view_presets_group.isAncestorOf(combo))
+            form = combo.parentWidget().layout().itemAt(0).layout()
+            self.assertIsInstance(form, QFormLayout)
+            self.assertEqual(
+                form.getWidgetPosition(checkbox)[0] + 1,
+                form.getWidgetPosition(combo)[0],
+            )
+            self.assertEqual(
+                widget.get_settings().symmetry_inference_model,
+                DEFAULT_SYMMETRY_INFERENCE_MODEL,
+            )
+            widget.dispose()
+
+    def test_object_symmetry_inference_changes_persist_and_emit_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            emitted: list[bool] = []
+            widget.settings_changed.connect(lambda: emitted.append(True))
+            model = SYMMETRY_INFERENCE_MODEL_OPTIONS[-1][1]
+            widget.enable_object_symmetry_inference_checkbox.setChecked(True)
+            self.assertEqual(emitted, [True])
+            self.assertTrue(widget.symmetry_inference_model_combo.isEnabled())
+            widget.symmetry_inference_model_combo.setCurrentIndex(
+                widget.symmetry_inference_model_combo.findData(model)
+            )
+            self.assertEqual(emitted, [True, True])
+            self.assertEqual(store.get(SYMMETRY_INFERENCE_MODEL_SETTING_KEY), model)
+            widget.enable_object_symmetry_inference_checkbox.setChecked(False)
+            self.assertEqual(emitted, [True, True, True])
+            self.assertFalse(widget.symmetry_inference_model_combo.isEnabled())
+            self.assertFalse(widget.symmetry_inference_model_label.isEnabled())
+            self.assertIs(store.get(ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY), False)
+            self.assertFalse(widget.get_settings().enable_object_symmetry_inference)
+            self.assertEqual(widget.get_settings().symmetry_inference_model, model)
+
+            restored_store = _build_test_settings(temporary_directory)
+            with patch.object(restored_store, "set", wraps=restored_store.set) as writer:
+                restored = SettingsWidget(
+                    application_settings=restored_store,
+                    environment={},
+                )
+                self.assertNotIn(
+                    ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY,
+                    [call.args[0] for call in writer.call_args_list],
+                )
+                self.assertNotIn(
+                    SYMMETRY_INFERENCE_MODEL_SETTING_KEY,
+                    [call.args[0] for call in writer.call_args_list],
+                )
+            self.assertFalse(restored.enable_object_symmetry_inference_checkbox.isChecked())
+            self.assertFalse(restored.symmetry_inference_model_combo.isEnabled())
+            self.assertEqual(restored.get_settings().symmetry_inference_model, model)
+            restored.enable_object_symmetry_inference_checkbox.setChecked(True)
+            self.assertTrue(restored.symmetry_inference_model_combo.isEnabled())
+            self.assertTrue(restored.symmetry_inference_model_label.isEnabled())
+            self.assertEqual(restored.get_settings().symmetry_inference_model, model)
+            self.assertTrue(read_enable_object_symmetry_inference(restored_store))
+            widget.dispose()
+            restored.dispose()
+
+    def test_object_symmetry_inference_rejects_malformed_settings(self) -> None:
+        self.assertFalse(read_enable_object_symmetry_inference(None))
+        self.assertEqual(
+            read_symmetry_inference_model(None),
+            DEFAULT_SYMMETRY_INFERENCE_MODEL,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            for value in (1, 0, "true", None, [], {}):
+                with self.subTest(enabled=value):
+                    with self.assertRaisesRegex(ValueError, "Object symmetry inference"):
+                        GenerationServiceSettings(enable_object_symmetry_inference=value)
+                    store.set(ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY, value)
+                    self.assertFalse(read_enable_object_symmetry_inference(store))
+            for value in (True, 1, "unknown-model", None, [], {}):
+                with self.subTest(model=value):
+                    with self.assertRaisesRegex(
+                        ValueError, "Unknown symmetric division inference model"
+                    ):
+                        GenerationServiceSettings(symmetry_inference_model=value)
+                    store.set(SYMMETRY_INFERENCE_MODEL_SETTING_KEY, value)
+                    self.assertEqual(
+                        read_symmetry_inference_model(store),
+                        DEFAULT_SYMMETRY_INFERENCE_MODEL,
+                    )
+            for _label, model in SYMMETRY_INFERENCE_MODEL_OPTIONS:
+                with self.subTest(valid_model=model):
+                    self.assertEqual(
+                        GenerationServiceSettings(
+                            symmetry_inference_model=model,
+                        ).symmetry_inference_model,
+                        model,
+                    )
+            widget = SettingsWidget(application_settings=store, environment={})
+            self.assertFalse(widget.get_settings().enable_object_symmetry_inference)
+            self.assertFalse(widget.enable_object_symmetry_inference_checkbox.isChecked())
+            self.assertFalse(widget.symmetry_inference_model_combo.isEnabled())
+            self.assertFalse(widget.symmetry_inference_model_label.isEnabled())
+            self.assertEqual(
+                widget.symmetry_inference_model_combo.currentData(),
+                SYMMETRY_MODEL_REFLECT3D,
+            )
+            self.assertEqual(
+                widget.get_settings().symmetry_inference_model,
+                DEFAULT_SYMMETRY_INFERENCE_MODEL,
+            )
+            widget.dispose()
+
+    def test_object_symmetry_inference_preserves_explicit_saved_enabled_qwen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            store.set(ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY, True)
+            store.set(SYMMETRY_INFERENCE_MODEL_SETTING_KEY, SYMMETRY_MODEL_QWEN)
+            restored_store = _build_test_settings(temporary_directory)
+            with patch.object(restored_store, "set", wraps=restored_store.set) as writer:
+                widget = SettingsWidget(
+                    application_settings=restored_store,
+                    environment={},
+                )
+            self.assertTrue(read_enable_object_symmetry_inference(restored_store))
+            self.assertEqual(
+                read_symmetry_inference_model(restored_store), SYMMETRY_MODEL_QWEN,
+            )
+            self.assertTrue(widget.enable_object_symmetry_inference_checkbox.isChecked())
+            self.assertTrue(widget.symmetry_inference_model_combo.isEnabled())
+            self.assertTrue(widget.symmetry_inference_model_label.isEnabled())
+            self.assertTrue(widget.get_settings().enable_object_symmetry_inference)
+            self.assertEqual(
+                widget.get_settings().symmetry_inference_model, SYMMETRY_MODEL_QWEN,
+            )
+            self.assertNotIn(
+                ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY,
+                [call.args[0] for call in writer.call_args_list],
+            )
+            self.assertNotIn(
+                SYMMETRY_INFERENCE_MODEL_SETTING_KEY,
+                [call.args[0] for call in writer.call_args_list],
+            )
+            widget.dispose()
+
+    # ### Existing generation and application settings ###
     def test_generation_service_defaults_to_two_thousand_target_tris(self) -> None:
         self.assertEqual(DEFAULT_MESHY_TARGET_POLYCOUNT, 2_000)
         self.assertEqual(
@@ -2095,13 +2281,31 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertNotIn("openai-secret", repr(restored_settings))
 
     def test_settings_model_rejects_invalid_smart_topology_polycounts(self) -> None:
-        for value in (99, 15_001, True, 4_000.0):
+        for value in (99, 30_001, True, 4_000.0):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "target polycount"):
                     GenerationServiceSettings(
                         meshy_api_key="",
                         meshy_target_polycount=value,  # type: ignore[arg-type]
                     )
+
+    def test_settings_model_accepts_t2_5_extended_polycount_range(self) -> None:
+        for value in (100, 15_001, 30_000):
+            with self.subTest(value=value):
+                settings = GenerationServiceSettings(meshy_target_polycount=value)
+                self.assertEqual(settings.meshy_target_polycount, value)
+
+    def test_meshy_t2_5_label_keeps_existing_provider_and_credentials(self) -> None:
+        self.assertIn(
+            ("Meshy t2.5", "meshy"),
+            SURFACE_TEXTURE_PROVIDER_OPTIONS,
+        )
+        settings = GenerationServiceSettings(
+            surface_texture_provider=SURFACE_TEXTURE_PROVIDER_MESHY,
+            meshy_api_key="existing-meshy-key",
+        )
+        self.assertEqual(settings.surface_texture_provider, "meshy")
+        self.assertEqual(settings.surface_texture_api_key, "existing-meshy-key")
 
     def test_canvas_3d_navigation_hotkey_uses_safe_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

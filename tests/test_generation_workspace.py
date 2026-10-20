@@ -2318,7 +2318,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
             )
         )
         self.assertEqual(spinbox.minimum(), 100)
-        self.assertEqual(spinbox.maximum(), 15_000)
+        self.assertEqual(spinbox.maximum(), 30_000)
         self.assertEqual(spinbox.value(), 7_200)
 
         spinbox.setValue(5_600)

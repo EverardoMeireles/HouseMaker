@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 REFERENCE_VIEW_PRESETS_SETTINGS_KEY = "generation/reference_view_presets"
 MAX_REFERENCE_VIEW_NAME_LENGTH = 80
 MAX_REFERENCE_VIEW_PROMPT_LENGTH = 4000
+REMOVED_DEFAULT_REFERENCE_VIEW_IDS = frozenset({"side", "top"})
 
 
 # ### Preset model ###
@@ -80,12 +81,6 @@ DEFAULT_REFERENCE_VIEW_PRESETS = (
         ),
     ),
     ReferenceViewPreset(
-        "side", "Side/profile", _default_prompt("straight-on side/profile view")
-    ),
-    ReferenceViewPreset(
-        "top", "Top-down", _default_prompt("top-down view, looking vertically downward")
-    ),
-    ReferenceViewPreset(
         "low-three-quarter",
         "Slightly low three-quarter",
         _default_prompt(
@@ -119,7 +114,14 @@ def read_reference_view_presets(
             )
         normalized_presets = _unique_presets(presets)
         _validate_unique_names(normalized_presets)
-        return _preferred_view_order(normalized_presets)
+        # Retire saved copies of the old built-ins without deleting custom views
+        # or rewriting the settings file while another app instance may use it.
+        retained_presets = tuple(
+            preset
+            for preset in normalized_presets
+            if preset.preset_id not in REMOVED_DEFAULT_REFERENCE_VIEW_IDS
+        )
+        return _preferred_view_order(retained_presets)
     except (KeyError, TypeError, ValueError):
         return DEFAULT_REFERENCE_VIEW_PRESETS
 

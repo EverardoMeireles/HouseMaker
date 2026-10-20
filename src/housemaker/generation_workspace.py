@@ -85,7 +85,11 @@ from housemaker.generation_state import (
     GeneratedObjectRecord,
     GenerationData,
 )
-from housemaker.generation_views import VideoInpaintView
+from housemaker.generation_views import (
+    VideoInpaintView,
+    _build_masked_frame_crop,
+    rasterize_mask_strokes,
+)
 from housemaker.glass_material import (
     DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED,
     HOUSEMAKER_GLASS_MATERIAL_NAME,
@@ -195,6 +199,7 @@ from housemaker.object_uv_scan_projection import (
     normalize_projection_camera_percentages,
     scan_project_textured_glb,
 )
+from housemaker.reference_generation import MAX_REFERENCE_PROMPT_CHARACTERS
 from housemaker.safe_duplicate_face_removal import (
     SafeDuplicateFaceRemovalCancelled,
     SafeDuplicateFaceRemovalResult,
@@ -329,6 +334,7 @@ GENERATION_JOB_KIND_MODEL = "Object generation"
 GENERATION_JOB_KIND_TEXTURE = "Object texture generation"
 GENERATION_JOB_KIND_FACE_EDIT = "Object face editing"
 GENERATION_BATCH_PIPELINE_KEY = "generation_batch"
+INPAINT_SOURCE_PIPELINE_KEY = "inpaint_source"
 SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
 SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
 SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
@@ -619,6 +625,27 @@ def _apply_generation_batch_pipeline_metadata(
     }
 
 
+# ### Stable per-inpaint model provenance ###
+def _apply_inpaint_source_pipeline_metadata(
+    pipeline: dict[str, object],
+    request: GenerationRequest | None,
+) -> None:
+    """Bind a result to its frozen mask, not a transient batch/list position."""
+
+    if request is None or request.inpaint_key is None:
+        return
+    frame_index, mask_sha256 = request.inpaint_key
+    video_path = request.inpaint_video_path
+    pipeline[INPAINT_SOURCE_PIPELINE_KEY] = {
+        "frame_index": frame_index,
+        "mask_sha256": mask_sha256,
+        "video_path": (
+            None if video_path is None else os.path.normcase(os.path.abspath(video_path))
+        ),
+    }
+
+
+# ### Scene-component provenance ###
 def _apply_door_slot_pipeline_metadata(
     pipeline: dict[str, object],
     target: _DoorSlotEditingTarget | None,
@@ -1135,6 +1162,8 @@ class GenerationRequest:
         door_side_duplication: DoorSideDuplication | None = None,
     ) -> None:
         self.frame_index = int(frame_index)
+        self.inpaint_key: tuple[int, str] | None = None
+        self.inpaint_video_path: str | None = None
         self.selected_object_bgra = np.ascontiguousarray(
             selected_object_bgra
         ).copy()
@@ -4512,6 +4541,7 @@ class GenerationWorkspace(QWidget):
     opening_generate_displacement_changed = Signal(str, str, bool)
     opening_preserve_profile_changed = Signal(str, str, bool)
     controls_synced = Signal()
+    inpaint_selection_changed = Signal()
 
     def __init__(
         self,
@@ -4557,10 +4587,28 @@ class GenerationWorkspace(QWidget):
         ] = {}
         self._latest_generation_batch_id: str | None = None
         self._latest_generation_batch_member_ids: dict[int, str] = {}
-        self._latest_generation_batch_mask_signature: (
-            tuple[int, tuple[int, ...], str] | None
-        ) = None
+        self._latest_generation_batch_mask_signature: tuple[object, ...] | None = None
+        self._latest_generation_batch_inpaint_keys: tuple[tuple[int, str], ...] = ()
+        self._latest_generation_batch_requests: dict[int, GenerationRequest] = {}
         self._temporary_object_reference_bgra: np.ndarray | None = None
+        self._inpaint_references: dict[tuple[int, str], np.ndarray] = {}
+        self._inpaint_reference_signatures: dict[tuple[int, str], tuple[object, ...]] = {}
+        self._inpaint_symmetric_divisions: dict[tuple[int, str], bool] = {}
+        self._inpaint_tried_reference_views: dict[
+            tuple[int, str], set[tuple[str, str]]
+        ] = {}
+        self._inpaint_reference_view_preferences: dict[
+            tuple[int, str], tuple[str, str]
+        ] = {}
+        self._inpaint_remove_objects_from_furniture: dict[tuple[int, str], bool] = {}
+        self._inpaint_pbr_maps: dict[tuple[int, str], tuple[str, ...]] = {}
+        self._active_inpaint_symmetry_key: tuple[int, str] | None = None
+        self._active_inpaint_reference_key: tuple[int, str] | None = None
+        self._is_restoring_inpaint_selection = False
+        self._inpaint_component_cache: dict[int, tuple[tuple[object, ...], np.ndarray, tuple[int, ...]]] = {}
+        self._inpaint_count_cache: dict[int, tuple[tuple[object, ...], int]] = {}
+        self._inpaint_key_cache: dict[int, tuple[tuple[object, ...], tuple[tuple[int, str], ...]]] = {}
+        self._selected_inpaint_key_cache: tuple[tuple[object, ...], tuple[int, str] | None] | None = None
         self._generation_thread: QThread | None = None
         self._generation_worker: (
             GenerationWorker
@@ -4649,14 +4697,24 @@ class GenerationWorkspace(QWidget):
         self._temporary_object_reference_bgra = (
             np.ascontiguousarray(reference).copy()
         )
+        key = self.current_inpaint_reference_key()
+        if key is not None:
+            self._inpaint_references[key] = self._temporary_object_reference_bgra.copy()
+            self._inpaint_reference_signatures.pop(key, None)
+        self._active_inpaint_reference_key = key
         self._sync_controls()
 
     def clear_temporary_object_reference(self) -> bool:
         """Discard an external image while preserving video and mask data."""
 
+        key = self.current_inpaint_reference_key()
+        if key is not None:
+            self._inpaint_references.pop(key, None)
+            self._inpaint_reference_signatures.pop(key, None)
         if self._temporary_object_reference_bgra is None:
             return False
         self._temporary_object_reference_bgra = None
+        self._active_inpaint_reference_key = None
         self.video_view.clear_reference_preview()
         self._sync_controls()
         return True
@@ -4700,9 +4758,549 @@ class GenerationWorkspace(QWidget):
         return self.video_view.build_selected_object_crop()
 
     def clear_temporary_object_reference_for_video_navigation(self) -> bool:
-        """Expire a temporary image whenever video navigation takes over."""
+        """Hide the current override without discarding another blob's image."""
 
-        return self.clear_temporary_object_reference()
+        had_reference = self._temporary_object_reference_bgra is not None
+        self._temporary_object_reference_bgra = None
+        self._active_inpaint_reference_key = None
+        self.video_view.clear_reference_preview()
+        return had_reference
+
+    # ### Cross-frame inpaint selection ###
+    @staticmethod
+    def _inpaint_reference_key(frame_index: int, mask: np.ndarray) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        digest.update(str(mask.shape).encode("ascii"))
+        digest.update(np.ascontiguousarray(mask).tobytes())
+        return int(frame_index), digest.hexdigest()
+
+    def current_inpaint_reference_key(self) -> tuple[int, str] | None:
+        """Identify a painted object independently of its temporary list index."""
+
+        if (
+            self._door_slot_editing_target is not None
+            or self._architectural_trim_editing_target is not None
+        ):
+            return None
+        signature = (
+            self._data.current_frame_index,
+            self.video_view.get_selected_blob_index(),
+            tuple(self.video_view.get_strokes()),
+            self.video_view.get_mask_shape(),
+        )
+        cached = self._selected_inpaint_key_cache
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        mask = self.video_view.get_selected_blob_mask()
+        key = (
+            None if mask.size == 0 or not np.any(mask)
+            else self._inpaint_reference_key(self._data.current_frame_index, mask)
+        )
+        self._selected_inpaint_key_cache = signature, key
+        return key
+
+    def _frame_inpaint_signature(self, frame_index: int) -> tuple[object, ...]:
+        if self._is_displayed_inpaint_frame(frame_index):
+            return tuple(self.video_view.get_strokes()), self.video_view.get_mask_shape()
+        metadata = self._data.video_metadata
+        shape = () if metadata is None else (metadata.height, metadata.width)
+        return tuple(self._data.strokes_for_frame(frame_index)), shape
+
+    def _is_displayed_inpaint_frame(self, frame_index: int) -> bool:
+        return bool(
+            frame_index == self._displayed_frame_index or (
+                self._displayed_frame_index is None
+                and frame_index == self._data.current_frame_index
+                and self.video_view.has_frame()
+            )
+        )
+
+    def _frame_inpaint_components(self, frame_index: int) -> tuple[np.ndarray, tuple[int, ...]]:
+        """Keep a small LRU of connectivity, not one large mask per object."""
+
+        signature = self._frame_inpaint_signature(frame_index)
+        cached = self._inpaint_component_cache.get(frame_index)
+        if cached is not None and cached[0] == signature:
+            self._inpaint_component_cache.pop(frame_index)
+            self._inpaint_component_cache[frame_index] = cached
+            return cached[1], cached[2]
+        if self._is_displayed_inpaint_frame(frame_index):
+            mask = self.video_view.get_mask()
+        else:
+            metadata = self._data.video_metadata
+            mask = rasterize_mask_strokes(
+                (metadata.width, metadata.height), self._data.strokes_for_frame(frame_index),
+            ) if metadata is not None else np.empty((0, 0), dtype=np.uint8)
+        if mask.size == 0 or not np.any(mask):
+            labels = np.empty((0, 0), dtype=np.int32)
+            indices = ()
+        else:
+            count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            indices = tuple(sorted(
+                range(1, count), key=lambda index: (
+                    int(stats[index, cv2.CC_STAT_TOP]), int(stats[index, cv2.CC_STAT_LEFT]),
+                ),
+            ))
+        self._inpaint_component_cache[frame_index] = signature, labels, indices
+        self._inpaint_count_cache[frame_index] = signature, len(indices)
+        while len(self._inpaint_component_cache) > 4:
+            self._inpaint_component_cache.pop(next(iter(self._inpaint_component_cache)))
+        return labels, indices
+
+    def _frame_inpaint_count(self, frame_index: int) -> int:
+        signature = self._frame_inpaint_signature(frame_index)
+        cached = self._inpaint_count_cache.get(frame_index)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        if self._is_displayed_inpaint_frame(frame_index):
+            # Blob connectivity has already been computed by the paint widget.
+            count = self.video_view.get_blob_count()
+            self._inpaint_count_cache[frame_index] = signature, count
+            return count
+        return len(self._frame_inpaint_components(frame_index)[1])
+
+    def _frame_inpaint_masks(self, frame_index: int) -> tuple[np.ndarray, ...]:
+        if self._is_displayed_inpaint_frame(frame_index):
+            return self.video_view.get_blob_masks()
+        labels, indices = self._frame_inpaint_components(frame_index)
+        return tuple(np.where(labels == index, 255, 0).astype(np.uint8) for index in indices)
+
+    # ### Queued reference generation inputs ###
+    def snapshot_inpaint_reference_inputs(
+        self,
+    ) -> tuple[tuple[tuple[int, str], np.ndarray], ...]:
+        """Own every queued reference image without changing the visible selection."""
+
+        if (
+            self._door_slot_editing_target is not None
+            or self._architectural_trim_editing_target is not None
+        ):
+            return ()
+        keys = self._current_inpaint_keys()
+        inputs: list[tuple[tuple[int, str], np.ndarray]] = []
+        for frame_index in sorted({key[0] for key in keys}):
+            frame_bgr = None
+            for mask in self._frame_inpaint_masks(frame_index):
+                key = self._inpaint_reference_key(frame_index, mask)
+                reference = self._inpaint_references.get(key)
+                if reference is None:
+                    if frame_bgr is None:
+                        frame_bgr = self._inpaint_reference_frame(frame_index)
+                    reference = _build_masked_frame_crop(frame_bgr, mask, 0.08)
+                inputs.append((key, np.ascontiguousarray(reference).copy()))
+        return tuple(inputs)
+
+    def get_inpaint_reference_input(
+        self,
+        key: tuple[int, str],
+    ) -> np.ndarray | None:
+        """Read one live job input; deleted or changed masks no longer match."""
+
+        if key not in self._current_inpaint_keys():
+            return None
+        reference = self._inpaint_references.get(key)
+        if reference is not None:
+            return reference.copy()
+        frame_index = key[0]
+        for mask in self._frame_inpaint_masks(frame_index):
+            if self._inpaint_reference_key(frame_index, mask) == key:
+                return np.ascontiguousarray(_build_masked_frame_crop(
+                    self._inpaint_reference_frame(frame_index), mask, 0.08,
+                )).copy()
+        return None
+
+    def set_inpaint_reference(
+        self,
+        key: tuple[int, str],
+        reference_bgra: np.ndarray,
+    ) -> bool:
+        """Attach a job result to its surviving blob, never to another selection."""
+
+        if key not in self._current_inpaint_keys():
+            return False
+        reference = np.asarray(reference_bgra)
+        if reference.ndim != 3 or reference.shape[2] != 4 or reference.size == 0:
+            raise ValueError("The object reference must be a non-empty BGRA image.")
+        if reference.dtype != np.uint8:
+            reference = np.clip(reference, 0, 255).astype(np.uint8)
+        if not np.any(reference[:, :, 3] > 0):
+            raise ValueError("The object reference is fully transparent.")
+        reference = np.ascontiguousarray(reference).copy()
+        self._inpaint_references[key] = reference
+        self._inpaint_reference_signatures.pop(key, None)
+        if key == self.current_inpaint_reference_key():
+            self._temporary_object_reference_bgra = reference.copy()
+            self._active_inpaint_reference_key = key
+            self.video_view.set_reference_preview_bgra(reference)
+            self._sync_controls()
+            self.inpaint_selection_changed.emit()
+        return True
+
+    def _inpaint_reference_frame(self, frame_index: int) -> np.ndarray:
+        """Read source pixels without seeking the shared video widget."""
+
+        frame = (
+            self.video_view.get_frame_bgr()
+            if self._is_displayed_inpaint_frame(frame_index)
+            else self._video_source.get_frame(frame_index)
+            if self._video_source is not None else None
+        )
+        if frame is None:
+            raise ValueError(f"Load the source video to generate frame {frame_index + 1}.")
+        return frame
+
+    # ### Per-inpaint symmetric division ###
+    def get_inpaint_symmetric_division(
+        self,
+        key: tuple[int, str],
+    ) -> bool | None:
+        """Read a surviving blob's explicit setting without changing selection."""
+
+        if key not in self._current_inpaint_keys():
+            return None
+        return self._inpaint_symmetric_divisions.get(key)
+
+    def set_inpaint_symmetric_division(
+        self,
+        key: tuple[int, str],
+        enabled: bool,
+    ) -> bool:
+        """Apply one job's result only to the exact mask that it analysed."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("Symmetric division must be enabled or disabled.")
+        if key not in self._current_inpaint_keys():
+            return False
+        self._inpaint_symmetric_divisions[key] = enabled
+        if key == self.current_inpaint_reference_key():
+            self._restore_inpaint_symmetric_division(key)
+            self._sync_controls()
+        return True
+
+    def _restore_inpaint_symmetric_division(
+        self,
+        key: tuple[int, str] | None,
+    ) -> None:
+        """Restore checked state without treating restoration as a manual edit."""
+
+        self._active_inpaint_symmetry_key = key
+        blocker = QSignalBlocker(self.symmetric_division_checkbox)
+        self.symmetric_division_checkbox.setChecked(
+            self._inpaint_symmetric_divisions.get(key, False)
+        )
+        del blocker
+
+    @Slot(bool)
+    def _handle_symmetric_division_changed(self, enabled: bool) -> None:
+        """Keep manual corrections local to the currently selected inpaint."""
+
+        key = self.current_inpaint_reference_key()
+        if key is not None:
+            self._inpaint_symmetric_divisions[key] = bool(enabled)
+            self._active_inpaint_symmetry_key = key
+        self._sync_controls()
+
+    # ### Per-inpaint reference view preferences ###
+    def get_inpaint_reference_view_preferences(
+        self,
+        key: tuple[int, str],
+    ) -> tuple[str, str] | None:
+        """Read a surviving blob's selected preset and editable prompt without seeking."""
+
+        if not self._inpaint_reference_key_is_live(key):
+            return None
+        return self._inpaint_reference_view_preferences.get(key)
+
+    def set_inpaint_reference_view_preferences(
+        self,
+        key: tuple[int, str],
+        preset_id: str,
+        prompt: str = "",
+    ) -> bool:
+        """Keep manual view choices local to their exact, surviving inpaint mask."""
+
+        if not isinstance(preset_id, str):
+            raise TypeError("The reference view preset must be a string.")
+        if not isinstance(prompt, str):
+            raise TypeError("The reference prompt must be a string.")
+        if len(prompt) > MAX_REFERENCE_PROMPT_CHARACTERS:
+            raise ValueError(
+                "The reference prompt must not exceed "
+                f"{MAX_REFERENCE_PROMPT_CHARACTERS} characters."
+            )
+        if not self._inpaint_reference_key_is_live(key):
+            return False
+        self._inpaint_reference_view_preferences[key] = (
+            preset_id.strip(), prompt,
+        )
+        return True
+
+    # ### Per-inpaint reference instructions and materials ###
+    def get_inpaint_remove_objects_from_furniture(
+        self,
+        key: tuple[int, str],
+    ) -> bool | None:
+        """Read one surviving blob's furniture-emptying preference without seeking."""
+
+        if not self._inpaint_reference_key_is_live(key):
+            return None
+        return self._inpaint_remove_objects_from_furniture.get(key)
+
+    def set_inpaint_remove_objects_from_furniture(
+        self,
+        key: tuple[int, str],
+        enabled: bool,
+    ) -> bool:
+        """Keep content removal independent for each exact, surviving inpaint mask."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("The furniture object removal preference must be a boolean.")
+        if not self._inpaint_reference_key_is_live(key):
+            return False
+        self._inpaint_remove_objects_from_furniture[key] = enabled
+        return True
+
+    def get_inpaint_pbr_maps(
+        self,
+        key: tuple[int, str],
+    ) -> tuple[str, ...] | None:
+        """Read an immutable material-map selection without moving the video."""
+
+        if not self._inpaint_reference_key_is_live(key):
+            return None
+        return self._inpaint_pbr_maps.get(key)
+
+    def set_inpaint_pbr_maps(
+        self,
+        key: tuple[int, str],
+        enabled_maps: Sequence[str],
+    ) -> bool:
+        """Set only one surviving blob's normal, roughness and metallic maps."""
+
+        normalized = _normalize_enabled_pbr_maps(enabled_maps)
+        if not self._inpaint_reference_key_is_live(key):
+            return False
+        self._inpaint_pbr_maps[key] = normalized
+        if key == self.current_inpaint_reference_key():
+            self._restore_inpaint_pbr_maps(key)
+            self._sync_controls()
+            self.inpaint_selection_changed.emit()
+        return True
+
+    def _restore_inpaint_pbr_maps(self, key: tuple[int, str] | None) -> None:
+        """Restore a blob's maps without recording programmatic checkbox edits."""
+
+        if key is None:
+            return
+        enabled_maps = self._inpaint_pbr_maps.get(key, PBR_MAP_TYPES)
+        for map_type, checkbox in self.pbr_map_checkboxes.items():
+            blocker = QSignalBlocker(checkbox)
+            checkbox.setChecked(map_type in enabled_maps)
+            del blocker
+        self.result_view.set_pbr_maps_enabled(enabled_maps)
+
+    # ### Per-inpaint tried reference views ###
+    def get_inpaint_tried_reference_views(
+        self,
+        key: tuple[int, str],
+    ) -> frozenset[tuple[str, str]]:
+        """Read an immutable history for one surviving blob without seeking."""
+
+        if not self._inpaint_reference_key_is_live(key):
+            return frozenset()
+        return frozenset(self._inpaint_tried_reference_views.get(key, ()))
+
+    def mark_inpaint_reference_view_tried(
+        self,
+        key: tuple[int, str],
+        preset_id: str,
+        prompt: str,
+    ) -> bool:
+        """Record a successful preset and its prompt for this exact blob only."""
+
+        if not isinstance(preset_id, str):
+            raise TypeError("The reference view preset must be a string.")
+        if not isinstance(prompt, str):
+            raise TypeError("The reference view prompt must be a string.")
+        preset_id = preset_id.strip()
+        if not preset_id:
+            raise ValueError("The reference view preset must not be empty.")
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("The reference view prompt must not be empty.")
+        if not self._inpaint_reference_key_is_live(key):
+            return False
+        self._inpaint_tried_reference_views.setdefault(key, set()).add((preset_id, prompt))
+        return True
+
+    def _inpaint_reference_key_is_live(self, key: tuple[int, str]) -> bool:
+        """Validate only the key's frame, reusing connectivity and key caches."""
+
+        frame_index = key[0]
+        if (
+            frame_index not in self._data.frame_strokes
+            and not self._is_displayed_inpaint_frame(frame_index)
+        ):
+            return False
+        signature = self._frame_inpaint_signature(frame_index)
+        cached = self._inpaint_key_cache.get(frame_index)
+        if cached is None or cached[0] != signature:
+            frame_keys = tuple(
+                self._inpaint_reference_key(frame_index, mask)
+                for mask in self._frame_inpaint_masks(frame_index)
+            )
+            self._inpaint_key_cache[frame_index] = signature, frame_keys
+        else:
+            frame_keys = cached[1]
+        return key in frame_keys
+
+    # ### Cross-frame inpaint navigation ###
+    def inpaint_queue(self) -> tuple[tuple[int, int], ...]:
+        """List painted objects across the video in frame and top-left order."""
+
+        self._store_current_frame_strokes()
+        frame_indices = set(self._data.frame_strokes)
+        if self.video_view.has_selection():
+            frame_indices.add(self._data.current_frame_index)
+        return tuple(
+            (frame_index, blob_index)
+            for frame_index in sorted(frame_indices)
+            for blob_index in range(self._frame_inpaint_count(frame_index))
+        )
+
+    def current_inpaint_position(self) -> tuple[int | None, int]:
+        queue = self.inpaint_queue()
+        selection = (
+            self._data.current_frame_index, self.video_view.get_selected_blob_index(),
+        )
+        return (queue.index(selection) if selection in queue else None, len(queue))
+
+    def navigate_inpaints(self, delta: int) -> bool:
+        """Select the next/previous painted object, wrapping across frames."""
+
+        queue = self.inpaint_queue()
+        if not queue:
+            return False
+        # Restoring a library preview is not entering component generation.
+        # Explicit inpaint navigation should leave that passive selection even
+        # when the next blob happens to be on the same frame.
+        opening_target = self._door_slot_editing_target
+        if opening_target is not None and not opening_target.generation_ready:
+            self.clear_door_slot_editing_target()
+        trim_target = self._architectural_trim_editing_target
+        if trim_target is not None and not trim_target.generation_ready:
+            self.clear_architectural_trim_editing_target()
+        current, _total = self.current_inpaint_position()
+        target = (0 if delta >= 0 else len(queue) - 1) if current is None else (
+            current + int(delta)
+        ) % len(queue)
+        frame_index, blob_index = queue[target]
+        self._is_restoring_inpaint_selection = True
+        try:
+            if frame_index != self._displayed_frame_index:
+                self.show_frame(frame_index)
+            if frame_index != self._displayed_frame_index:
+                return False
+            self.video_view.select_blob(blob_index)
+        finally:
+            self._is_restoring_inpaint_selection = False
+        self._handle_inpaint_selection_changed()
+        self._select_current_inpaint_generated_object()
+        return True
+
+    # ### Generated model selection for manual inpaint navigation ###
+    def _inpaint_source_video_path(self) -> str | None:
+        metadata = self._data.video_metadata
+        if metadata is None:
+            return None
+        return os.path.normcase(os.path.abspath(metadata.path))
+
+    def _record_matches_inpaint_source(
+        self,
+        record: GeneratedObjectRecord,
+        key: tuple[int, str] | None,
+    ) -> bool:
+        """Never confuse same-frame blobs or identical masks from other videos."""
+
+        if key is None:
+            return False
+        source = record.pipeline.get(INPAINT_SOURCE_PIPELINE_KEY)
+        if not isinstance(source, dict):
+            return False
+        video_path = source.get("video_path")
+        if video_path is not None:
+            if not isinstance(video_path, str):
+                return False
+            video_path = os.path.normcase(os.path.abspath(video_path))
+        return bool(
+            source.get("frame_index") == key[0]
+            and source.get("mask_sha256") == key[1]
+            and video_path == self._inpaint_source_video_path()
+        )
+
+    def _select_current_inpaint_generated_object(self) -> bool:
+        """Display the newest completed result next to the selected blob's reference."""
+
+        if (
+            self._door_slot_editing_target is not None
+            or self._architectural_trim_editing_target is not None
+        ):
+            return False
+        key = self.current_inpaint_reference_key()
+        record = next(
+            (
+                candidate for candidate in reversed(self._data.generated_objects)
+                if self._record_matches_inpaint_source(candidate, key)
+            ),
+            None,
+        )
+        self._select_generated_object(None if record is None else record.object_id)
+        return record is not None
+
+    # ### Per-inpaint reference restoration ###
+    def _handle_inpaint_selection_changed(self) -> None:
+        """Restore the selected object's private reference before publishing it."""
+
+        if (
+            self._is_restoring_inpaint_selection
+            or self._door_slot_editing_target is not None
+            or self._architectural_trim_editing_target is not None
+        ):
+            return
+        key = self.current_inpaint_reference_key()
+        if key is not None or key != self._active_inpaint_symmetry_key:
+            self._restore_inpaint_symmetric_division(key)
+        self._restore_inpaint_pbr_maps(key)
+        if key != self._active_inpaint_reference_key:
+            reference = self._inpaint_references.get(key) if key is not None else None
+            self._temporary_object_reference_bgra = (
+                None if reference is None else reference.copy()
+            )
+            self._active_inpaint_reference_key = key
+            self.video_view.clear_reference_preview()
+            if reference is not None:
+                self.video_view.set_reference_preview_bgra(reference)
+        self._sync_controls()
+        self.inpaint_selection_changed.emit()
+
+    def _handle_inpaint_frame_changed(self) -> None:
+        # The merged workspace also changes frames directly on the shared view.
+        self._selected_inpaint_key_cache = None
+        if self.current_inpaint_reference_key() is not None:
+            self._active_inpaint_reference_key = None
+        self._handle_inpaint_selection_changed()
+
+    def _reset_inpaint_caches(self) -> None:
+        self._inpaint_component_cache.clear()
+        self._inpaint_count_cache.clear()
+        self._inpaint_key_cache.clear()
+        self._selected_inpaint_key_cache = None
+        self._inpaint_symmetric_divisions.clear()
+        self._inpaint_tried_reference_views.clear()
+        self._inpaint_reference_view_preferences.clear()
+        self._inpaint_remove_objects_from_furniture.clear()
+        self._inpaint_pbr_maps.clear()
+        self._restore_inpaint_symmetric_division(None)
 
     def get_shared_controls(self) -> GenerationSharedControls:
         """Expose the canonical controls shared by both generation pipelines."""
@@ -5217,6 +5815,7 @@ class GenerationWorkspace(QWidget):
             return
         self._door_slot_editing_target = None
         self._door_slot_generation_prompt_visible = False
+        self._handle_inpaint_selection_changed()
         self.result_view.set_selected_placed_object_ids(())
         self._select_generated_object(None)
         self.door_slot_editing_changed.emit(False)
@@ -5228,6 +5827,7 @@ class GenerationWorkspace(QWidget):
         if self._architectural_trim_editing_target is None:
             return
         self._architectural_trim_editing_target = None
+        self._handle_inpaint_selection_changed()
         self.result_view.set_selected_placed_object_ids(())
         self._select_generated_object(None)
         self.architectural_trim_editing_changed.emit(False)
@@ -5645,17 +6245,46 @@ class GenerationWorkspace(QWidget):
 
     def _build_current_generation_mask_signature(
         self,
-    ) -> tuple[int, tuple[int, ...], str] | None:
-        """Fingerprint the exact current mask without retaining its pixel buffer."""
+    ) -> tuple[object, ...] | None:
+        """Fingerprint every queued mask and its optional replacement image."""
 
-        mask = np.ascontiguousarray(self.video_view.get_mask())
-        if mask.size == 0 or not np.any(mask > 0):
+        keys = self._current_inpaint_keys()
+        if not keys:
             return None
-        return (
-            int(self._data.current_frame_index),
-            tuple(int(value) for value in mask.shape),
-            hashlib.sha256(mask.tobytes()).hexdigest(),
-        )
+        signature: list[object] = []
+        for key in keys:
+            reference = self._inpaint_references.get(key)
+            if reference is None:
+                reference_signature = None
+            else:
+                reference_signature = self._inpaint_reference_signatures.get(key)
+                if reference_signature is None:
+                    reference_signature = (
+                        reference.shape, hashlib.sha256(reference.tobytes()).hexdigest(),
+                    )
+                    self._inpaint_reference_signatures[key] = reference_signature
+            signature.append((key, reference_signature))
+        return tuple(signature)
+
+    def _current_inpaint_keys(self) -> tuple[tuple[int, str], ...]:
+        self._store_current_frame_strokes()
+        frame_indices = set(self._data.frame_strokes)
+        if self.video_view.has_selection():
+            frame_indices.add(self._data.current_frame_index)
+        keys: list[tuple[int, str]] = []
+        for frame_index in sorted(frame_indices):
+            signature = self._frame_inpaint_signature(frame_index)
+            cached = self._inpaint_key_cache.get(frame_index)
+            if cached is None or cached[0] != signature:
+                frame_keys = tuple(
+                    self._inpaint_reference_key(frame_index, mask)
+                    for mask in self._frame_inpaint_masks(frame_index)
+                )
+                self._inpaint_key_cache[frame_index] = signature, frame_keys
+            else:
+                frame_keys = cached[1]
+            keys.extend(frame_keys)
+        return tuple(keys)
 
     def get_scene_bound_placeable_object_ids(self) -> tuple[str, ...]:
         """Return sources represented by an authored placement or an instance."""
@@ -5971,7 +6600,13 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_id = None
         self._latest_generation_batch_member_ids.clear()
         self._latest_generation_batch_mask_signature = None
+        self._latest_generation_batch_inpaint_keys = ()
+        self._latest_generation_batch_requests.clear()
         self._temporary_object_reference_bgra = None
+        self._inpaint_references.clear()
+        self._inpaint_reference_signatures.clear()
+        self._active_inpaint_reference_key = None
+        self._reset_inpaint_caches()
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = GenerationData() if data is None else data.clone()
@@ -7412,6 +8047,8 @@ class GenerationWorkspace(QWidget):
     def generate_selected_object_texture(self) -> bool:
         """Generate the selected object's texture from the current mask."""
 
+        if self._has_matching_inpaint_generation_batch():
+            return self._generate_inpaint_batch_textures()
         trim_target = self._architectural_trim_editing_target
         if trim_target is not None:
             trim_record = self._find_generated_object_record(trim_target.object_id)
@@ -7441,6 +8078,60 @@ class GenerationWorkspace(QWidget):
         if request is None:
             return False
         return self._start_texture_regeneration(request)
+
+    def _has_matching_inpaint_generation_batch(self) -> bool:
+        return bool(
+            self._door_slot_editing_target is None
+            and self._architectural_trim_editing_target is None
+            and self._latest_generation_batch_inpaint_keys
+            and self._latest_generation_batch_requests
+            and (
+                self._selected_object_id is None
+                or self._selected_object_id in self._latest_generation_batch_member_ids.values()
+            )
+            and self._current_inpaint_keys() == self._latest_generation_batch_inpaint_keys
+        )
+
+    def can_generate_inpaint_batch_texture(self) -> bool:
+        """Allow queue textures even while an unpainted frame is displayed."""
+
+        if not self._has_matching_inpaint_generation_batch():
+            return False
+        return all(
+            self._can_regenerate_object_texture(
+                self._find_generated_object_record(
+                    self._latest_generation_batch_member_ids.get(index)
+                ),
+                require_current_reference=False,
+            )
+            for index in self._latest_generation_batch_requests
+        )
+
+    def _generate_inpaint_batch_textures(self) -> bool:
+        """Retexture each completed queue member with its own source reference."""
+
+        if not self.can_generate_inpaint_batch_texture():
+            self.status_label.setText("Wait for every inpaint's geometry to finish before generating textures.")
+            return False
+        requests: list[_TextureRegenerationPreflight] = []
+        for index, original in self._latest_generation_batch_requests.items():
+            key = self._latest_generation_batch_inpaint_keys[index - 1]
+            reference = self._inpaint_references.get(key, original.selected_object_bgra)
+            request = self._build_texture_regeneration_request(
+                object_id=self._latest_generation_batch_member_ids[index],
+                reference_image_bgra=np.ascontiguousarray(reference).copy(),
+                reference_frame_index=original.frame_index,
+                symmetric_division_override=self._inpaint_symmetric_divisions.get(
+                    key, original.symmetric_division_enabled,
+                ),
+                enabled_pbr_maps_override=self._inpaint_pbr_maps.get(
+                    key, original.enabled_pbr_maps,
+                ),
+            )
+            if request is None:
+                return False
+            requests.append(request)
+        return all(self._start_texture_regeneration(request) for request in requests)
 
     def _start_empty_door_slot_generation(
         self,
@@ -7898,6 +8589,12 @@ class GenerationWorkspace(QWidget):
         self._data.current_frame_index = 0
         self._data.frame_strokes = {}
         self._temporary_object_reference_bgra = None
+        self._inpaint_references.clear()
+        self._inpaint_reference_signatures.clear()
+        self._active_inpaint_reference_key = None
+        self._reset_inpaint_caches()
+        self._latest_generation_batch_inpaint_keys = ()
+        self._latest_generation_batch_requests.clear()
         self._sync_video_controls()
         self.show_frame(0)
         self.status_label.setText(
@@ -7930,6 +8627,7 @@ class GenerationWorkspace(QWidget):
             frame_bgr,
             self._data.strokes_for_frame(safe_index),
         )
+        self._handle_inpaint_selection_changed()
         self._sync_seekbar_value(safe_index)
         self._sync_controls()
 
@@ -8020,6 +8718,10 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_mask_signature = (
             self._build_current_generation_mask_signature()
         )
+        self._latest_generation_batch_inpaint_keys = self._current_inpaint_keys()
+        self._latest_generation_batch_requests = {
+            index: request for index, request in enumerate(requests, start=1)
+        }
         self.generation_batch_started.emit(tuple(operation_ids))
 
     def _reserved_generated_object_names(self) -> set[str]:
@@ -8728,6 +9430,10 @@ class GenerationWorkspace(QWidget):
         self.video_view.strokes_changed.connect(
             self._handle_video_strokes_changed
         )
+        self.video_view.selected_blob_changed.connect(
+            self._handle_inpaint_selection_changed
+        )
+        self.video_view.frame_changed.connect(self._handle_inpaint_frame_changed)
         views_layout.addWidget(
             _build_labeled_view("Source video and object mask", self.video_view),
             VIEW_STRETCH,
@@ -8932,7 +9638,7 @@ class GenerationWorkspace(QWidget):
 
         self.ai_prompt_edit = QLineEdit()
         self.ai_prompt_edit.setObjectName("object_generation_ai_prompt_edit")
-        self.ai_prompt_edit.setPlaceholderText("AI prompt (optional)")
+        self.ai_prompt_edit.setPlaceholderText("Texture prompt (optional)")
         self.ai_prompt_edit.setClearButtonEnabled(True)
         self.ai_prompt_edit.setMaxLength(
             MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS
@@ -8958,7 +9664,9 @@ class GenerationWorkspace(QWidget):
             "generation for a door body. For cornices, the full geometry is "
             "kept and only its texture is packed into the left atlas half."
         )
-        self.symmetric_division_checkbox.toggled.connect(self._sync_controls)
+        self.symmetric_division_checkbox.toggled.connect(
+            self._handle_symmetric_division_changed
+        )
         buttons_layout.addWidget(self.symmetric_division_checkbox)
 
         self.side_door_duplication_checkbox = QCheckBox(
@@ -9158,9 +9866,13 @@ class GenerationWorkspace(QWidget):
 
     @Slot(bool)
     def _handle_pbr_map_toggled(self, _enabled: bool) -> None:
-        """Apply PBR contribution changes without reloading the model."""
+        """Keep manual material choices local and update the preview in place."""
 
-        self.result_view.set_pbr_maps_enabled(self._get_enabled_pbr_maps())
+        enabled_maps = self._get_enabled_pbr_maps()
+        key = self.current_inpaint_reference_key()
+        if key is not None:
+            self._inpaint_pbr_maps[key] = enabled_maps
+        self.result_view.set_pbr_maps_enabled(enabled_maps)
         self._sync_controls()
 
     @Slot(bool)
@@ -9176,6 +9888,31 @@ class GenerationWorkspace(QWidget):
             self._displayed_frame_index,
             self.video_view.get_strokes(),
         )
+        live_keys = {
+            self._inpaint_reference_key(self._displayed_frame_index, mask)
+            for mask in self.video_view.get_blob_masks()
+        }
+        for key in tuple(self._inpaint_references):
+            if key[0] == self._displayed_frame_index and key not in live_keys:
+                self._inpaint_references.pop(key, None)
+                self._inpaint_reference_signatures.pop(key, None)
+        for key in tuple(self._inpaint_symmetric_divisions):
+            if key[0] == self._displayed_frame_index and key not in live_keys:
+                self._inpaint_symmetric_divisions.pop(key, None)
+        for key in tuple(self._inpaint_tried_reference_views):
+            if key[0] == self._displayed_frame_index and key not in live_keys:
+                self._inpaint_tried_reference_views.pop(key, None)
+        for key in tuple(self._inpaint_reference_view_preferences):
+            if key[0] == self._displayed_frame_index and key not in live_keys:
+                self._inpaint_reference_view_preferences.pop(key, None)
+        for preferences in (
+            self._inpaint_remove_objects_from_furniture,
+            self._inpaint_pbr_maps,
+        ):
+            for key in tuple(preferences):
+                if key[0] == self._displayed_frame_index and key not in live_keys:
+                    preferences.pop(key, None)
+        self._handle_inpaint_selection_changed()
         self._emit_data_changed()
         self._sync_controls()
 
@@ -9346,7 +10083,11 @@ class GenerationWorkspace(QWidget):
             return False
 
         should_select_result = True
-        if is_architectural_trim_component_record(record):
+        if INPAINT_SOURCE_PIPELINE_KEY in record.pipeline:
+            should_select_result = self._record_matches_inpaint_source(
+                record, self.current_inpaint_reference_key(),
+            )
+        elif is_architectural_trim_component_record(record):
             active_trim_target = self._architectural_trim_editing_target
             should_select_result = bool(
                 active_trim_target is not None
@@ -10310,6 +11051,7 @@ class GenerationWorkspace(QWidget):
             )
             return
         _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
+        _apply_inpaint_source_pipeline_metadata(pipeline, generation_request)
         _apply_door_slot_pipeline_metadata(pipeline, door_slot_target)
         _apply_architectural_trim_pipeline_metadata(
             pipeline,
@@ -10467,6 +11209,7 @@ class GenerationWorkspace(QWidget):
             return
         pipeline = copy.deepcopy(saved.pipeline)
         _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
+        _apply_inpaint_source_pipeline_metadata(pipeline, generation_request)
         _apply_door_slot_pipeline_metadata(pipeline, door_slot_target)
         _apply_architectural_trim_pipeline_metadata(
             pipeline,
@@ -11283,20 +12026,26 @@ class GenerationWorkspace(QWidget):
         self,
         *,
         geometry_only: bool = False,
+        reference_bgra: np.ndarray | None = None,
+        reference_frame_index: int | None = None,
     ) -> GenerationRequest | None:
         has_temporary_reference = self.has_temporary_object_reference()
         if (
             self.video_view.get_frame_bgr() is None
             and not has_temporary_reference
+            and reference_bgra is None
         ):
             self.status_label.setText(
                 "Load a video or reference image before generating."
             )
             return None
-        if not self._has_current_object_generation_reference():
+        if reference_bgra is None and not self._has_current_object_generation_reference():
             self.status_label.setText("Paint over the object to generate first.")
             return None
-        selected_crop = self._build_current_object_generation_reference()
+        selected_crop = (
+            self._build_current_object_generation_reference()
+            if reference_bgra is None else reference_bgra
+        )
         if selected_crop.size == 0:
             self.status_label.setText("The selected object mask is empty.")
             return None
@@ -11359,7 +12108,10 @@ class GenerationWorkspace(QWidget):
                 DEFAULT_PROJECTION_CAMERA_PERCENTAGES
             )
         return GenerationRequest(
-            frame_index=self._data.current_frame_index,
+            frame_index=(
+                self._data.current_frame_index
+                if reference_frame_index is None else int(reference_frame_index)
+            ),
             selected_object_bgra=selected_crop,
             settings=(
                 replace(
@@ -11418,52 +12170,73 @@ class GenerationWorkspace(QWidget):
         *,
         geometry_only: bool = False,
     ) -> tuple[GenerationRequest, ...]:
-        """Snapshot shared settings into one request per disconnected mask blob."""
+        """Snapshot all painted objects without navigating away from the live frame."""
 
-        template = self._build_generation_request(geometry_only=geometry_only)
-        if template is None:
-            return ()
-        if self.has_temporary_object_reference():
-            selected_crops = (template.selected_object_bgra,)
-        else:
-            selected_crops = self.video_view.build_selected_object_crops()
-            if not selected_crops:
-                self.status_label.setText("The selected object mask is empty.")
-                return ()
-        return tuple(
-            GenerationRequest(
-                frame_index=template.frame_index,
-                selected_object_bgra=selected_crop,
-                settings=template.settings,
-                geometry_only=template.geometry_only,
-                symmetric_division_enabled=(
-                    template.symmetric_division_enabled
-                ),
-                symmetric_division_orientation=(
-                    template.symmetric_division_orientation
-                ),
-                projection_camera_percentages=(
-                    template.projection_camera_percentages
-                ),
-                enabled_pbr_maps=template.enabled_pbr_maps,
-                ai_prompt=template.ai_prompt,
-                architectural_trim_fit_dimensions=(
-                    template.architectural_trim_fit_dimensions
-                ),
-                architectural_trim_kind=template.architectural_trim_kind,
-                cornice_uv_texture_domain=(
-                    template.cornice_uv_texture_domain
-                ),
-                door_body_fit_dimensions=(
-                    template.door_body_fit_dimensions
-                ),
-                door_body_profile_outline=(
-                    template.door_body_profile_outline
-                ),
-                door_side_duplication=template.door_side_duplication,
-            )
-            for selected_crop in selected_crops
+        component_mode = bool(
+            self._door_slot_editing_target is not None
+            or self._architectural_trim_editing_target is not None
         )
+        if component_mode:
+            request = self._build_generation_request(geometry_only=geometry_only)
+            return () if request is None else (request,)
+        self._store_current_frame_strokes()
+        requests: list[GenerationRequest] = []
+        template: GenerationRequest | None = None
+        try:
+            frame_indices = sorted(self._data.frame_strokes)
+            if self.video_view.has_selection():
+                frame_indices = sorted(set(frame_indices) | {self._data.current_frame_index})
+            for frame_index in frame_indices:
+                masks = self._frame_inpaint_masks(frame_index)
+                if not masks:
+                    continue
+                frame_bgr = (
+                    self.video_view.get_frame_bgr()
+                    if frame_index == self._data.current_frame_index
+                    else self._video_source.get_frame(frame_index)
+                    if self._video_source is not None else None
+                )
+                if frame_bgr is None:
+                    raise ValueError(f"Load the source video to generate frame {frame_index + 1}.")
+                for mask in masks:
+                    key = self._inpaint_reference_key(frame_index, mask)
+                    reference = self._inpaint_references.get(key)
+                    selected_crop = (
+                        _build_masked_frame_crop(frame_bgr, mask, 0.08)
+                        if reference is None else reference.copy()
+                    )
+                    if template is None:
+                        template = self._build_generation_request(
+                            geometry_only=geometry_only,
+                            reference_bgra=selected_crop,
+                            reference_frame_index=frame_index,
+                        )
+                        if template is None:
+                            return ()
+                    request = copy.copy(template)
+                    request.frame_index = frame_index
+                    request.inpaint_key = key
+                    request.inpaint_video_path = self._inpaint_source_video_path()
+                    request.selected_object_bgra = np.ascontiguousarray(selected_crop).copy()
+                    request.symmetric_division_enabled = bool(
+                        not geometry_only
+                        and self._inpaint_symmetric_divisions.get(
+                            key,
+                            template.symmetric_division_enabled
+                            if not self._inpaint_symmetric_divisions else False,
+                        )
+                    )
+                    request.enabled_pbr_maps = self._inpaint_pbr_maps.get(
+                        key, PBR_MAP_TYPES,
+                    )
+                    requests.append(request)
+        except (IndexError, ValueError) as error:
+            self.status_label.setText(f"Generation could not start: {error}")
+            return ()
+        if requests:
+            return tuple(requests)
+        request = self._build_generation_request(geometry_only=geometry_only)
+        return () if request is None else (request,)
 
     def _build_texture_regeneration_request(
         self,
@@ -11471,6 +12244,10 @@ class GenerationWorkspace(QWidget):
         object_id: str | None = None,
         glass_face_indices: Sequence[int] = (),
         glass_double_sided: bool | None = None,
+        reference_image_bgra: np.ndarray | None = None,
+        reference_frame_index: int | None = None,
+        symmetric_division_override: bool | None = None,
+        enabled_pbr_maps_override: Sequence[str] | None = None,
     ) -> _TextureRegenerationPreflight | None:
         target_object_id = (
             self._selected_object_id
@@ -11478,7 +12255,9 @@ class GenerationWorkspace(QWidget):
             else str(object_id).strip()
         )
         record = self._find_generated_object_record(target_object_id)
-        if not self._can_regenerate_object_texture(record):
+        if not self._can_regenerate_object_texture(
+            record, require_current_reference=reference_image_bgra is None,
+        ):
             self.status_label.setText(
                 "Select a generated object and paint or accept a current video "
                 "reference before generating its texture."
@@ -11493,7 +12272,10 @@ class GenerationWorkspace(QWidget):
         if any(index < 0 for index in normalized_glass_faces):
             self.status_label.setText("Selected glass faces are invalid.")
             return None
-        selected_crop = self._build_current_object_generation_reference()
+        selected_crop = (
+            self._build_current_object_generation_reference()
+            if reference_image_bgra is None else reference_image_bgra
+        )
         if selected_crop.size == 0:
             self.status_label.setText("The selected texture reference is empty.")
             return None
@@ -11564,15 +12346,22 @@ class GenerationWorkspace(QWidget):
             new_symmetric_division_orientation = (
                 SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
                 if (
-                    is_door_component
-                    and is_door_body_slot(door_component_slot_id)
-                    and self._door_slot_editing_target is not None
-                    and self._door_slot_editing_target.generation_ready
-                    and self._door_slot_editing_target.object_id
-                    == record.object_id
-                    and self.symmetric_division_checkbox.isChecked()
-                    and not preserve_symmetric_uvs
+                    (
+                        is_door_component
+                        and is_door_body_slot(door_component_slot_id)
+                        and self._door_slot_editing_target is not None
+                        and self._door_slot_editing_target.generation_ready
+                        and self._door_slot_editing_target.object_id
+                        == record.object_id
+                        and self.symmetric_division_checkbox.isChecked()
+                    )
+                    or (
+                        not is_door_component
+                        and not is_architectural_trim_component_record(record)
+                        and symmetric_division_override is True
+                    )
                 )
+                and not preserve_symmetric_uvs
                 else None
             )
             preserve_existing_glass = isinstance(
@@ -11628,11 +12417,16 @@ class GenerationWorkspace(QWidget):
             enabled_pbr_maps = (
                 PBR_MAP_TYPES
                 if normalized_glass_faces
+                else _normalize_enabled_pbr_maps(enabled_pbr_maps_override)
+                if enabled_pbr_maps_override is not None
                 else self._get_enabled_pbr_maps()
             )
             request = _TextureRegenerationPreflight(
                 object_id=record.object_id,
-                reference_frame_index=self._data.current_frame_index,
+                reference_frame_index=(
+                    self._data.current_frame_index
+                    if reference_frame_index is None else int(reference_frame_index)
+                ),
                 reference_image_bgra=selected_crop,
                 source_asset_path=source_asset_path,
                 source_asset_revision=source_asset_revision,
@@ -11979,15 +12773,21 @@ class GenerationWorkspace(QWidget):
         )
         self.regenerate_texture_button.setEnabled(
             (
-                missing_door_slot_can_generate
-                or not architectural_trim_mode
-                or architectural_trim_can_generate_texture
+                self.can_generate_inpaint_batch_texture()
+                and projection_camera_percentages_are_valid
             )
-            and (
-                missing_door_slot_can_generate
-                or (
-                    self._can_regenerate_object_texture(selected_record)
-                    and projection_camera_percentages_are_valid
+            or (
+                (
+                    missing_door_slot_can_generate
+                    or not architectural_trim_mode
+                    or architectural_trim_can_generate_texture
+                )
+                and (
+                    missing_door_slot_can_generate
+                    or (
+                        self._can_regenerate_object_texture(selected_record)
+                        and projection_camera_percentages_are_valid
+                    )
                 )
             )
         )
@@ -12026,7 +12826,7 @@ class GenerationWorkspace(QWidget):
             self.ai_prompt_edit.setEnabled(not has_untracked_legacy_job)
         ordinary_geometry_generation_is_available = bool(
             has_reference_source
-            and has_generation_reference
+            and (has_generation_reference or bool(self.inpaint_queue()))
             and required_key_is_available
             and not has_untracked_legacy_job
         )
@@ -12123,6 +12923,8 @@ class GenerationWorkspace(QWidget):
     def _can_regenerate_object_texture(
         self,
         record: GeneratedObjectRecord | None,
+        *,
+        require_current_reference: bool = True,
     ) -> bool:
         return not (
             record is None
@@ -12133,10 +12935,11 @@ class GenerationWorkspace(QWidget):
             )
             or not self._settings.meshy_api_key
             or (
-                self._video_source is None
+                require_current_reference
+                and self._video_source is None
                 and not self.has_temporary_object_reference()
             )
-            or not self._has_current_object_generation_reference()
+            or (require_current_reference and not self._has_current_object_generation_reference())
             or (
                 record.provider != GENERATION_BACKEND_MESHY
                 and not is_door_component_record(record)

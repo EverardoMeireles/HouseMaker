@@ -2905,6 +2905,10 @@ class BlueprintWorkspace(QWidget):
         self.merged_generation_workspace.set_reference_generation_model(
             generation_settings.reference_generation_model
         )
+        self.merged_generation_workspace.set_object_symmetry_inference(
+            generation_settings.enable_object_symmetry_inference,
+            generation_settings.symmetry_inference_model,
+        )
         self.merged_generation_workspace.set_ceiling_height_estimation_model(
             generation_settings.ceiling_height_estimation_model
         )
@@ -30080,6 +30084,10 @@ class BlueprintWorkspace(QWidget):
         self.surface_texture_generation.set_runtime_settings(settings)
         self.merged_generation_workspace.set_reference_generation_model(
             settings.reference_generation_model
+        )
+        self.merged_generation_workspace.set_object_symmetry_inference(
+            settings.enable_object_symmetry_inference,
+            settings.symmetry_inference_model,
         )
         self.merged_generation_workspace.set_ceiling_height_estimation_model(
             settings.ceiling_height_estimation_model

@@ -25,6 +25,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QImage, QImageReader, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
     QApplication,
     QComboBox,
     QDoubleSpinBox,
@@ -67,6 +68,9 @@ from housemaker.ceiling_height_ranges import (
 )
 from housemaker.door_state import is_door_body_slot
 from housemaker.generation_jobs import (
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_FAILED,
     JOB_STATUS_RUNNING,
     GenerationJobManager,
 )
@@ -79,14 +83,28 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.models import LevelData
+from housemaker.plan_correction_models import PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
 from housemaker.plan_metric_state import (
     PlanMetricCalibration,
     build_ceiling_height_plan_context,
+)
+from housemaker.reference_generation import (
+    MAX_REFERENCE_PROMPT_CHARACTERS,
+    REMOVE_OBJECTS_FROM_FURNITURE_PROMPT,
+)
+from housemaker.reference_generation_batch import (
+    LocalReferenceBatchItem,
+)
+from housemaker.reference_generation_batch import (
+    LocalReferenceBatchThread as _LocalReferenceBatchThread,
 )
 from housemaker.reference_generation_models import (
     DEFAULT_REFERENCE_NEGATIVE_PROMPT,
     REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
     REFERENCE_GENERATION_MODELS,
+)
+from housemaker.reference_symmetry_inference import (
+    SYMMETRY_INFERENCE_MODEL_OPTIONS,
 )
 from housemaker.reference_view_presets import (
     DEFAULT_REFERENCE_VIEW_PRESETS,
@@ -96,7 +114,9 @@ from housemaker.reference_view_presets import (
 from housemaker.settings_widget import (
     DEFAULT_CLEAR_MASK_HOTKEY,
     read_ceiling_height_estimation_model,
+    read_enable_object_symmetry_inference,
     read_reference_generation_model,
+    read_symmetry_inference_model,
 )
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import SurfaceTextureGenerationWorkspace
@@ -127,7 +147,8 @@ GENERATION_ACTION_GEOMETRY = "generate_geometry"
 GENERATION_ACTION_OBJECT_TEXTURE = "generate_object_texture"
 GENERATION_ACTION_SURFACE_TEXTURE = "generate_surface_texture"
 REFERENCE_GENERATION_JOB_KIND = "Reference generation"
-REFERENCE_GENERATION_PROMPT_SETTINGS_KEY = "generation/reference_generation_prompt"
+REFERENCE_GENERATION_PROMPT_SETTINGS_KEY = "generation/reference_prompt"
+REMOVE_OBJECTS_FROM_FURNITURE_SETTINGS_KEY = "generation/remove_objects_from_furniture"
 REFERENCE_GENERATION_VIEW_SETTINGS_KEY = "generation/reference_generation_view"
 REFERENCE_GENERATION_CUSTOM_VIEW_ID = ""
 REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY = (
@@ -441,6 +462,9 @@ class _ReferenceGenerationThread(QThread):
         self._negative_prompt = str(negative_prompt)
         self.result: np.ndarray | None = None
         self.error_message: str | None = None
+        self.symmetry_model: str | None = None
+        self.symmetry_result = None
+        self.symmetry_error: str | None = None
         self.was_cancelled = False
 
     def run(self) -> None:  # type: ignore[override]
@@ -458,6 +482,8 @@ class _ReferenceGenerationThread(QThread):
                 cancellation_check=self.isInterruptionRequested,
             )
             self.was_cancelled = self.isInterruptionRequested()
+            if not self.was_cancelled:
+                self._infer_generated_symmetry()
         except Exception as error:  # noqa: BLE001 - report provider failures on the GUI thread.
             self.was_cancelled = self.isInterruptionRequested()
             if not self.was_cancelled:
@@ -469,6 +495,36 @@ class _ReferenceGenerationThread(QThread):
         finally:
             self._api_key = ""
 
+    # ### Post-generation symmetry analysis ###
+    def _analysis_error(self, error) -> str:
+        return str(error).replace(self._api_key, "[redacted]") if self._api_key else str(error)
+
+    def _infer_generated_symmetry(self) -> None:
+        if self.symmetry_model is None or self.was_cancelled:
+            return
+        from housemaker.reference_symmetry_inference import (
+            SymmetryInferenceCancelled,
+            infer_reference_symmetry,
+        )
+
+        self.progress_changed.emit("Inferring symmetric division from the generated reference...", 95)
+        try:
+            arguments = {
+                "cancellation_check": self.isInterruptionRequested,
+                "progress_callback": lambda message: self.progress_changed.emit(message, 95),
+            }
+            self.symmetry_result = infer_reference_symmetry(
+                self.result, self.symmetry_model, api_key=self._api_key, **arguments,
+            )
+        except SymmetryInferenceCancelled:
+            self.was_cancelled = True
+        except Exception as error:  # noqa: BLE001 - Keep the usable image on analysis failure.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.symmetry_error = self._analysis_error(error)
+        self.was_cancelled = self.was_cancelled or self.isInterruptionRequested()
+
 
 @dataclass
 class _ReferenceGenerationRuntime:
@@ -478,6 +534,7 @@ class _ReferenceGenerationRuntime:
     job_id: str
     context_signature: tuple[object, ...]
     source_bgra: np.ndarray
+    reference_view: tuple[str, str] | None = None
     cancel_requested: bool = False
 
 
@@ -490,14 +547,48 @@ class _ReferenceGenerationRetrySource:
 
 
 @dataclass
+class _BatchReferenceGenerationRuntime:
+    """One queued reference job, owned by a blob rather than the current frame."""
+
+    thread: _ReferenceGenerationThread | _LocalReferenceBatchThread
+    job_id: str
+    inpaint_key: tuple[int, str]
+    generation_data: object
+    video_source: object
+    source_bgra: np.ndarray
+    input_signature: tuple[object, ...]
+    started: bool = False
+    reference_applied: bool = False
+    reference_view: tuple[str, str] | None = None
+    cancel_requested: bool = False
+
+
+@dataclass
+class _BatchReferenceRetrySource:
+    """Reuse the original input only while its accepted output is unchanged."""
+
+    generation_data: object
+    video_source: object
+    source_bgra: np.ndarray
+    output_signature: tuple[object, ...]
+
+
+def _reference_image_signature(image: np.ndarray) -> tuple[object, ...]:
+    return image.shape, hashlib.blake2b(
+        np.ascontiguousarray(image).tobytes(), digest_size=16,
+    ).digest()
+
+
+@dataclass
 class _TemporaryObjectReferenceSession:
-    """Keep one external reference coherent across same-frame refreshes."""
+    """Keep one external reference bound to its selected inpaint object."""
 
     active_bgra: np.ndarray
     source_label: str
     generation_data_identity: int
     video_source: object | None
     frame_index: int | None
+    inpaint_key: tuple[object, ...] | None = None
 
 
 # ### Merged generation workspace ###
@@ -549,19 +640,38 @@ class MergedGenerationWorkspace(QWidget):
             _ReferenceGenerationRuntime | None
         ) = None
         self._retired_reference_generation_runtimes: dict[
-            str, _ReferenceGenerationRuntime
+            str, _ReferenceGenerationRuntime | _BatchReferenceGenerationRuntime
         ] = {}
+        self._batch_reference_generation_runtimes: dict[str, _BatchReferenceGenerationRuntime] = {}
+        self._local_reference_batch_thread: _LocalReferenceBatchThread | None = None
+        self._batch_reference_generation_job_ids: tuple[str, ...] = ()
+        self._batch_reference_retry_sources: dict[tuple[int, str], _BatchReferenceRetrySource] = {}
+        self._reference_batch_scope: tuple[object, object] | None = None
+        self._cancelling_all_reference_jobs = False
         self._reference_generation_retry_source: (
             _ReferenceGenerationRetrySource | None
         ) = None
         self._reference_generation_input_revision = 0
+        self._standalone_reference_tried_views: set[tuple[str, str]] = set()
         self._reference_generation_model = read_reference_generation_model(
             application_settings
         )
+        self._enable_object_symmetry_inference = read_enable_object_symmetry_inference(application_settings)
+        self._symmetry_inference_model = read_symmetry_inference_model(application_settings)
         self._ceiling_height_estimation_model = read_ceiling_height_estimation_model(
             application_settings
         )
         self._reference_view_presets = read_reference_view_presets(application_settings)
+        default_view = self._reference_view_presets[0].preset_id if self._reference_view_presets else ""
+        self._default_inpaint_reference_view_preferences = (
+            self._read_initial_reference_preferences(default_view)
+        )
+        self._default_inpaint_remove_objects_from_furniture = (
+            self._reference_generation_preference(
+                REMOVE_OBJECTS_FROM_FURNITURE_SETTINGS_KEY, False,
+            ) is True
+        )
+        self._displayed_reference_view_scope = None
 
         self.surface_workspace.setParent(self)
         self.object_workspace.setParent(self)
@@ -593,6 +703,14 @@ class MergedGenerationWorkspace(QWidget):
             return
         self._is_shutdown = True
         self._invalidate_reference_generation_input()
+        self._cancel_all_reference_generations()
+        local_batch = self._local_reference_batch_thread
+        if local_batch is not None:
+            local_batch.requestInterruption()
+            while local_batch.isRunning():
+                local_batch.wait(CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS)
+            local_batch.deleteLater()
+            self._local_reference_batch_thread = None
         for retired_runtime in tuple(
             self._retired_reference_generation_runtimes.values()
         ):
@@ -883,7 +1001,7 @@ class MergedGenerationWorkspace(QWidget):
         material_layout.addWidget(self.pbr_map_control)
 
         self.ai_prompt_edit.setObjectName("generation_ai_prompt_edit")
-        self.ai_prompt_edit.setPlaceholderText("AI prompt (optional)")
+        self.ai_prompt_edit.setPlaceholderText("Texture prompt (optional)")
         self.ai_prompt_edit.setMaxLength(800)
         self.ai_prompt_edit.setMinimumWidth(190)
         self.ai_prompt_edit.setToolTip(
@@ -892,7 +1010,7 @@ class MergedGenerationWorkspace(QWidget):
             "Retexture jobs keep the painted image as their sole style source."
         )
         material_layout.addWidget(
-            _build_labeled_inline_control("AI prompt", self.ai_prompt_edit)
+            _build_labeled_inline_control("Texture prompt", self.ai_prompt_edit)
         )
 
         shared_layout.addWidget(self.shared_material_section)
@@ -927,18 +1045,34 @@ class MergedGenerationWorkspace(QWidget):
                 "Reference view", self.reference_generation_view_combo
             )
         )
+        self.remove_objects_from_furniture_checkbox = QCheckBox(
+            "Remove objects from furniture"
+        )
+        self.remove_objects_from_furniture_checkbox.setObjectName(
+            "remove_objects_from_furniture_checkbox"
+        )
+        self.remove_objects_from_furniture_checkbox.setChecked(
+            self._default_inpaint_remove_objects_from_furniture
+        )
+        self.remove_objects_from_furniture_checkbox.setToolTip(
+            REMOVE_OBJECTS_FROM_FURNITURE_PROMPT
+        )
+        layout.addWidget(self.remove_objects_from_furniture_checkbox)
         self.reference_generation_prompt_edit = QLineEdit()
         self.reference_generation_prompt_edit.setObjectName(
             "reference_generation_prompt_edit"
         )
-        self.reference_generation_prompt_edit.setMaxLength(4_000)
+        self.reference_generation_prompt_edit.setMaxLength(MAX_REFERENCE_PROMPT_CHARACTERS)
         self.reference_generation_prompt_edit.setPlaceholderText(
-            "Describe the object to generate for Meshy"
+            "Choose a reference view, then edit its prompt for this object"
+        )
+        self.reference_generation_prompt_edit.setToolTip(
+            "The prompt sent to reference image generation. Selecting a view "
+            "fills its prompt; edits apply only to the current inpainted object, "
+            "without changing the reusable view in Settings."
         )
         self.reference_generation_prompt_edit.setText(
-            str(self._reference_generation_preference(
-                REFERENCE_GENERATION_PROMPT_SETTINGS_KEY, ""
-            ))
+            self._default_inpaint_reference_view_preferences[1]
         )
         self.reference_generation_prompt_control = _build_labeled_inline_control(
             "Reference prompt", self.reference_generation_prompt_edit
@@ -1003,6 +1137,13 @@ class MergedGenerationWorkspace(QWidget):
             "by the next generation. Click again to retry the original input."
         )
         layout.addWidget(self.generate_reference_button)
+        self.generate_all_references_button = QPushButton("Generate reference for all")
+        self.generate_all_references_button.setObjectName("generate_all_references_button")
+        self.generate_all_references_button.setToolTip(
+            "Create one reference-generation job for each painted object across all video frames. "
+            "Uses the selected model and view; results stay attached to their original objects."
+        )
+        layout.addWidget(self.generate_all_references_button)
         self.reference_generation_status_label = QLabel(
             "Paint a mask, paste or load an image."
         )
@@ -1013,13 +1154,16 @@ class MergedGenerationWorkspace(QWidget):
         self.reference_generation_status_label.setTextFormat(
             Qt.TextFormat.PlainText
         )
+        self.reference_generation_status_label.setText(
+            self._reference_prompt_migration_warning
+        )
         layout.addWidget(self.reference_generation_status_label)
         layout.addStretch(1)
         return section
 
     # ### Reference view presets ###
     def _populate_reference_generation_views(self, selected_id: str) -> None:
-        """Keep renamed views selected by ID without replacing a custom draft."""
+        """Keep views selected by ID without replacing the editable prompt."""
 
         combo = self.reference_generation_view_combo
         with QSignalBlocker(combo):
@@ -1043,24 +1187,61 @@ class MergedGenerationWorkspace(QWidget):
         updated_presets = tuple(presets)
         if updated_presets == self._reference_view_presets:
             return
+        previous_prompts = {
+            preset.preset_id: preset.prompt for preset in self._reference_view_presets
+        }
+        updated_prompts = {preset.preset_id: preset.prompt for preset in updated_presets}
+
+        def updated_preferences(preferences):
+            preset_id, prompt = preferences
+            if preset_id in updated_prompts:
+                if prompt == previous_prompts.get(preset_id):
+                    prompt = updated_prompts[preset_id]
+            elif preset_id:
+                preset_id = REFERENCE_GENERATION_CUSTOM_VIEW_ID
+            return preset_id, prompt
+
+        self._store_current_reference_preferences()
+        self._default_inpaint_reference_view_preferences = updated_preferences(
+            self._default_inpaint_reference_view_preferences
+        )
+        objects = self.object_workspace
+        for key, preferences in tuple(objects._inpaint_reference_view_preferences.items()):
+            objects.set_inpaint_reference_view_preferences(
+                key, *updated_preferences(preferences)
+            )
         self._reference_view_presets = updated_presets
         self._populate_reference_generation_views(selected_id)
-        current_id = self.reference_generation_view_combo.currentData()
-        if current_id != selected_id and self._application_settings is not None:
-            self._application_settings.set(REFERENCE_GENERATION_VIEW_SETTINGS_KEY, current_id)
+        self._displayed_reference_view_scope = None
         self._sync_reference_generation_controls()
+        if objects.current_inpaint_reference_key() is None:
+            self._handle_reference_generation_preferences_changed()
+
+    @Slot(int)
+    def _handle_reference_generation_view_changed(self, _index: int) -> None:
+        """Use a preset as an editable starting point for this object only."""
+
+        selected_id = self.reference_generation_view_combo.currentData()
+        preset = next(
+            (view for view in self._reference_view_presets if view.preset_id == selected_id),
+            None,
+        )
+        if preset is not None:
+            with QSignalBlocker(self.reference_generation_prompt_edit):
+                self.reference_generation_prompt_edit.setText(preset.prompt)
+        self._handle_reference_generation_preferences_changed()
 
     def _selected_reference_generation_prompt(self) -> str:
-        selected_id = self.reference_generation_view_combo.currentData()
-        if selected_id == REFERENCE_GENERATION_CUSTOM_VIEW_ID:
-            return self.reference_generation_prompt_edit.text().strip()
-        return next(
-            (
-                preset.prompt
-                for preset in self._reference_view_presets
-                if preset.preset_id == selected_id
-            ),
-            "",
+        """Use the visible prompt, with optional furniture-emptying instructions."""
+
+        prompt = self.reference_generation_prompt_edit.text().strip()
+        removal_prompt = (
+            REMOVE_OBJECTS_FROM_FURNITURE_PROMPT
+            if self.remove_objects_from_furniture_checkbox.isChecked()
+            else ""
+        )
+        return ", ".join(
+            part for part in (prompt, removal_prompt) if part
         )
 
     def _update_reference_generation_view_tooltip(self) -> None:
@@ -1105,6 +1286,42 @@ class MergedGenerationWorkspace(QWidget):
             )
 
     # ### Reference generation preferences and state ###
+    def _read_initial_reference_preferences(self, default_view: str) -> tuple[str, str]:
+        """Migrate the former custom/extra fields into one authoritative prompt."""
+
+        self._reference_prompt_migration_warning = ""
+        preset_id = str(self._reference_generation_preference(
+            REFERENCE_GENERATION_VIEW_SETTINGS_KEY, default_view,
+        ))
+        preset = next(
+            (view for view in self._reference_view_presets if view.preset_id == preset_id),
+            None,
+        )
+        if preset is None:
+            preset_id = REFERENCE_GENERATION_CUSTOM_VIEW_ID
+        prompt = self._reference_generation_preference(
+            REFERENCE_GENERATION_PROMPT_SETTINGS_KEY, None,
+        )
+        if not isinstance(prompt, str):
+            legacy_custom = self._reference_generation_preference(
+                "generation/reference_generation_prompt", "",
+            )
+            legacy_extra = self._reference_generation_preference(
+                "generation/reference_generation_ai_prompt", "",
+            )
+            base = preset.prompt if preset is not None else str(legacy_custom).strip()
+            prompt = ", ".join(
+                part for part in (base, str(legacy_extra).strip()) if part
+            )
+        if len(prompt) > MAX_REFERENCE_PROMPT_CHARACTERS:
+            self._reference_prompt_migration_warning = (
+                "Saved reference instructions are too long. Only the first "
+                f"{MAX_REFERENCE_PROMPT_CHARACTERS:,} characters were loaded; "
+                "the full saved text was left unchanged."
+            )
+            prompt = prompt[:MAX_REFERENCE_PROMPT_CHARACTERS]
+        return preset_id, prompt
+
     def set_reference_generation_model(self, model: str) -> None:
         """Apply the Settings provider to future requests and local controls."""
 
@@ -1114,6 +1331,19 @@ class MergedGenerationWorkspace(QWidget):
             return
         self._reference_generation_model = model
         self._sync_reference_generation_controls()
+
+    def set_object_symmetry_inference(self, enabled: bool, model: str) -> None:
+        """Apply Settings to future reference jobs without changing running ones."""
+
+        if type(enabled) is not bool:
+            raise TypeError("Object symmetry inference must be enabled or disabled.")
+        if not isinstance(model, str) or model not in dict(SYMMETRY_INFERENCE_MODEL_OPTIONS).values():
+            raise ValueError(f"Unknown symmetry inference model: {model!r}.")
+        self._enable_object_symmetry_inference = enabled
+        self._symmetry_inference_model = model
+
+    def _reference_symmetry_model(self) -> str | None:
+        return self._symmetry_inference_model if self._enable_object_symmetry_inference else None
 
     def _reference_generation_preference(
         self, key: str, default: object
@@ -1130,16 +1360,9 @@ class MergedGenerationWorkspace(QWidget):
 
         self._update_reference_generation_view_tooltip()
         self._make_default_reference_negative_prompt_view_compatible()
+        self._store_current_reference_preferences()
         if self._application_settings is not None:
-            for key, value in (
-                (
-                    REFERENCE_GENERATION_PROMPT_SETTINGS_KEY,
-                    self.reference_generation_prompt_edit.text(),
-                ),
-                (
-                    REFERENCE_GENERATION_VIEW_SETTINGS_KEY,
-                    self.reference_generation_view_combo.currentData(),
-                ),
+            preferences = [
                 (
                     REFERENCE_GENERATION_STRENGTH_SETTINGS_KEY,
                     self.reference_generation_strength_spinbox.value(),
@@ -1148,20 +1371,32 @@ class MergedGenerationWorkspace(QWidget):
                     REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY,
                     self.reference_generation_negative_prompt_edit.text(),
                 ),
-            ):
+            ]
+            if self.object_workspace.current_inpaint_reference_key() is None:
+                preferences.extend((
+                    (REFERENCE_GENERATION_PROMPT_SETTINGS_KEY, self.reference_generation_prompt_edit.text()),
+                    (REFERENCE_GENERATION_VIEW_SETTINGS_KEY, self.reference_generation_view_combo.currentData()),
+                    (REMOVE_OBJECTS_FROM_FURNITURE_SETTINGS_KEY, self.remove_objects_from_furniture_checkbox.isChecked()),
+                ))
+            for key, value in preferences:
                 self._application_settings.set(key, value)
         self._sync_reference_generation_controls()
 
     def _sync_reference_generation_controls(self) -> None:
         """Keep local-only options and the cancellable action coherent."""
 
+        self._sync_inpaint_reference_preferences()
         self._make_default_reference_negative_prompt_view_compatible()
+        self._cancel_batch_references_if_source_changed()
+        self._update_reference_view_tried_labels()
         running = self._reference_generation_runtime is not None
+        batch_running = bool(self._batch_reference_generation_runtimes) or self._local_reference_batch_thread is not None
         self.generate_reference_button.setText(
             "Cancel" if running else "Generate reference"
         )
         self.generate_reference_button.setEnabled(
             not self._is_shutdown
+            and not batch_running
             and (
                 running
                 or (
@@ -1173,12 +1408,22 @@ class MergedGenerationWorkspace(QWidget):
                 )
             )
         )
-        settings_available = not running and not self._is_shutdown
-        self.reference_generation_view_combo.setEnabled(settings_available)
-        self.reference_generation_prompt_control.setVisible(
-            self.reference_generation_view_combo.currentData()
-            == REFERENCE_GENERATION_CUSTOM_VIEW_ID
+        self.generate_all_references_button.setText(
+            "Cancel all" if batch_running else "Generate reference for all"
         )
+        self.generate_all_references_button.setEnabled(
+            not self._is_shutdown
+            and (batch_running or (
+                not running
+                and self.object_workspace._door_slot_editing_target is None
+                and self.object_workspace._architectural_trim_editing_target is None
+                and bool(self._selected_reference_generation_prompt())
+                and bool(self.object_workspace.inpaint_queue())
+            ))
+        )
+        settings_available = not running and not batch_running and not self._is_shutdown
+        self.reference_generation_view_combo.setEnabled(settings_available)
+        self.remove_objects_from_furniture_checkbox.setEnabled(settings_available)
         self.reference_generation_prompt_edit.setEnabled(settings_available)
         self.reference_generation_strength_spinbox.setEnabled(settings_available)
         self.reference_generation_negative_prompt_edit.setEnabled(settings_available)
@@ -1214,6 +1459,7 @@ class MergedGenerationWorkspace(QWidget):
             id(objects._data),
             id(objects._video_source),
             objects._displayed_frame_index,
+            objects.current_inpaint_reference_key(),
             tuple(self.video_view.get_strokes()),
             temporary_signature,
             (
@@ -1249,6 +1495,7 @@ class MergedGenerationWorkspace(QWidget):
 
         self._reference_generation_input_revision += 1
         self._reference_generation_retry_source = None
+        self._standalone_reference_tried_views.clear()
         runtime = self._reference_generation_runtime
         if runtime is not None:
             self._cancel_reference_generation(runtime.job_id)
@@ -1259,7 +1506,7 @@ class MergedGenerationWorkspace(QWidget):
         if runtime is not None:
             self.job_manager.cancel_job(runtime.job_id)
             return
-        if self._is_shutdown:
+        if self._is_shutdown or self._batch_reference_generation_runtimes or self._local_reference_batch_thread is not None:
             return
         prompt = self._selected_reference_generation_prompt()
         source = self.object_workspace.get_current_object_generation_reference()
@@ -1274,6 +1521,12 @@ class MergedGenerationWorkspace(QWidget):
         retry_source = self._reference_generation_retry_source
         if retry_source is not None and retry_source.context_signature == signature:
             source = retry_source.source_bgra.copy()
+        else:
+            batch_retry = self._batch_reference_retry_sources.get(
+                self.object_workspace.current_inpaint_reference_key()
+            )
+            if self._batch_retry_source_matches(batch_retry, source):
+                source = batch_retry.source_bgra.copy()
         model = self._reference_generation_model
         api_key = (
             self.object_workspace.get_runtime_settings().openai_api_key.strip()
@@ -1287,6 +1540,7 @@ class MergedGenerationWorkspace(QWidget):
             negative_prompt=self.reference_generation_negative_prompt_edit.text(),
             parent=self,
         )
+        thread.symmetry_model = self._reference_symmetry_model()
         job = self.job_manager.create_job(
             kind=REFERENCE_GENERATION_JOB_KIND,
             requested_name="",
@@ -1298,6 +1552,7 @@ class MergedGenerationWorkspace(QWidget):
             job_id=job.job_id,
             context_signature=signature,
             source_bgra=np.ascontiguousarray(source).copy(),
+            reference_view=self._selected_reference_view_token(),
         )
         self.job_manager.set_cancel_callback(
             job.job_id, partial(self._cancel_reference_generation, job.job_id)
@@ -1419,14 +1674,533 @@ class MergedGenerationWorkspace(QWidget):
                     ),
                 )
             )
-            self.job_manager.complete_job(job_id)
-            self.reference_generation_status_label.setText(
-                "Generated reference is active. Generate reference retries the original input; "
-                "move the video seekbar to return to the video."
+            self._mark_reference_view_tried(runtime.reference_view, self.object_workspace.current_inpaint_reference_key())
+            symmetry_status = self._apply_generated_reference_symmetry(
+                thread, self.object_workspace.current_inpaint_reference_key(),
             )
+            if getattr(thread, "symmetry_error", None):
+                self.job_manager.fail_job(job_id, stage=symmetry_status)
+                self.reference_generation_status_label.setText(symmetry_status)
+            else:
+                self.job_manager.complete_job(job_id, stage=symmetry_status or "Completed")
+                self.reference_generation_status_label.setText(
+                    "Generated reference is active. Generate reference retries the original input; "
+                    "move the video seekbar to return to the video. " + symmetry_status
+                )
         finally:
             thread.deleteLater()
             self._sync_reference_generation_controls()
+
+    def _apply_generated_reference_symmetry(self, thread, inpaint_key) -> str:
+        """Only the matching reference's completed inference may change its flag."""
+
+        error = getattr(thread, "symmetry_error", None)
+        if error:
+            return f"Reference generated; symmetry inference failed: {error}. The checkbox was kept unchanged."
+        result = getattr(thread, "symmetry_result", None)
+        if result is None:
+            return ""
+        return self._apply_reference_symmetry_result(result, inpaint_key)
+
+    def _apply_reference_symmetry_result(self, result, inpaint_key) -> str:
+        if not isinstance(result.symmetric, bool):
+            raise TypeError("The symmetry model did not return a boolean decision.")
+        if inpaint_key is not None:
+            if not self.object_workspace.set_inpaint_symmetric_division(inpaint_key, result.symmetric):
+                return "The painted object changed; its symmetry result was discarded."
+        elif self.object_workspace.symmetric_division_checkbox.isEnabled():
+            self.object_workspace.symmetric_division_checkbox.setChecked(result.symmetric)
+        labels = {model: name for name, model in SYMMETRY_INFERENCE_MODEL_OPTIONS}
+        label = labels.get(result.model, result.model)
+        decision = "on" if result.symmetric else "off"
+        confidence = "" if result.confidence is None else f", score {result.confidence:.2f}"
+        return (f"Symmetric division {decision} ({label}, {result.elapsed_seconds:.1f}s{confidence}). "
+                f"{result.reason}").strip()
+
+    # ### Per-object reference preferences ###
+    def _store_current_reference_preferences(self) -> None:
+        preferences = (
+            str(self.reference_generation_view_combo.currentData() or ""),
+            self.reference_generation_prompt_edit.text(),
+        )
+        key = self.object_workspace.current_inpaint_reference_key()
+        if key is None:
+            self._default_inpaint_reference_view_preferences = preferences
+            self._default_inpaint_remove_objects_from_furniture = self.remove_objects_from_furniture_checkbox.isChecked()
+        else:
+            self.object_workspace.set_inpaint_reference_view_preferences(key, *preferences)
+            self.object_workspace.set_inpaint_remove_objects_from_furniture(
+                key, self.remove_objects_from_furniture_checkbox.isChecked(),
+            )
+
+    def _inpaint_reference_view_preferences(self, key):
+        preferences = self.object_workspace.get_inpaint_reference_view_preferences(key)
+        preset_id, prompt = preferences or self._default_inpaint_reference_view_preferences
+        if preset_id and not any(preset.preset_id == preset_id for preset in self._reference_view_presets):
+            preset_id = REFERENCE_GENERATION_CUSTOM_VIEW_ID
+        return preset_id, prompt
+
+    def _inpaint_remove_objects_from_furniture(self, key) -> bool:
+        enabled = self.object_workspace.get_inpaint_remove_objects_from_furniture(key)
+        return self._default_inpaint_remove_objects_from_furniture if enabled is None else enabled
+
+    def _sync_inpaint_reference_preferences(self) -> None:
+        """Restore one blob's reference options without changing other blobs."""
+
+        objects = self.object_workspace
+        key = objects.current_inpaint_reference_key()
+        scope = id(objects._data), id(objects._video_source), key
+        if scope == self._displayed_reference_view_scope:
+            return
+        self._displayed_reference_view_scope = scope
+        if key is None:
+            preset_id, prompt = self._default_inpaint_reference_view_preferences
+            if self.reference_generation_view_combo.findData(preset_id) < 0:
+                preset_id = REFERENCE_GENERATION_CUSTOM_VIEW_ID
+            remove_objects = self._default_inpaint_remove_objects_from_furniture
+        else:
+            preset_id, prompt = self._inpaint_reference_view_preferences(key)
+            remove_objects = self._inpaint_remove_objects_from_furniture(key)
+            objects.set_inpaint_reference_view_preferences(key, preset_id, prompt)
+            objects.set_inpaint_remove_objects_from_furniture(key, remove_objects)
+        combo = self.reference_generation_view_combo
+        with (
+            QSignalBlocker(combo), QSignalBlocker(self.reference_generation_prompt_edit),
+            QSignalBlocker(self.remove_objects_from_furniture_checkbox),
+        ):
+            combo.setCurrentIndex(combo.findData(preset_id))
+            self.reference_generation_prompt_edit.setText(prompt)
+            self.remove_objects_from_furniture_checkbox.setChecked(remove_objects)
+        self._update_reference_generation_view_tooltip()
+
+    def _reference_options_for_inpaint(self, key):
+        preset_id, reference_prompt = self._inpaint_reference_view_preferences(key)
+        preset = next((view for view in self._reference_view_presets if view.preset_id == preset_id), None)
+        removal_prompt = (
+            REMOVE_OBJECTS_FROM_FURNITURE_PROMPT
+            if self._inpaint_remove_objects_from_furniture(key)
+            else ""
+        )
+        prompt = ", ".join(part for part in (reference_prompt.strip(), removal_prompt) if part)
+        if not prompt:
+            raise ValueError(f"The inpainted object on frame {key[0] + 1} needs a reference view or custom prompt.")
+        token = (preset.preset_id, preset.prompt.strip()) if preset is not None else None
+        return prompt, token
+
+    # ### Tried reference views ###
+    def _selected_reference_view_token(self) -> tuple[str, str] | None:
+        selected_id = self.reference_generation_view_combo.currentData()
+        return next(
+            ((preset.preset_id, preset.prompt.strip()) for preset in self._reference_view_presets
+             if preset.preset_id == selected_id),
+            None,
+        )
+
+    def _mark_reference_view_tried(self, token, inpaint_key=None) -> None:
+        """Record the view captured by an accepted job, never its current label."""
+
+        if token is None:
+            return
+        if inpaint_key is None:
+            self._standalone_reference_tried_views.add(token)
+        else:
+            self.object_workspace.mark_inpaint_reference_view_tried(inpaint_key, *token)
+        self._update_reference_view_tried_labels()
+
+    def _update_reference_view_tried_labels(self) -> None:
+        """Decorate this object's menu without changing IDs or saved presets."""
+
+        key = self.object_workspace.current_inpaint_reference_key()
+        tried = (
+            self._standalone_reference_tried_views if key is None
+            else self.object_workspace.get_inpaint_tried_reference_views(key)
+        )
+        combo = self.reference_generation_view_combo
+        with QSignalBlocker(combo):
+            for preset in self._reference_view_presets:
+                index = combo.findData(preset.preset_id)
+                if index >= 0:
+                    suffix = " (Already tried)" if (preset.preset_id, preset.prompt.strip()) in tried else ""
+                    label = preset.name + suffix
+                    if combo.itemText(index) != label:
+                        combo.setItemText(index, label)
+
+    # ### Reference generation for all painted objects ###
+    def _batch_retry_source_matches(self, retry, current_source: np.ndarray) -> bool:
+        objects = self.object_workspace
+        return bool(
+            retry is not None
+            and retry.generation_data is objects._data
+            and retry.video_source is objects._video_source
+            and retry.output_signature == _reference_image_signature(current_source)
+        )
+
+    def _cancel_batch_references_if_source_changed(self) -> None:
+        scope = self._reference_batch_scope
+        if scope is None or self._cancelling_all_reference_jobs:
+            return
+        objects = self.object_workspace
+        if scope[0] is not objects._data or scope[1] is not objects._video_source:
+            self._reference_batch_scope = None
+            self._batch_reference_retry_sources.clear()
+            self._cancel_all_reference_generations()
+
+    @Slot()
+    def _handle_generate_all_references_clicked(self) -> None:
+        if self._batch_reference_generation_runtimes or self._local_reference_batch_thread is not None:
+            self._cancel_all_reference_generations()
+            return
+        objects = self.object_workspace
+        if (self._is_shutdown or self._reference_generation_runtime is not None
+                or objects._door_slot_editing_target is not None
+                or objects._architectural_trim_editing_target is not None):
+            return
+        prompt = self._selected_reference_generation_prompt()
+        if not prompt:
+            self.reference_generation_status_label.setText("Choose a reference view or write a prompt first.")
+            return
+        try:
+            inputs = objects.snapshot_inpaint_reference_inputs()
+        except (OSError, RuntimeError, ValueError) as error:
+            self.reference_generation_status_label.setText(f"Reference generation could not start: {error}")
+            return
+        if not inputs:
+            self.reference_generation_status_label.setText("Paint at least one object before generating references.")
+            return
+        try:
+            reference_options = {key: self._reference_options_for_inpaint(key) for key, _source in inputs}
+        except ValueError as error:
+            self.reference_generation_status_label.setText(str(error))
+            return
+        self._cancel_batch_references_if_source_changed()
+        self._reference_batch_scope = objects._data, objects._video_source
+        api_key = objects.get_runtime_settings().openai_api_key.strip()
+        single_retry = self._reference_generation_retry_source
+        single_signature = self._reference_generation_context_signature() if single_retry is not None else None
+        if self._reference_generation_model in {
+            PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1, REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        }:
+            self._start_local_reference_batch(inputs, prompt, api_key, single_retry, single_signature, reference_options)
+            return
+        for ordinal, (key, current_source) in enumerate(inputs, start=1):
+            retry = self._batch_reference_retry_sources.get(key)
+            use_batch_retry = self._batch_retry_source_matches(retry, current_source)
+            source = retry.source_bgra if use_batch_retry else current_source
+            if (not use_batch_retry and single_retry is not None
+                    and single_retry.context_signature == single_signature
+                    and key == objects.current_inpaint_reference_key()):
+                source = single_retry.source_bgra
+            thread = _ReferenceGenerationThread(
+                source, reference_options[key][0], self._reference_generation_model,
+                api_key=api_key,
+                strength=self.reference_generation_strength_spinbox.value(),
+                negative_prompt=self.reference_generation_negative_prompt_edit.text(),
+                parent=self,
+            )
+            thread.symmetry_model = self._reference_symmetry_model()
+            job = self.job_manager.create_job(
+                kind=REFERENCE_GENERATION_JOB_KIND, requested_name="",
+                default_name=f"Object reference {ordinal} (frame {key[0] + 1})",
+                stage="Queued reference generation",
+            )
+            runtime = _BatchReferenceGenerationRuntime(
+                thread=thread, job_id=job.job_id, inpaint_key=key,
+                generation_data=objects._data, video_source=objects._video_source,
+                source_bgra=np.ascontiguousarray(source).copy(),
+                input_signature=_reference_image_signature(current_source),
+                reference_view=reference_options[key][1],
+            )
+            self._batch_reference_generation_runtimes[job.job_id] = runtime
+            self.job_manager.set_cancel_callback(job.job_id, partial(self._cancel_batch_reference_generation, job.job_id))
+            thread.progress_changed.connect(partial(self._handle_batch_reference_generation_progress, job.job_id, thread))
+            thread.finished.connect(partial(self._handle_batch_reference_generation_finished, job.job_id, thread))
+        self._batch_reference_generation_job_ids = tuple(self._batch_reference_generation_runtimes)
+        self.reference_generation_status_label.setText(f"Queued {len(inputs)} object reference jobs.")
+        self._sync_reference_generation_controls()
+        self._start_next_batch_reference_generation()
+
+    def _batch_reference_input_matches(self, runtime: _BatchReferenceGenerationRuntime) -> bool:
+        objects = self.object_workspace
+        if (self._is_shutdown or runtime.generation_data is not objects._data
+                or runtime.video_source is not objects._video_source):
+            return False
+        current = objects.get_inpaint_reference_input(runtime.inpaint_key)
+        return current is not None and _reference_image_signature(current) == runtime.input_signature
+
+    def _start_next_batch_reference_generation(self) -> None:
+        # Create all job rows immediately, but avoid loading multiple local
+        # image models concurrently or retaining a thread per waiting GPU job.
+        if (self._is_shutdown or self._cancelling_all_reference_jobs
+                or self._local_reference_batch_thread is not None
+                or any(runtime.started for runtime in self._batch_reference_generation_runtimes.values())
+                or any(isinstance(runtime, _BatchReferenceGenerationRuntime) and runtime.thread.isRunning()
+                       for runtime in self._retired_reference_generation_runtimes.values())):
+            return
+        for job_id, runtime in tuple(self._batch_reference_generation_runtimes.items()):
+            try:
+                matches_input = self._batch_reference_input_matches(runtime)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._batch_reference_generation_runtimes.pop(job_id)
+                self.job_manager.set_cancel_callback(job_id, None)
+                self.job_manager.fail_job(job_id, stage=f"The object reference could not be read: {error}")
+                runtime.thread.deleteLater()
+                continue
+            if not matches_input:
+                self._batch_reference_generation_runtimes.pop(job_id)
+                self.job_manager.set_cancel_callback(job_id, None)
+                self.job_manager.mark_cancelled(job_id, stage="Object reference input changed")
+                runtime.thread.deleteLater()
+                continue
+            runtime.started = True
+            self.job_manager.update_job(job_id, stage="Generating object reference", progress=0)
+            try:
+                runtime.thread.start()
+            except RuntimeError as error:
+                self._batch_reference_generation_runtimes.pop(job_id)
+                self.job_manager.set_cancel_callback(job_id, None)
+                self.job_manager.fail_job(job_id, stage=f"The reference worker could not start: {error}")
+                runtime.thread.deleteLater()
+                continue
+            break
+        self._update_batch_reference_status()
+        self._sync_reference_generation_controls()
+
+    def _cancel_batch_reference_generation(self, job_id: str) -> bool:
+        runtime = self._batch_reference_generation_runtimes.pop(str(job_id), None)
+        if runtime is None:
+            return False
+        runtime.cancel_requested = True
+        if runtime.thread is self._local_reference_batch_thread:
+            runtime.thread.cancel_item(str(job_id))
+            self.job_manager.set_cancel_callback(job_id, None)
+            self.job_manager.mark_cancelled(job_id)
+            if not self._cancelling_all_reference_jobs:
+                self._update_batch_reference_status()
+                self._sync_reference_generation_controls()
+            return True
+        runtime.thread.requestInterruption()
+        self.job_manager.set_cancel_callback(job_id, None)
+        self.job_manager.mark_cancelled(job_id)
+        if runtime.started:
+            self._retired_reference_generation_runtimes[job_id] = runtime
+        else:
+            runtime.thread.deleteLater()
+        if not self._cancelling_all_reference_jobs:
+            self._start_next_batch_reference_generation()
+            self._update_batch_reference_status()
+        return True
+
+    def _cancel_all_reference_generations(self) -> None:
+        self._cancelling_all_reference_jobs = True
+        try:
+            if self._local_reference_batch_thread is not None:
+                self._local_reference_batch_thread.requestInterruption()
+            for job_id in tuple(self._batch_reference_generation_runtimes):
+                self._cancel_batch_reference_generation(job_id)
+        finally:
+            self._cancelling_all_reference_jobs = False
+        self._update_batch_reference_status()
+        self._sync_reference_generation_controls()
+
+    def _update_batch_reference_status(self) -> None:
+        counts = Counter(
+            job.status for job_id in self._batch_reference_generation_job_ids
+            if (job := self.job_manager.get_job(job_id)) is not None
+        )
+        self.reference_generation_status_label.setText(
+            f"Reference jobs: {counts[JOB_STATUS_COMPLETED]} completed, "
+            f"{counts[JOB_STATUS_FAILED]} failed, {counts[JOB_STATUS_CANCELLED]} cancelled; "
+            f"{len(self._batch_reference_generation_runtimes)} remaining."
+        )
+
+    def _handle_batch_reference_generation_progress(self, job_id, thread, stage, progress) -> None:
+        runtime = self._batch_reference_generation_runtimes.get(job_id)
+        if runtime is None or runtime.thread is not thread:
+            return
+        self.job_manager.update_job(job_id, stage=stage, progress=progress)
+        self.reference_generation_status_label.setText(f"{self.job_manager.get_job(job_id).name}: {stage}")
+
+    def _handle_batch_reference_generation_finished(self, job_id, thread) -> None:
+        retired = self._retired_reference_generation_runtimes.pop(job_id, None)
+        if retired is not None:
+            thread.deleteLater()
+            self._start_next_batch_reference_generation()
+            return
+        runtime = self._batch_reference_generation_runtimes.get(job_id)
+        if runtime is None or runtime.thread is not thread:
+            return
+        self._batch_reference_generation_runtimes.pop(job_id)
+        self.job_manager.set_cancel_callback(job_id, None)
+        try:
+            if runtime.cancel_requested or thread.was_cancelled or not self._batch_reference_input_matches(runtime):
+                self.job_manager.mark_cancelled(job_id, stage="Object reference input changed; result discarded")
+            elif thread.error_message is not None or thread.result is None:
+                self.job_manager.fail_job(job_id, stage=thread.error_message or "The model returned no usable image.")
+            elif not self.object_workspace.set_inpaint_reference(runtime.inpaint_key, thread.result):
+                self.job_manager.mark_cancelled(job_id, stage="The painted object no longer exists")
+            else:
+                self._batch_reference_retry_sources[runtime.inpaint_key] = _BatchReferenceRetrySource(
+                    generation_data=runtime.generation_data, video_source=runtime.video_source,
+                    source_bgra=runtime.source_bgra.copy(), output_signature=_reference_image_signature(thread.result),
+                )
+                self._mark_reference_view_tried(runtime.reference_view, runtime.inpaint_key)
+                symmetry_status = self._apply_generated_reference_symmetry(thread, runtime.inpaint_key)
+                if getattr(thread, "symmetry_error", None):
+                    self.job_manager.fail_job(job_id, stage=symmetry_status)
+                else:
+                    self.job_manager.complete_job(job_id, stage=symmetry_status or "Completed")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.job_manager.fail_job(job_id, stage=f"Reference generation failed: {error}")
+        finally:
+            thread.deleteLater()
+            self._start_next_batch_reference_generation()
+            self._update_batch_reference_status()
+            self._sync_reference_generation_controls()
+
+    # ### Resident local batch integration ###
+    def _start_local_reference_batch(
+        self, inputs, prompt, api_key, single_retry, single_signature, reference_options,
+    ) -> None:
+        """Snapshot all inputs, then let one worker own both model phases."""
+
+        objects = self.object_workspace
+        queued = []
+        for ordinal, (key, current_source) in enumerate(inputs, start=1):
+            retry = self._batch_reference_retry_sources.get(key)
+            use_batch_retry = self._batch_retry_source_matches(retry, current_source)
+            source = retry.source_bgra if use_batch_retry else current_source
+            if (not use_batch_retry and single_retry is not None
+                    and single_retry.context_signature == single_signature
+                    and key == objects.current_inpaint_reference_key()):
+                source = single_retry.source_bgra
+            job = self.job_manager.create_job(
+                kind=REFERENCE_GENERATION_JOB_KIND, requested_name="",
+                default_name=f"Object reference {ordinal} (frame {key[0] + 1})",
+                stage="Queued local reference generation",
+            )
+            queued.append((job.job_id, key, np.ascontiguousarray(source).copy(), current_source))
+        thread = _LocalReferenceBatchThread(
+            tuple(LocalReferenceBatchItem(job_id, source, reference_options[key][0])
+                  for job_id, key, source, _ in queued),
+            self._reference_generation_model, self._reference_symmetry_model(),
+            api_key=api_key, prompt=prompt,
+            strength=self.reference_generation_strength_spinbox.value(),
+            negative_prompt=self.reference_generation_negative_prompt_edit.text(), parent=self,
+        )
+        self._local_reference_batch_thread = thread
+        for job_id, key, source, current_source in queued:
+            self._batch_reference_generation_runtimes[job_id] = _BatchReferenceGenerationRuntime(
+                thread=thread, job_id=job_id, inpaint_key=key,
+                generation_data=objects._data, video_source=objects._video_source,
+                source_bgra=source, input_signature=_reference_image_signature(current_source),
+                reference_view=reference_options[key][1],
+            )
+            self.job_manager.set_cancel_callback(job_id, partial(self._cancel_batch_reference_generation, job_id))
+        self._batch_reference_generation_job_ids = tuple(self._batch_reference_generation_runtimes)
+        thread.item_progress.connect(self._handle_local_reference_progress)
+        thread.reference_ready.connect(self._handle_local_reference_ready)
+        thread.item_finished.connect(self._handle_local_reference_item_finished)
+        thread.finished.connect(self._handle_local_reference_worker_stopped)
+        phases = (
+            "image generation first, symmetry inference second"
+            if thread.symmetry_model is not None else "symmetry inference disabled"
+        )
+        self.reference_generation_status_label.setText(
+            f"Queued {len(queued)} local references; {phases}."
+        )
+        self._sync_reference_generation_controls()
+        try:
+            thread.start()
+        except RuntimeError as error:
+            thread.error_message = f"The local reference worker could not start: {error}"
+            self._handle_local_reference_batch_finished(thread)
+
+    def _matching_local_reference_runtime(self, job_id):
+        runtime = self._batch_reference_generation_runtimes.get(job_id)
+        if runtime is None or runtime.thread is not self._local_reference_batch_thread:
+            return None
+        try:
+            matches = self._batch_reference_input_matches(runtime)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            matches = False
+        if not matches:
+            self._cancel_batch_reference_generation(job_id)
+            return None
+        return runtime
+
+    @Slot(str, str, int)
+    def _handle_local_reference_progress(self, job_id, stage, progress) -> None:
+        runtime = self._matching_local_reference_runtime(job_id)
+        if runtime is None:
+            return
+        runtime.started = True
+        self.job_manager.update_job(job_id, stage=stage, progress=progress)
+        self.reference_generation_status_label.setText(f"{self.job_manager.get_job(job_id).name}: {stage}")
+
+    @Slot(str, object)
+    def _handle_local_reference_ready(self, job_id, image) -> None:
+        runtime = self._matching_local_reference_runtime(job_id)
+        if runtime is None:
+            return
+        try:
+            if not self.object_workspace.set_inpaint_reference(runtime.inpaint_key, image):
+                self._cancel_batch_reference_generation(job_id)
+                return
+            runtime.input_signature = _reference_image_signature(image)
+            runtime.reference_applied = True
+            self._mark_reference_view_tried(runtime.reference_view, runtime.inpaint_key)
+            self._batch_reference_retry_sources[runtime.inpaint_key] = _BatchReferenceRetrySource(
+                generation_data=runtime.generation_data, video_source=runtime.video_source,
+                source_bgra=runtime.source_bgra.copy(), output_signature=runtime.input_signature,
+            )
+            stage = "Reference ready; queued for symmetry inference" if runtime.thread.symmetry_model is not None else "Reference ready"
+            self.job_manager.update_job(job_id, stage=stage, progress=85)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._cancel_batch_reference_generation(job_id)
+            self.job_manager.fail_job(job_id, stage=f"The generated reference could not be applied: {error}")
+
+    @Slot(str, object, str, bool)
+    def _handle_local_reference_item_finished(self, job_id, result, error, cancelled) -> None:
+        runtime = self._matching_local_reference_runtime(job_id)
+        if runtime is None:
+            return
+        self._batch_reference_generation_runtimes.pop(job_id)
+        self.job_manager.set_cancel_callback(job_id, None)
+        try:
+            if cancelled or runtime.cancel_requested:
+                self.job_manager.mark_cancelled(job_id)
+            elif not runtime.reference_applied:
+                self.job_manager.fail_job(job_id, stage=error or "The model did not return a usable reference.")
+            else:
+                symmetry_status = self._apply_reference_symmetry_result(result, runtime.inpaint_key) if result is not None else ""
+                if error:
+                    self.job_manager.fail_job(job_id, stage=" ".join(part for part in (symmetry_status, error) if part))
+                else:
+                    self.job_manager.complete_job(job_id, stage=symmetry_status or "Completed")
+        except (OSError, RuntimeError, TypeError, ValueError) as failure:
+            self.job_manager.fail_job(job_id, stage=f"Reference processing failed: {failure}")
+        self._update_batch_reference_status()
+        self._sync_reference_generation_controls()
+
+    @Slot()
+    def _handle_local_reference_worker_stopped(self) -> None:
+        self._handle_local_reference_batch_finished(self.sender())
+
+    def _handle_local_reference_batch_finished(self, thread) -> None:
+        if thread is not self._local_reference_batch_thread:
+            return
+        for job_id, runtime in tuple(self._batch_reference_generation_runtimes.items()):
+            if runtime.thread is thread:
+                self._batch_reference_generation_runtimes.pop(job_id)
+                self.job_manager.set_cancel_callback(job_id, None)
+                if self._is_shutdown:
+                    self.job_manager.mark_cancelled(job_id)
+                else:
+                    self.job_manager.fail_job(job_id, stage=thread.error_message or "The local reference worker stopped unexpectedly.")
+        self._local_reference_batch_thread = None
+        thread.deleteLater()
+        self._update_batch_reference_status()
+        self._sync_reference_generation_controls()
 
     # ### Object generation controls ###
     def _build_object_controls(self) -> QWidget:
@@ -1497,6 +2271,29 @@ class MergedGenerationWorkspace(QWidget):
         generation_header_layout.addWidget(self.door_slot_generation_indicator)
         generation_header_layout.addStretch(1)
         creation_layout.addWidget(generation_header)
+
+        self.inpaint_navigation_control = QWidget()
+        self.inpaint_navigation_control.setObjectName("inpaint_navigation_control")
+        navigation_layout = QHBoxLayout(self.inpaint_navigation_control)
+        navigation_layout.setContentsMargins(0, 0, 0, 0)
+        navigation_layout.setSpacing(6)
+        self.previous_inpaint_button = QPushButton("Previous")
+        self.previous_inpaint_button.setObjectName("previous_inpaint_button")
+        self.next_inpaint_button = QPushButton("Next")
+        self.next_inpaint_button.setObjectName("next_inpaint_button")
+        self.inpaint_position_label = QLabel("No inpaints")
+        self.inpaint_position_label.setObjectName("inpaint_position_label")
+        self.previous_inpaint_button.setToolTip(
+            "Select the previous painted object, including objects on other video frames."
+        )
+        self.next_inpaint_button.setToolTip(
+            "Select the next painted object, including objects on other video frames."
+        )
+        navigation_layout.addWidget(self.previous_inpaint_button)
+        navigation_layout.addWidget(self.next_inpaint_button)
+        navigation_layout.addWidget(self.inpaint_position_label)
+        navigation_layout.addStretch(1)
+        creation_layout.addWidget(self.inpaint_navigation_control)
 
         generation_settings = QWidget()
         generation_settings.setObjectName(
@@ -1645,7 +2442,17 @@ class MergedGenerationWorkspace(QWidget):
             self._handle_load_reference_image_clicked
         )
         self.generate_reference_button.clicked.connect(self._handle_generate_reference_clicked)
+        self.generate_all_references_button.clicked.connect(self._handle_generate_all_references_clicked)
+        self.previous_inpaint_button.clicked.connect(
+            partial(self._navigate_inpaints, -1)
+        )
+        self.next_inpaint_button.clicked.connect(
+            partial(self._navigate_inpaints, 1)
+        )
         self.reference_generation_view_combo.currentIndexChanged.connect(
+            self._handle_reference_generation_view_changed
+        )
+        self.remove_objects_from_furniture_checkbox.toggled.connect(
             self._handle_reference_generation_preferences_changed
         )
         self.reference_generation_prompt_edit.textChanged.connect(
@@ -1668,6 +2475,7 @@ class MergedGenerationWorkspace(QWidget):
         self.video_view.strokes_changed.connect(self._invalidate_reference_generation_input)
         self.video_view.strokes_changed.connect(self.sync_shared_controls)
         self.video_view.frame_changed.connect(self._handle_video_frame_changed)
+        objects.inpaint_selection_changed.connect(self._handle_inpaint_selection_changed)
         objects.door_slot_editing_changed.connect(
             self._handle_door_slot_editing_changed
         )
@@ -1932,6 +2740,39 @@ class MergedGenerationWorkspace(QWidget):
         self._sync_object_reference_preview()
         self._sync_ceiling_height_analysis_source()
         self.current_video_frame_changed.emit()
+        self.sync_shared_controls()
+
+    # ### Cross-frame manual object navigation ###
+    def _navigate_inpaints(self, delta: int) -> None:
+        """Keep the shared Surface editor on the selected object's frame too."""
+
+        if not self.object_workspace.navigate_inpaints(delta):
+            return
+        objects, surface = self.object_workspace, self.surface_workspace
+        surface._data.current_frame_index = objects._data.current_frame_index
+        surface._displayed_frame_index = objects._displayed_frame_index
+        if surface._displayed_frame_index is not None:
+            surface._data.set_frame_strokes(
+                surface._displayed_frame_index, self.video_view.get_strokes(),
+            )
+        surface._sync_painted_frames_label()
+        self._handle_inpaint_selection_changed()
+
+    @Slot()
+    def _handle_inpaint_selection_changed(self) -> None:
+        """Never reuse a different blob's image or late reference-generation result."""
+
+        self._cancel_reference_generation_if_context_changed()
+        session = self._temporary_object_reference_session
+        if session is not None and not self._temporary_reference_session_matches_context(session):
+            self._clear_temporary_object_reference_session()
+        reference = self.object_workspace.get_temporary_object_reference()
+        if reference is None:
+            self.surface_workspace.clear_temporary_reference()
+        else:
+            self.surface_workspace.set_temporary_reference(reference)
+        self.surface_workspace._handle_pbr_map_toggled(False)
+        self._sync_object_reference_preview()
         self.sync_shared_controls()
 
     @Slot()
@@ -2475,7 +3316,7 @@ class MergedGenerationWorkspace(QWidget):
         *,
         source_label: str,
     ) -> _TemporaryObjectReferenceSession:
-        """Start one external-reference session bound to the current frame."""
+        """Start an external-reference session bound to the current object."""
 
         reference = np.ascontiguousarray(reference_bgra).copy()
         objects = self.object_workspace
@@ -2489,6 +3330,7 @@ class MergedGenerationWorkspace(QWidget):
                 if objects._video_source is None
                 else objects._displayed_frame_index
             ),
+            inpaint_key=objects.current_inpaint_reference_key(),
         )
         self._temporary_object_reference_session = session
         return session
@@ -2502,12 +3344,13 @@ class MergedGenerationWorkspace(QWidget):
         self,
         session: _TemporaryObjectReferenceSession,
     ) -> bool:
-        """Return whether a cached external image still belongs to this frame."""
+        """Return whether a cached external image still belongs to this blob."""
 
         objects = self.object_workspace
         return bool(
             session.generation_data_identity == id(objects._data)
             and session.video_source is objects._video_source
+            and session.inpaint_key == objects.current_inpaint_reference_key()
             and (
                 session.video_source is None
                 or session.frame_index == objects._displayed_frame_index
@@ -2690,7 +3533,7 @@ class MergedGenerationWorkspace(QWidget):
         self._sync_object_reference_preview()
         message = (
             f"{source_label} is active for Object and Surface generation. Move the "
-            "video seekbar to return to the video."
+            "video seekbar to return to the video; this inpaint keeps its reference."
             if self.object_workspace._video_source is not None
             else f"{source_label} is active for Object and Surface generation."
         )
@@ -2794,7 +3637,24 @@ class MergedGenerationWorkspace(QWidget):
         self.erase_mask_button.setEnabled(inpainting_is_available)
         self.brush_size_spinbox.setEnabled(inpainting_is_available)
         self.clear_mask_button.setEnabled(
-            inpainting_is_available and self.video_view.has_selection()
+            video_editor_is_available and self.video_view.has_selection()
+        )
+        self.clear_mask_button.setToolTip("Remove only the currently selected red inpaint object.")
+        inpaint_index, inpaint_count = objects.current_inpaint_position()
+        opening_target = objects._door_slot_editing_target
+        trim_target = objects._architectural_trim_editing_target
+        navigation_enabled = bool(
+            video_editor_is_available
+            and inpaint_count
+            and not (opening_target is not None and opening_target.generation_ready)
+            and not (trim_target is not None and trim_target.generation_ready)
+        )
+        self.previous_inpaint_button.setEnabled(navigation_enabled)
+        self.next_inpaint_button.setEnabled(navigation_enabled)
+        self.inpaint_position_label.setText(
+            (f"Inpaint {inpaint_index + 1} of {inpaint_count}"
+             if inpaint_index is not None else f"{inpaint_count} inpaints queued")
+            if inpaint_count else "No inpaints"
         )
         self.pbr_map_control.setEnabled(not has_untracked_object_job)
         self.ai_prompt_edit.setEnabled(not has_untracked_object_job)

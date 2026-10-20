@@ -144,12 +144,12 @@ class ReferenceViewPresetsSettingsTests(unittest.TestCase):
                     DEFAULT_REFERENCE_GENERATION_MODEL,
                 )
 
-    def test_six_defaults_load_in_an_editable_settings_section(self) -> None:
+    def test_four_defaults_load_in_an_editable_settings_section(self) -> None:
         self.assertEqual(
             self.widget.get_reference_view_presets(),
             DEFAULT_REFERENCE_VIEW_PRESETS,
         )
-        self.assertEqual(self.widget.reference_view_preset_list.count(), 6)
+        self.assertEqual(self.widget.reference_view_preset_list.count(), 4)
         self.assertEqual(
             self.widget.reference_view_name_edit.text(),
             DEFAULT_REFERENCE_VIEW_PRESETS[0].name,
@@ -183,9 +183,9 @@ class ReferenceViewPresetsSettingsTests(unittest.TestCase):
         self.widget.add_reference_view_button.click()
 
         presets = read_reference_view_presets(self.store)
-        self.assertEqual(len(presets), 7)
+        self.assertEqual(len(presets), 5)
         self.assertEqual(presets[-1].name, "New view 1")
-        self.assertEqual(self.widget.reference_view_preset_list.currentRow(), 6)
+        self.assertEqual(self.widget.reference_view_preset_list.currentRow(), 4)
         self.assertTrue(self.widget.reference_view_prompt_edit.toPlainText())
         self.assertEqual(changes, [presets])
         self.assertEqual(ordinary_changes, [])
@@ -396,7 +396,7 @@ class ReferenceViewPresetsSettingsTests(unittest.TestCase):
             self.widget.add_reference_view_button.click()
 
         self.assertEqual(write.call_count, 1)
-        self.assertEqual(self.widget.reference_view_preset_list.count(), 6)
+        self.assertEqual(self.widget.reference_view_preset_list.count(), 4)
         self.assertEqual(self.widget.reference_view_name_edit.text(), "Keep this draft")
         self.assertIn(
             "Could not save", self.widget.reference_view_preset_status_label.text()
@@ -406,14 +406,14 @@ class ReferenceViewPresetsSettingsTests(unittest.TestCase):
 
         presets = read_reference_view_presets(self.store)
         self.assertEqual(presets[0].name, "Keep this draft")
-        self.assertEqual(len(presets), 7)
+        self.assertEqual(len(presets), 5)
 
     def test_failed_add_or_remove_does_not_change_the_visible_list(self) -> None:
         with patch.object(self.store, "set", return_value=False):
             self.widget.add_reference_view_button.click()
-            self.assertEqual(self.widget.reference_view_preset_list.count(), 6)
+            self.assertEqual(self.widget.reference_view_preset_list.count(), 4)
             self.widget.remove_reference_view_button.click()
-            self.assertEqual(self.widget.reference_view_preset_list.count(), 6)
+            self.assertEqual(self.widget.reference_view_preset_list.count(), 4)
         self.assertEqual(
             self.widget.get_reference_view_presets(), DEFAULT_REFERENCE_VIEW_PRESETS
         )

@@ -159,12 +159,12 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(encoded_image), image_png)
         self.assertIn("glb", body["target_formats"])
 
-    def test_request_body_uses_compatible_smart_topology_t2_options(self) -> None:
+    def test_request_body_uses_compatible_smart_topology_t2_5_options(self) -> None:
         body = build_image_to_3d_request_body(b"png bytes")
 
         self.assertEqual(DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT, 2_000)
         self.assertEqual(body["model_type"], "smart-topology")
-        self.assertEqual(body["ai_model"], "meshy-t2")
+        self.assertEqual(body["ai_model"], "meshy-t2.5")
         self.assertEqual(body["texture_resolution"], "2k")
         self.assertTrue(body["should_texture"])
         self.assertFalse(body["moderation"])
@@ -345,15 +345,19 @@ class MeshyRequestConstructionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_retexture_request_body(model_glb, references)
 
-    def test_request_body_accepts_only_the_smart_topology_t2_polycount_range(
+    def test_request_body_accepts_only_the_smart_topology_t2_5_polycount_range(
         self,
     ) -> None:
-        body = build_image_to_3d_request_body(
-            b"png bytes",
-            target_polycount=12_345,
-        )
-
-        self.assertEqual(body["target_polycount"], 12_345)
+        self.assertEqual(MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT, 100)
+        self.assertEqual(MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT, 30_000)
+        for valid_polycount in (100, 12_345, 15_001, 30_000):
+            with self.subTest(target_polycount=valid_polycount):
+                body = build_image_to_3d_request_body(
+                    b"png bytes",
+                    target_polycount=valid_polycount,
+                )
+                self.assertEqual(body["target_polycount"], valid_polycount)
+                self.assertEqual(body["ai_model"], "meshy-t2.5")
         for invalid_polycount in (
             MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT - 1,
             MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT + 1,
@@ -394,6 +398,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertTrue(sent_body["image_url"].startswith("data:image/png;base64,"))
         self.assertIn("glb", sent_body["target_formats"])
         self.assertEqual(sent_body["target_polycount"], 6_789)
+        self.assertEqual(sent_body["ai_model"], "meshy-t2.5")
         self.assertTrue(sent_body["enable_pbr"])
         self.assertEqual(sent_body["texture_prompt"], "blue ceramic")
 

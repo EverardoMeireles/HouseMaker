@@ -1555,7 +1555,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             options,
             [
-                ("Meshy", SURFACE_TEXTURE_PROVIDER_MESHY),
+                ("Meshy t2.5", SURFACE_TEXTURE_PROVIDER_MESHY),
                 ("GPT-4o-mini", SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI),
                 ("GPT-5.6 Luna", SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA),
                 ("GPT-5.6 Terra", SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA),

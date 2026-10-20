@@ -272,26 +272,30 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.reference_generation_negative_prompt_control.isHidden()
         )
 
-    def test_view_dropdown_contains_six_defaults_and_write_prompt(self):
+    def test_view_dropdown_contains_four_defaults_and_write_prompt(self):
         combo = self.workspace.reference_generation_view_combo
         items = tuple(
             (combo.itemText(index), combo.itemData(index))
             for index in range(combo.count())
         )
-        self.assertEqual(len(DEFAULT_REFERENCE_VIEW_PRESETS), 6)
+        self.assertEqual(len(DEFAULT_REFERENCE_VIEW_PRESETS), 4)
         for preset in DEFAULT_REFERENCE_VIEW_PRESETS:
             self.assertIn((preset.name, preset.preset_id), items)
         self.assertIn(("(Write prompt)", ""), items)
-        self.assertEqual(combo.count(), 7)
+        self.assertEqual(combo.count(), 5)
         self.assertEqual(
-            items[:6],
+            items[:4],
             tuple(
                 (preset.name, preset.preset_id)
                 for preset in DEFAULT_REFERENCE_VIEW_PRESETS
             ),
         )
         self.assertEqual(combo.currentData(), "elevated-three-quarter")
-        self.assertTrue(self.workspace.reference_generation_prompt_control.isHidden())
+        self.assertFalse(self.workspace.reference_generation_prompt_control.isHidden())
+        self.assertEqual(
+            self.workspace.reference_generation_prompt_edit.text(),
+            DEFAULT_REFERENCE_VIEW_PRESETS[0].prompt,
+        )
 
     def test_settings_model_change_preserves_running_request_and_updates_the_next(self):
         combo = self.settings_widget.reference_generation_model_combo
@@ -310,24 +314,24 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         second = self._start()
         self.assertEqual(second.model, REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION)
 
-    def test_custom_prompt_only_appears_for_write_prompt_and_is_retained(self):
+    def test_prompt_is_always_visible_and_write_prompt_retains_current_text(self):
         combo = self.workspace.reference_generation_view_combo
         self.workspace.reference_generation_prompt_edit.setText("My custom reference")
         self.assertEqual(combo.currentData(), "elevated-three-quarter")
-        self.assertTrue(self.workspace.reference_generation_prompt_control.isHidden())
+        self.assertFalse(self.workspace.reference_generation_prompt_control.isHidden())
         combo.setCurrentIndex(combo.findData(""))
         self.assertFalse(self.workspace.reference_generation_prompt_control.isHidden())
         self.assertEqual(
             self.workspace.reference_generation_prompt_edit.text(), "My custom reference"
         )
         combo.setCurrentIndex(combo.findData("front"))
-        self.assertTrue(self.workspace.reference_generation_prompt_control.isHidden())
+        self.assertFalse(self.workspace.reference_generation_prompt_control.isHidden())
         self.assertEqual(
-            self.workspace.reference_generation_prompt_edit.text(), "My custom reference"
+            self.workspace.reference_generation_prompt_edit.text(),
+            DEFAULT_REFERENCE_VIEW_PRESETS[1].prompt,
         )
 
     def test_selected_preset_generates_without_a_typed_prompt(self):
-        self.workspace.reference_generation_prompt_edit.clear()
         self.workspace._activate_temporary_object_reference(
             _opaque_reference(), source_label="Loaded image"
         )
@@ -339,31 +343,33 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             DEFAULT_REFERENCE_VIEW_PRESETS[0].prompt,
         )
 
-    def test_selected_preset_overrides_hidden_custom_prompt_in_request(self):
+    def test_selected_preset_uses_edited_visible_prompt_in_request(self):
         preset = DEFAULT_REFERENCE_VIEW_PRESETS[1]
         combo = self.workspace.reference_generation_view_combo
         combo.setCurrentIndex(combo.findData(preset.preset_id))
-        self.workspace.reference_generation_prompt_edit.setText("Do not use this prompt")
+        self.workspace.reference_generation_prompt_edit.setText("Use this edited prompt")
         self.workspace._activate_temporary_object_reference(
             _opaque_reference(), source_label="Loaded image"
         )
         self.workspace.generate_reference_button.click()
-        self.assertEqual(_ControlledReferenceThread.created[-1].prompt, preset.prompt)
+        self.assertEqual(
+            _ControlledReferenceThread.created[-1].prompt, "Use this edited prompt"
+        )
 
     def test_custom_prompt_is_forwarded_when_write_prompt_is_selected(self):
         thread = self._start(_opaque_reference())
         self.assertEqual(thread.prompt, "A plain wooden chair without the fabric cover")
 
-    def test_selected_view_persists_across_reopening_without_erasing_custom_text(self):
+    def test_selected_view_and_edited_prompt_persist_across_reopening(self):
         preset = DEFAULT_REFERENCE_VIEW_PRESETS[2]
         combo = self.workspace.reference_generation_view_combo
-        self.workspace.reference_generation_prompt_edit.setText("Retained custom prompt")
         combo.setCurrentIndex(combo.findData(preset.preset_id))
+        self.workspace.reference_generation_prompt_edit.setText("Retained custom prompt")
         with self._reopened_workspace() as reopened:
             self.assertEqual(
                 reopened.reference_generation_view_combo.currentData(), preset.preset_id
             )
-            self.assertTrue(reopened.reference_generation_prompt_control.isHidden())
+            self.assertFalse(reopened.reference_generation_prompt_control.isHidden())
             self.assertEqual(
                 reopened.reference_generation_prompt_edit.text(), "Retained custom prompt"
             )
@@ -405,6 +411,29 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(
                 reopened.reference_generation_prompt_edit.text(), "My saved prompt"
             )
+
+    def test_reopening_removed_builtin_views_keeps_custom_prompt_and_remaining_views(self):
+        retired_views = (
+            ReferenceViewPreset("side", "Side/profile", "An old side view."),
+            ReferenceViewPreset("top", "Top-down", "An old overhead view."),
+        )
+        save_reference_view_presets(
+            self.settings, (*DEFAULT_REFERENCE_VIEW_PRESETS, *retired_views)
+        )
+        self.settings.set(REFERENCE_GENERATION_PROMPT_SETTINGS_KEY, "My saved prompt")
+        for removed_id in ("side", "top"):
+            with self.subTest(view=removed_id):
+                self.settings.set(REFERENCE_GENERATION_VIEW_SETTINGS_KEY, removed_id)
+                with self._reopened_workspace() as reopened:
+                    combo = reopened.reference_generation_view_combo
+                    self.assertEqual(combo.count(), 5)
+                    self.assertEqual(combo.findData("side"), -1)
+                    self.assertEqual(combo.findData("top"), -1)
+                    self.assertEqual(combo.currentData(), "")
+                    self.assertFalse(reopened.reference_generation_prompt_control.isHidden())
+                    self.assertEqual(
+                        reopened.reference_generation_prompt_edit.text(), "My saved prompt"
+                    )
 
     def test_live_preset_updates_keep_selection_and_use_updated_prompt(self):
         preset = DEFAULT_REFERENCE_VIEW_PRESETS[1]
@@ -466,7 +495,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(combo.currentText(), "(Write prompt)")
             self.assertEqual(combo.currentData(), "")
             self.assertFalse(self.workspace.reference_generation_prompt_control.isHidden())
-            self.assertFalse(self.workspace.generate_reference_button.isEnabled())
+            self.assertTrue(self.workspace.generate_reference_button.isEnabled())
         finally:
             settings_widget.reference_view_presets_changed.disconnect(
                 self.workspace.set_reference_view_presets

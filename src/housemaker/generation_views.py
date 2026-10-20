@@ -22,6 +22,7 @@ from housemaker.video_source import normalize_video_frame
 VIEW_BACKGROUND_COLOR = QColor("#15181d")
 VIEW_EMPTY_TEXT_COLOR = QColor("#e5e7eb")
 MASK_OVERLAY_RGB = (48, 190, 255)
+SELECTED_MASK_OVERLAY_RGB = (255, 60, 60)
 MASK_OVERLAY_ALPHA = 112
 MASK_OUTLINE_COLOR = QColor(95, 215, 255, 230)
 BRUSH_CURSOR_PAINT_COLOR = QColor(95, 215, 255, 235)
@@ -39,6 +40,7 @@ class VideoInpaintView(QWidget):
 
     strokes_changed = Signal(object)
     frame_changed = Signal()
+    selected_blob_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -47,6 +49,10 @@ class VideoInpaintView(QWidget):
         self._mask = np.empty((0, 0), dtype=np.uint8)
         self._mask_overlay_image = QImage()
         self._strokes: list[MaskStroke] = []
+        self._blob_labels = np.empty((0, 0), dtype=np.int32)
+        self._blob_indices: tuple[int, ...] = ()
+        self._selected_blob_index: int | None = None
+        self._press_on_blob = False
         self._reference_preview_bgra: np.ndarray | None = None
         self._reference_preview_image = QImage()
         self._active_points: list[MaskPoint] = []
@@ -58,8 +64,9 @@ class VideoInpaintView(QWidget):
         self.setMinimumSize(160, 120)
         self.setMouseTracking(True)
         self.setToolTip(
-            "Left-drag to paint. Right-click inside a closed painted outline "
-            "to fill the enclosed area."
+            "Left-drag to paint; click a painted object to select it. "
+            "Right-click a painted object to remove it, or inside a closed "
+            "painted outline to fill the enclosed area."
         )
 
     def set_frame(
@@ -75,6 +82,7 @@ class VideoInpaintView(QWidget):
             self._mask = np.empty((0, 0), dtype=np.uint8)
             self._mask_overlay_image = QImage()
             self._strokes = []
+            self._refresh_blob_components()
             self.update()
             self.frame_changed.emit()
             return
@@ -103,6 +111,54 @@ class VideoInpaintView(QWidget):
 
     def get_mask(self) -> np.ndarray:
         return self._mask.copy()
+
+    def get_mask_shape(self) -> tuple[int, int]:
+        """Report the source-mask height and width without copying its pixels."""
+
+        return self._mask.shape
+
+    def get_blob_masks(self) -> tuple[np.ndarray, ...]:
+        """Return independent full-frame masks in top-to-bottom, left order."""
+
+        return tuple(
+            np.where(self._blob_labels == label, 255, 0).astype(np.uint8)
+            for label in self._blob_indices
+        )
+
+    def get_blob_count(self) -> int:
+        """Count cached connected objects without constructing pixel masks."""
+
+        return len(self._blob_indices)
+
+    def get_selected_blob_index(self) -> int | None:
+        return self._selected_blob_index
+
+    def select_blob(self, index: int | None) -> None:
+        if index is not None and not 0 <= index < len(self._blob_indices):
+            raise IndexError("The selected inpaint object does not exist.")
+        if index == self._selected_blob_index:
+            return
+        self._selected_blob_index = index
+        self._update_mask_overlay()
+        self.update()
+        self.selected_blob_changed.emit()
+
+    def get_selected_blob_mask(self) -> np.ndarray:
+        mask = np.zeros_like(self._mask)
+        if (
+            self._selected_blob_index is not None
+            and self._blob_labels.shape == self._mask.shape
+        ):
+            label = self._blob_indices[self._selected_blob_index]
+            mask[self._blob_labels == label] = 255
+        return mask
+
+    def get_selected_blob_crop(self, padding_ratio: float = 0.08) -> np.ndarray:
+        if self._frame_bgr is None:
+            return np.empty((0, 0, 4), dtype=np.uint8)
+        return _build_masked_frame_crop(
+            self._frame_bgr, self.get_selected_blob_mask(), padding_ratio,
+        )
 
     def get_frame_bgr(self) -> np.ndarray | None:
         if self._frame_bgr is None:
@@ -180,11 +236,18 @@ class VideoInpaintView(QWidget):
 
     def clear_mask(self) -> None:
         self._cancel_active_stroke()
-        if not self._strokes and not self.has_selection():
+        selected_mask = self.get_selected_blob_mask()
+        rows, columns = np.nonzero(selected_mask)
+        if rows.size == 0:
             return
-        self._strokes = []
-        self._rebuild_mask()
-        self.strokes_changed.emit([])
+        height, width = selected_mask.shape
+        removed = self._append_blob_removal(MaskPoint(
+            x=int(columns[0]) / max(width - 1, 1),
+            y=int(rows[0]) / max(height - 1, 1),
+        ))
+        if not removed:
+            return
+        self.strokes_changed.emit(self.get_strokes())
         self.update()
 
     def fill_enclosed_regions(self) -> int:
@@ -251,15 +314,9 @@ class VideoInpaintView(QWidget):
         self,
         padding_ratio: float = 0.08,
     ) -> np.ndarray:
-        """Return a BGRA crop whose alpha channel is the painted selection."""
+        """Return the selected object's BGRA crop, not its neighboring blobs."""
 
-        if self._frame_bgr is None or not self.has_selection():
-            return np.empty((0, 0, 4), dtype=np.uint8)
-        return _build_masked_frame_crop(
-            self._frame_bgr,
-            self._mask,
-            padding_ratio,
-        )
+        return self.get_selected_blob_crop(padding_ratio)
 
     def build_selected_object_crops(
         self,
@@ -269,24 +326,8 @@ class VideoInpaintView(QWidget):
 
         if self._frame_bgr is None or not self.has_selection():
             return ()
-        selected_mask = np.where(self._mask > 0, 255, 0).astype(np.uint8)
-        component_count, labels, stats, _centroids = (
-            cv2.connectedComponentsWithStats(selected_mask, connectivity=8)
-        )
-        component_indices = sorted(
-            range(1, component_count),
-            key=lambda index: (
-                int(stats[index, cv2.CC_STAT_TOP]),
-                int(stats[index, cv2.CC_STAT_LEFT]),
-            ),
-        )
         crops: list[np.ndarray] = []
-        for component_index in component_indices:
-            component_mask = np.where(
-                labels == component_index,
-                self._mask,
-                0,
-            ).astype(np.uint8)
+        for component_mask in self.get_blob_masks():
             crop = _build_masked_frame_crop(
                 self._frame_bgr,
                 component_mask,
@@ -328,7 +369,8 @@ class VideoInpaintView(QWidget):
             point = self._widget_to_mask_point(event.position())
             if point is not None:
                 self._cancel_active_stroke()
-                if self._append_enclosed_fill(point):
+                removed = self._append_blob_removal(point)
+                if removed or self._append_enclosed_fill(point):
                     self.strokes_changed.emit(self.get_strokes())
                 self.update()
                 event.accept()
@@ -344,7 +386,14 @@ class VideoInpaintView(QWidget):
             super().mousePressEvent(event)
             return
         self._active_points = [point]
-        self._rebuild_mask()
+        clicked_blob = self._blob_index_at(point)
+        self._press_on_blob = (
+            clicked_blob is not None and self._brush_mode == MASK_MODE_PAINT
+        )
+        if self._press_on_blob:
+            self.select_blob(clicked_blob)
+        else:
+            self._rebuild_mask()
         self.update()
         event.accept()
 
@@ -353,6 +402,7 @@ class VideoInpaintView(QWidget):
         if self._active_points and event.buttons() & Qt.MouseButton.LeftButton:
             point = self._widget_to_mask_point(event.position())
             if point is not None and self._point_is_distinct(point):
+                self._press_on_blob = False
                 self._active_points.append(point)
                 self._rebuild_mask()
         self.update()
@@ -364,10 +414,18 @@ class VideoInpaintView(QWidget):
             return
         point = self._widget_to_mask_point(event.position())
         if point is not None and self._point_is_distinct(point):
+            self._press_on_blob = False
             self._active_points.append(point)
+        if self._press_on_blob:
+            self._active_points = []
+            self._press_on_blob = False
+            self.update()
+            event.accept()
+            return
+        preferred_point = self._active_points[-1]
         self._strokes.append(self._build_active_stroke())
         self._active_points = []
-        self._rebuild_mask()
+        self._rebuild_mask(preferred_point=preferred_point)
         self.strokes_changed.emit(self.get_strokes())
         self.update()
         event.accept()
@@ -433,6 +491,8 @@ class VideoInpaintView(QWidget):
         reload, unlike storing a one-off pixel mask.
         """
 
+        if len(self._strokes) >= MAX_MASK_STROKES_PER_FRAME:
+            return False
         candidate_mask = self._mask.copy()
         fill = MaskStroke(
             mode=MASK_MODE_PAINT,
@@ -443,13 +503,40 @@ class VideoInpaintView(QWidget):
         if not _rasterize_enclosed_fill(candidate_mask, fill):
             return False
         self._strokes.append(fill)
+        self._rebuild_mask(preferred_point=point)
+        return True
+
+    def _append_blob_removal(self, point: MaskPoint) -> bool:
+        if (
+            len(self._strokes) >= MAX_MASK_STROKES_PER_FRAME
+            or self._blob_index_at(point) is None
+        ):
+            return False
+        self._strokes.append(MaskStroke(
+            mode=MASK_MODE_ERASE,
+            radius_normalized=MIN_NORMALIZED_BRUSH_RADIUS,
+            points=(point,),
+            is_fill=True,
+        ))
         self._rebuild_mask()
         return True
 
-    def _rebuild_mask(self) -> None:
+    def _blob_index_at(self, point: MaskPoint) -> int | None:
+        if self._blob_labels.size == 0:
+            return None
+        height, width = self._blob_labels.shape
+        x = min(max(round(point.x * (width - 1)), 0), width - 1)
+        y = min(max(round(point.y * (height - 1)), 0), height - 1)
+        label = int(self._blob_labels[y, x])
+        if label == 0:
+            return None
+        return self._blob_indices.index(label)
+
+    def _rebuild_mask(self, preferred_point: MaskPoint | None = None) -> None:
         if self._frame_bgr is None:
             self._mask = np.empty((0, 0), dtype=np.uint8)
             self._mask_overlay_image = QImage()
+            self._refresh_blob_components()
             return
         frame_height, frame_width = self._frame_bgr.shape[:2]
         mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
@@ -459,7 +546,69 @@ class VideoInpaintView(QWidget):
         for stroke in strokes:
             _rasterize_stroke(mask, stroke)
         self._mask = mask
-        self._mask_overlay_image = _build_mask_overlay_qimage(mask)
+        if not self._active_points:
+            self._refresh_blob_components(preferred_point)
+        self._update_mask_overlay()
+
+    def _refresh_blob_components(
+        self, preferred_point: MaskPoint | None = None,
+    ) -> None:
+        """Cache connectivity once per completed edit, retaining object identity."""
+
+        previous_index = self._selected_blob_index
+        previous_mask = None
+        if previous_index is not None and self._blob_labels.size:
+            previous_label = self._blob_indices[previous_index]
+            previous_mask = self._blob_labels == previous_label
+        if self._mask.size:
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(
+                self._mask, connectivity=8,
+            )
+            self._blob_labels = labels
+            self._blob_indices = tuple(sorted(
+                range(1, count),
+                key=lambda label: (
+                    int(stats[label, cv2.CC_STAT_TOP]),
+                    int(stats[label, cv2.CC_STAT_LEFT]),
+                ),
+            ))
+        else:
+            self._blob_labels = np.empty((0, 0), dtype=np.int32)
+            self._blob_indices = ()
+        preserved_index = None
+        if (
+            previous_mask is not None
+            and previous_mask.shape == self._blob_labels.shape
+            and self._blob_indices
+        ):
+            overlap = np.bincount(
+                self._blob_labels[previous_mask],
+                minlength=max(self._blob_indices) + 1,
+            )
+            overlap[0] = 0
+            label = int(np.argmax(overlap))
+            if overlap[label]:
+                preserved_index = self._blob_indices.index(label)
+        selected_index = (
+            self._blob_index_at(preferred_point)
+            if preferred_point is not None else None
+        )
+        if selected_index is None:
+            selected_index = preserved_index
+        if selected_index is None and self._blob_indices:
+            selected_index = min(previous_index or 0, len(self._blob_indices) - 1)
+        self._selected_blob_index = selected_index
+        changed_object = selected_index != preserved_index
+        if previous_index != selected_index or changed_object:
+            self.selected_blob_changed.emit()
+
+    def _update_mask_overlay(self) -> None:
+        selected_mask = self.get_selected_blob_mask()
+        if self._active_points and not self._press_on_blob:
+            _rasterize_stroke(selected_mask, self._build_active_stroke())
+        self._mask_overlay_image = _build_mask_overlay_qimage(
+            self._mask, selected_mask,
+        )
 
     def _paint_mask_outline(
         self,
@@ -510,6 +659,7 @@ class VideoInpaintView(QWidget):
         if not self._active_points:
             return
         self._active_points = []
+        self._press_on_blob = False
         self._rebuild_mask()
 
     def _get_display_image(self) -> QImage:
@@ -603,7 +753,10 @@ def rasterize_mask_strokes(
 
 def _rasterize_stroke(mask: np.ndarray, stroke: MaskStroke) -> None:
     if stroke.is_fill:
-        _rasterize_enclosed_fill(mask, stroke)
+        if stroke.mode == MASK_MODE_ERASE:
+            _rasterize_blob_removal(mask, stroke)
+        else:
+            _rasterize_enclosed_fill(mask, stroke)
         return
     frame_height, frame_width = mask.shape
     shortest_side = max(1, min(frame_width, frame_height))
@@ -634,6 +787,19 @@ def _rasterize_stroke(mask: np.ndarray, stroke: MaskStroke) -> None:
             thickness=-1,
             lineType=cv2.LINE_8,
         )
+
+
+def _rasterize_blob_removal(mask: np.ndarray, stroke: MaskStroke) -> None:
+    """Replay one connected-object removal using its normalized painted seed."""
+
+    if mask.size == 0:
+        return
+    height, width = mask.shape
+    point = stroke.points[0]
+    x = min(max(round(point.x * (width - 1)), 0), width - 1)
+    y = min(max(round(point.y * (height - 1)), 0), height - 1)
+    if mask[y, x]:
+        cv2.floodFill(mask, None, (x, y), 0, flags=8)
 
 
 def _rasterize_enclosed_fill(mask: np.ndarray, fill: MaskStroke) -> bool:
@@ -704,13 +870,17 @@ def _bgra_array_to_qimage(frame_bgra: np.ndarray) -> QImage:
     return image.copy()
 
 
-def _build_mask_overlay_qimage(mask: np.ndarray) -> QImage:
+def _build_mask_overlay_qimage(
+    mask: np.ndarray, selected_mask: np.ndarray | None = None,
+) -> QImage:
     if mask.size == 0 or not np.any(mask > 0):
         return QImage()
     overlay = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
     overlay[:, :, 0] = MASK_OVERLAY_RGB[0]
     overlay[:, :, 1] = MASK_OVERLAY_RGB[1]
     overlay[:, :, 2] = MASK_OVERLAY_RGB[2]
+    if selected_mask is not None:
+        overlay[selected_mask > 0, :3] = SELECTED_MASK_OVERLAY_RGB
     overlay[:, :, 3] = np.where(mask > 0, MASK_OVERLAY_ALPHA, 0).astype(
         np.uint8
     )

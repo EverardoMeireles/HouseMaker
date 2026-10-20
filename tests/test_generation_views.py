@@ -19,7 +19,7 @@ from housemaker.generation_state import (
     MaskPoint,
     MaskStroke,
 )
-from housemaker.generation_views import MASK_OVERLAY_RGB, VideoInpaintView
+from housemaker.generation_views import SELECTED_MASK_OVERLAY_RGB, VideoInpaintView
 
 # ### Test helpers ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -62,15 +62,18 @@ class ObjectMaskTests(unittest.TestCase):
 
         self.view.clear_mask()
 
-        self.assertFalse(self.view.has_selection())
+        self.assertTrue(self.view.has_selection())
+        self.assertEqual(len(self.view.get_blob_masks()), 1)
+        self.assertTrue(self.view.get_mask()[50, 60])
+        self.assertFalse(self.view.get_mask()[50, 124])
         self.assertEqual(signal.count(), 2)
 
-    def test_object_overlay_uses_the_standard_mask_color(self) -> None:
+    def test_selected_object_overlay_uses_the_red_mask_color(self) -> None:
         object_color = self.view._mask_overlay_image.pixelColor(60, 50)
 
         self.assertEqual(
             (object_color.red(), object_color.green(), object_color.blue()),
-            MASK_OVERLAY_RGB,
+            SELECTED_MASK_OVERLAY_RGB,
         )
 
     def test_frame_restores_the_existing_object_strokes(self) -> None:
