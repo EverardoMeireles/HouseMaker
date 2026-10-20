@@ -681,6 +681,7 @@ class BlueprintCanvas(QWidget):
         self.pressed_vertex_id: int | None = None
         self.drag_vertex_id: int | None = None
         self.drag_press_position: QPointF | None = None
+        self._vertex_drag_raw_image_point: QPointF | None = None
         self._is_wall_vertex_interaction_active = False
         self._vertex_selection_start_image: QPointF | None = None
         self._vertex_selection_current_image: QPointF | None = None
@@ -2525,6 +2526,16 @@ class BlueprintCanvas(QWidget):
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if (
+            event.key() == Qt.Key.Key_Control
+            and not event.isAutoRepeat()
+            and self._refresh_wall_vertex_drag_modifier_preview(
+                event.modifiers() | Qt.KeyboardModifier.ControlModifier
+            )
+        ):
+            event.accept()
+            return
+
+        if (
             event.key() == Qt.Key.Key_Escape
             and self._request_wall_verification_dismissal()
         ):
@@ -2712,6 +2723,16 @@ class BlueprintCanvas(QWidget):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Control
+            and not event.isAutoRepeat()
+            and self._refresh_wall_vertex_drag_modifier_preview(
+                event.modifiers() & ~Qt.KeyboardModifier.ControlModifier
+            )
+        ):
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Shift
             and not event.isAutoRepeat()
@@ -3340,18 +3361,7 @@ class BlueprintCanvas(QWidget):
 
             if self.drag_vertex_id is not None:
                 image_point = self._widget_to_image_clamped(event.position())
-                snap_preview = self._build_drag_preview(
-                    image_point,
-                    dragged_vertex_id=self.drag_vertex_id,
-                )
-                self.vertex_data.move_vertex(
-                    self.drag_vertex_id,
-                    snap_preview.point[0],
-                    snap_preview.point[1],
-                )
-                self.preview_point = snap_preview.point
-                self.preview_guides = snap_preview.guides
-                self.update()
+                self._move_dragged_vertex(image_point, event.modifiers())
                 event.accept()
                 return
 
@@ -3500,7 +3510,13 @@ class BlueprintCanvas(QWidget):
                 return
 
             if self.drag_vertex_id is not None:
-                self._join_dragged_vertex_to_edge(self.drag_vertex_id)
+                self._move_dragged_vertex(
+                    self._widget_to_image_clamped(event.position()),
+                    event.modifiers(),
+                )
+                # Do not silently restore unrelated edge snapping at release.
+                if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    self._join_dragged_vertex_to_edge(self.drag_vertex_id)
                 self.preview_point = None
                 self.preview_guides = []
                 self._reset_pointer_state(finish_wall_interaction=False)
@@ -7776,8 +7792,27 @@ class BlueprintCanvas(QWidget):
         self,
         image_point: QPointF,
         dragged_vertex_id: int,
+        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
     ) -> SnapPreview:
         raw_point = self._clamp_image_point(image_point.x(), image_point.y())
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            # Keep only direct wall neighbours; ignore all other points,
+            # rectangle centres, open-space corners and cross-level marks.
+            connected_ids = {
+                edge.end_vertex_id
+                if edge.start_vertex_id == dragged_vertex_id
+                else edge.start_vertex_id
+                for edge in self.vertex_data.edges
+                if dragged_vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
+            }
+            connected_ids.discard(dragged_vertex_id)
+            return self._build_axis_only_preview(
+                raw_point,
+                self._find_axis_snap_candidates(
+                    raw_point, included_vertex_ids=connected_ids
+                ),
+            )
+
         reference_point = self._find_outer_wall_reference_snap_point(raw_point)
         if reference_point is not None:
             return SnapPreview(point=reference_point, guides=[])
@@ -7938,6 +7973,34 @@ class BlueprintCanvas(QWidget):
 
         self._push_undo_state()
         self.drag_vertex_id = self.pressed_vertex_id
+        self._vertex_drag_raw_image_point = None
+
+    def _move_dragged_vertex(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier,
+    ) -> None:
+        """Refresh the 2D drag without committing the delayed 3D mesh edit."""
+
+        if self.drag_vertex_id is None:
+            return
+        self._vertex_drag_raw_image_point = QPointF(image_point)
+        preview = self._build_drag_preview(image_point, self.drag_vertex_id, modifiers)
+        self.vertex_data.move_vertex(self.drag_vertex_id, *preview.point)
+        self.preview_point = preview.point
+        self.preview_guides = preview.guides
+        self.update()
+
+    def _refresh_wall_vertex_drag_modifier_preview(
+        self,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        """Apply Ctrl changes even while the held pointer is stationary."""
+
+        if self.drag_vertex_id is None or self._vertex_drag_raw_image_point is None:
+            return False
+        self._move_dragged_vertex(self._vertex_drag_raw_image_point, modifiers)
+        return True
 
     def _begin_wall_vertex_interaction(self) -> None:
         """Notify listeners that a wall vertex is held by the pointer."""
@@ -7963,6 +8026,7 @@ class BlueprintCanvas(QWidget):
         self.pressed_vertex_id = None
         self.drag_vertex_id = None
         self.drag_press_position = None
+        self._vertex_drag_raw_image_point = None
         self._stop_panning()
         if finish_wall_interaction:
             self._finish_wall_vertex_interaction()
@@ -8035,6 +8099,8 @@ class BlueprintCanvas(QWidget):
         self,
         point: tuple[float, float],
         excluded_vertex_ids: set[int] | None = None,
+        *,
+        included_vertex_ids: set[int] | None = None,
     ) -> list[AxisSnapCandidate]:
         excluded_ids = excluded_vertex_ids or set()
         tolerance = self._screen_distance_to_image(AXIS_SNAP_TOLERANCE_SCREEN)
@@ -8044,6 +8110,8 @@ class BlueprintCanvas(QWidget):
 
         for vertex in self.vertex_data.vertices:
             if vertex.id in excluded_ids:
+                continue
+            if included_vertex_ids is not None and vertex.id not in included_vertex_ids:
                 continue
 
             x_distance = abs(point_x - vertex.x)
