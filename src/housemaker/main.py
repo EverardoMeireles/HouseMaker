@@ -3301,6 +3301,19 @@ class BlueprintWorkspace(QWidget):
             self.floor_thickness_spinbox,
         )
         right_side_layout.addWidget(self.level_dimensions_group)
+        self.highlight_non_right_angles_checkbox = QCheckBox(
+            "Highlight non 90° angles and dead-end vertices."
+        )
+        self.highlight_non_right_angles_checkbox.setToolTip(
+            "Blink connected wall corners and their edges purple when the angle "
+            "is neither 90 degrees nor straight (180 degrees). "
+            "Vertices with exactly one wall connection blink brown. "
+            "This is a live Canvas visual aid only."
+        )
+        self.highlight_non_right_angles_checkbox.toggled.connect(
+            self.canvas.set_highlight_non_right_angles
+        )
+        right_side_layout.addWidget(self.highlight_non_right_angles_checkbox)
         # Room analysis belongs beside the level dimensions it can update.
         right_side_layout.addWidget(
             self.merged_generation_workspace.ceiling_height_section

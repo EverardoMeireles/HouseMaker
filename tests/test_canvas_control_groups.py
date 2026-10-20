@@ -112,7 +112,7 @@ class CanvasControlGroupingTests(unittest.TestCase):
                 self.assertTrue(workspace.canvas_left_scroll_area.isAncestorOf(control))
                 self.assertFalse(workspace.side_panel.isAncestorOf(control))
 
-    def test_room_analysis_follows_dimensions_in_the_right_panel(self) -> None:
+    def test_angle_highlight_and_room_analysis_follow_dimensions(self) -> None:
         workspace = self.workspace
         merged = workspace.merged_generation_workspace
         group = self._group_named("Room analysis")
@@ -123,14 +123,41 @@ class CanvasControlGroupingTests(unittest.TestCase):
         right_layout = workspace.canvas_right_controls.layout()
         assert right_layout is not None
         self.assertEqual(
-            right_layout.indexOf(group),
+            right_layout.indexOf(workspace.highlight_non_right_angles_checkbox),
             right_layout.indexOf(workspace.level_dimensions_group) + 1,
+        )
+        self.assertEqual(
+            right_layout.indexOf(group),
+            right_layout.indexOf(workspace.highlight_non_right_angles_checkbox) + 1,
         )
         self.assertEqual(
             right_layout.indexOf(workspace.transform_controls_scroll_area),
             right_layout.indexOf(group) + 1,
         )
         self.assertTrue(merged.infer_ceiling_height_button.isEnabled())
+
+    def test_angle_highlight_checkbox_updates_canvas_and_survives_level_change(
+        self,
+    ) -> None:
+        workspace = self.workspace
+        checkbox = workspace.highlight_non_right_angles_checkbox
+        self.assertEqual(
+            checkbox.text(), "Highlight non 90° angles and dead-end vertices."
+        )
+        self.assertFalse(checkbox.isChecked())
+        self.assertFalse(workspace.canvas.highlight_non_right_angles_enabled)
+        self.assertTrue(workspace.side_panel.isAncestorOf(checkbox))
+
+        checkbox.click()
+        self.assertTrue(workspace.canvas.highlight_non_right_angles_enabled)
+        next_level_index = (workspace.current_level_index + 1) % len(workspace.levels)
+        self.assertNotEqual(next_level_index, workspace.current_level_index)
+        workspace._handle_level_selection_changed(next_level_index)
+        self.assertTrue(checkbox.isChecked())
+        self.assertTrue(workspace.canvas.highlight_non_right_angles_enabled)
+
+        checkbox.click()
+        self.assertFalse(workspace.canvas.highlight_non_right_angles_enabled)
 
     def test_project_buttons_share_a_right_panel_row_below_levels(self) -> None:
         workspace = self.workspace

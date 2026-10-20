@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal, Slot
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -34,6 +34,10 @@ from housemaker.canvas_openings import (
     CanvasOpeningBounds,
     CanvasOpeningEdit,
     CanvasOpeningReference,
+)
+from housemaker.canvas_wall_angles import (
+    WallAngleHighlights,
+    find_non_right_angle_wall_parts,
 )
 from housemaker.doorway_bridge import (
     find_doorway_bridge_target,
@@ -90,6 +94,11 @@ CANVAS_PANEL_COLOR = QColor("#252a31")
 EDGE_COLOR = QColor("#63c0ff")
 SELECTED_WALL_EDGE_COLOR = QColor("#f6c85f")
 SELECTED_WALL_EDGE_WIDTH_SCREEN = 5.0
+NON_RIGHT_ANGLE_HIGHLIGHT_COLOR = QColor("#c85bff")
+DEAD_END_VERTEX_HIGHLIGHT_COLOR = QColor("#a66b3f")
+NON_RIGHT_ANGLE_EDGE_WIDTH_SCREEN = 4.0
+NON_RIGHT_ANGLE_VERTEX_RADIUS_SCREEN = 7.5
+NON_RIGHT_ANGLE_BLINK_INTERVAL_MS = 400
 PREVIEW_EDGE_COLOR = QColor("#f6c85f")
 GENERATED_WALL_PREVIEW_EDGE_COLOR = QColor("#2ee59d")
 GENERATED_WALL_PREVIEW_VERTEX_COLOR = QColor("#b7ffe4")
@@ -627,6 +636,17 @@ class BlueprintCanvas(QWidget):
         super().__init__(parent)
 
         self.vertex_data = VertexData()
+        self.highlight_non_right_angles_enabled = False
+        self._non_right_angle_highlight_phase = True
+        self._wall_angle_highlight_source: VertexData | GeneratedWallPreview | None = None
+        self._wall_angle_highlight_cache_key: tuple[object, ...] | None = None
+        self._wall_angle_highlights = WallAngleHighlights()
+        self._wall_angle_highlight_vertices: dict[int, Vertex] = {}
+        self._non_right_angle_highlight_timer = QTimer(self)
+        self._non_right_angle_highlight_timer.setInterval(NON_RIGHT_ANGLE_BLINK_INTERVAL_MS)
+        self._non_right_angle_highlight_timer.timeout.connect(
+            self._advance_non_right_angle_highlight
+        )
         self.rooms: list[RoomData] = []
         self.doorways: list[DoorwayData] = []
         self.windows: list[WindowData] = []
@@ -3545,12 +3565,127 @@ class BlueprintCanvas(QWidget):
             self.unsetCursor()
         super().leaveEvent(event)
 
+    # ### Non-right-angle wall highlighting ###
+    def set_highlight_non_right_angles(self, enabled: bool) -> bool:
+        """Toggle a view-only diagnostic without editing the wall graph."""
+
+        enabled = bool(enabled)
+        if enabled == self.highlight_non_right_angles_enabled:
+            return False
+        self.highlight_non_right_angles_enabled = enabled
+        self._non_right_angle_highlight_phase = True
+        if not enabled:
+            self._non_right_angle_highlight_timer.stop()
+            self._wall_angle_highlight_source = None
+            self._wall_angle_highlight_cache_key = None
+            self._wall_angle_highlights = WallAngleHighlights()
+            self._wall_angle_highlight_vertices = {}
+        self.update()
+        return True
+
+    def _get_wall_angle_highlights(self) -> WallAngleHighlights:
+        """Reuse angle analysis until the displayed graph or room spokes change."""
+
+        preview = self._generated_wall_preview
+        source = self.vertex_data if preview is None else preview
+        excluded_ids = frozenset(room.center_vertex_id for room in self.rooms)
+        cache_key = (
+            self.vertex_data.revision if preview is None else None,
+            excluded_ids,
+        )
+        if (
+            source is not self._wall_angle_highlight_source
+            or cache_key != self._wall_angle_highlight_cache_key
+        ):
+            self._wall_angle_highlights = find_non_right_angle_wall_parts(
+                source.vertices,
+                source.edges,
+                excluded_vertex_ids=excluded_ids,
+            )
+            self._wall_angle_highlight_vertices = {
+                vertex.id: vertex for vertex in source.vertices
+            }
+            self._wall_angle_highlight_source = source
+            self._wall_angle_highlight_cache_key = cache_key
+            self._non_right_angle_highlight_phase = True
+        return self._wall_angle_highlights
+
+    def _advance_non_right_angle_highlight(self) -> None:
+        """Blink only while the diagnostic is enabled on a visible canvas."""
+
+        if not self.highlight_non_right_angles_enabled or not self.isVisible():
+            self._non_right_angle_highlight_timer.stop()
+            return
+        self._non_right_angle_highlight_phase = not self._non_right_angle_highlight_phase
+        self.update()
+
+    def _paint_non_right_angle_highlights(self, painter: QPainter) -> None:
+        """Paint invalid corners and their incident edges over ordinary colors."""
+
+        if not self.highlight_non_right_angles_enabled:
+            return
+        highlights = self._get_wall_angle_highlights()
+        timer = self._non_right_angle_highlight_timer
+        if (
+            highlights.edge_keys or highlights.dead_end_vertex_ids
+        ) and self.isVisible():
+            if not timer.isActive():
+                self._non_right_angle_highlight_phase = True
+                timer.start()
+        else:
+            timer.stop()
+        if not self._non_right_angle_highlight_phase:
+            return
+        painter.save()
+        edge_pen = QPen(NON_RIGHT_ANGLE_HIGHLIGHT_COLOR, NON_RIGHT_ANGLE_EDGE_WIDTH_SCREEN)
+        edge_pen.setCosmetic(True)
+        edge_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(edge_pen)
+        vertices = self._wall_angle_highlight_vertices
+        display_rect = self._image_display_rect()
+        visible_ids = (
+            highlights.vertex_ids
+            | highlights.dead_end_vertex_ids
+            | frozenset(
+                vertex_id for edge_key in highlights.edge_keys for vertex_id in edge_key
+            )
+        )
+        points = {
+            vertex_id: self._image_to_widget_in_rect(
+                vertices[vertex_id].x,
+                vertices[vertex_id].y,
+                display_rect,
+            )
+            for vertex_id in visible_ids
+        }
+        for first_id, second_id in sorted(highlights.edge_keys):
+            painter.drawLine(points[first_id], points[second_id])
+        painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
+        for vertex_ids, color in (
+            (highlights.vertex_ids, NON_RIGHT_ANGLE_HIGHLIGHT_COLOR),
+            (highlights.dead_end_vertex_ids, DEAD_END_VERTEX_HIGHLIGHT_COLOR),
+        ):
+            painter.setBrush(color)
+            for vertex_id in sorted(vertex_ids):
+                painter.drawEllipse(
+                    points[vertex_id],
+                    NON_RIGHT_ANGLE_VERTEX_RADIUS_SCREEN,
+                    NON_RIGHT_ANGLE_VERTEX_RADIUS_SCREEN,
+                )
+        painter.restore()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._non_right_angle_highlight_timer.stop()
+        super().hideEvent(event)
+
+    # ### Canvas painting ###
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(self.rect(), CANVAS_BACKGROUND_COLOR)
 
         if self.blueprint_image is None:
+            self._non_right_angle_highlight_timer.stop()
             self._paint_empty_state(painter)
             return
 
@@ -3570,6 +3705,7 @@ class BlueprintCanvas(QWidget):
         self._paint_preview_guides(painter)
         self._paint_preview_edge(painter)
         self._paint_vertices(painter)
+        self._paint_non_right_angle_highlights(painter)
         self._paint_stairs(painter)
         self._paint_pending_stair_placement(painter)
         self._paint_pending_open_space(painter)

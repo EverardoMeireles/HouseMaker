@@ -13,6 +13,7 @@ import shapely
 import trimesh
 from PIL import Image
 from shapely import Point, Polygon
+from shapely.geometry.base import BaseGeometry
 
 import housemaker.sloped_ceiling as sloped_ceiling_module
 from housemaker.glb import convert_to_glb, convert_to_preview_model
@@ -126,6 +127,47 @@ def _build_level_with_internal_wall() -> LevelData:
         floor_thickness_meters=0.3,
         vertex_data=vertex_data,
     )
+
+
+def _build_close_outline_level() -> LevelData:
+    """Close the two plan outlines of a twenty-centimeter-thick wall."""
+
+    vertex_data = VertexData()
+    vertex_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in ((0.0, 0.0), (200.0, 0.0), (200.0, 10.0), (0.0, 10.0))
+    )
+    for first, second in zip(vertex_ids, (*vertex_ids[1:], vertex_ids[0])):
+        vertex_data.add_edge(first, second)
+    return LevelData(
+        index=2,
+        name="Ground",
+        height_meters=3.0,
+        vertex_data=vertex_data,
+    )
+
+
+def _build_room_with_exterior_wall_outline() -> LevelData:
+    """Keep the rear wall outline outside the actual room ceiling footprint."""
+
+    level = _build_room_level()
+    level.rooms = []
+    rear_start = level.vertex_data.add_vertex(0.0, -10.0)
+    rear_end = level.vertex_data.add_vertex(200.0, -10.0)
+    level.vertex_data.add_edge(rear_start.id, rear_end.id)
+    return level
+
+
+def _mesh_xy_footprint(meshes: tuple[trimesh.Trimesh, ...]) -> BaseGeometry:
+    """Project actual triangles, excluding vertical faces with no XY area."""
+
+    polygons = []
+    for mesh in meshes:
+        for triangle in np.asarray(mesh.triangles, dtype=float):
+            polygon = Polygon(triangle[:, :2])
+            if polygon.area > 1e-10:
+                polygons.append(polygon)
+    return shapely.union_all(polygons)
 
 
 def _build_room_level_with_spanning_inner_wall() -> LevelData:
@@ -2464,6 +2506,440 @@ class SlopedCeilingEditApiTests(unittest.TestCase):
             preview_meshes[0].faces,
             committed_meshes[0].faces,
         )
+
+    def test_paired_outline_previews_match_the_committed_ceiling_envelope(
+        self,
+    ) -> None:
+        level = _build_close_outline_level()
+        surfaces = build_base_fixed_surfaces([level], apply_sloped_ceilings=False)
+        walls = tuple(
+            surface
+            for surface in surfaces
+            if surface.surface_type == "wall"
+            and math.isclose(
+                surface.wall_start_world[1], surface.wall_end_world[1]
+            )
+        )
+        level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=str(index + 1) * 32,
+                wall_surface_id=wall.surface_id,
+                depth_meters=0.8,
+                joined_group_id="c" * 32,
+            )
+            for index, wall in enumerate(walls)
+        ]
+
+        previews = build_sloped_ceiling_preview_meshes([level], surfaces)
+        committed = _combined_ceiling_surface(build_fixed_surfaces([level]))
+
+        self.assertEqual(len(previews), 2)
+        for preview in previews:
+            for point in np.concatenate((preview.vertices, preview.triangles_center)):
+                self.assertAlmostEqual(
+                    point[2],
+                    _ceiling_height_at_xy(committed, tuple(point[:2])),
+                    places=8,
+                )
+
+    def test_paired_preview_omits_the_mirrored_skin_outside_the_real_ceiling(
+        self,
+    ) -> None:
+        for rounded in (False, True):
+            with self.subTest(rounded=rounded):
+                level = _build_room_with_exterior_wall_outline()
+                surfaces = build_base_fixed_surfaces(
+                    [level], apply_sloped_ceilings=False
+                )
+                walls = tuple(
+                    surface
+                    for surface in surfaces
+                    if surface.surface_type == "wall"
+                    and math.isclose(
+                        surface.wall_start_world[1], surface.wall_end_world[1]
+                    )
+                    and surface.wall_start_world[1] >= -1e-8
+                )
+                self.assertEqual(len(walls), 2)
+                level.sloped_ceilings = [
+                    SlopedCeilingData(
+                        slope_id=str(index + 1) * 32,
+                        wall_surface_id=wall.surface_id,
+                        depth_meters=0.8,
+                        transition_radius_meters=0.15 if rounded else 0.0,
+                        wall_transition_radius_meters=0.15 if rounded else 0.0,
+                        joined_group_id="c" * 32,
+                    )
+                    for index, wall in enumerate(walls)
+                ]
+                original_records = tuple(level.sloped_ceilings)
+                targets = tuple(
+                    target
+                    for target in build_sloped_ceiling_edit_targets(
+                        [level], surfaces
+                    )
+                    if target.slope_id is not None
+                )
+                # The rear outline really faces away from the room; checking
+                # only Z values over a skinny wall-only host misses this case.
+                self.assertLess(
+                    np.dot(targets[0].inward_world, targets[1].inward_world),
+                    -0.999,
+                )
+
+                previews = build_sloped_ceiling_preview_meshes([level], surfaces)
+                committed = build_fixed_surfaces([level])
+                expected = _mesh_xy_footprint(
+                    tuple(
+                        surface.mesh
+                        for surface in committed
+                        if surface.surface_type == "ceiling"
+                        and surface.sloped_ceiling_part == "main"
+                    )
+                )
+                actual = _mesh_xy_footprint(previews)
+
+                self.assertEqual(tuple(level.sloped_ceilings), original_records)
+                self.assertEqual(len(previews), 1)
+                self.assertAlmostEqual(expected.area, 3.2)
+                self.assertLess(actual.symmetric_difference(expected).area, 1e-8)
+                ceiling = _combined_ceiling_surface(committed)
+                for preview in previews:
+                    for point in np.concatenate(
+                        (preview.vertices, preview.triangles_center)
+                    ):
+                        self.assertAlmostEqual(
+                            point[2],
+                            _ceiling_height_at_xy(ceiling, tuple(point[:2])),
+                            places=8,
+                        )
+
+    def test_filtered_rear_outline_preview_is_empty_outside_the_ceiling(
+        self,
+    ) -> None:
+        level = _build_room_with_exterior_wall_outline()
+        surfaces = build_base_fixed_surfaces([level], apply_sloped_ceilings=False)
+        rear_wall = next(
+            surface
+            for surface in surfaces
+            if surface.surface_type == "wall"
+            and math.isclose(surface.wall_start_world[1], 0.2)
+            and math.isclose(surface.wall_end_world[1], 0.2)
+        )
+        level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=SLOPE_ID,
+                wall_surface_id=rear_wall.surface_id,
+                depth_meters=0.8,
+            )
+        ]
+
+        previews = build_sloped_ceiling_preview_meshes(
+            [level], surfaces, wall_surface_id=rear_wall.surface_id
+        )
+
+        self.assertEqual(previews, ())
+
+    def test_preview_clips_overhanging_ends_and_depth_to_the_committed_host(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        boundary_ids = tuple(
+            vertex_data.add_vertex(*point).id
+            for point in (
+                (0.0, 0.0),
+                (200.0, 0.0),
+                (200.0, 50.0),
+                (100.0, 50.0),
+                (100.0, 200.0),
+                (0.0, 200.0),
+            )
+        )
+        for first, second in zip(
+            boundary_ids, (*boundary_ids[1:], boundary_ids[0])
+        ):
+            vertex_data.add_edge(first, second)
+        overhang_start = vertex_data.add_vertex(-20.0, 10.0)
+        overhang_end = vertex_data.add_vertex(220.0, 10.0)
+        vertex_data.add_edge(overhang_start.id, overhang_end.id)
+        level = LevelData(
+            index=2,
+            name="Ground",
+            height_meters=3.0,
+            vertex_data=vertex_data,
+        )
+        surfaces = build_base_fixed_surfaces([level], apply_sloped_ceilings=False)
+        wall = next(
+            surface
+            for surface in surfaces
+            if surface.surface_type == "wall"
+            and math.isclose(surface.wall_start_world[1], -0.2)
+            and math.isclose(surface.wall_end_world[1], -0.2)
+        )
+        level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=SLOPE_ID,
+                wall_surface_id=wall.surface_id,
+                depth_meters=2.0,
+            )
+        ]
+
+        previews = build_sloped_ceiling_preview_meshes([level], surfaces)
+        committed = build_fixed_surfaces([level])
+        expected = _mesh_xy_footprint(
+            tuple(
+                surface.mesh
+                for surface in committed
+                if surface.surface_type == "ceiling"
+                and surface.sloped_ceiling_part == "main"
+            )
+        )
+        actual = _mesh_xy_footprint(previews)
+
+        self.assertEqual(len(previews), 1)
+        self.assertGreater(expected.area, 0.0)
+        self.assertLess(actual.symmetric_difference(expected).area, 1e-8)
+        self.assertLessEqual(float(np.max(previews[0].vertices[:, 0])), 4.0 + 1e-8)
+        self.assertGreaterEqual(float(np.min(previews[0].vertices[:, 0])), -1e-8)
+        # Beyond the L-shaped host's shallow right arm there is no ceiling.
+        self.assertFalse(actual.covers(Point((3.0, -1.5))))
+        ceiling = _combined_ceiling_surface(committed)
+        for point in np.concatenate(
+            (previews[0].vertices, previews[0].triangles_center)
+        ):
+            self.assertAlmostEqual(
+                point[2],
+                _ceiling_height_at_xy(ceiling, tuple(point[:2])),
+                places=8,
+            )
+
+    def test_preview_retains_a_wall_only_fallback_without_a_ceiling_host(
+        self,
+    ) -> None:
+        level = _build_room_level()
+        surfaces = build_base_fixed_surfaces([level], apply_sloped_ceilings=False)
+        wall = _host_wall(surfaces)
+        level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=SLOPE_ID,
+                wall_surface_id=wall.surface_id,
+                depth_meters=0.8,
+            )
+        ]
+
+        previews = build_sloped_ceiling_preview_meshes([level], (wall,))
+
+        self.assertEqual(len(previews), 1)
+        self.assertAlmostEqual(_mesh_xy_footprint(previews).area, 3.2)
+        self.assertTrue(np.all(np.isfinite(previews[0].vertices)))
+
+    def test_filtered_peer_preview_includes_a_live_edit_on_the_other_outline(
+        self,
+    ) -> None:
+        level = _build_close_outline_level()
+        surfaces = build_base_fixed_surfaces([level], apply_sloped_ceilings=False)
+        walls = tuple(
+            surface
+            for surface in surfaces
+            if surface.surface_type == "wall"
+            and math.isclose(
+                surface.wall_start_world[1], surface.wall_end_world[1]
+            )
+        )
+        level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=str(index + 1) * 32,
+                wall_surface_id=wall.surface_id,
+                depth_meters=0.15,
+                joined_group_id="c" * 32,
+            )
+            for index, wall in enumerate(walls)
+        ]
+        original_records = tuple(level.sloped_ceilings)
+        edit = SlopedCeilingEdit(
+            slope_id=original_records[0].slope_id,
+            wall_surface_id=walls[0].surface_id,
+            level_index=level.index,
+            handle_kind=SLOPED_CEILING_HANDLE_WALL_DROP,
+            value=0.3,
+        )
+
+        previews = build_sloped_ceiling_preview_meshes(
+            [level], surfaces, edit, wall_surface_id=walls[1].surface_id
+        )
+
+        self.assertEqual(tuple(level.sloped_ceilings), original_records)
+        self.assertEqual(len(previews), 1)
+        # The peer's own grid ends at -0.05; the edited wall bends at -0.15.
+        self.assertTrue(np.any(np.isclose(previews[0].vertices[:, 1], -0.15)))
+        apply_sloped_ceiling_edit([level], edit)
+        committed = _combined_ceiling_surface(build_fixed_surfaces([level]))
+        for point in np.concatenate(
+            (previews[0].vertices, previews[0].triangles_center)
+        ):
+            self.assertAlmostEqual(
+                point[2],
+                _ceiling_height_at_xy(committed, tuple(point[:2])),
+                places=8,
+            )
+
+    def test_preview_envelopes_do_not_mix_other_rooms_or_levels(self) -> None:
+        for other_host in ("room", "level"):
+            with self.subTest(other_host=other_host):
+                level = _build_close_outline_level()
+                surfaces = build_base_fixed_surfaces(
+                    [level], apply_sloped_ceilings=False
+                )
+                wall = _host_wall(surfaces)
+                peer = next(
+                    surface
+                    for surface in surfaces
+                    if surface.surface_type == "wall"
+                    and math.isclose(surface.wall_start_world[1], -0.2)
+                    and math.isclose(surface.wall_end_world[1], -0.2)
+                )
+                ceiling = next(
+                    surface
+                    for surface in surfaces
+                    if surface.surface_type == "ceiling"
+                )
+                level.sloped_ceilings = [
+                    SlopedCeilingData(
+                        slope_id=SLOPE_ID,
+                        wall_surface_id=wall.surface_id,
+                        depth_meters=0.15,
+                        wall_drop_meters=0.2,
+                    )
+                ]
+                expected = build_sloped_ceiling_preview_meshes(
+                    [level], surfaces, wall_surface_id=wall.surface_id
+                )[0]
+                other_level_index = (
+                    level.index if other_host == "room" else level.index + 1
+                )
+                other_room_index = 9 if other_host == "room" else None
+                other_wall = replace(
+                    peer,
+                    surface_id=f"level:{other_level_index}/wall:9001:9002",
+                    level_index=other_level_index,
+                    room_index=other_room_index,
+                )
+                other_ceiling = replace(
+                    ceiling,
+                    surface_id=f"{ceiling.surface_id}/other-{other_host}",
+                    level_index=other_level_index,
+                    room_index=other_room_index,
+                )
+                other_record = SlopedCeilingData(
+                    slope_id="b" * 32,
+                    wall_surface_id=other_wall.surface_id,
+                    depth_meters=0.15,
+                    wall_drop_meters=0.7,
+                )
+                levels = [level]
+                if other_host == "room":
+                    level.sloped_ceilings.append(other_record)
+                else:
+                    levels.append(
+                        LevelData(
+                            index=other_level_index,
+                            name="Other level",
+                            height_meters=3.0,
+                            sloped_ceilings=[other_record],
+                        )
+                    )
+
+                actual = build_sloped_ceiling_preview_meshes(
+                    levels,
+                    (*surfaces, other_wall, other_ceiling),
+                    wall_surface_id=wall.surface_id,
+                )
+
+                self.assertEqual(len(actual), 1)
+                np.testing.assert_allclose(actual[0].vertices, expected.vertices)
+                np.testing.assert_array_equal(actual[0].faces, expected.faces)
+
+    def test_parallel_preview_row_drops_match_scalar_rounded_profile(self) -> None:
+        level = _build_room_level()
+        surfaces = build_base_fixed_surfaces([level], apply_sloped_ceilings=False)
+        wall = _host_wall(surfaces)
+        level.sloped_ceilings = [
+            SlopedCeilingData(
+                slope_id=SLOPE_ID,
+                wall_surface_id=wall.surface_id,
+                depth_meters=1.1,
+                wall_drop_meters=0.9,
+                transition_radius_meters=0.25,
+                wall_transition_radius_meters=0.2,
+                side_transition_radius_meters=0.3,
+                start_ratio=0.2,
+                end_ratio=0.8,
+            )
+        ]
+        initial_frame = sloped_ceiling_module._build_slope_frames(
+            [level], surfaces
+        )[0]
+        epsilon = sloped_ceiling_module.SLOPED_CEILING_GEOMETRY_EPSILON
+        epsilon_offsets = (-2 * epsilon, -epsilon / 2, 0.0, epsilon / 2, 2 * epsilon)
+        for reverse_axis in (False, True):
+            frame = (
+                replace(
+                    initial_frame,
+                    wall_start=initial_frame.wall_end,
+                    wall_end=initial_frame.wall_start,
+                    tangent_xy=-initial_frame.tangent_xy,
+                )
+                if reverse_axis
+                else initial_frame
+            )
+            tangent_values = np.unique(
+                np.concatenate(
+                    (
+                        np.linspace(-0.1, frame.wall_length + 0.1, 61),
+                        [
+                            bound + offset
+                            for bound in (frame.start_distance, frame.end_distance)
+                            for offset in epsilon_offsets
+                        ],
+                    )
+                )
+            )
+            depth_values = np.unique(
+                np.concatenate(
+                    (
+                        np.linspace(-0.1, frame.data.depth_meters + 0.1, 31),
+                        [
+                            bound + offset
+                            for bound in (
+                                0.0,
+                                frame.profile.wall_tangent_depth_meters,
+                                frame.profile.ceiling_tangent_depth_meters,
+                                frame.data.depth_meters,
+                            )
+                            for offset in epsilon_offsets
+                        ],
+                    )
+                )
+            )
+            for depth in depth_values:
+                with self.subTest(reverse_axis=reverse_axis, depth=depth):
+                    points = (
+                        frame.wall_start[:2]
+                        + tangent_values[:, np.newaxis] * frame.tangent_xy
+                        + depth * frame.inward_xy
+                    )
+                    expected = np.asarray(
+                        [
+                            sloped_ceiling_module._single_slope_drop_at_xy(
+                                point, frame
+                            )
+                            for point in points
+                        ]
+                    )
+                    actual = sloped_ceiling_module._get_parallel_preview_row_drops(
+                        points, frame
+                    )
+                    np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=0.0)
 
     def test_one_shared_lateral_handle_exists_when_any_blue_bound_is_internal(
         self,

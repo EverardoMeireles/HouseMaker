@@ -623,15 +623,7 @@ def build_sloped_ceiling_preview_meshes(
     ]
     if edit is not None:
         records = _preview_records_with_edit(records, edit)
-    if wall_surface_id is not None:
-        normalized_wall_surface_id = str(wall_surface_id).strip()
-        records = [
-            (level_index, record)
-            for level_index, record in records
-            if record.wall_surface_id == normalized_wall_surface_id
-        ]
-
-    meshes: list[trimesh.Trimesh] = []
+    frames: list[_SlopeFrame] = []
     for level_index, record in records:
         level = level_lookup.get(level_index)
         surface = surfaces_by_id.get(record.wall_surface_id)
@@ -648,9 +640,26 @@ def build_sloped_ceiling_preview_meshes(
                 (level_index, getattr(surface, "room_index", None))
             ),
         )
-        if frame is None:
+        if frame is not None:
+            frames.append(frame)
+    frames_by_host = _group_frames_by_host(frames)
+    normalized_wall_surface_id = (
+        None if wall_surface_id is None else str(wall_surface_id).strip()
+    )
+    meshes: list[trimesh.Trimesh] = []
+    for frame in frames:
+        if (
+            normalized_wall_surface_id is not None
+            and frame.data.wall_surface_id != normalized_wall_surface_id
+        ):
             continue
-        mesh = _build_preview_mesh(frame)
+        mesh = _build_preview_mesh(
+            frame,
+            frames_by_host[(frame.level_index, frame.room_index)],
+            host_ceiling_geometry=ceiling_geometry_lookup.get(
+                (frame.level_index, frame.room_index)
+            ),
+        )
         if mesh is not None:
             meshes.append(mesh)
     return tuple(meshes)
@@ -4017,26 +4026,113 @@ def _resolve_main_wall_normal(
 
 
 # ### Preview geometry helpers ###
-def _build_preview_mesh(frame: _SlopeFrame) -> trimesh.Trimesh | None:
-    tangent_values = _slope_tangent_breakpoints(frame)
-    depth_values = _slope_depth_breakpoints(frame)
+def _build_preview_sampling_values(
+    frame: _SlopeFrame,
+    host_frames: Sequence[_SlopeFrame],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Include parallel peers' profile bends in the lightweight preview grid."""
+
+    tangent_values = set(_slope_tangent_breakpoints(frame))
+    depth_values = set(_slope_depth_breakpoints(frame))
+    for peer in host_frames:
+        if peer is frame or abs(float(np.dot(frame.tangent_xy, peer.tangent_xy))) < (
+            1.0 - SLOPED_CEILING_GEOMETRY_EPSILON
+        ):
+            continue
+        offset = peer.wall_start[:2] - frame.wall_start[:2]
+        tangent_offset = float(np.dot(offset, frame.tangent_xy))
+        tangent_sign = float(np.dot(peer.tangent_xy, frame.tangent_xy))
+        peer_tangent_values = tuple(
+            tangent_offset + tangent_sign * value
+            for value in _slope_tangent_breakpoints(peer)
+        )
+        if (
+            max(peer_tangent_values) < frame.start_distance
+            or min(peer_tangent_values) > frame.end_distance
+        ):
+            continue
+        depth_offset = float(np.dot(offset, frame.inward_xy))
+        depth_sign = float(np.dot(peer.inward_xy, frame.inward_xy))
+        peer_depth_values = tuple(
+            depth_offset + depth_sign * value
+            for value in _slope_depth_breakpoints(peer)
+        )
+        if max(peer_depth_values) < 0.0 or min(peer_depth_values) > frame.data.depth_meters:
+            continue
+        tangent_values.update(
+            value
+            for value in peer_tangent_values
+            if frame.start_distance + SLOPED_CEILING_GEOMETRY_EPSILON
+            < value
+            < frame.end_distance - SLOPED_CEILING_GEOMETRY_EPSILON
+        )
+        depth_values.update(
+            value
+            for value in peer_depth_values
+            if SLOPED_CEILING_GEOMETRY_EPSILON
+            < value
+            < frame.data.depth_meters - SLOPED_CEILING_GEOMETRY_EPSILON
+        )
+    return (
+        _merge_preview_sample_values(tangent_values),
+        _merge_preview_sample_values(depth_values),
+    )
+
+
+def _merge_preview_sample_values(values: Collection[float]) -> tuple[float, ...]:
+    """Avoid near-zero-width grid strips caused by projected float roundoff."""
+
+    ordered = sorted(values)
+    merged: list[float] = []
+    for value in ordered:
+        if not merged or value - merged[-1] > SLOPED_CEILING_GEOMETRY_EPSILON:
+            merged.append(value)
+    if len(merged) > 1:
+        merged[-1] = ordered[-1]
+    return tuple(merged)
+
+
+def _build_preview_mesh(
+    frame: _SlopeFrame,
+    host_frames: Sequence[_SlopeFrame],
+    *,
+    host_ceiling_geometry: BaseGeometry | None = None,
+) -> trimesh.Trimesh | None:
+    """Preview the shared slope only where the committed ceiling can exist."""
+
+    clipped_footprint: BaseGeometry | None = None
+    if host_ceiling_geometry is not None:
+        start = frame.wall_start[:2] + frame.tangent_xy * frame.start_distance
+        end = frame.wall_start[:2] + frame.tangent_xy * frame.end_distance
+        offset = frame.inward_xy * frame.data.depth_meters
+        footprint = Polygon((start, end, end + offset, start + offset))
+        if not host_ceiling_geometry.covers(footprint):
+            clipped_footprint = host_ceiling_geometry.intersection(footprint)
+            if clipped_footprint.area <= SLOPED_CEILING_GEOMETRY_EPSILON:
+                return None
+
+    tangent_values, depth_values = _build_preview_sampling_values(frame, host_frames)
     if len(tangent_values) < 2 or len(depth_values) < 2:
         return None
     vertices: list[tuple[float, float, float]] = []
+    tangent_offsets = np.asarray(tangent_values)[:, np.newaxis] * frame.tangent_xy
     for depth in depth_values:
-        for tangent_distance in tangent_values:
-            point_xy = (
-                frame.wall_start[:2]
-                + frame.tangent_xy * tangent_distance
-                + frame.inward_xy * depth
-            )
-            vertices.append(
-                (
-                    float(point_xy[0]),
-                    float(point_xy[1]),
-                    frame.ceiling_z - _single_slope_drop_at_xy(point_xy, frame),
+        points_xy = frame.wall_start[:2] + tangent_offsets + frame.inward_xy * depth
+        drops = np.zeros(len(points_xy), dtype=float)
+        for peer in host_frames:
+            if abs(float(np.dot(frame.tangent_xy, peer.inward_xy))) <= 1e-12:
+                peer_drops = _get_parallel_preview_row_drops(points_xy, peer)
+            else:
+                peer_drops = np.fromiter(
+                    (_single_slope_drop_at_xy(point, peer) for point in points_xy),
+                    dtype=float,
+                    count=len(points_xy),
                 )
-            )
+            np.maximum(drops, peer_drops, out=drops)
+        vertices.extend(
+            (float(point[0]), float(point[1]), float(frame.ceiling_z - drop))
+            for point, drop in zip(points_xy, drops)
+        )
     row_width = len(tangent_values)
     faces: list[tuple[int, int, int]] = []
     for row in range(len(depth_values) - 1):
@@ -4046,7 +4142,110 @@ def _build_preview_mesh(frame: _SlopeFrame) -> trimesh.Trimesh | None:
             fourth = first + row_width
             third = fourth + 1
             faces.extend(((first, third, second), (first, fourth, third)))
-    return _build_mesh(vertices, faces)
+    mesh = _build_mesh(vertices, faces)
+    if mesh is not None and clipped_footprint is not None:
+        return _clip_preview_mesh_to_footprint(
+            mesh, clipped_footprint, frame, host_frames
+        )
+    return mesh
+
+
+def _clip_preview_mesh_to_footprint(
+    mesh: trimesh.Trimesh,
+    footprint: BaseGeometry,
+    frame: _SlopeFrame,
+    host_frames: Sequence[_SlopeFrame],
+) -> trimesh.Trimesh | None:
+    """Retain the grid and tessellate only triangles crossing the host boundary."""
+
+    triangle_polygons = shapely.polygons(np.asarray(mesh.triangles)[:, :, :2])
+    inside = shapely.covers(footprint, triangle_polygons)
+    crossing = ~inside & shapely.intersects(footprint, triangle_polygons)
+    retained_meshes: list[trimesh.Trimesh] = []
+    if np.any(inside):
+        retained_meshes.append(_extract_mesh_faces(mesh, np.flatnonzero(inside)))
+    boundary_parts = shapely.intersection(triangle_polygons[crossing], footprint)
+    vertices: list[tuple[float, float, float]] = []
+    vertex_index: dict[tuple[float, float, float], int] = {}
+    faces: list[tuple[int, int, int]] = []
+    normal = np.asarray(mesh.face_normals[0], dtype=float)
+    for intersection in boundary_parts:
+        for part in _iter_polygon_parts(intersection):
+            if part.area <= SLOPED_CEILING_GEOMETRY_EPSILON:
+                continue
+            representative = part.representative_point().coords[0]
+            buffered_part = part.buffer(SLOPED_CEILING_GEOMETRY_EPSILON)
+            for triangle in shapely.get_parts(shapely.constrained_delaunay_triangles(part)):
+                if not isinstance(triangle, Polygon) or not buffered_part.covers(triangle):
+                    continue
+                world_points = tuple(
+                    (
+                        float(x),
+                        float(y),
+                        frame.ceiling_z
+                        - _ceiling_drop_at_xy(
+                            (x, y), host_frames, lateral_reference_xy=representative
+                        ),
+                    )
+                    for x, y in tuple(triangle.exterior.coords)[:-1]
+                )
+                _append_oriented_triangle(
+                    vertices, vertex_index, faces, world_points, normal
+                )
+    boundary_mesh = _build_mesh(vertices, faces)
+    if boundary_mesh is not None:
+        retained_meshes.append(boundary_mesh)
+    if not retained_meshes:
+        return None
+    return (
+        retained_meshes[0]
+        if len(retained_meshes) == 1
+        else trimesh.util.concatenate(retained_meshes)
+    )
+
+
+def _get_parallel_preview_row_drops(
+    points_xy: np.ndarray,
+    frame: _SlopeFrame,
+) -> np.ndarray:
+    """Reuse one exact profile evaluation across a parallel preview row."""
+
+    relative = points_xy - frame.wall_start[:2]
+    tangent_distances = relative @ frame.tangent_xy
+    inward_distance = float(np.dot(relative[0], frame.inward_xy))
+    if (
+        inward_distance < -SLOPED_CEILING_GEOMETRY_EPSILON
+        or inward_distance > frame.data.depth_meters + SLOPED_CEILING_GEOMETRY_EPSILON
+    ):
+        return np.zeros(len(points_xy), dtype=float)
+    profile_drop = _profile_drop_at_depth(frame.profile, inward_distance)
+    radius = _effective_lateral_edge_radius(inward_distance, profile_drop, frame)
+    drops = np.full(len(points_xy), profile_drop, dtype=float)
+    if radius > SLOPED_CEILING_GEOMETRY_EPSILON:
+        edge_distances = np.full(len(points_xy), np.inf, dtype=float)
+        if _start_side_is_internal(frame):
+            np.minimum(
+                edge_distances,
+                np.maximum(0.0, tangent_distances - frame.start_distance),
+                out=edge_distances,
+            )
+        if _end_side_is_internal(frame):
+            np.minimum(
+                edge_distances,
+                np.maximum(0.0, frame.end_distance - tangent_distances),
+                out=edge_distances,
+            )
+        near_edge = edge_distances < radius
+        offsets = edge_distances[near_edge] - radius
+        drops[near_edge] -= radius - np.sqrt(
+            np.maximum(0.0, radius * radius - offsets * offsets)
+        )
+    np.clip(drops, 0.0, frame.maximum_drop, out=drops)
+    outside_span = (
+        tangent_distances < frame.start_distance - SLOPED_CEILING_GEOMETRY_EPSILON
+    ) | (tangent_distances > frame.end_distance + SLOPED_CEILING_GEOMETRY_EPSILON)
+    drops[outside_span] = 0.0
+    return drops
 
 
 # ### Generic helpers ###
