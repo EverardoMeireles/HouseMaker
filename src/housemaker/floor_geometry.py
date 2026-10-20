@@ -10,6 +10,7 @@ import trimesh
 from shapely import LineString, Point, Polygon, STRtree
 from shapely.geometry.base import BaseGeometry
 
+from housemaker.doorway_connections import get_level_structural_edges
 from housemaker.models import LevelData
 
 # ### Constants ###
@@ -352,7 +353,7 @@ def _build_structural_lines(
 
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
     line_by_edge_key: dict[tuple[Point2D, Point2D], LineString] = {}
-    for edge in level.vertex_data.edges:
+    for edge in get_level_structural_edges(level):
         if (
             edge.start_vertex_id in ignored_vertex_ids
             or edge.end_vertex_id in ignored_vertex_ids

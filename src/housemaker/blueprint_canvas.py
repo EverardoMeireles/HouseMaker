@@ -40,10 +40,16 @@ from housemaker.canvas_wall_angles import (
     find_non_right_angle_wall_parts,
 )
 from housemaker.doorway_bridge import (
-    find_doorway_bridge_target,
     find_doorway_bridges_covered_by_rectangle,
 )
+from housemaker.doorway_connections import get_doorway_structural_edges
 from housemaker.doorway_geometry import doorway_indices_on_removed_wall_edges
+from housemaker.doorway_topology import (
+    DoorwayFit,
+    apply_doorway_fit,
+    find_doorway_fit,
+    move_doorway_corner_vertices,
+)
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
@@ -84,6 +90,7 @@ from housemaker.surface_geometry import (
 )
 from housemaker.uv_layout import build_room_walls
 from housemaker.window_frame_bridge import build_window_frame_bridge_placement
+from housemaker.window_topology import resolve_linked_window_frame
 
 if TYPE_CHECKING:
     from housemaker.wall_llm_verification import WallAdditionProposal
@@ -164,6 +171,8 @@ DRAG_THRESHOLD_SCREEN = 4.0
 WINDOW_STRIP_HALF_WIDTH_SCREEN = 5.0
 WINDOW_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 12.0
+# Keep the fixed outward wall edges nonzero at a linked opening's limits.
+WINDOW_LINKED_BOUNDARY_CLEARANCE_PIXELS = 1e-4
 DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
 DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
@@ -699,7 +708,7 @@ class BlueprintCanvas(QWidget):
         self.pending_doorway_preset: DoorwayPreset | None = None
         self.pending_doorway: DoorwayData | None = None
         self.pending_doorway_image_point: QPointF | None = None
-        self.pending_doorway_bridge_vertex_ids: tuple[int, int] | None = None
+        self._pending_doorway_fit: DoorwayFit | None = None
         self._window_placement_active = False
         self._pending_window_placement: WallWindowPlacement | None = None
         self._pending_window_image_point: QPointF | None = None
@@ -709,9 +718,12 @@ class BlueprintCanvas(QWidget):
         self.window_drag_press_position: QPointF | None = None
         self.window_drag_press_image_point: tuple[float, float] | None = None
         self.window_drag_initial_window: WindowData | None = None
+        self.window_drag_initial_bounds: CanvasOpeningBounds | None = None
         self.window_drag_wall_frame: WindowWallFrame | None = None
+        self.window_drag_is_linked = False
         self.window_drag_width_side_sign = 0.0
         self.window_drag_start_edit: CanvasOpeningEdit | None = None
+        self.window_drag_current_edit: CanvasOpeningEdit | None = None
         self.selected_doorway_index: int | None = None
         self._fixture_opening_keys: frozenset[str] = frozenset()
         self.pressed_doorway_index: int | None = None
@@ -2380,7 +2392,7 @@ class BlueprintCanvas(QWidget):
         self.pending_doorway_preset = preset
         self.pending_doorway = None
         self.pending_doorway_image_point = None
-        self.pending_doorway_bridge_vertex_ids = None
+        self._pending_doorway_fit = None
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.update()
@@ -2543,6 +2555,16 @@ class BlueprintCanvas(QWidget):
             return
 
         if self._wall_verification_preview and event.key() == Qt.Key.Key_Delete:
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and event.isAutoRepeat()
+            and self.selected_window_id is not None
+        ):
+            # Holding Delete must not remove the frame immediately after
+            # the first press has detached its installed window.
             event.accept()
             return
 
@@ -3089,7 +3111,7 @@ class BlueprintCanvas(QWidget):
                 else (image_point.x(), image_point.y())
             )
             self.window_drag_initial_window = window
-            self.window_drag_wall_frame = self._get_window_wall_frame(window)
+            self._prepare_window_drag_frame(window)
             self.window_drag_width_side_sign = window_hit.width_side_sign
             self.update()
             event.accept()
@@ -3276,7 +3298,7 @@ class BlueprintCanvas(QWidget):
             if image_point is None:
                 self.pending_doorway = None
                 self.pending_doorway_image_point = None
-                self.pending_doorway_bridge_vertex_ids = None
+                self._pending_doorway_fit = None
             else:
                 self._update_pending_doorway(
                     image_point,
@@ -3552,7 +3574,7 @@ class BlueprintCanvas(QWidget):
         if self.pending_doorway_preset is not None:
             self.pending_doorway = None
             self.pending_doorway_image_point = None
-            self.pending_doorway_bridge_vertex_ids = None
+            self._pending_doorway_fit = None
             self.update()
         if (
             self._window_placement_active
@@ -5584,7 +5606,10 @@ class BlueprintCanvas(QWidget):
         """Request fixture removal before Delete can alter its opening."""
 
         reference = self._selected_opening_reference()
-        if reference is None or reference.key not in self._fixture_opening_keys:
+        if reference is None or (
+            reference.kind != CANVAS_OPENING_WINDOW
+            and reference.key not in self._fixture_opening_keys
+        ):
             return False
         self.canvas_opening_fixture_deletion_requested.emit(reference)
         return True
@@ -5655,6 +5680,11 @@ class BlueprintCanvas(QWidget):
         wall_frames = self._build_window_wall_frames()
         for window_index in range(len(self.windows) - 1, -1, -1):
             window = self.windows[window_index]
+            linked_polygon = self._get_linked_window_widget_polygon(window)
+            if linked_polygon is not None and linked_polygon.containsPoint(
+                widget_point, Qt.FillRule.OddEvenFill
+            ):
+                return WindowHit(window_index)
             segment = self._get_window_widget_segment(
                 window,
                 wall_frames.get(window.wall_surface_id),
@@ -5739,11 +5769,14 @@ class BlueprintCanvas(QWidget):
         current_index = self._find_window_index_by_id(initial_window.window_id)
         if current_index is None:
             return
-        start_edit = self._build_window_edit(current_index, initial_window)
+        start_edit = self._build_window_edit(
+            current_index, initial_window, bounds=self.window_drag_initial_bounds
+        )
         if start_edit is None:
             return
         self.drag_window_index = current_index
         self.window_drag_start_edit = start_edit
+        self.window_drag_current_edit = start_edit
         self.canvas_opening_edit_started.emit(start_edit)
         if self.window_drag_width_side_sign:
             frame = self.window_drag_wall_frame
@@ -5754,13 +5787,40 @@ class BlueprintCanvas(QWidget):
         else:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
+    def _prepare_window_drag_frame(self, window: WindowData) -> None:
+        """Freeze the complete wall run before the four opening corners move."""
+
+        level = self.level_context
+        linked = None if level is None else resolve_linked_window_frame(level, window)
+        self.window_drag_is_linked = linked is not None
+        if linked is not None:
+            self.window_drag_wall_frame = WindowWallFrame(
+                linked.start_point, linked.end_point, float(level.height_meters)
+            )
+            start_ratio, end_ratio = linked.start_ratio, linked.end_ratio
+        else:
+            self.window_drag_wall_frame = self._get_window_wall_frame(window)
+            start_ratio, end_ratio = window.start_ratio, window.end_ratio
+        self.window_drag_initial_bounds = CanvasOpeningBounds(
+            start_ratio=start_ratio,
+            end_ratio=end_ratio,
+            bottom_ratio=window.bottom_ratio,
+            top_ratio=window.top_ratio,
+        )
+
     def _move_dragged_window(self, image_point: QPointF) -> None:
         """Move a window only along its owning semantic wall."""
 
         initial_window = self.window_drag_initial_window
+        initial_bounds = self.window_drag_initial_bounds
         frame = self.window_drag_wall_frame
         press_point = self.window_drag_press_image_point
-        if initial_window is None or frame is None or press_point is None:
+        if (
+            initial_window is None
+            or initial_bounds is None
+            or frame is None
+            or press_point is None
+        ):
             return
         pressed_ratio = self._project_image_point_to_window_ratio(
             QPointF(*press_point),
@@ -5769,16 +5829,18 @@ class BlueprintCanvas(QWidget):
         pointer_ratio = self._project_image_point_to_window_ratio(image_point, frame)
         if pressed_ratio is None or pointer_ratio is None:
             return
-        span = initial_window.end_ratio - initial_window.start_ratio
-        initial_center = (
-            initial_window.start_ratio + initial_window.end_ratio
-        ) * 0.5
+        span = initial_bounds.end_ratio - initial_bounds.start_ratio
+        initial_center = (initial_bounds.start_ratio + initial_bounds.end_ratio) * 0.5
         requested_center = initial_center + pointer_ratio - pressed_ratio
         half_span = span * 0.5
-        center = min(max(requested_center, half_span), 1.0 - half_span)
+        minimum_ratio, maximum_ratio = self._get_window_drag_ratio_limits(frame)
+        center = min(
+            max(requested_center, minimum_ratio + half_span),
+            maximum_ratio - half_span,
+        )
         self._preview_dragged_window(
             replace(
-                initial_window,
+                initial_bounds,
                 start_ratio=center - half_span,
                 end_ratio=center + half_span,
             )
@@ -5788,11 +5850,15 @@ class BlueprintCanvas(QWidget):
         """Move one plan-view endpoint while anchoring the opposite endpoint."""
 
         initial_window = self.window_drag_initial_window
+        initial_bounds = self.window_drag_initial_bounds
         frame = self.window_drag_wall_frame
         side_sign = self.window_drag_width_side_sign
-        minimum_span = self._get_window_minimum_width_ratio(frame)
+        minimum_span = (
+            None if frame is None else self._get_window_minimum_width_ratio(frame)
+        )
         if (
             initial_window is None
+            or initial_bounds is None
             or frame is None
             or not side_sign
             or minimum_span is None
@@ -5804,70 +5870,77 @@ class BlueprintCanvas(QWidget):
         )
         if requested_ratio is None:
             return
+        minimum_ratio, maximum_ratio = self._get_window_drag_ratio_limits(frame)
         if side_sign < 0.0:
             resized = replace(
-                initial_window,
+                initial_bounds,
                 start_ratio=min(
-                    max(requested_ratio, 0.0),
-                    max(0.0, initial_window.end_ratio - minimum_span),
+                    max(requested_ratio, minimum_ratio),
+                    max(minimum_ratio, initial_bounds.end_ratio - minimum_span),
                 ),
             )
         else:
             resized = replace(
-                initial_window,
+                initial_bounds,
                 end_ratio=max(
-                    min(requested_ratio, 1.0),
-                    min(1.0, initial_window.start_ratio + minimum_span),
+                    min(requested_ratio, maximum_ratio),
+                    min(maximum_ratio, initial_bounds.start_ratio + minimum_span),
                 ),
             )
         self._preview_dragged_window(resized)
 
-    def _preview_dragged_window(self, window: WindowData) -> None:
+    def _get_window_drag_ratio_limits(
+        self, frame: WindowWallFrame
+    ) -> tuple[float, float]:
+        if not self.window_drag_is_linked:
+            return 0.0, 1.0
+        length = math.dist(frame.start_point, frame.end_point)
+        inset = WINDOW_LINKED_BOUNDARY_CLEARANCE_PIXELS / length
+        return inset, 1.0 - inset
+
+    def _preview_dragged_window(self, bounds: CanvasOpeningBounds) -> None:
         initial_window = self.window_drag_initial_window
         if initial_window is None:
             return
         window_index = self._find_window_index_by_id(initial_window.window_id)
-        if window_index is None or self.windows[window_index] == window:
+        if window_index is None:
             return
-        edit = self._build_window_edit(window_index, window)
-        if edit is None:
+        edit = self._build_window_edit(window_index, initial_window, bounds=bounds)
+        if edit is None or edit == self.window_drag_current_edit:
             return
-        self.windows[window_index] = window
+        if not self.window_drag_is_linked:
+            self.windows[window_index] = replace(
+                initial_window,
+                start_ratio=bounds.start_ratio,
+                end_ratio=bounds.end_ratio,
+                bottom_ratio=bounds.bottom_ratio,
+                top_ratio=bounds.top_ratio,
+            )
         self.drag_window_index = window_index
+        self.window_drag_current_edit = edit
         self.canvas_opening_edit_preview_changed.emit(edit)
 
     def _reset_window_pointer_state(self, *, emit_finished: bool) -> None:
         """Release one 2D window edit without changing its selection."""
 
-        initial_window = self.window_drag_initial_window
         start_edit = self.window_drag_start_edit
-        current_index = (
-            None
-            if initial_window is None
-            else self._find_window_index_by_id(initial_window.window_id)
-        )
-        current_window = (
-            None if current_index is None else self.windows[current_index]
-        )
-        final_edit = (
-            None
-            if current_index is None or current_window is None
-            else self._build_window_edit(current_index, current_window)
-        )
-        changed = bool(
+        final_edit = self.window_drag_current_edit
+        changed = (
             start_edit is not None
-            and initial_window is not None
-            and current_window is not None
-            and current_window != initial_window
+            and final_edit is not None
+            and final_edit != start_edit
         )
         self.pressed_window_index = None
         self.drag_window_index = None
         self.window_drag_press_position = None
         self.window_drag_press_image_point = None
         self.window_drag_initial_window = None
+        self.window_drag_initial_bounds = None
         self.window_drag_wall_frame = None
+        self.window_drag_is_linked = False
         self.window_drag_width_side_sign = 0.0
         self.window_drag_start_edit = None
+        self.window_drag_current_edit = None
         if emit_finished and start_edit is not None and final_edit is not None:
             self.canvas_opening_edit_finished.emit(final_edit, changed)
 
@@ -5893,6 +5966,8 @@ class BlueprintCanvas(QWidget):
         self,
         window_index: int,
         window: WindowData,
+        *,
+        bounds: CanvasOpeningBounds | None = None,
     ) -> CanvasOpeningEdit | None:
         level = self.level_context
         if level is None:
@@ -5905,7 +5980,7 @@ class BlueprintCanvas(QWidget):
                 stable_id=window.window_id,
             ),
             wall_surface_id=window.wall_surface_id,
-            bounds=CanvasOpeningBounds(
+            bounds=bounds or CanvasOpeningBounds(
                 start_ratio=window.start_ratio,
                 end_ratio=window.end_ratio,
                 bottom_ratio=window.bottom_ratio,
@@ -5953,6 +6028,9 @@ class BlueprintCanvas(QWidget):
     ) -> tuple[QPointF, QPointF] | None:
         if getattr(window, "sloped_ceiling_id", None) is not None:
             return None
+        linked_corners = self._get_linked_window_corner_points(window)
+        if linked_corners is not None:
+            return tuple(self._image_to_widget(*point) for point in linked_corners[:2])
         frame = wall_frame or self._get_window_wall_frame(window)
         if frame is None:
             return None
@@ -5975,7 +6053,11 @@ class BlueprintCanvas(QWidget):
         window: WindowData | WallWindowPlacement,
         wall_frame: WindowWallFrame | None = None,
     ) -> QPolygonF | None:
-        """Return the fixed-screen-width plan strip for one wall opening."""
+        """Show four-corner wall thickness, or a thin legacy wall strip."""
+
+        linked_polygon = self._get_linked_window_widget_polygon(window)
+        if linked_polygon is not None:
+            return linked_polygon
 
         segment = self._get_window_widget_segment(window, wall_frame)
         if segment is None:
@@ -5997,6 +6079,39 @@ class BlueprintCanvas(QWidget):
                 end - perpendicular,
                 start - perpendicular,
             )
+        )
+
+    def _get_linked_window_corner_points(
+        self,
+        window: WindowData | WallWindowPlacement,
+    ) -> tuple[tuple[float, float], ...] | None:
+        """Read the physical corner positions, never full-run edit ratios."""
+
+        if (
+            not isinstance(window, WindowData)
+            or window.sloped_ceiling_id is not None
+        ):
+            return None
+        corner_ids = getattr(window, "corner_vertex_ids", None)
+        if corner_ids is None and self.level_context is not None:
+            linked = resolve_linked_window_frame(self.level_context, window)
+            corner_ids = None if linked is None else linked.corner_vertex_ids
+        if corner_ids is None:
+            return None
+        corners = tuple(self.vertex_data.get_vertex(value) for value in corner_ids)
+        if any(point is None for point in corners):
+            return None
+        return tuple((point.x, point.y) for point in corners)
+
+    def _get_linked_window_widget_polygon(
+        self,
+        window: WindowData | WallWindowPlacement,
+    ) -> QPolygonF | None:
+        corners = self._get_linked_window_corner_points(window)
+        if corners is None:
+            return None
+        return QPolygonF(
+            [self._image_to_widget(*corners[index]) for index in (0, 1, 3, 2)]
         )
 
     def _update_pending_window(
@@ -6021,20 +6136,19 @@ class BlueprintCanvas(QWidget):
             return
 
         pointer = (float(image_point.x()), float(image_point.y()))
-        if modifiers & Qt.KeyboardModifier.ShiftModifier:
-            bridge = build_window_frame_bridge_placement(
-                level,
-                pointer,
-                self._screen_distance_to_image(
-                    DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN
-                ),
-                preferred_width_meters=DEFAULT_CANVAS_WINDOW_WIDTH_METERS,
-                height_meters=DEFAULT_CANVAS_WINDOW_HEIGHT_METERS,
-                wall_margin_meters=CANVAS_WINDOW_WALL_MARGIN_METERS,
-            )
-            if bridge is not None:
-                self._pending_window_placement = bridge
-                return
+        # Fit both sides of a solid wall as well as existing four-corner gaps.
+        # Hovering remains read-only; the four vertices are created at commit.
+        bridge = build_window_frame_bridge_placement(
+            level,
+            pointer,
+            self._screen_distance_to_image(DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN),
+            preferred_width_meters=DEFAULT_CANVAS_WINDOW_WIDTH_METERS,
+            height_meters=DEFAULT_CANVAS_WINDOW_HEIGHT_METERS,
+            wall_margin_meters=CANVAS_WINDOW_WALL_MARGIN_METERS,
+        )
+        if bridge is not None:
+            self._pending_window_placement = bridge
+            return
         selected_surface_id = self._selected_wall_surface_id
         nearest: tuple[
             tuple[float, int, str],
@@ -6124,6 +6238,19 @@ class BlueprintCanvas(QWidget):
                     end_point=(second.x, second.y),
                     height_meters=float(self.level_context.height_meters),
                 )
+        fit = getattr(window, "opening_fit", None)
+        if fit is not None and self.level_context is not None:
+            start_point, end_point = fit.corner_positions[:2]
+            # Preserve the placement's ratio direction when either face is chosen.
+            if vertex_ids is not None and fit.corner_vertex_ids is not None:
+                positions_by_id = dict(zip(fit.corner_vertex_ids, fit.corner_positions))
+                start_point = positions_by_id[vertex_ids[0]]
+                end_point = positions_by_id[vertex_ids[1]]
+            return WindowWallFrame(
+                start_point=start_point,
+                end_point=end_point,
+                height_meters=float(self.level_context.height_meters),
+            )
         return self._build_window_wall_frames().get(window.wall_surface_id)
 
     def _refresh_pending_window_modifier_preview(
@@ -6276,7 +6403,7 @@ class BlueprintCanvas(QWidget):
         if preset is None:
             self.pending_doorway = None
             self.pending_doorway_image_point = None
-            self.pending_doorway_bridge_vertex_ids = None
+            self._pending_doorway_fit = None
             return
 
         self.pending_doorway_image_point = QPointF(image_point)
@@ -6291,51 +6418,49 @@ class BlueprintCanvas(QWidget):
             shape=preset.shape,
             arch_amount=preset.arch_amount,
         )
-        bridge_target = None
-        if modifiers & Qt.KeyboardModifier.ShiftModifier:
-            bridge_target = find_doorway_bridge_target(
-                self.vertex_data,
-                {room.center_vertex_id for room in self.rooms},
-                unsnapped_center,
-                float(preset.width_meters),
-                self._screen_distance_to_image(
-                    DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN
-                ),
-                meters_per_pixel=self._get_level_meters_per_pixel(),
-            )
-        if bridge_target is not None:
-            self.pending_doorway = self._copy_doorway_with(
-                doorway,
-                center_x=bridge_target.center[0],
-                center_y=bridge_target.center[1],
-                width_meters=bridge_target.width_meters,
-                rotation_degrees=bridge_target.rotation_degrees,
-            )
-            self.pending_doorway_bridge_vertex_ids = (
-                bridge_target.first_vertex_id,
-                bridge_target.second_vertex_id,
-            )
-            return
-
-        self.pending_doorway_bridge_vertex_ids = None
-        self.pending_doorway = self._snap_doorway_to_walls(
-            doorway,
+        self._pending_doorway_fit = find_doorway_fit(
+            self.vertex_data,
             unsnapped_center,
+            doorway,
+            self._screen_distance_to_image(DOORWAY_BRIDGE_SNAP_TOLERANCE_SCREEN),
+            room_center_vertex_ids={room.center_vertex_id for room in self.rooms},
+            meters_per_pixel=self._get_level_meters_per_pixel(),
+        )
+        if self._pending_doorway_fit is not None:
+            corner_ids = self._pending_doorway_fit.corner_vertex_ids
+            if corner_ids is not None and any(
+                placed.corner_vertex_ids is not None
+                and set(placed.corner_vertex_ids) == set(corner_ids)
+                for placed in self.doorways
+            ):
+                self._pending_doorway_fit = None
+        self.pending_doorway = (
+            None if self._pending_doorway_fit is None else self._pending_doorway_fit.doorway
         )
 
     def _commit_pending_doorway(self) -> None:
         doorway = self.pending_doorway
-        if doorway is None:
+        fit = self._pending_doorway_fit
+        if doorway is None or fit is None:
             return
 
+        # Validate and prepare against a clone so stale previews never leave
+        # partial cuts or an empty undo entry in the real wall graph.
+        fitted_graph = self.vertex_data.clone()
+        try:
+            doorway = apply_doorway_fit(fitted_graph, fit)
+        except ValueError:
+            self.pending_doorway = None
+            self._pending_doorway_fit = None
+            self.update()
+            return
         self._push_undo_state()
-        bridge_edge_added = self._commit_pending_doorway_bridge()
+        self.vertex_data.copy_from(fitted_graph)
         self.doorways.append(copy.deepcopy(doorway))
         self._set_selected_doorway_index(len(self.doorways) - 1)
         self._reset_doorway_placement()
         self.unsetCursor()
-        if bridge_edge_added:
-            self.doorway_bridge_edges_added.emit()
+        self.doorway_bridge_edges_added.emit()
         self.doorways_changed.emit()
         self.update()
 
@@ -6343,7 +6468,7 @@ class BlueprintCanvas(QWidget):
         self.pending_doorway_preset = None
         self.pending_doorway = None
         self.pending_doorway_image_point = None
-        self.pending_doorway_bridge_vertex_ids = None
+        self._pending_doorway_fit = None
 
     def _reset_doorway_pointer_state(self) -> None:
         drag_was_active = self.pressed_doorway_index is not None
@@ -6591,11 +6716,7 @@ class BlueprintCanvas(QWidget):
         )
         if resized_doorway == self.doorways[doorway_index]:
             return
-        if not self.doorway_drag_changed:
-            self._push_undo_state()
-        self.doorways[doorway_index] = resized_doorway
-        self.doorway_drag_changed = True
-        self.doorway_dimension_preview_changed.emit()
+        self._apply_doorway_pointer_edit(doorway_index, resized_doorway)
 
     def _resize_dragged_doorway_depth(self, image_point: QPointF) -> None:
         """Move one depth side while keeping the opposite cut edge anchored."""
@@ -6668,11 +6789,7 @@ class BlueprintCanvas(QWidget):
         )
         if resized_doorway == self.doorways[doorway_index]:
             return
-        if not self.doorway_drag_changed:
-            self._push_undo_state()
-        self.doorways[doorway_index] = resized_doorway
-        self.doorway_drag_changed = True
-        self.doorway_dimension_preview_changed.emit()
+        self._apply_doorway_pointer_edit(doorway_index, resized_doorway)
 
     def _move_dragged_doorway(self, image_point: QPointF) -> None:
         """Move one doorway along its original wall while preserving depth."""
@@ -6732,9 +6849,28 @@ class BlueprintCanvas(QWidget):
         current_doorway = self.doorways[doorway_index]
         if moved_doorway == current_doorway:
             return
+        self._apply_doorway_pointer_edit(doorway_index, moved_doorway)
+
+    def _apply_doorway_pointer_edit(
+        self, doorway_index: int, doorway: DoorwayData
+    ) -> None:
+        """Keep a linked opening and its wall corners in one undo transaction."""
+
+        staged = None
+        if doorway.corner_vertex_ids is not None:
+            staged = self.vertex_data.clone()
+            try:
+                move_doorway_corner_vertices(
+                    staged, doorway,
+                    meters_per_pixel=self._get_level_meters_per_pixel(),
+                )
+            except ValueError:
+                return
         if not self.doorway_drag_changed:
             self._push_undo_state()
-        self.doorways[doorway_index] = moved_doorway
+        if staged is not None:
+            self.vertex_data.copy_from(staged)
+        self.doorways[doorway_index] = doorway
         self.doorway_drag_changed = True
         self.doorway_dimension_preview_changed.emit()
 
@@ -6751,18 +6887,6 @@ class BlueprintCanvas(QWidget):
         self._update_pending_doorway(image_point, modifiers)
         self.update()
         return True
-
-    def _commit_pending_doorway_bridge(self) -> bool:
-        """Connect the exact previewed endpoints before adding the doorway."""
-
-        vertex_ids = self.pending_doorway_bridge_vertex_ids
-        if vertex_ids is None:
-            return False
-        first_vertex = self.vertex_data.get_vertex(vertex_ids[0])
-        second_vertex = self.vertex_data.get_vertex(vertex_ids[1])
-        if first_vertex is None or second_vertex is None:
-            return False
-        return self.vertex_data.add_edge(*vertex_ids) is not None
 
     def _connect_doorway_covered_bridges(self, doorway: DoorwayData) -> bool:
         """Connect every straight vertex gap covered by a resized doorway."""
@@ -6795,16 +6919,20 @@ class BlueprintCanvas(QWidget):
         initial_doorway = self.doorway_drag_initial_doorway
         if (
             not self.doorway_drag_changed
-            or not (
-                self.doorway_drag_width_side_sign
-                or self.doorway_drag_depth_side_sign
-            )
             or doorway_index is None
             or not 0 <= doorway_index < len(self.doorways)
             or initial_doorway is None
         ):
             return False
         final_doorway = self.doorways[doorway_index]
+        if final_doorway.corner_vertex_ids is not None:
+            # Linked doorways own their missing face spans. Never add them
+            # back as editable walls when resizing an opening.
+            return True
+        if not (
+            self.doorway_drag_width_side_sign or self.doorway_drag_depth_side_sign
+        ):
+            return False
         doorway_extended = (
             final_doorway.width_meters > initial_doorway.width_meters + 1e-9
             or final_doorway.depth_meters > initial_doorway.depth_meters + 1e-9
@@ -6871,7 +6999,7 @@ class BlueprintCanvas(QWidget):
             center[1] + depth_direction_y * half_depth_pixels,
         )
         intersections: list[tuple[float, float]] = []
-        for edge in self.vertex_data.edges:
+        for edge in get_doorway_structural_edges(self.vertex_data, self.doorways):
             start_vertex = self.vertex_data.get_vertex(edge.start_vertex_id)
             end_vertex = self.vertex_data.get_vertex(edge.end_vertex_id)
             if start_vertex is None or end_vertex is None:
@@ -7038,7 +7166,7 @@ class BlueprintCanvas(QWidget):
             tuple[Edge, Vertex, Vertex, float, float, float]
         ] = []
         doorway_center = (doorway.center_x, doorway.center_y)
-        for edge in self.vertex_data.edges:
+        for edge in get_doorway_structural_edges(self.vertex_data, self.doorways):
             if (
                 edge.start_vertex_id in ignored_vertex_ids
                 or edge.end_vertex_id in ignored_vertex_ids
@@ -7382,6 +7510,7 @@ class BlueprintCanvas(QWidget):
     ) -> DoorwayData:
         return DoorwayData(
             doorway_id=doorway.doorway_id,
+            corner_vertex_ids=doorway.corner_vertex_ids,
             center_x=doorway.center_x if center_x is None else center_x,
             center_y=doorway.center_y if center_y is None else center_y,
             width_meters=(
@@ -7435,9 +7564,25 @@ class BlueprintCanvas(QWidget):
             return False
 
         self._push_undo_state()
+        doorway = self.doorways[doorway_index]
+        topology_changed = False
+        if doorway.corner_vertex_ids is not None:
+            # Removing an opening restores its owned wall spans, just as
+            # deleting a legacy cutout did, without deleting its vertices.
+            old_keys = {
+                tuple(sorted((edge.start_vertex_id, edge.end_vertex_id)))
+                for edge in self.vertex_data.edges
+            }
+            for edge in get_doorway_structural_edges(self.vertex_data, (doorway,)):
+                key = tuple(sorted((edge.start_vertex_id, edge.end_vertex_id)))
+                if key not in old_keys:
+                    self.vertex_data.add_edge(edge.start_vertex_id, edge.end_vertex_id)
+                    topology_changed = True
         del self.doorways[doorway_index]
         self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
+        if topology_changed:
+            self.doorway_bridge_edges_added.emit()
         self.doorways_changed.emit()
         self.update()
         return True
@@ -7495,6 +7640,12 @@ class BlueprintCanvas(QWidget):
             meters_per_pixel=self._get_level_meters_per_pixel(),
         )
         removed_doorway_indices.difference_update(retained_doorway_indices)
+        removed_doorway_indices.update(
+            index
+            for index, doorway in enumerate(self.doorways)
+            if doorway.corner_vertex_ids is not None
+            and deleted_vertex_id_set.intersection(doorway.corner_vertex_ids)
+        )
         self._remove_vertices_from_rooms(deleted_vertex_id_set)
         doorways_changed = bool(removed_doorway_indices)
         if doorways_changed:
@@ -7531,6 +7682,15 @@ class BlueprintCanvas(QWidget):
             self.doorways,
             (Edge(*vertex_ids),),
             meters_per_pixel=self._get_level_meters_per_pixel(),
+        )
+        removed_doorway_indices.update(
+            index
+            for index, doorway in enumerate(self.doorways)
+            if doorway.corner_vertex_ids is not None
+            and set(vertex_ids) in (
+                {doorway.corner_vertex_ids[0], doorway.corner_vertex_ids[2]},
+                {doorway.corner_vertex_ids[1], doorway.corner_vertex_ids[3]},
+            )
         )
         self.vertex_data.remove_edge(*vertex_ids)
         rooms_changed = False
@@ -8959,8 +9119,7 @@ class BlueprintCanvas(QWidget):
         placement = self._pending_window_placement
         if placement is None:
             return
-        frame = self._get_window_wall_frame(placement)
-        strip = self._get_window_widget_strip(placement, frame)
+        strip = self._get_window_placement_widget_polygon(placement)
         if strip is None:
             return
         preview_pen = QPen(
@@ -8972,6 +9131,32 @@ class BlueprintCanvas(QWidget):
         painter.setPen(preview_pen)
         painter.setBrush(PENDING_WINDOW_FILL_COLOR)
         painter.drawPolygon(strip)
+
+    def _get_window_placement_widget_polygon(
+        self, placement: WallWindowPlacement
+    ) -> QPolygonF | None:
+        """Show the full wall thickness for a four-corner gap preview."""
+
+        corner_ids = placement.bridge_corner_vertex_ids
+        if placement.opening_fit is not None:
+            return QPolygonF([
+                self._image_to_widget(*placement.opening_fit.corner_positions[index])
+                for index in (0, 1, 3, 2)
+            ])
+        if corner_ids is not None:
+            corners = tuple(
+                self.vertex_data.get_vertex(vertex_id) for vertex_id in corner_ids
+            )
+            if all(vertex is not None for vertex in corners):
+                return QPolygonF(
+                    [
+                        self._image_to_widget(corners[index].x, corners[index].y)
+                        for index in (0, 1, 3, 2)
+                    ]
+                )
+        return self._get_window_widget_strip(
+            placement, self._get_window_wall_frame(placement)
+        )
 
     def _paint_doorways(self, painter: QPainter) -> None:
         for doorway_index, doorway in enumerate(self.doorways):

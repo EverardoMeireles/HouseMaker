@@ -33,6 +33,11 @@ from shapely.geometry.base import BaseGeometry
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.doorway_connections import (
+    get_doorway_structural_edges,
+    get_level_structural_edges,
+    get_level_structural_vertex_data,
+)
 from housemaker.doorway_geometry import (
     build_doorway_cross_section_outline,
 )
@@ -7574,7 +7579,7 @@ def _build_level_meshes(
         *window_openings,
     ]
     wall_meshes: list[trimesh.Trimesh] = []
-    for edge in vertex_data.edges:
+    for edge in get_doorway_structural_edges(vertex_data, doorways):
         if (
             edge.start_vertex_id in ignored_ids
             or edge.end_vertex_id in ignored_ids
@@ -7620,13 +7625,14 @@ def _build_room_mesh(
     blueprint_size_pixels: tuple[float, float] | None,
     wall_orientation: WallOrientationResolver | None = None,
 ) -> trimesh.Trimesh | None:
-    room_walls = build_room_walls(room, level.vertex_data)
+    structural_vertex_data = get_level_structural_vertex_data(level)
+    room_walls = build_room_walls(room, structural_vertex_data)
     if not room_walls:
         return None
 
     layout = build_uv_wall_layout(
         room=room,
-        vertex_data=level.vertex_data,
+        vertex_data=structural_vertex_data,
         wall_height_meters=room.height_meters,
         meters_per_pixel=level.meters_per_pixel,
     )
@@ -8260,7 +8266,7 @@ def _build_window_wall_target_lookup(
     if wall_orientation is None:
         wall_orientation = build_level_wall_orientation_resolver(level)
     for room in level.rooms:
-        for wall in build_room_walls(room, level.vertex_data):
+        for wall in build_room_walls(room, get_level_structural_vertex_data(level)):
             surface_id = _build_room_wall_surface_id(level, room, wall)
             exterior_direction = (
                 wall_orientation.resolve_image_paired_wall_exterior_direction(
@@ -8291,7 +8297,7 @@ def _build_window_wall_target_lookup(
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
     structural_edges = [
         edge
-        for edge in level.vertex_data.edges
+        for edge in get_level_structural_edges(level)
         if edge.start_vertex_id not in ignored_vertex_ids
         and edge.end_vertex_id not in ignored_vertex_ids
     ]
@@ -8337,7 +8343,19 @@ def _build_window_depth_footprint(
     target: WallSource,
     center: tuple[float, float],
 ) -> tuple[tuple[float, float], tuple[float, float], float]:
-    """Extend a window 50 cm behind its selected semantic wall face."""
+    """Span four snapped corners, or retain the legacy 50 cm wall cut."""
+
+    paired_depth = _get_window_four_corner_depth(level, target)
+    if paired_depth is not None:
+        depth_direction, depth_pixels = paired_depth
+        return (
+            (
+                center[0] + depth_direction[0] * depth_pixels * 0.5,
+                center[1] + depth_direction[1] * depth_pixels * 0.5,
+            ),
+            depth_direction,
+            depth_pixels * 0.5 + WINDOW_COPLANAR_DEPTH_PIXELS,
+        )
 
     depth_pixels = WINDOW_CUT_DEPTH_METERS / (
         level.meters_per_pixel * _get_valid_level_scale(level)
@@ -8364,6 +8382,98 @@ def _build_window_depth_footprint(
         exterior_direction,
         half_depth,
     )
+
+
+def _get_window_four_corner_depth(
+    level: LevelData,
+    target: WallSource,
+) -> tuple[tuple[float, float], float] | None:
+    """Recognize the paired face bounded by a snapped frame's two jambs.
+
+    The surviving outward branches distinguish a real opening from four
+    ordinary room corners. Only authored edges establish these connections;
+    doorway-owned virtual spans must not redirect an unrelated window cut.
+    """
+
+    try:
+        first_id, second_id = (int(value) for value in target.key.split(":"))
+    except (ValueError, TypeError):
+        return None
+    excluded = {room.center_vertex_id for room in level.rooms}
+    vertices = {
+        vertex.id: vertex
+        for vertex in level.vertex_data.vertices
+        if vertex.id not in excluded
+    }
+    edges = {
+        tuple(sorted((edge.start_vertex_id, edge.end_vertex_id)))
+        for edge in level.vertex_data.edges
+        if edge.start_vertex_id in vertices and edge.end_vertex_id in vertices
+    }
+    if tuple(sorted((first_id, second_id))) not in edges:
+        return None
+    first = vertices[first_id]
+    second = vertices[second_id]
+    width_delta = (second.x - first.x, second.y - first.y)
+    width_length = math.hypot(*width_delta)
+    if width_length <= WALL_OPENING_EPSILON:
+        return None
+    width_axis = (width_delta[0] / width_length, width_delta[1] / width_length)
+    depth_axis = (-width_axis[1], width_axis[0])
+    neighbors: dict[int, list[int]] = {vertex_id: [] for vertex_id in vertices}
+    for start_id, end_id in edges:
+        neighbors[start_id].append(end_id)
+        neighbors[end_id].append(start_id)
+
+    def has_outward_branch(vertex_id: int, direction: float) -> bool:
+        vertex = vertices[vertex_id]
+        return any(
+            direction
+            * (
+                (vertices[other].x - vertex.x) * width_axis[0]
+                + (vertices[other].y - vertex.y) * width_axis[1]
+            )
+            > WALL_OPENING_EPSILON
+            and abs(
+                (vertices[other].x - vertex.x) * depth_axis[0]
+                + (vertices[other].y - vertex.y) * depth_axis[1]
+            )
+            <= WINDOW_COPLANAR_DEPTH_PIXELS
+            for other in neighbors[vertex_id]
+        )
+
+    if not has_outward_branch(first_id, -1.0) or not has_outward_branch(second_id, 1.0):
+        return None
+    depths: list[float] = []
+    for back_first_id in neighbors[first_id]:
+        back_first = vertices[back_first_id]
+        first_delta = (back_first.x - first.x, back_first.y - first.y)
+        depth = first_delta[0] * depth_axis[0] + first_delta[1] * depth_axis[1]
+        if (
+            abs(depth) <= WINDOW_COPLANAR_DEPTH_PIXELS
+            or abs(first_delta[0] * width_axis[0] + first_delta[1] * width_axis[1])
+            > WINDOW_COPLANAR_DEPTH_PIXELS
+            or not has_outward_branch(back_first_id, -1.0)
+        ):
+            continue
+        for back_second_id in neighbors[second_id]:
+            if tuple(sorted((back_first_id, back_second_id))) not in edges:
+                continue
+            back_second = vertices[back_second_id]
+            aligned = (
+                math.hypot(
+                    back_second.x - second.x - first_delta[0],
+                    back_second.y - second.y - first_delta[1],
+                )
+                <= WINDOW_COPLANAR_DEPTH_PIXELS
+            )
+            if aligned and has_outward_branch(back_second_id, 1.0):
+                depths.append(depth)
+    if not depths:
+        return None
+    depth = min(depths, key=lambda value: (abs(value), value))
+    sign = 1.0 if depth > 0.0 else -1.0
+    return (depth_axis[0] * sign, depth_axis[1] * sign), abs(depth)
 
 
 def _get_wall_right_normal(
@@ -8886,7 +8996,7 @@ def _build_level_wall_sources(
     room_vertex_sets_list = list(room_vertex_sets)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
 
-    for edge in level.vertex_data.edges:
+    for edge in get_level_structural_edges(level):
         if (
             edge.start_vertex_id in ignored_vertex_ids
             or edge.end_vertex_id in ignored_vertex_ids
@@ -8923,7 +9033,7 @@ def _build_level_wall_sources(
         ):
             continue
 
-        for wall in build_room_walls(room, level.vertex_data):
+        for wall in build_room_walls(room, get_level_structural_vertex_data(level)):
             surface_id = (
                 f"level:{level.index}/room:{room.center_vertex_id}/wall:{wall.key}"
             )
@@ -10044,7 +10154,7 @@ def _build_level_preview_textured_walls(
     for room_index, room in enumerate(level.rooms):
         layout = build_uv_wall_layout(
             room=room,
-            vertex_data=level.vertex_data,
+            vertex_data=get_level_structural_vertex_data(level),
             wall_height_meters=room.height_meters,
             meters_per_pixel=level.meters_per_pixel,
         )

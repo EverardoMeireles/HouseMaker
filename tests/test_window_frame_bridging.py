@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
+from housemaker.doorway_topology import find_doorway_fit
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import DoorwayData, LevelData, VertexData
 from housemaker.surface_geometry import add_wall_window, build_fixed_surfaces
@@ -38,10 +39,18 @@ def _gap_level(*, diagonal_offset: float = 0.0) -> LevelData:
         (40.0, 50.0),
         (90.0, 50.0 + diagonal_offset),
         (130.0, 50.0 + diagonal_offset),
+        (10.0, 60.0),
+        (40.0, 60.0),
+        (90.0, 60.0 + diagonal_offset),
+        (130.0, 60.0 + diagonal_offset),
     ):
         vertices.add_vertex(*point)
     vertices.add_edge(1, 2)
     vertices.add_edge(3, 4)
+    vertices.add_edge(5, 6)
+    vertices.add_edge(7, 8)
+    vertices.add_edge(2, 6)
+    vertices.add_edge(3, 7)
     return LevelData(index=2, name="Ground", vertex_data=vertices)
 
 
@@ -56,6 +65,13 @@ def _bridge_placement(level: LevelData):
     )
 
 
+def _vertical_face_area(surface) -> float:
+    """Exclude the four tunnel reveals owned by the selected wall surface."""
+
+    faces = abs(surface.mesh.face_normals[:, 1]) > 1.0 - 1e-6
+    return float(surface.mesh.area_faces[faces].sum())
+
+
 # ### Bridge validation tests ###
 class WindowFrameBridgeTests(unittest.TestCase):
     def test_preview_connects_exact_gap_and_keeps_centered_window_height(self) -> None:
@@ -64,6 +80,7 @@ class WindowFrameBridgeTests(unittest.TestCase):
         self.assertIsNotNone(placement)
         assert placement is not None
         self.assertEqual(placement.bridge_vertex_ids, (2, 3))
+        self.assertEqual(placement.bridge_corner_vertex_ids, (2, 3, 6, 7))
         self.assertEqual((placement.start_ratio, placement.end_ratio), (0.0, 1.0))
         self.assertAlmostEqual(placement.bottom_ratio + placement.top_ratio, 1.0)
         self.assertAlmostEqual(
@@ -71,39 +88,61 @@ class WindowFrameBridgeTests(unittest.TestCase):
             1.0,
         )
         self.assertFalse(level.vertex_data.has_edge(2, 3))
+        self.assertFalse(level.vertex_data.has_edge(6, 7))
 
         bridge = add_window_frame_bridge([level], placement)
         self.assertIsNotNone(bridge)
+        self.assertEqual(len(bridge.added_edges), 2)
         window = add_wall_window([level], placement)
         self.assertTrue(level.vertex_data.has_edge(2, 3))
+        self.assertTrue(level.vertex_data.has_edge(6, 7))
         self.assertEqual(window.wall_surface_id, placement.wall_surface_id)
         wall = next(
-            surface for surface in build_fixed_surfaces([level])
+            surface
+            for surface in build_fixed_surfaces([level])
             if surface.surface_id == window.wall_surface_id
         )
-        self.assertAlmostEqual(wall.area_square_meters, level.height_meters - 1.0)
+        self.assertAlmostEqual(_vertical_face_area(wall), level.height_meters - 1.0)
 
-    def test_shift_never_bridges_connected_or_non_aligned_vertices(self) -> None:
-        for kind in ("connected", "non_aligned"):
-            with self.subTest(kind=kind):
-                level = _gap_level(
-                    diagonal_offset=5.0 if kind == "non_aligned" else 0.0
-                )
-                if kind == "connected":
-                    level.vertex_data.add_edge(2, 3)
-                self.assertIsNone(_bridge_placement(level))
+    def test_connected_solid_span_reuses_four_corners_without_duplicate_edges(self) -> None:
+        level = _gap_level()
+        level.vertex_data.add_edge(2, 3)
+        level.vertex_data.add_edge(6, 7)
+        placement = _bridge_placement(level)
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual(placement.bridge_corner_vertex_ids, (2, 3, 6, 7))
+        previous_pairs = {
+            frozenset((edge.start_vertex_id, edge.end_vertex_id))
+            for edge in level.vertex_data.edges
+        }
+        transaction = add_window_frame_bridge([level], placement)
+        self.assertIsNotNone(transaction)
+        self.assertEqual(len(level.vertex_data.vertices), 8)
+        self.assertEqual(len(level.vertex_data.edges), 8)
+        self.assertEqual(
+            {
+                frozenset((edge.start_vertex_id, edge.end_vertex_id))
+                for edge in level.vertex_data.edges
+            },
+            previous_pairs,
+        )
+
+    def test_non_aligned_gap_does_not_snap(self) -> None:
+        self.assertIsNone(_bridge_placement(_gap_level(diagonal_offset=5.0)))
 
     def test_changed_gap_is_rejected_before_adding_an_edge(self) -> None:
         level = _gap_level()
         placement = _bridge_placement(level)
         assert placement is not None
         level.vertex_data.add_edge(2, 3)
-        with self.assertRaisesRegex(ValueError, "aligned and unconnected"):
+        level.vertex_data.add_edge(6, 7)
+        with self.assertRaisesRegex(ValueError, "four aligned"):
             add_window_frame_bridge([level], placement)
-        self.assertEqual(len(level.vertex_data.edges), 3)
+        self.assertEqual(len(level.vertex_data.edges), 8)
         self.assertEqual(level.windows, [])
 
-    def test_shift_press_release_updates_stationary_canvas_preview_and_cancel_is_safe(self) -> None:
+    def test_gap_snap_without_shift_and_modifier_refresh_cancel_is_safe(self) -> None:
         level = _gap_level()
         canvas = BlueprintCanvas()
         canvas.resize(640, 520)
@@ -122,22 +161,38 @@ class WindowFrameBridgeTests(unittest.TestCase):
         try:
             self.assertTrue(canvas.start_window_placement())
             canvas._update_pending_window(QPointF(65.0, 50.0))
-            self.assertIsNone(canvas._pending_window_placement.bridge_vertex_ids)
+            self.assertEqual(canvas._pending_window_placement.bridge_vertex_ids, (2, 3))
             QTest.keyPress(canvas, Qt.Key.Key_Shift)
             pending = canvas._pending_window_placement
             assert pending is not None
             self.assertEqual(pending.bridge_vertex_ids, (2, 3))
+            polygon = canvas._get_window_placement_widget_polygon(pending)
+            self.assertIsNotNone(polygon)
+            self.assertEqual(len(polygon), 4)
+            self.assertEqual(
+                {(point.x(), point.y()) for point in polygon},
+                {
+                    (point.x(), point.y())
+                    for point in (
+                        canvas._image_to_widget(40.0, 50.0),
+                        canvas._image_to_widget(90.0, 50.0),
+                        canvas._image_to_widget(40.0, 60.0),
+                        canvas._image_to_widget(90.0, 60.0),
+                    )
+                },
+            )
             segment = canvas._get_window_widget_segment(pending)
             self.assertIsNotNone(segment)
             assert segment is not None
             self.assertEqual(segment[0], canvas._image_to_widget(40.0, 50.0))
             self.assertEqual(segment[1], canvas._image_to_widget(90.0, 50.0))
             QTest.keyRelease(canvas, Qt.Key.Key_Shift)
-            self.assertIsNone(canvas._pending_window_placement.bridge_vertex_ids)
+            self.assertEqual(canvas._pending_window_placement.bridge_vertex_ids, (2, 3))
             QTest.keyPress(canvas, Qt.Key.Key_Shift)
             QTest.keyClick(canvas, Qt.Key.Key_Escape)
             self.assertFalse(canvas.is_window_placement_active())
             self.assertFalse(level.vertex_data.has_edge(2, 3))
+            self.assertFalse(level.vertex_data.has_edge(6, 7))
             self.assertEqual(level.windows, [])
         finally:
             canvas.close()
@@ -171,13 +226,16 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
         placement = _bridge_placement(self.level)
         assert placement is not None
         with (
-            patch.object(self.workspace, "_build_viewer_preview_model") as build_preview,
+            patch.object(
+                self.workspace, "_build_viewer_preview_model"
+            ) as build_preview,
             patch.object(
                 self.workspace, "_reconcile_canvas_surface_edit_and_refresh"
             ) as refresh,
         ):
             self.workspace._handle_canvas_window_placement_requested(placement)
             self.assertTrue(self.level.vertex_data.has_edge(2, 3))
+            self.assertTrue(self.level.vertex_data.has_edge(6, 7))
             self.assertEqual(len(self.level.windows), 1)
             self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
             self.assertTrue(self.workspace._pending_doorway_bridge_topology_change)
@@ -192,7 +250,8 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
         self.workspace._handle_canvas_undo_requested()
         self.assertEqual(self.level.windows, [])
         self.assertFalse(self.level.vertex_data.has_edge(2, 3))
-        self.assertEqual(len(self.level.vertex_data.edges), 2)
+        self.assertFalse(self.level.vertex_data.has_edge(6, 7))
+        self.assertEqual(len(self.level.vertex_data.edges), 6)
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_failed_window_commit_leaves_no_bridge_or_undo_entry(self) -> None:
@@ -204,15 +263,55 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
         ):
             self.workspace._handle_canvas_window_placement_requested(placement)
         self.assertFalse(self.level.vertex_data.has_edge(2, 3))
+        self.assertFalse(self.level.vertex_data.has_edge(6, 7))
         self.assertEqual(self.level.windows, [])
         self.assertEqual(self.workspace._canvas_undo_stack, [])
         self.assertFalse(self.workspace._pending_doorway_bridge_topology_change)
 
+    def test_failed_window_commit_preserves_preexisting_opposite_face_support(
+        self,
+    ) -> None:
+        self.level.vertex_data.add_edge(6, 7)
+        placement = _bridge_placement(self.level)
+        assert placement is not None
+        with patch(
+            "housemaker.main.add_wall_window",
+            side_effect=ValueError("rejected opening"),
+        ):
+            self.workspace._handle_canvas_window_placement_requested(placement)
+        self.assertTrue(self.level.vertex_data.has_edge(6, 7))
+        self.assertFalse(self.level.vertex_data.has_edge(2, 3))
+        self.assertEqual(self.level.windows, [])
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
+    def test_undo_window_preserves_preexisting_opposite_face_support(self) -> None:
+        self.level.vertex_data.add_edge(6, 7)
+        placement = _bridge_placement(self.level)
+        assert placement is not None
+        self.workspace._handle_canvas_window_placement_requested(placement)
+        self.assertEqual(len(self.level.windows), 1)
+        self.assertTrue(self.level.vertex_data.has_edge(2, 3))
+        self.workspace._handle_canvas_undo_requested()
+        self.assertTrue(self.level.vertex_data.has_edge(6, 7))
+        self.assertFalse(self.level.vertex_data.has_edge(2, 3))
+        self.assertEqual(self.level.windows, [])
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
     def test_undo_latest_pending_bridge_keeps_earlier_bridge_and_cutout(self) -> None:
         self.level.vertex_data.add_vertex(180.0, 50.0)
         self.level.vertex_data.add_vertex(220.0, 50.0)
-        self.level.vertex_data.add_edge(5, 6)
+        self.level.vertex_data.add_vertex(180.0, 60.0)
+        self.level.vertex_data.add_vertex(220.0, 60.0)
+        self.level.vertex_data.add_edge(9, 10)
+        self.level.vertex_data.add_edge(11, 12)
+        self.level.vertex_data.add_edge(4, 8)
+        self.level.vertex_data.add_edge(9, 11)
         first_placement = _bridge_placement(self.level)
+        assert first_placement is not None
+        self.workspace._handle_canvas_window_placement_requested(first_placement)
+        first_window = self.level.windows[0]
+        # Each hover fit describes the complete current graph. Refresh after
+        # the first commit instead of submitting a deliberately stale preview.
         second_placement = build_window_frame_bridge_placement(
             self.level,
             (155.0, 50.0),
@@ -221,10 +320,7 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
             height_meters=1.0,
             wall_margin_meters=0.025,
         )
-        assert first_placement is not None
         assert second_placement is not None
-        self.workspace._handle_canvas_window_placement_requested(first_placement)
-        first_window = self.level.windows[0]
         self.workspace._handle_canvas_window_placement_requested(second_placement)
         self.assertEqual(len(self.level.windows), 2)
         self.assertTrue(self.workspace._doorway_mesh_update_timer.isActive())
@@ -233,7 +329,9 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
 
         self.assertEqual(self.level.windows, [first_window])
         self.assertTrue(self.level.vertex_data.has_edge(2, 3))
-        self.assertFalse(self.level.vertex_data.has_edge(4, 5))
+        self.assertTrue(self.level.vertex_data.has_edge(6, 7))
+        self.assertFalse(self.level.vertex_data.has_edge(4, 9))
+        self.assertFalse(self.level.vertex_data.has_edge(8, 11))
         preview_level = self.workspace._build_viewer_preview_levels()[0]
         self.assertEqual(preview_level.windows, [first_window])
         self.assertIsNotNone(self.workspace.viewer.model)
@@ -241,7 +339,7 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
             first_window.wall_surface_id
         ]
         self.assertAlmostEqual(
-            first_wall.area_square_meters, self.level.height_meters - 1.0
+            _vertical_face_area(first_wall), self.level.height_meters - 1.0
         )
         self.assertNotIn(
             second_placement.wall_surface_id,
@@ -251,6 +349,7 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
 
         self.workspace._handle_canvas_undo_requested()
         self.assertFalse(self.level.vertex_data.has_edge(2, 3))
+        self.assertFalse(self.level.vertex_data.has_edge(6, 7))
         self.assertEqual(self.level.windows, [])
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
@@ -262,8 +361,21 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
             height_meters=1.8,
             rotation_degrees=90.0,
         )
-        self.workspace.canvas.pending_doorway = doorway
+        fit = find_doorway_fit(
+            self.level.vertex_data,
+            (doorway.center_x, doorway.center_y),
+            doorway,
+            5.0,
+            meters_per_pixel=self.level.meters_per_pixel,
+        )
+        self.assertIsNotNone(fit)
+        assert fit is not None
+        self.workspace.canvas.pending_doorway = fit.doorway
+        self.workspace.canvas._pending_doorway_fit = fit
         self.workspace.canvas._commit_pending_doorway()
+        self.assertEqual(len(self.level.doorways), 1)
+        doorway = self.level.doorways[0]
+        self.assertEqual(len(doorway.corner_vertex_ids), 4)
         self.assertEqual(self.level.doorways, [doorway])
         self.assertEqual(self.workspace._viewer_doorways_by_level_index[2], ())
         self.assertIsNotNone(self.workspace._pending_doorway_mesh_level_index)
@@ -275,26 +387,31 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
 
         self.assertEqual(self.level.windows, [])
         self.assertEqual(self.level.doorways, [doorway])
-        self.assertEqual(
-            self.workspace._viewer_doorways_by_level_index[2], (doorway,)
+        self.assertEqual(self.workspace._viewer_doorways_by_level_index[2], (doorway,))
+        opening_side_ids = sorted(
+            vertex_id
+            for vertex_id in doorway.corner_vertex_ids
+            if self.level.vertex_data.get_vertex(vertex_id).y == 50.0
         )
-        rendered_wall = self.workspace.viewer._window_wall_targets[
-            "level:2/wall:3:4"
-        ]
+        self.assertEqual(len(opening_side_ids), 2)
+        opening_wall_id = f"level:2/wall:{opening_side_ids[0]}:{opening_side_ids[1]}"
+        rendered_wall = self.workspace.viewer._window_wall_targets[opening_wall_id]
         expected_wall = next(
             surface
             for surface in build_fixed_surfaces([self.level])
-            if surface.surface_id == "level:2/wall:3:4"
+            if surface.surface_id == opening_wall_id
         )
         self.assertAlmostEqual(
             rendered_wall.area_square_meters,
             expected_wall.area_square_meters,
         )
         self.assertNotAlmostEqual(
-            rendered_wall.area_square_meters, 0.8 * self.level.height_meters
+            rendered_wall.area_square_meters,
+            doorway.width_meters * self.level.height_meters,
         )
         self.assertFalse(self.workspace._doorway_mesh_update_timer.isActive())
         self.assertFalse(self.level.vertex_data.has_edge(2, 3))
+        self.assertFalse(self.level.vertex_data.has_edge(6, 7))
         self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
 
     def test_unexpected_window_failure_also_rolls_back_bridge(self) -> None:
@@ -309,6 +426,7 @@ class WindowFrameBridgeMainTests(unittest.TestCase):
         ):
             self.workspace._handle_canvas_window_placement_requested(placement)
         self.assertFalse(self.level.vertex_data.has_edge(2, 3))
+        self.assertFalse(self.level.vertex_data.has_edge(6, 7))
         self.assertEqual(self.level.windows, [])
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 

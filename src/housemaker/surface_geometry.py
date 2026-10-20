@@ -13,6 +13,11 @@ import trimesh
 from shapely import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
+from housemaker.doorway_connections import (
+    get_level_structural_edges,
+    get_level_structural_vertex_data,
+)
+from housemaker.doorway_topology import DoorwayFit
 from housemaker.floor_geometry import (
     FLOOR_FASCIA_GUARD_HALF_WIDTH_METERS,
     build_level_floor_footprint,
@@ -191,6 +196,8 @@ class WallWindowPlacement:
     bottom_ratio: float
     top_ratio: float
     bridge_vertex_ids: tuple[int, int] | None = None
+    bridge_corner_vertex_ids: tuple[int, int, int, int] | None = None
+    opening_fit: DoorwayFit | None = None
 
     def __post_init__(self) -> None:
         validated = WindowData(
@@ -223,6 +230,18 @@ class WallWindowPlacement:
                     "A window bridge needs two distinct wall vertex IDs."
                 )
             object.__setattr__(self, "bridge_vertex_ids", vertex_ids)
+        if self.bridge_corner_vertex_ids is not None:
+            corner_ids = tuple(self.bridge_corner_vertex_ids)
+            if (
+                len(corner_ids) != 4
+                or any(type(vertex_id) is not int or vertex_id <= 0 for vertex_id in corner_ids)
+                or len(set(corner_ids)) != 4
+                or self.bridge_vertex_ids != corner_ids[:2]
+            ):
+                raise ValueError("A window bridge needs four rectangular wall corner IDs.")
+            object.__setattr__(self, "bridge_corner_vertex_ids", corner_ids)
+        if self.opening_fit is not None and not isinstance(self.opening_fit, DoorwayFit):
+            raise TypeError("A fitted window placement requires a wall-opening fit.")
 
 
 # ### Public surface builders ###
@@ -1015,6 +1034,7 @@ def add_wall_window(
         end_ratio=current_placement.end_ratio,
         bottom_ratio=current_placement.bottom_ratio,
         top_ratio=current_placement.top_ratio,
+        corner_vertex_ids=placement.bridge_corner_vertex_ids,
     )
     owning_level.windows.append(window)
     try:
@@ -1082,7 +1102,7 @@ def _build_room_surfaces(
     room_identity = room.center_vertex_id
     wall_openings = _build_level_wall_openings(level, wall_orientation)
     room_polygon = _build_room_world_polygon(level, room)
-    for wall in build_room_walls(room, level.vertex_data):
+    for wall in build_room_walls(room, get_level_structural_vertex_data(level)):
         wall_surface = _build_wall_surface(
             level=level,
             start_point=wall.start_point,
@@ -1169,7 +1189,7 @@ def _build_plain_level_wall_surfaces(
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
     structural_edges = [
         edge
-        for edge in sorted(level.vertex_data.edges, key=_get_edge_sort_key)
+        for edge in sorted(get_level_structural_edges(level), key=_get_edge_sort_key)
         if edge.start_vertex_id not in ignored_vertex_ids
         and edge.end_vertex_id not in ignored_vertex_ids
     ]
@@ -1741,7 +1761,7 @@ def _build_room_world_polygon(
 ) -> Polygon | None:
     room_vertex_ids = set(room.vertex_ids)
     lines: list[LineString] = []
-    for edge in level.vertex_data.edges:
+    for edge in get_level_structural_edges(level):
         if (
             edge.start_vertex_id not in room_vertex_ids
             or edge.end_vertex_id not in room_vertex_ids

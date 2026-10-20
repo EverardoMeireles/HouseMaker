@@ -15,6 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.models import (
+    DOORWAY_SHAPE_ARCH,
     DoorwayPreset,
     create_default_levels,
     create_fallback_doorway_preset,
@@ -27,6 +28,33 @@ _qt_application.setQuitOnLastWindowClosed(False)
 
 
 # ### Tests ###
+class DoorwayPresetLabelTests(unittest.TestCase):
+    def test_rectangular_preset_explicitly_shows_not_arched(self) -> None:
+        from housemaker.main import _format_doorway_preset_label
+
+        self.assertEqual(
+            _format_doorway_preset_label(
+                DoorwayPreset(width_meters=0.9, height_meters=2.1)
+            ),
+            "0.90 m × 2.10 m — Not arched",
+        )
+
+    def test_arched_preset_shows_arch_status_and_amount(self) -> None:
+        from housemaker.main import _format_doorway_preset_label
+
+        self.assertEqual(
+            _format_doorway_preset_label(
+                DoorwayPreset(
+                    width_meters=1.35,
+                    height_meters=2.45,
+                    shape=DOORWAY_SHAPE_ARCH,
+                    arch_amount=0.625,
+                )
+            ),
+            "1.35 m × 2.45 m — Arched 62.5%",
+        )
+
+
 class DoorwayPresetInvariantTests(unittest.TestCase):
     def setUp(self) -> None:
         self._widgets: list[QWidget] = []
@@ -65,7 +93,7 @@ class DoorwayPresetInvariantTests(unittest.TestCase):
         self.assertEqual(workspace.doorway_preset_list.currentRow(), 0)
         self.assertEqual(
             workspace.doorway_preset_list.currentItem().text(),
-            "1.00 m × 1.00 m",
+            "1.00 m × 1.00 m — Not arched",
         )
         self.assertTrue(workspace.remove_doorway_preset_button.isEnabled())
 

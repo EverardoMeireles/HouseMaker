@@ -502,7 +502,12 @@ from housemaker.viewer import (
     build_scene_object_placement_group_candidate,
     build_texture_preview_bundle,
 )
-from housemaker.window_frame_bridge import add_window_frame_bridge
+from housemaker.window_frame_bridge import (
+    WindowFrameBridgeTransaction,
+    add_window_frame_bridge,
+    normalize_wall_window_placement,
+)
+from housemaker.window_topology import resolve_linked_window_frame
 
 # ### Constants ###
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
@@ -1594,10 +1599,19 @@ class _PendingLevelTransform:
 
 
 @dataclass(frozen=True)
+class _CanvasWindowEditSnapshot:
+    """A frame and its linked wall graph before one drag or rehosting edit."""
+
+    window: WindowData
+    vertex_data: VertexData | None = None
+
+
+@dataclass(frozen=True)
 class _CanvasOpeningEditUndoState:
     """One doorway or window rectangle before a committed gizmo edit."""
 
     start_edit: CanvasOpeningEdit
+    window_snapshot: _CanvasWindowEditSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -1606,7 +1620,18 @@ class _CanvasWindowAdditionUndoState:
 
     window_id: str
     bridge_level_index: int | None = None
-    bridge_edge: Edge | None = None
+    bridge_edges: tuple[Edge, ...] = ()
+    bridge_previous_vertex_data: VertexData | None = None
+
+
+@dataclass(frozen=True)
+class _CanvasWindowRemovalUndoState:
+    """One removed frame, without altering its wall or library asset."""
+
+    level_index: int
+    item_index: int
+    window: WindowData
+    addition_order: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1698,6 +1723,7 @@ _CanvasUndoState = (
     | _CanvasOuterWallMarkUndoState
     | _CanvasOpeningEditUndoState
     | _CanvasWindowAdditionUndoState
+    | _CanvasWindowRemovalUndoState
     | _CanvasPlacedObjectUndoState
     | _CanvasPlacedObjectGroupUndoState
     | _CanvasStairsUndoState
@@ -1993,6 +2019,8 @@ class BlueprintWorkspace(QWidget):
         self._is_canvas_opening_drag_active = False
         self._active_canvas_opening_reference: CanvasOpeningReference | None = None
         self._active_canvas_opening_start_edit: CanvasOpeningEdit | None = None
+        self._active_canvas_window_edit_snapshot: _CanvasWindowEditSnapshot | None = None
+        self._active_canvas_opening_topology_was_pending = False
         self._canvas_opening_targets_by_key: dict[
             str,
             CanvasOpeningTarget,
@@ -5284,9 +5312,10 @@ class BlueprintWorkspace(QWidget):
         windows_before_by_level_index = {
             level.index: self._copy_windows(level.windows) for level in self.levels
         }
-        bridge: tuple[LevelData, Edge] | None = None
+        bridge: WindowFrameBridgeTransaction | None = None
         try:
             if isinstance(raw_placement, WallWindowPlacement):
+                raw_placement = normalize_wall_window_placement(self.levels, raw_placement)
                 bridge = add_window_frame_bridge(self.levels, raw_placement)
             window = (
                 add_sloped_ceiling_window(self.levels, raw_placement)
@@ -5295,9 +5324,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             if bridge is not None:
-                bridge[0].vertex_data.remove_edge(
-                    bridge[1].start_vertex_id, bridge[1].end_vertex_id
-                )
+                bridge.level.vertex_data.copy_from(bridge.previous_vertex_data)
             if not isinstance(error, (TypeError, ValueError)):
                 raise
             self.viewer.set_window_tools_status(f"Window not added: {error}")
@@ -5306,9 +5333,7 @@ class BlueprintWorkspace(QWidget):
         if added_window is None:
             self._rollback_canvas_window(window.window_id)
             if bridge is not None:
-                bridge[0].vertex_data.remove_edge(
-                    bridge[1].start_vertex_id, bridge[1].end_vertex_id
-                )
+                bridge.level.vertex_data.copy_from(bridge.previous_vertex_data)
             self._reset_viewer_window_snapshots()
             self.canvas.update()
             self.viewer.set_window_tools_status(
@@ -5336,8 +5361,11 @@ class BlueprintWorkspace(QWidget):
         self._record_canvas_undo_state(
             _CanvasWindowAdditionUndoState(
                 window_id=window.window_id,
-                bridge_level_index=None if bridge is None else bridge[0].index,
-                bridge_edge=None if bridge is None else bridge[1],
+                bridge_level_index=None if bridge is None else bridge.level.index,
+                bridge_edges=() if bridge is None else bridge.added_edges,
+                bridge_previous_vertex_data=(
+                    None if bridge is None else bridge.previous_vertex_data
+                ),
             )
         )
         self._sync_canvas_window_undo_availability()
@@ -5371,22 +5399,27 @@ class BlueprintWorkspace(QWidget):
             ),
             None,
         )
-        bridge_edge = (
-            addition_state.bridge_edge
+        bridge_edges = (
+            addition_state.bridge_edges
+            if addition_state is not None
+            and addition_state.bridge_level_index == level.index
+            else ()
+        )
+        previous_graph = (
+            addition_state.bridge_previous_vertex_data
             if addition_state is not None
             and addition_state.bridge_level_index == level.index
             else None
         )
-        if bridge_edge is not None:
-            level.vertex_data.remove_edge(
-                bridge_edge.start_vertex_id, bridge_edge.end_vertex_id
-            )
+        graph_before_undo = level.vertex_data.clone()
+        if previous_graph is not None:
+            level.vertex_data.copy_from(previous_graph)
+        else:
+            for edge in bridge_edges:
+                level.vertex_data.remove_edge(edge.start_vertex_id, edge.end_vertex_id)
 
         def restore_window_and_bridge() -> None:
-            if bridge_edge is not None:
-                level.vertex_data.add_edge(
-                    bridge_edge.start_vertex_id, bridge_edge.end_vertex_id
-                )
+            level.vertex_data.copy_from(graph_before_undo)
             level.windows.insert(window_index, window)
 
         # Shared Ctrl+Z cancels the opening timers before reaching this action.
@@ -5443,7 +5476,7 @@ class BlueprintWorkspace(QWidget):
         if not self._is_restoring_canvas_undo:
             self._discard_removed_window_undo_states(window_id)
         self._reconcile_window_placements()
-        if bridge_edge is not None:
+        if previous_graph is not None or bridge_edges:
             self._sync_canvas_outer_wall_marking()
             self.canvas.update()
         self._sync_canvas_window_undo_availability()
@@ -5557,7 +5590,7 @@ class BlueprintWorkspace(QWidget):
         self,
         raw_reference: object,
     ) -> None:
-        """Remove an installed fixture while preserving its structural opening."""
+        """Remove an installed fixture first, or an empty selected frame."""
 
         if not isinstance(raw_reference, CanvasOpeningReference):
             return
@@ -5585,10 +5618,10 @@ class BlueprintWorkspace(QWidget):
             ]
             window_placements = list(library.window_placements)
         else:
-            resolved_window = self._resolve_window_frame_reference(raw_reference)
+            resolved_window = self._find_canvas_window(raw_reference.stable_id or "")
             if resolved_window is None:
                 return
-            level, frame, _target = resolved_window
+            level, _frame_index, frame = resolved_window
             removed_windows = tuple(
                 placement
                 for placement in library.window_placements
@@ -5596,6 +5629,7 @@ class BlueprintWorkspace(QWidget):
                 and placement.window_frame_id == frame.window_id
             )
             if not removed_windows:
+                self._delete_canvas_window_frame(raw_reference)
                 return
             selected_window_id = removed_windows[-1].window_id
             placements = list(library.placements)
@@ -5620,6 +5654,35 @@ class BlueprintWorkspace(QWidget):
         self._sync_viewer_scene_levels()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    def _delete_canvas_window_frame(self, reference: CanvasOpeningReference) -> None:
+        """Delete just the structural cutout, keeping the wall vertices intact."""
+
+        found = self._find_canvas_window(reference.stable_id or "")
+        if found is None or found[0].index != reference.level_index:
+            return
+        self._commit_pending_doorway_mesh_update()
+        found = self._find_canvas_window(reference.stable_id or "")
+        if found is None:
+            return
+        level, item_index, window = found
+        self._record_canvas_undo_state(
+            _CanvasWindowRemovalUndoState(
+                level.index, item_index, window, tuple(self._canvas_window_undo_ids)
+            )
+        )
+        del level.windows[item_index]
+        self._canvas_window_undo_ids = [
+            window_id for window_id in self._canvas_window_undo_ids
+            if window_id != window.window_id
+        ]
+        self._sync_viewer_window_snapshot(level)
+        self._refresh_canvas_windows_for_level(level)
+        self.canvas._set_selected_window_id(None, notify=False)
+        self.viewer.select_canvas_opening(None)
+        self._sync_canvas_window_undo_availability()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self.viewer.set_window_tools_status("Window frame deleted.")
+
     def _handle_canvas_opening_edit_started(
         self,
         raw_edit: object,
@@ -5637,6 +5700,20 @@ class BlueprintWorkspace(QWidget):
         self._is_canvas_opening_drag_active = True
         self._active_canvas_opening_reference = raw_edit.reference
         self._active_canvas_opening_start_edit = raw_edit
+        self._active_canvas_window_edit_snapshot = None
+        self._active_canvas_opening_topology_was_pending = (
+            self._pending_doorway_bridge_topology_change
+        )
+        if raw_edit.reference.kind == CANVAS_OPENING_WINDOW:
+            found = self._find_canvas_window(raw_edit.reference.stable_id or "")
+            if found is not None:
+                level, _index, window = found
+                self._active_canvas_window_edit_snapshot = _CanvasWindowEditSnapshot(
+                    window,
+                    level.vertex_data.clone()
+                    if resolve_linked_window_frame(level, window) is not None
+                    else None,
+                )
         self._doorway_mesh_update_timer.stop()
         if raw_edit.reference.kind == CANVAS_OPENING_DOORWAY:
             self.viewer.set_doorway_preview_outline(None)
@@ -5690,9 +5767,14 @@ class BlueprintWorkspace(QWidget):
         start_edit = self._active_canvas_opening_start_edit
         if changed and start_edit is not None and raw_edit != start_edit:
             self._record_canvas_undo_state(
-                _CanvasOpeningEditUndoState(start_edit=start_edit),
+                _CanvasOpeningEditUndoState(
+                    start_edit=start_edit,
+                    window_snapshot=self._active_canvas_window_edit_snapshot,
+                ),
                 commit_pending_surface_edit=False,
             )
+        elif start_edit is not None and self._active_canvas_window_edit_snapshot is not None:
+            self._restore_cancelled_canvas_window_edit(start_edit)
         self._finish_canvas_opening_drag()
 
     def _handle_canvas_opening_edit_cancelled(
@@ -5707,8 +5789,44 @@ class BlueprintWorkspace(QWidget):
             else self._active_canvas_opening_start_edit
         )
         if start_edit is not None:
-            self._handle_canvas_opening_edit_preview_changed(start_edit)
+            if self._active_canvas_window_edit_snapshot is not None:
+                self._restore_cancelled_canvas_window_edit(start_edit)
+            else:
+                self._handle_canvas_opening_edit_preview_changed(start_edit)
         self._finish_canvas_opening_drag()
+
+    def _restore_canvas_window_edit_snapshot(
+        self, snapshot: _CanvasWindowEditSnapshot, reference: CanvasOpeningReference
+    ) -> LevelData:
+        """Restore original linkage even after a drag detached it onto a slope."""
+
+        found = self._find_canvas_window(snapshot.window.window_id)
+        if found is None or found[0].index != reference.level_index:
+            raise ValueError("The edited window frame no longer exists.")
+        level, index, _window = found
+        if snapshot.vertex_data is not None:
+            level.vertex_data.copy_from(snapshot.vertex_data)
+        level.windows[index] = snapshot.window
+        return level
+
+    def _restore_cancelled_canvas_window_edit(self, start_edit: CanvasOpeningEdit) -> None:
+        """Restore drag-start data and retain only work pending before the drag."""
+
+        snapshot = self._active_canvas_window_edit_snapshot
+        if snapshot is None:
+            return
+        target = self._canvas_opening_targets_by_key.get(start_edit.reference.key)
+        if target is None:
+            return
+        restored_target = target.with_edit(start_edit)
+        level = self._restore_canvas_window_edit_snapshot(snapshot, start_edit.reference)
+        self._canvas_opening_targets_by_key[restored_target.key] = restored_target
+        self.viewer.update_canvas_opening_target(restored_target)
+        self._sync_live_canvas_opening(start_edit.reference, level)
+        self._pending_doorway_bridge_topology_change = (
+            self._active_canvas_opening_topology_was_pending
+        )
+        self._refresh_pending_canvas_opening_state(start_edit.reference)
 
     def _finish_canvas_opening_drag(self) -> None:
         """End pointer ownership and resume a pending opening debounce."""
@@ -5716,10 +5834,13 @@ class BlueprintWorkspace(QWidget):
         self._is_canvas_opening_drag_active = False
         self._active_canvas_opening_reference = None
         self._active_canvas_opening_start_edit = None
+        self._active_canvas_window_edit_snapshot = None
+        self._active_canvas_opening_topology_was_pending = False
         if (
             self._staged_canvas_opening_mesh_update
             or self._pending_doorway_mesh_level_index is not None
             or self._pending_window_mesh_level_index is not None
+            or self._pending_doorway_bridge_topology_change
         ):
             self._doorway_mesh_update_timer.start()
 
@@ -5730,6 +5851,23 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Repaint the active 2D Canvas from the same edited project object."""
 
+        linked_opening = (
+            any(
+                doorway.corner_vertex_ids is not None
+                and doorway.doorway_id == reference.stable_id
+                for doorway in level.doorways
+            )
+            if reference.kind == CANVAS_OPENING_DOORWAY
+            else any(
+                window.corner_vertex_ids is not None
+                and window.window_id == reference.stable_id
+                for window in level.windows
+            )
+        )
+        if linked_opening:
+            # A linked opening edit also moves its wall corner vertices.
+            # Reconcile those surfaces after the existing mesh-edit delay.
+            self._pending_doorway_bridge_topology_change = True
         if level.index != self.current_level.index:
             return
         if reference.kind == CANVAS_OPENING_DOORWAY:
@@ -5762,7 +5900,10 @@ class BlueprintWorkspace(QWidget):
             self._pending_doorway_mesh_level_index = level.index if is_pending else None
         else:
             committed = self._viewer_windows_by_level_index.get(level.index)
-            is_pending = self._copy_windows(level.windows) != committed
+            is_pending = (
+                self._copy_windows(level.windows) != committed
+                or self._pending_doorway_bridge_topology_change
+            )
             self._pending_window_mesh_level_index = level.index if is_pending else None
         if is_pending:
             self._pending_canvas_opening_key = reference.key
@@ -8712,6 +8853,8 @@ class BlueprintWorkspace(QWidget):
                 self._restore_canvas_opening_edit_undo_state(state)
             elif isinstance(state, _CanvasWindowAdditionUndoState):
                 self._restore_canvas_window_addition_undo_state(state)
+            elif isinstance(state, _CanvasWindowRemovalUndoState):
+                self._restore_canvas_window_removal_undo_state(state)
             elif isinstance(state, _CanvasPlacedObjectUndoState):
                 skipped_texture_bindings = (
                     self._restore_canvas_placed_object_undo_state(state)
@@ -9058,19 +9201,27 @@ class BlueprintWorkspace(QWidget):
         target = self._canvas_opening_targets_by_key.get(state.start_edit.reference.key)
         if target is None:
             raise ValueError("The Canvas opening in this undo step no longer exists.")
-        applied = apply_canvas_opening_edit(
-            self.levels,
-            target,
-            state.start_edit,
-        )
+        if state.window_snapshot is not None:
+            level = self._restore_canvas_window_edit_snapshot(
+                state.window_snapshot, state.start_edit.reference
+            )
+            reference = state.start_edit.reference
+        else:
+            applied = apply_canvas_opening_edit(
+                self.levels,
+                target,
+                state.start_edit,
+            )
+            level, reference = applied.level, applied.reference
         restored_target = target.with_edit(state.start_edit)
         self._canvas_opening_targets_by_key[target.key] = restored_target
         self.viewer.update_canvas_opening_target(restored_target)
-        self._sync_live_canvas_opening(applied.reference, applied.level)
-        self._refresh_pending_canvas_opening_state(applied.reference)
+        self._sync_live_canvas_opening(reference, level)
+        self._refresh_pending_canvas_opening_state(reference)
         if (
             self._pending_doorway_mesh_level_index is not None
             or self._pending_window_mesh_level_index is not None
+            or self._pending_doorway_bridge_topology_change
         ):
             self._doorway_mesh_update_timer.start()
 
@@ -9089,6 +9240,23 @@ class BlueprintWorkspace(QWidget):
         self._handle_canvas_window_undo_requested()
         if len(self._canvas_window_undo_ids) != previous_count - 1:
             raise RuntimeError("The added Canvas window could not be undone.")
+
+    def _restore_canvas_window_removal_undo_state(
+        self, state: _CanvasWindowRemovalUndoState
+    ) -> None:
+        """Restore a removed frame without changing its supporting wall graph."""
+
+        level = self._get_level_by_index(state.level_index)
+        if level is None or self._find_canvas_window(state.window.window_id) is not None:
+            raise ValueError("The removed window frame can no longer be restored.")
+        level.windows.insert(min(state.item_index, len(level.windows)), state.window)
+        self._canvas_window_undo_ids = list(state.addition_order)
+        self._sync_viewer_window_snapshot(level)
+        self._refresh_canvas_windows_for_level(level)
+        if level.index == self.current_level.index:
+            self.canvas._set_selected_window_id(state.window.window_id, notify=False)
+        self._sync_canvas_window_undo_availability()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _restore_canvas_placed_object_undo_state(
         self,
@@ -19002,6 +19170,8 @@ class BlueprintWorkspace(QWidget):
         self._is_canvas_opening_drag_active = False
         self._active_canvas_opening_reference = None
         self._active_canvas_opening_start_edit = None
+        self._active_canvas_window_edit_snapshot = None
+        self._active_canvas_opening_topology_was_pending = False
         if not clear_outline:
             return
         self._doorway_outline_commit_revision = None
@@ -29571,7 +29741,7 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer.start()
 
     def _handle_doorway_bridge_edges_added(self) -> None:
-        """Defer new doorway bridge topology through the opening mesh timer."""
+        """Defer doorway wall cuts/connections through the opening mesh timer."""
 
         self._pending_doorway_bridge_topology_change = True
         if self._pending_doorway_mesh_level_index is None:
@@ -31281,10 +31451,10 @@ def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:
         f"{doorway_preset.width_meters:.2f} m × {doorway_preset.height_meters:.2f} m"
     )
     if doorway_preset.shape != DOORWAY_SHAPE_ARCH:
-        return dimension_text
+        return f"{dimension_text} — Not arched"
 
     arch_amount_percent = round(doorway_preset.arch_amount * 100.0, 1)
-    return f"{dimension_text} — Arch {arch_amount_percent:g}%"
+    return f"{dimension_text} — Arched {arch_amount_percent:g}%"
 
 
 # ### Path helpers ###

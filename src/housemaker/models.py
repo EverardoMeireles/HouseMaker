@@ -286,6 +286,7 @@ class DoorwayData:
     arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT
     bottom_height_meters: float = DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS
     doorway_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    corner_vertex_ids: tuple[int, int, int, int] | None = None
 
     def __post_init__(self) -> None:
         self.doorway_id = _normalize_doorway_id(self.doorway_id)
@@ -294,8 +295,18 @@ class DoorwayData:
         self.bottom_height_meters = normalize_doorway_bottom_height_meters(
             self.bottom_height_meters
         )
+        if self.corner_vertex_ids is not None:
+            corners = tuple(self.corner_vertex_ids)
+            if (
+                len(corners) != 4
+                or any(type(vertex_id) is not int or vertex_id < 1 for vertex_id in corners)
+                or len(set(corners)) != 4
+            ):
+                raise ValueError("A doorway must reference four distinct wall vertices.")
+            self.corner_vertex_ids = corners
 
 
+# ### Window models ###
 @dataclass(frozen=True)
 class WindowData:
     """One stable rectangular opening attached to a wall or its ceiling slope."""
@@ -307,6 +318,7 @@ class WindowData:
     bottom_ratio: float
     top_ratio: float
     sloped_ceiling_id: str | None = None
+    corner_vertex_ids: tuple[int, int, int, int] | None = None
 
     def __post_init__(self) -> None:
         window_id = _normalize_window_text(
@@ -341,6 +353,25 @@ class WindowData:
             raise ValueError("A window must have a positive wall-local width.")
         if top_ratio - bottom_ratio <= MIN_WINDOW_RATIO_SPAN:
             raise ValueError("A window must have a positive wall-local height.")
+        corner_vertex_ids = None
+        if self.corner_vertex_ids is not None:
+            try:
+                corner_vertex_ids = tuple(self.corner_vertex_ids)
+            except TypeError as error:
+                raise ValueError(
+                    "A window frame must reference four distinct wall vertices."
+                ) from error
+            if (
+                len(corner_vertex_ids) != 4
+                or any(
+                    type(vertex_id) is not int or vertex_id < 1
+                    for vertex_id in corner_vertex_ids
+                )
+                or len(set(corner_vertex_ids)) != 4
+            ):
+                raise ValueError(
+                    "A window frame must reference four distinct wall vertices."
+                )
 
         object.__setattr__(self, "window_id", window_id)
         object.__setattr__(self, "wall_surface_id", wall_surface_id)
@@ -349,6 +380,7 @@ class WindowData:
         object.__setattr__(self, "bottom_ratio", bottom_ratio)
         object.__setattr__(self, "top_ratio", top_ratio)
         object.__setattr__(self, "sloped_ceiling_id", sloped_ceiling_id)
+        object.__setattr__(self, "corner_vertex_ids", corner_vertex_ids)
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -361,6 +393,8 @@ class WindowData:
         }
         if self.sloped_ceiling_id is not None:
             payload["sloped_ceiling_id"] = self.sloped_ceiling_id
+        if self.corner_vertex_ids is not None:
+            payload["corner_vertex_ids"] = list(self.corner_vertex_ids)
         return payload
 
     @classmethod
@@ -375,6 +409,7 @@ class WindowData:
             bottom_ratio=payload.get("bottom_ratio"),
             top_ratio=payload.get("top_ratio"),
             sloped_ceiling_id=payload.get("sloped_ceiling_id"),
+            corner_vertex_ids=payload.get("corner_vertex_ids"),
         )
 
 

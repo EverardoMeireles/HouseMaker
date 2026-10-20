@@ -10,6 +10,7 @@ import shapely
 from shapely import LineString, Point, Polygon, STRtree
 from shapely.geometry.base import BaseGeometry
 
+from housemaker.doorway_connections import get_level_structural_edges
 from housemaker.floor_geometry import (
     OUTER_ENVELOPE_CLOSING_RADIUS_METERS,
     _build_linework_footprint,
@@ -401,7 +402,7 @@ def build_level_wall_orientation_resolver(
     if not isinstance(level, LevelData):
         raise TypeError("Wall orientation requires LevelData.")
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
-    source_edges = tuple(level.vertex_data.edges if edges is None else edges)
+    source_edges = tuple(get_level_structural_edges(level) if edges is None else edges)
     point_to_world, world_direction_to_image = _build_level_transforms(level)
     lines: list[LineString] = []
     for edge in source_edges:

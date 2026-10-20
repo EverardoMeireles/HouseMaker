@@ -819,8 +819,8 @@ def _deserialize_doorway_presets(raw_presets: object) -> list[DoorwayPreset]:
     return doorway_presets or [create_fallback_doorway_preset()]
 
 
-def _serialize_doorway(doorway: DoorwayData) -> dict[str, float | str]:
-    return {
+def _serialize_doorway(doorway: DoorwayData) -> dict[str, object]:
+    payload: dict[str, object] = {
         "doorway_id": doorway.doorway_id,
         "center_x": float(doorway.center_x),
         "center_y": float(doorway.center_y),
@@ -832,6 +832,9 @@ def _serialize_doorway(doorway: DoorwayData) -> dict[str, float | str]:
         "arch_amount": float(doorway.arch_amount),
         "bottom_height_meters": float(doorway.bottom_height_meters),
     }
+    if doorway.corner_vertex_ids is not None:
+        payload["corner_vertex_ids"] = list(doorway.corner_vertex_ids)
+    return payload
 
 
 def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
@@ -896,11 +899,31 @@ def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
                     )
                 )
             ),
+            corner_vertex_ids=_deserialize_doorway_corner_vertex_ids(
+                raw_doorway.get("corner_vertex_ids")
+            ),
         )
         doorways.append(doorway)
         occupied_doorway_ids.add(doorway.doorway_id)
 
     return doorways
+
+
+def _deserialize_doorway_corner_vertex_ids(
+    raw_ids: object,
+) -> tuple[int, int, int, int] | None:
+    """Keep legacy doorways readable, but reject corrupt new attachments."""
+
+    if raw_ids is None:
+        return None
+    if (
+        not isinstance(raw_ids, (list, tuple))
+        or len(raw_ids) != 4
+        or any(type(vertex_id) is not int or vertex_id < 1 for vertex_id in raw_ids)
+        or len(set(raw_ids)) != 4
+    ):
+        raise ValueError("A doorway must reference four distinct wall vertices.")
+    return tuple(raw_ids)
 
 
 def _deserialize_doorway_id(

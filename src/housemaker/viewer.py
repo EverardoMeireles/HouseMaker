@@ -2289,7 +2289,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
         if event.key() == Qt.Key.Key_Delete:
-            self.delete_requested.emit()
+            # Holding Delete must not remove a fixture and then its frame.
+            if not event.isAutoRepeat():
+                self.delete_requested.emit()
             event.accept()
             return
         if self._primary_pointer_finish_enabled and event.key() in {
@@ -20000,6 +20002,17 @@ class GlbViewerWidget(QWidget):
             if host_hit is None:
                 return False
             host, hit, _distance = host_hit
+            if isinstance(host, FixedSurface) and _window_host_shares_wall_run(target, host):
+                # Keep the press and drag projections on one plane, including
+                # when the camera sees the paired back wall first.
+                hit = _intersect_ray_with_plane(
+                    ray_origin,
+                    ray_direction,
+                    target.plane_start_world,
+                    target.wall_normal_world,
+                )
+                if hit is None:
+                    return False
             preview_target = _build_rehosted_canvas_window_target(
                 target,
                 host,
@@ -27391,6 +27404,19 @@ def _build_rehosted_canvas_window_target(
     except (TypeError, ValueError):
         return None
 
+    if isinstance(host, FixedSurface) and _window_host_shares_wall_run(source, host):
+        # A linked frame's selectable wall is split at its jambs. Those short
+        # surfaces are still the same host, not new movement constraints.
+        pointer_local = source.world_to_local(pointer_world)
+        return _build_dragged_canvas_opening_target(
+            source,
+            _CanvasOpeningGizmoHandle(CANVAS_OPENING_GIZMO_ANCHOR),
+            (
+                pointer_local[0] + pointer_offset_local[0],
+                pointer_local[1] + pointer_offset_local[1],
+            ),
+        )
+
     window_width = source.bounds.horizontal_span * source.wall_width_meters
     window_height = source.bounds.vertical_span * source.wall_height_meters
     if (
@@ -27420,6 +27446,7 @@ def _build_rehosted_canvas_window_target(
         wall_height_meters=host_height,
         bounds=empty_bounds,
         sloped_ceiling_id=sloped_ceiling_id,
+        opposite_wall_plane_world=None,
     )
     pointer_horizontal, pointer_vertical = destination_frame.world_to_local(
         pointer_world
@@ -27457,6 +27484,49 @@ def _build_rehosted_canvas_window_target(
             bottom_ratio=center_vertical - half_vertical_span,
             top_ratio=center_vertical + half_vertical_span,
         )
+    )
+
+
+def _window_host_shares_wall_run(
+    source: CanvasOpeningTarget, host: FixedSurface
+) -> bool:
+    """Keep the full edit frame across touching coplanar wall subdivisions."""
+
+    if (
+        source.sloped_ceiling_id is not None
+        or source.reference.level_index != host.level_index
+        or host.wall_start_world is None
+        or host.wall_end_world is None
+        or host.wall_height_meters is None
+    ):
+        return False
+    tolerance = 1e-7
+    origin = np.asarray(source.plane_start_world, dtype=float)
+    tangent = np.asarray(source.wall_tangent_world, dtype=float)
+    normal = np.asarray(source.wall_normal_world, dtype=float)
+    start = np.asarray(host.wall_start_world, dtype=float) - origin
+    end = np.asarray(host.wall_end_world, dtype=float) - origin
+    plane_offsets = [0.0]
+    if source.opposite_wall_plane_world is not None:
+        plane_offsets.append(
+            float(np.dot(np.asarray(source.opposite_wall_plane_world) - origin, normal))
+        )
+    if (
+        not any(
+            abs(float(np.dot(start, normal)) - offset) <= tolerance
+            and abs(float(np.dot(end, normal)) - offset) <= tolerance
+            for offset in plane_offsets
+        )
+        or abs(float(start[2])) > tolerance
+        or abs(float(end[2])) > tolerance
+        or abs(float(host.wall_height_meters) - source.wall_height_meters) > tolerance
+    ):
+        return False
+    minimum, maximum = sorted((float(np.dot(start, tangent)), float(np.dot(end, tangent))))
+    return (
+        maximum - minimum > tolerance
+        and maximum >= -tolerance
+        and minimum <= source.wall_width_meters + tolerance
     )
 
 

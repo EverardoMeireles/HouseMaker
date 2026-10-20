@@ -1,6 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 import math
 import re
 from collections.abc import Sequence
@@ -8,6 +9,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from housemaker.doorway_topology import move_doorway_corner_vertices
 from housemaker.level_coordinates import (
     level_image_to_world_xy,
     level_world_to_image_xy,
@@ -25,6 +27,10 @@ from housemaker.surface_geometry import (
     MIN_WINDOW_SIZE_METERS,
     SURFACE_TYPE_WALL,
     FixedSurface,
+)
+from housemaker.window_topology import (
+    move_linked_window_vertices,
+    resolve_linked_window_frame,
 )
 
 # ### Constants ###
@@ -128,6 +134,7 @@ class CanvasOpeningTarget:
     arch_amount: float | None = None
     vertical_axis_world: tuple[float, float, float] = (0.0, 0.0, 1.0)
     sloped_ceiling_id: str | None = None
+    opposite_wall_plane_world: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasOpeningReference):
@@ -198,6 +205,14 @@ class CanvasOpeningTarget:
         object.__setattr__(self, "minimum_height_meters", minimum_height)
         object.__setattr__(self, "arch_amount", arch_amount)
         object.__setattr__(self, "sloped_ceiling_id", sloped_ceiling_id)
+        if self.opposite_wall_plane_world is not None:
+            object.__setattr__(
+                self,
+                "opposite_wall_plane_world",
+                _normalize_world_vector(
+                    self.opposite_wall_plane_world, "opening opposite wall plane"
+                ),
+            )
 
     @property
     def key(self) -> str:
@@ -421,6 +436,7 @@ def build_canvas_opening_targets(
                 continue
             surface = surface_by_id.get(window.wall_surface_id)
             target = _build_window_target(
+                level,
                 window,
                 window_index,
                 surface,
@@ -538,6 +554,7 @@ def preserve_canvas_window_dimensions(
         level.index: level for level in levels if isinstance(level, LevelData)
     }
     replacements_by_level: dict[int, dict[str, WindowData]] = {}
+    staged_levels: dict[int, LevelData] = {}
     for snapshot in snapshot_sequence:
         window_id = snapshot.window.window_id
         level = levels_by_index.get(snapshot.level_index)
@@ -595,16 +612,21 @@ def preserve_canvas_window_dimensions(
                 "The edited wall or ceiling is too small to keep an existing "
                 "window frame at its current dimensions."
             ) from error
-        replacements_by_level.setdefault(level.index, {})[window_id] = replace(
-            current_window,
-            start_ratio=bounds.start_ratio,
-            end_ratio=bounds.end_ratio,
-            bottom_ratio=bounds.bottom_ratio,
-            top_ratio=bounds.top_ratio,
+        if level.index not in staged_levels:
+            staged = copy.copy(level)
+            staged.vertex_data = level.vertex_data.clone()
+            staged_levels[level.index] = staged
+        replacements_by_level.setdefault(level.index, {})[window_id] = (
+            _window_from_edited_bounds(
+                staged_levels[level.index], current_window, target, bounds
+            )
         )
 
     for level_index, replacements in replacements_by_level.items():
         level = levels_by_index[level_index]
+        staged_graph = staged_levels[level_index].vertex_data
+        if staged_graph.to_dict() != level.vertex_data.to_dict():
+            level.vertex_data.copy_from(staged_graph)
         level.windows[:] = [
             replacements.get(window.window_id, window)
             for window in level.windows
@@ -612,6 +634,7 @@ def preserve_canvas_window_dimensions(
 
 
 def _build_window_target(
+    level: LevelData,
     window: WindowData,
     window_index: int,
     surface: FixedSurface | None,
@@ -622,6 +645,21 @@ def _build_window_target(
     if frame is None:
         return None
     wall_start, tangent, normal, wall_width, wall_height = frame
+    start_ratio, end_ratio = window.start_ratio, window.end_ratio
+    opposite_wall_plane = None
+    linked_frame = resolve_linked_window_frame(level, window)
+    if linked_frame is not None:
+        start_xy = level_image_to_world_xy(level, *linked_frame.start_point)
+        end_xy = level_image_to_world_xy(level, *linked_frame.end_point)
+        wall_start = np.asarray((*start_xy, wall_start[2]), dtype=float)
+        wall_end = np.asarray((*end_xy, wall_start[2]), dtype=float)
+        wall_width = float(np.linalg.norm(wall_end - wall_start))
+        tangent = (wall_end - wall_start) / wall_width
+        normal = np.cross(tangent, np.asarray((0.0, 0.0, 1.0)))
+        start_ratio, end_ratio = linked_frame.start_ratio, linked_frame.end_ratio
+        back_vertex = level.vertex_data.get_vertex(linked_frame.corner_vertex_ids[2])
+        back_xy = level_image_to_world_xy(level, back_vertex.x, back_vertex.y)
+        opposite_wall_plane = (*back_xy, float(wall_start[2]))
     return CanvasOpeningTarget(
         reference=CanvasOpeningReference(
             kind=CANVAS_OPENING_WINDOW,
@@ -638,12 +676,13 @@ def _build_window_target(
         minimum_width_meters=MIN_WINDOW_SIZE_METERS,
         minimum_height_meters=MIN_WINDOW_SIZE_METERS,
         bounds=CanvasOpeningBounds(
-            start_ratio=window.start_ratio,
-            end_ratio=window.end_ratio,
+            start_ratio=start_ratio,
+            end_ratio=end_ratio,
             bottom_ratio=window.bottom_ratio,
             top_ratio=window.top_ratio,
         ),
         sloped_ceiling_id=None,
+        opposite_wall_plane_world=opposite_wall_plane,
     )
 
 
@@ -657,6 +696,8 @@ def _build_doorway_target(
     if selected is None:
         return None
     surface, frame, center_world = selected
+    if doorway.corner_vertex_ids is not None:
+        frame = _extend_linked_doorway_frame(surface, frame, surfaces)
     wall_start, tangent, normal, wall_width, wall_height = frame
     normal_offset = float(np.dot(center_world - wall_start, normal))
     plane_start = wall_start + normal * normal_offset
@@ -694,6 +735,66 @@ def _build_doorway_target(
             else None
         ),
         sloped_ceiling_id=None,
+    )
+
+
+def _extend_linked_doorway_frame(
+    selected_surface: FixedSurface,
+    frame: tuple[np.ndarray, np.ndarray, np.ndarray, float, float],
+    surfaces: Sequence[FixedSurface],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Join touching coplanar wall spans around a four-corner opening.
+
+    The opening's semantic wall face only spans the gap above its lintel.
+    Its gizmos need the surrounding straight wall run, without crossing a
+    real gap or borrowing space from another parallel wall or level.
+    """
+
+    wall_start, tangent, normal, wall_width, wall_height = frame
+    tolerance = OPENING_FRAME_EPSILON * 100.0
+    intervals = [(0.0, wall_width)]
+    for surface in surfaces:
+        if (
+            surface.level_index != selected_surface.level_index
+            or surface.surface_type != SURFACE_TYPE_WALL
+        ):
+            continue
+        candidate = _get_surface_frame(surface)
+        if candidate is None:
+            continue
+        start, direction, _normal, width, height = candidate
+        offset = start - wall_start
+        if (
+            abs(float(np.dot(direction, tangent))) < 1.0 - tolerance
+            or abs(float(np.dot(offset, normal))) > tolerance
+            or abs(float(np.dot(offset + direction * width, normal))) > tolerance
+            or abs(float(offset[2])) > tolerance
+            or abs(height - wall_height) > tolerance
+        ):
+            continue
+        start_distance = float(np.dot(offset, tangent))
+        end_distance = start_distance + float(np.dot(direction, tangent)) * width
+        intervals.append(tuple(sorted((start_distance, end_distance))))
+
+    # Merge in order so extension works equally in both directions and
+    # does not depend on the order of generated semantic surfaces.
+    connected: list[tuple[float, float]] = []
+    for start, end in sorted(intervals):
+        if connected and start <= connected[-1][1] + tolerance:
+            connected[-1] = connected[-1][0], max(end, connected[-1][1])
+        else:
+            connected.append((start, end))
+    minimum, maximum = next(
+        (start, end)
+        for start, end in connected
+        if start <= tolerance and end >= wall_width - tolerance
+    )
+    return (
+        wall_start + tangent * minimum,
+        tangent,
+        normal,
+        maximum - minimum,
+        wall_height,
     )
 
 
@@ -862,21 +963,51 @@ def _apply_window_edit(
     if window_index is None:
         raise ValueError("The edited Canvas window no longer exists.")
     previous = level.windows[window_index]
-    current = WindowData(
-        window_id=previous.window_id,
-        wall_surface_id=target.wall_surface_id,
-        start_ratio=edit.bounds.start_ratio,
-        end_ratio=edit.bounds.end_ratio,
-        bottom_ratio=edit.bounds.bottom_ratio,
-        top_ratio=edit.bounds.top_ratio,
-        sloped_ceiling_id=target.sloped_ceiling_id,
-    )
+    current = _window_from_edited_bounds(level, previous, target, edit.bounds)
     level.windows[window_index] = current
     return AppliedCanvasOpeningEdit(
         reference=replace(edit.reference, item_index=window_index),
         level=level,
         previous=previous,
         current=current,
+    )
+
+
+def _window_from_edited_bounds(
+    level: LevelData,
+    window: WindowData,
+    target: CanvasOpeningTarget,
+    bounds: CanvasOpeningBounds,
+) -> WindowData:
+    """Keep a four-corner window on its own moving physical wall span."""
+
+    if (
+        target.sloped_ceiling_id is None
+        and target.wall_surface_id == window.wall_surface_id
+        and resolve_linked_window_frame(level, window) is not None
+    ):
+        start_world = target.local_to_world(bounds.start_ratio, 0.0)
+        end_world = target.local_to_world(bounds.end_ratio, 0.0)
+        window = move_linked_window_vertices(
+            level,
+            window,
+            level_world_to_image_xy(level, *start_world[:2]),
+            level_world_to_image_xy(level, *end_world[:2]),
+        )
+        return replace(
+            window,
+            bottom_ratio=bounds.bottom_ratio,
+            top_ratio=bounds.top_ratio,
+        )
+    return replace(
+        window,
+        wall_surface_id=target.wall_surface_id,
+        start_ratio=bounds.start_ratio,
+        end_ratio=bounds.end_ratio,
+        bottom_ratio=bounds.bottom_ratio,
+        top_ratio=bounds.top_ratio,
+        sloped_ceiling_id=target.sloped_ceiling_id,
+        corner_vertex_ids=None,
     )
 
 
@@ -918,6 +1049,12 @@ def _apply_doorway_edit(
             else edit.arch_amount
         ),
     )
+    if current.corner_vertex_ids is not None:
+        move_doorway_corner_vertices(
+            level.vertex_data,
+            current,
+            meters_per_pixel=level.meters_per_pixel,
+        )
     level.doorways[doorway_index] = current
     return AppliedCanvasOpeningEdit(
         reference=edit.reference,

@@ -144,6 +144,9 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         )
         self.workspace.resize(1400, 850)
         self.workspace.show()
+        # Every test installs a single-level fixture below; keep its active
+        # index valid when topology commits synchronize the canvas.
+        self.workspace.current_level_index = 0
         _qt_application.processEvents()
 
     def tearDown(self) -> None:
@@ -282,17 +285,19 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             )
         )
         self.assertFalse(
-            _mesh_covers_point_on_plane(
-                cut_surfaces[wall.surface_id].mesh,
-                inner_center,
-                fixed_axis=1,
+            any(
+                _mesh_covers_point_on_plane(
+                    surface.mesh, inner_center, fixed_axis=1
+                )
+                for surface in cut_surfaces.values()
             )
         )
         self.assertFalse(
-            _mesh_covers_point_on_plane(
-                cut_surfaces[outer_surface_id].mesh,
-                outer_center,
-                fixed_axis=1,
+            any(
+                _mesh_covers_point_on_plane(
+                    surface.mesh, outer_center, fixed_axis=1
+                )
+                for surface in cut_surfaces.values()
             )
         )
 
