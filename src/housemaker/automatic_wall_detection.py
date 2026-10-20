@@ -14,6 +14,7 @@ import numpy as np
 
 from .models import Edge, Vertex, VertexData
 from .plan_wall_options import PlanWallDetectionError, PlanWallDetectionOptions
+from .plan_wall_orthogonalization import orthogonalize_wall_graph
 from .plan_wall_pixel_tracing import PixelWallTracingCancelled, trace_plan_ink_paths
 
 # ### Detection constants ###
@@ -362,6 +363,19 @@ def reconstruct_plan_walls(
         analysis.image_width,
         analysis.image_height,
         resolved_options,
+    )
+    # Endpoint clustering and ink tracing can bend an initially exact line.
+    # Finish the whole network jointly before exposing the green preview.
+    orthogonalize_wall_graph(
+        result,
+        fixed_vertex_ids=existing_vertex_ids,
+        ink=(
+            analysis.normalized_ink
+            if analysis.normalized_ink is not None
+            else analysis.structural_ink
+        ),
+        image_size=(analysis.image_width, analysis.image_height),
+        angle_tolerance_degrees=min(8.0, resolved_options.parallel_angle_tolerance_degrees),
     )
     _validate_vertex_graph(
         result,
