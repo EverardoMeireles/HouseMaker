@@ -14,6 +14,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from housemaker.plan_correction_models import (
     OPENAI_PLAN_CORRECTION_MODELS,
     PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+    PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
     PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
     PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
     PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
@@ -162,7 +163,11 @@ def _create_reference_image_editor(model: str):
 
     if model == PLAN_CORRECTION_MODEL_GPT_IMAGE_2:
         return openai_image_edit
-    if model in {PLAN_CORRECTION_MODEL_GPT_5_6_LUNA, PLAN_CORRECTION_MODEL_GPT_5_6_TERRA}:
+    if model in {
+        PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+        PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
+        PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
+    }:
         return partial(
             openai_responses_image_edit,
             model=model,
@@ -246,9 +251,16 @@ def generate_object_reference(
             if progress_callback is not None:
                 progress_callback("Generating the new object reference", 15)
             editor = image_editor or _create_reference_image_editor(model)
-            # Resident editors already poll cancellation. Wait for their native
-            # request to unwind before closing the session or loading symmetry.
-            invoke = editor if image_editor is not None else partial(_invoke_editor_cancellably, editor)
+            if model == PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH and image_editor is None:
+                editor = partial(editor, progress_callback=progress_callback)
+            # Resident and Batch editors poll cancellation themselves. Do not
+            # detach their cleanup: Batch must send the remote cancel request
+            # before the owning worker exits or starts another stage.
+            invoke = (
+                editor
+                if image_editor is not None or model == PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH
+                else partial(_invoke_editor_cancellably, editor)
+            )
             generated = invoke(
                 prepared_image,
                 api_key=str(api_key).strip(),

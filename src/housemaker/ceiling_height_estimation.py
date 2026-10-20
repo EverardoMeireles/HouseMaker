@@ -19,6 +19,14 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
+from housemaker.openai_batch import (
+    LUNA_BATCH_MODEL,
+    OpenAIBatchCancelled,
+    OpenAIBatchError,
+    request_luna_batch_response,
+    run_responses_batch,
+    to_openai_model,
+)
 from housemaker.plan_metric_state import (
     PlanMetricCalibration,
     ceiling_height_plan_measurements,
@@ -36,6 +44,7 @@ CEILING_HEIGHT_INFERENCE_MODEL = "gpt-5.6-luna"
 CEILING_HEIGHT_ESTIMATION_MODEL_SETTING_KEY = "generation/ceiling_height_estimation_model"
 CEILING_HEIGHT_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
     ("GPT-5.6 Luna", "gpt-5.6-luna"),
+    ("GPT-5.6 Luna (Batch API)", LUNA_BATCH_MODEL),
     ("GPT-5.6 Terra", "gpt-5.6-terra"),
     ("Qwen3-VL 8B (Local)", LOCAL_QWEN_CEILING_HEIGHT_MODEL),
 )
@@ -267,6 +276,67 @@ class UrlOpenFunction(Protocol):
     def __call__(self, request: Request, **kwargs: Any) -> object: ...
 
 
+# ### Grouped Batch API inference ###
+def build_ceiling_height_batch_request(
+    frame_bgr: np.ndarray,
+    *,
+    previous_frame_bgr: np.ndarray | None = None,
+    plan_context: str = "",
+    plan_image_data_uri: str | None = None,
+) -> dict[str, Any]:
+    """Encode an independent frame pair before submitting the entire video."""
+
+    return build_ceiling_height_request_body(
+        _encode_frame_data_uri(frame_bgr),
+        previous_image_data_uri=(
+            None if previous_frame_bgr is None
+            else _encode_frame_data_uri(previous_frame_bgr)
+        ),
+        plan_context=plan_context,
+        plan_image_data_uri=plan_image_data_uri,
+        model=LUNA_BATCH_MODEL,
+    )
+
+
+def infer_ceiling_height_batch(
+    requests: Mapping[str, Mapping[str, Any]],
+    *,
+    api_key: str,
+    cancellation_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, CeilingHeightEstimate | CeilingHeightEstimationError]:
+    """Submit all independent sampled frame pairs in one asynchronous job."""
+
+    try:
+        results = run_responses_batch(
+            requests,
+            api_key=api_key,
+            cancellation_check=cancellation_check,
+            progress_callback=progress_callback,
+        )
+    except OpenAIBatchCancelled as error:
+        raise CeilingHeightEstimationCancelled(str(error)) from None
+    except OpenAIBatchError as error:
+        raise CeilingHeightEstimationError(str(error)) from None
+    estimates: dict[str, CeilingHeightEstimate | CeilingHeightEstimationError] = {}
+    for identifier, response in results.items():
+        _raise_if_cancelled(cancellation_check)
+        if response.error:
+            estimates[identifier] = CeilingHeightEstimationError(str(response.error))
+            continue
+        try:
+            estimates[identifier] = parse_ceiling_height_estimate(
+                json.loads(_extract_openai_output_text(response.body))
+            )
+        except CeilingHeightEstimationError as error:
+            estimates[identifier] = error
+        except (ValueError, TypeError):
+            estimates[identifier] = CeilingHeightEstimationError(
+                "GPT-5.6 Luna Batch API returned unusable ceiling-height JSON."
+            )
+    return estimates
+
+
 # ### Request construction ###
 def build_ceiling_height_request_body(
     image_data_uri: str,
@@ -348,7 +418,7 @@ def build_ceiling_height_request_body(
         )
     )
     return {
-        "model": str(model).strip() or CEILING_HEIGHT_INFERENCE_MODEL,
+        "model": to_openai_model(str(model).strip() or CEILING_HEIGHT_INFERENCE_MODEL),
         "store": False,
         "reasoning": {"effort": "none"},
         "input": [
@@ -435,7 +505,8 @@ def estimate_ceiling_height_api_cost_usd(
 ) -> float | None:
     """Return a conservative paired-frame API cost estimate, when paid."""
 
-    prices = OPENAI_MODEL_TOKEN_PRICES_USD.get(str(model).strip())
+    normalized_model = str(model).strip()
+    prices = OPENAI_MODEL_TOKEN_PRICES_USD.get(to_openai_model(normalized_model))
     if prices is None:
         return None
     if frame_width < 1 or frame_height < 1:
@@ -500,7 +571,8 @@ def estimate_ceiling_height_api_cost_usd(
     )
     total_output_tokens = sample_count * MAX_OUTPUT_TOKENS
     input_price, output_price = prices
-    return (
+    batch_discount = 0.5 if normalized_model == LUNA_BATCH_MODEL else 1.0
+    return batch_discount * (
         total_input_tokens * input_price
         + total_output_tokens * output_price
     ) / 1_000_000.0
@@ -986,6 +1058,26 @@ def _infer_openai_ceiling_height(
         plan_image_data_uri=plan_image_data_uri,
         model=model,
     )
+
+    if model == LUNA_BATCH_MODEL:
+        try:
+            payload = request_luna_batch_response(
+                request_body,
+                api_key=key,
+                cancellation_check=cancellation_check,
+                opener=opener,
+            )
+            return parse_ceiling_height_estimate(
+                json.loads(_extract_openai_output_text(payload))
+            )
+        except OpenAIBatchCancelled as error:
+            raise CeilingHeightEstimationCancelled(str(error)) from None
+        except OpenAIBatchError as error:
+            raise CeilingHeightEstimationError(str(error)) from None
+        except (ValueError, TypeError):
+            raise CeilingHeightEstimationError(
+                "GPT-5.6 Luna Batch API returned unusable ceiling-height JSON."
+            ) from None
 
     transport_cancelled = threading.Event()
 

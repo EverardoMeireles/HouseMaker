@@ -20908,6 +20908,80 @@ class GlbViewerWidget(QWidget):
         return selected[5], selected[6]
 
     # ### Sloped-ceiling gizmo dragging ###
+    def _select_sloped_ceiling_creation_peer(
+        self,
+        target: SlopedCeilingEditTarget,
+        handle: SlopedCeilingEditHandle,
+    ) -> None:
+        """Include the nearest parallel wall when starting a one-wall slope."""
+
+        selected_wall_ids, selected_slope_ids = (
+            self._get_selected_sloped_ceiling_scope()
+        )
+        if (
+            target.slope_id is not None
+            or handle.handle_kind != SLOPED_CEILING_HANDLE_CREATE_DEPTH
+            or selected_wall_ids != {target.wall_surface_id}
+            or selected_slope_ids
+        ):
+            return
+        targets = tuple(self._sloped_ceiling_edit_targets.values())
+        candidates: list[tuple[float, float, str]] = []
+        for wall_surface_id in dict.fromkeys(
+            candidate.wall_surface_id for candidate in targets
+        ):
+            if wall_surface_id == target.wall_surface_id:
+                continue
+            surface = self._canvas_surface_targets.get(wall_surface_id)
+            if surface is None or not self._canvas_surface_is_visible(surface):
+                continue
+            peer = _get_corresponding_parallel_sloped_ceiling_target(
+                target,
+                targets,
+                wall_surface_id,
+            )
+            if peer is None:
+                continue
+            distance = _get_sloped_ceiling_creation_peer_distance(target, peer)
+            if (
+                distance is None
+                or not _sloped_ceiling_target_group_has_common_handle_ranges(
+                    (target, peer)
+                )
+            ):
+                continue
+            overlap = _get_sloped_ceiling_creation_span_overlap(target, peer)
+            candidates.append((distance, overlap, wall_surface_id))
+        if not candidates:
+            return
+        nearest_distance = min(distance for distance, _overlap, _wall_id in candidates)
+        # A back wall may be split into several collinear plan segments. Pick
+        # the largest shared span on the nearest plane, not a tiny end stub.
+        _distance, _overlap, peer_wall_id = min(
+            (
+                candidate
+                for candidate in candidates
+                if math.isclose(
+                    candidate[0],
+                    nearest_distance,
+                    abs_tol=SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS,
+                    rel_tol=0.0,
+                )
+            ),
+            key=lambda candidate: (-candidate[1], candidate[2]),
+        )
+        # Keep the clicked surface (including an edited child face) active and
+        # last in the selection remembered by the controller after a rebuild.
+        selected_ids = self._selected_canvas_surface_ids
+        active_id = self._active_canvas_surface_id
+        self.set_selected_canvas_surface_ids(
+            (peer_wall_id,)
+            + tuple(
+                surface_id for surface_id in selected_ids if surface_id != active_id
+            )
+            + ((active_id,) if active_id is not None else ())
+        )
+
     def _get_compatible_sloped_ceiling_target_handles(
         self,
         target: SlopedCeilingEditTarget,
@@ -21031,6 +21105,12 @@ class GlbViewerWidget(QWidget):
             drag_plane_normal,
         )
         if hit is None:
+            return False
+        self._select_sloped_ceiling_creation_peer(target, handle)
+        affected_target_handles = self._get_compatible_sloped_ceiling_target_handles(
+            target, handle
+        )
+        if not affected_target_handles:
             return False
         handle_origin = np.asarray(handle.origin_world, dtype=float)
         start_axis_parameter = float(np.dot(hit - handle_origin, axis))
@@ -25331,6 +25411,47 @@ def _sloped_ceiling_targets_are_parallel(
     )
 
 
+def _get_sloped_ceiling_creation_peer_distance(
+    reference: SlopedCeilingEditTarget,
+    candidate: SlopedCeilingEditTarget,
+) -> float | None:
+    """Measure the physical gap without trusting wall winding or inward signs."""
+
+    if (
+        reference.slope_id is not None
+        or candidate.slope_id is not None
+        or reference.level_index != candidate.level_index
+        or not _sloped_ceiling_targets_are_parallel(reference, candidate)
+        or not _sloped_ceiling_creation_spans_overlap(reference, candidate)
+    ):
+        return None
+    tolerance = SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS
+    if not math.isclose(
+        reference.ceiling_z_meters,
+        candidate.ceiling_z_meters,
+        abs_tol=tolerance,
+        rel_tol=0.0,
+    ) or not math.isclose(
+        reference.wall_start_world[2],
+        candidate.wall_start_world[2],
+        abs_tol=tolerance,
+        rel_tol=0.0,
+    ):
+        return None
+    direction = _get_sloped_ceiling_target_wall_direction(reference)
+    if direction is None:
+        return None
+    perpendicular = np.asarray((-direction[1], direction[0], 0.0), dtype=float)
+    separation = np.asarray(candidate.wall_start_world, dtype=float) - np.asarray(
+        reference.wall_start_world, dtype=float
+    )
+    # Inner/outer plan outlines can have either winding and lie on either side
+    # of the selected wall. The nearest physical line is the peer, not a more
+    # distant wall across the room whose normals happen to face this one.
+    distance = abs(float(np.dot(separation, perpendicular)))
+    return distance if distance > tolerance else None
+
+
 def _get_corresponding_parallel_sloped_ceiling_target(
     reference: SlopedCeilingEditTarget,
     targets: Sequence[SlopedCeilingEditTarget],
@@ -25490,9 +25611,21 @@ def _sloped_ceiling_creation_spans_overlap(
 ) -> bool:
     """Return whether two parallel creation spans share physical world extent."""
 
+    return (
+        _get_sloped_ceiling_creation_span_overlap(first, second)
+        > SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS
+    )
+
+
+def _get_sloped_ceiling_creation_span_overlap(
+    first: SlopedCeilingEditTarget,
+    second: SlopedCeilingEditTarget,
+) -> float:
+    """Measure common span along the first wall, regardless of wall winding."""
+
     reference_direction = _get_sloped_ceiling_target_wall_direction(first)
     if reference_direction is None:
-        return False
+        return 0.0
     intervals = []
     for target in (first, second):
         projections = tuple(
@@ -25506,7 +25639,7 @@ def _sloped_ceiling_creation_spans_overlap(
     overlap = min(interval[1] for interval in intervals) - max(
         interval[0] for interval in intervals
     )
-    return overlap > SLOPED_CEILING_TARGET_DISTANCE_TOLERANCE_METERS
+    return max(0.0, overlap)
 
 
 def _sloped_ceiling_target_group_has_common_handle_ranges(

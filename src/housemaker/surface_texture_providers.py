@@ -27,12 +27,18 @@ from housemaker.meshy_generation import (
     MESHY_RETEXTURE_ENDPOINT,
     build_retexture_request_body,
 )
+from housemaker.openai_batch import (
+    LUNA_BATCH_MODEL,
+    OpenAIBatchCancelled,
+    OpenAIBatchError,
+    request_luna_batch_response,
+    to_openai_model,
+)
 from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_TYPES,
     normalize_pbr_map_types,
 )
-
 
 # ### Provider constants ###
 MESHY_IMAGE_TO_IMAGE_ENDPOINT = (
@@ -58,7 +64,7 @@ DEFAULT_OPENAI_IMAGE_MODEL = "gpt-5.6-luna"
 OPENAI_MINI_ANALYSIS_MODEL = "gpt-4o-mini"
 OPENAI_IMAGE_RENDER_MODEL = "gpt-image-2"
 OPENAI_DIRECT_IMAGE_MODELS = frozenset(
-    {"gpt-5.6-luna", "gpt-5.6-terra"}
+    {"gpt-5.6-luna", LUNA_BATCH_MODEL, "gpt-5.6-terra"}
 )
 SUPPORTED_OPENAI_IMAGE_MODELS = (
     OPENAI_DIRECT_IMAGE_MODELS | {OPENAI_MINI_ANALYSIS_MODEL}
@@ -343,7 +349,7 @@ def build_openai_responses_request_body(
         "size": "2048x2048",
     }
     return {
-        "model": request.settings.model,
+        "model": to_openai_model(request.settings.model),
         "store": False,
         "input": [
             {
@@ -1177,6 +1183,26 @@ def _generate_with_openai_responses(
 ) -> bytes:
     api_key = request.settings.openai_api_key
     _notify_progress(progress_callback, "IN_PROGRESS", 10)
+    if request.settings.model == LUNA_BATCH_MODEL:
+        try:
+            response = request_luna_batch_response(
+                build_openai_responses_request_body(request),
+                api_key=api_key,
+                cancellation_check=cancel_event.is_set if cancel_event else None,
+                progress_callback=(
+                    (lambda message: _notify_progress(progress_callback, message, 20))
+                    if progress_callback is not None else None
+                ),
+                opener=opener,
+            )
+        except OpenAIBatchCancelled as error:
+            raise SurfaceTextureTaskError(str(error)) from None
+        except OpenAIBatchError as error:
+            raise SurfaceTextureRequestError(str(error)) from None
+        _raise_if_cancelled(cancel_event)
+        result = _extract_openai_responses_png(response)
+        _notify_progress(progress_callback, "SUCCEEDED", 100)
+        return result
     response = _request_json(
         Request(
             OPENAI_RESPONSES_ENDPOINT,

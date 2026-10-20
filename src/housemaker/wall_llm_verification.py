@@ -20,6 +20,13 @@ import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 
 from .models import Vertex, VertexData
+from .openai_batch import (
+    LUNA_BATCH_MODEL,
+    OpenAIBatchCancelled,
+    OpenAIBatchError,
+    request_luna_batch_response,
+    to_openai_model,
+)
 from .qwen_ceiling_height_estimation import (
     LOCAL_QWEN_CEILING_HEIGHT_MODEL,
     QwenCeilingHeightCancelled,
@@ -662,6 +669,7 @@ def verify_plan_walls(
     cancellation_check: Callable[[], bool] | None = None,
     excluded_polygons: tuple[tuple[tuple[float, float], ...], ...] = (),
     opener: Callable | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> WallVerificationResult:
     """Analyze the source image and graph with the explicitly selected model."""
 
@@ -704,7 +712,7 @@ def verify_plan_walls(
             ) from None
     else:
         body = {
-            "model": model,
+            "model": to_openai_model(model),
             "input": [
                 {
                     "role": "user",
@@ -725,12 +733,26 @@ def verify_plan_walls(
                 }
             },
         }
-        cancelled = threading.Event()
-        payload = _request_cancellably(
-            lambda: _request_openai(body, str(api_key).strip(), opener, cancelled),
-            cancellation_check,
-            cancelled,
-        )
+        if model == LUNA_BATCH_MODEL:
+            try:
+                payload = _extract_response(request_luna_batch_response(
+                    body,
+                    api_key=str(api_key).strip(),
+                    cancellation_check=cancellation_check,
+                    progress_callback=progress_callback,
+                    opener=opener,
+                ))
+            except OpenAIBatchCancelled as error:
+                raise WallVerificationCancelled(str(error)) from None
+            except OpenAIBatchError as error:
+                raise WallVerificationError(str(error)) from None
+        else:
+            cancelled = threading.Event()
+            payload = _request_cancellably(
+                lambda: _request_openai(body, str(api_key).strip(), opener, cancelled),
+                cancellation_check,
+                cancelled,
+            )
     _raise_if_cancelled(cancellation_check)
     return parse_wall_verification_result(
         payload, vertex_data, image_size=image_size, excluded_polygons=excluded_polygons

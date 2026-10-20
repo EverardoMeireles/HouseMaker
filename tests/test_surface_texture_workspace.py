@@ -48,6 +48,7 @@ from housemaker.settings_widget import (
     FIRST_PERSON_SPEED_SETTING_KEY,
     SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA,
+    SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
     SURFACE_TEXTURE_PROVIDER_MESHY,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
@@ -1558,23 +1559,24 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
                 ("Meshy t2.5", SURFACE_TEXTURE_PROVIDER_MESHY),
                 ("GPT-4o-mini", SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI),
                 ("GPT-5.6 Luna", SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA),
+                ("GPT-5.6 Luna (Batch API)", SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH),
                 ("GPT-5.6 Terra", SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA),
             ],
         )
 
-        terra_index = combo.findData(SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA)
-        combo.setCurrentIndex(terra_index)
+        batch_index = combo.findData(SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH)
+        combo.setCurrentIndex(batch_index)
 
         settings_store = ApplicationSettingsStore(
             self._temporary_path / "settings.json"
         )
         self.assertEqual(
             settings_store.get(SURFACE_TEXTURE_PROVIDER_SETTING_KEY),
-            SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
+            SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH,
         )
         self.assertEqual(
             self.workspace.get_runtime_settings().surface_texture_provider,
-            SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
+            SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH,
         )
 
         restored = SurfaceTextureGenerationWorkspace(
@@ -1584,7 +1586,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         try:
             self.assertEqual(
                 restored.surface_texture_provider_combo.currentData(),
-                SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
+                SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH,
             )
         finally:
             restored.shutdown()

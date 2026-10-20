@@ -75,13 +75,16 @@ def _response(
 
 # ### Model selection and validation tests ###
 class ReferenceSymmetryValidationTests(unittest.TestCase):
-    def test_options_expose_only_the_three_requested_backends(self) -> None:
+    def test_options_expose_local_and_luna_realtime_and_batch_backends(self) -> None:
         self.assertEqual(
             tuple(
                 identifier
                 for _label, identifier in symmetry.SYMMETRY_INFERENCE_MODEL_OPTIONS
             ),
-            ("qwen3-vl-8b-local", "reflect3d-local", "gpt-5.6-luna"),
+            (
+                "qwen3-vl-8b-local", "reflect3d-local", "gpt-5.6-luna",
+                "gpt-5.6-luna-batch",
+            ),
         )
         self.assertEqual(symmetry.DEFAULT_SYMMETRY_INFERENCE_MODEL, "reflect3d-local")
 

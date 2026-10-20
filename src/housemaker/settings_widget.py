@@ -215,11 +215,13 @@ DEFAULT_MESHY_TARGET_POLYCOUNT = 2_000
 SURFACE_TEXTURE_PROVIDER_MESHY = "meshy"
 SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI = "gpt-4o-mini"
 SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA = "gpt-5.6-luna"
+SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH = "gpt-5.6-luna-batch"
 SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA = "gpt-5.6-terra"
 SURFACE_TEXTURE_PROVIDER_OPTIONS = (
     ("Meshy t2.5", SURFACE_TEXTURE_PROVIDER_MESHY),
     ("GPT-4o-mini", SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI),
     ("GPT-5.6 Luna", SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA),
+    ("GPT-5.6 Luna (Batch API)", SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA_BATCH),
     ("GPT-5.6 Terra", SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA),
 )
 SURFACE_TEXTURE_PROVIDERS = frozenset(
@@ -959,9 +961,10 @@ class SettingsWidget(QWidget):
             "GPT-5.6 Terra use the configured OpenAI API key. The GPT-5.6 "
             "token prices shown here exclude the additional GPT Image 2 tool "
             "charges incurred when producing the corrected image. Displayed "
-            "prices are Standard API rates per 1M tokens; Luna and Terra use "
-            "their short-context rates. Cached, long-context, Batch, Flex, and "
-            "other processing-tier rates are not shown. Qwen runs locally, "
+            "prices are Standard API rates per 1M tokens, except the explicit "
+            "Luna (Batch API) option which shows Batch rates. Luna and Terra use "
+            "their short-context rates. Batch jobs can take up to 24 hours, "
+            "not an interactive-speed request. Qwen runs locally, "
             "but its Research License limits use to non-commercial research "
             "or evaluation unless you obtain a separate commercial license."
         )
@@ -1561,7 +1564,9 @@ class SettingsWidget(QWidget):
         self.reference_generation_model_combo.setToolTip(
             "Choose the model used to generate object reference images. "
             "OpenAI models use the configured API key; Qwen and Stable "
-            "Diffusion run locally. Stable Diffusion downloads its model "
+            "Diffusion run locally. Luna (Batch API) queues requests with "
+            "a 24-hour completion window and discounted token rates. Stable "
+            "Diffusion downloads its model "
             "(about 7 GB) on first use. Changes apply to the next request."
         )
         for label, model in REFERENCE_GENERATION_MODEL_OPTIONS:

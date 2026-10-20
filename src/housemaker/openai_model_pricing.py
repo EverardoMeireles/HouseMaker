@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from housemaker.plan_correction_models import (
     OPENAI_PLAN_CORRECTION_MODELS,
     PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+    PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
     PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
     PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
     PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
@@ -27,6 +28,7 @@ LOCAL_MODEL_PRICE_TEXT = "Local; no API token charge"
 _FLAGSHIP_SECTION_START = "Flagship models"
 _FLAGSHIP_SECTION_END = "Cyber models"
 _STANDARD_PRICING_HEADING = "### Standard pricing data"
+_BATCH_PRICING_HEADING = "### Batch pricing data"
 _FLAGSHIP_HEADER = (
     "Model",
     "Short context input",
@@ -55,7 +57,7 @@ _PRICE_PATTERN = re.compile(r"^\$(?:0|[1-9]\d*)(?:\.\d+)?$")
 # ### Public data models ###
 @dataclass(frozen=True)
 class TokenRate:
-    """One Standard API token rate, expressed in USD per million tokens."""
+    """One API token rate, expressed in USD per million tokens."""
 
     modality: str
     input_usd: Decimal
@@ -64,7 +66,7 @@ class TokenRate:
 
 @dataclass(frozen=True)
 class ModelTokenPricing:
-    """The Standard token rates needed for one plan-correction model."""
+    """The selected-tier token rates needed for one plan-correction model."""
 
     model_id: str
     rates: tuple[TokenRate, ...]
@@ -74,7 +76,7 @@ class ModelTokenPricing:
 def parse_openai_pricing_markdown(
     markdown: str,
 ) -> dict[str, ModelTokenPricing]:
-    """Parse supported Standard rates from OpenAI's public pricing Markdown.
+    """Parse supported Standard and explicitly selected Batch token rates.
 
     The document publishes several processing tiers and repeats model rows.
     Parsing is intentionally strict so a documentation-layout change produces
@@ -87,10 +89,41 @@ def parse_openai_pricing_markdown(
     lines = tuple(line.strip() for line in markdown.splitlines())
     prices: dict[str, ModelTokenPricing] = {}
     prices.update(_parse_flagship_prices(lines))
+    batch_price = _parse_luna_batch_price(lines)
+    if batch_price is not None:
+        prices[batch_price.model_id] = batch_price
     image_price = _parse_gpt_image_2_price(lines)
     if image_price is not None:
         prices[image_price.model_id] = image_price
     return prices
+
+
+# ### Explicit Batch pricing parser ###
+def _parse_luna_batch_price(lines: tuple[str, ...]) -> ModelTokenPricing | None:
+    """Never substitute Standard/Flex pricing for a missing Batch table."""
+
+    section = _slice_between_unique_labels(
+        lines, _FLAGSHIP_SECTION_START, _FLAGSHIP_SECTION_END
+    )
+    if section is None:
+        return None
+    table = _table_after_unique_heading(section, _BATCH_PRICING_HEADING)
+    if table is None or not table or table[0] != _FLAGSHIP_HEADER:
+        return None
+    row = _find_unique_row(table[1:], PLAN_CORRECTION_MODEL_GPT_5_6_LUNA)
+    if row is None or len(row) != len(_FLAGSHIP_HEADER):
+        return None
+    try:
+        rate = TokenRate(
+            modality="Tokens",
+            input_usd=_parse_usd(row[1]),
+            output_usd=_parse_optional_usd(row[4]),
+        )
+    except ValueError:
+        return None
+    if rate.output_usd is None:
+        return None
+    return ModelTokenPricing(PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH, (rate,))
 
 
 # ### Public display helpers ###

@@ -13,6 +13,7 @@ from housemaker.openai_model_pricing import (
 )
 from housemaker.plan_correction_models import (
     PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+    PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
     PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
     PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
     PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
@@ -101,6 +102,11 @@ def test_parser_uses_standard_short_context_and_not_discounted_tiers() -> None:
         pricing[PLAN_CORRECTION_MODEL_GPT_5_6_TERRA],
     ) == "GPT-5.6 Terra ($2.00 in / $12.00 out per 1M tokens)"
     assert format_plan_correction_model_label(
+        "GPT-5.6 Luna (Batch API)",
+        PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
+        pricing[PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH],
+    ) == "GPT-5.6 Luna (Batch API) ($0.10 in / $0.60 out per 1M tokens)"
+    assert format_plan_correction_model_label(
         "gpt-image-2",
         PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
         pricing[PLAN_CORRECTION_MODEL_GPT_IMAGE_2],
@@ -145,8 +151,26 @@ def test_parser_returns_no_prices_for_changed_or_invalid_documents() -> None:
         _pricing_markdown().replace("$12.00", "USD 12", 1)
     ).keys() == {
         PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+        PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
         PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
     }
+
+
+def test_missing_or_ambiguous_batch_rates_never_use_standard_or_flex() -> None:
+    for markdown in (
+        _pricing_markdown().replace("### Batch pricing data", "### Unknown pricing"),
+        _pricing_markdown().replace(
+            "| gpt-5.6-luna | $0.10 | $0.01 | $0.125 | $0.60 | $0.20 | $0.02 | $0.25 | $0.90 |",
+            "| gpt-5.6-luna | bad | $0.01 | $0.125 | $0.60 | $0.20 | $0.02 | $0.25 | $0.90 |",
+            1,
+        ),
+    ):
+        prices = parse_openai_pricing_markdown(markdown)
+        assert PLAN_CORRECTION_MODEL_GPT_5_6_LUNA in prices
+        assert PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH not in prices
+        assert format_plan_correction_model_label(
+            "GPT-5.6 Luna (Batch API)", PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH, None
+        ) == "GPT-5.6 Luna (Batch API) (Price not found)"
 
 
 # ### Display fallback tests ###

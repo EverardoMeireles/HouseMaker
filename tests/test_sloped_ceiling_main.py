@@ -100,6 +100,28 @@ def _build_unequal_reversed_parallel_wall_level() -> LevelData:
     )
 
 
+def _build_close_parallel_wall_level(*, reverse_second: bool) -> LevelData:
+    """Represent the two plan outlines of one twenty-centimeter wall."""
+
+    vertex_data = VertexData()
+    first_start = vertex_data.add_vertex(0.0, 0.0)
+    first_end = vertex_data.add_vertex(200.0, 0.0)
+    second_points = ((0.0, 10.0), (200.0, 10.0))
+    if reverse_second:
+        second_points = tuple(reversed(second_points))
+    second_start, second_end = (
+        vertex_data.add_vertex(*point) for point in second_points
+    )
+    vertex_data.add_edge(first_start.id, first_end.id)
+    vertex_data.add_edge(second_start.id, second_end.id)
+    return LevelData(
+        index=2,
+        name="Ground",
+        height_meters=3.0,
+        vertex_data=vertex_data,
+    )
+
+
 def _build_unequal_closed_parallel_wall_level() -> LevelData:
     """Build a closed room whose opposite horizontal walls differ in length."""
 
@@ -137,6 +159,19 @@ def _edit(
         creation_start_ratio=target.creation_start_ratio,
         creation_end_ratio=target.creation_end_ratio,
     )
+
+
+def _slope_handle_camera_ray(
+    handle: SlopedCeilingEditHandle,
+    displacement_meters: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aim a deterministic pointer ray at one displaced slope handle."""
+
+    axis = np.asarray(handle.axis_world, dtype=float)
+    axis /= np.linalg.norm(axis)
+    camera_direction = np.eye(3, dtype=float)[int(np.argmin(np.abs(axis)))]
+    hit = np.asarray(handle.origin_world, dtype=float) + axis * displacement_meters
+    return hit - camera_direction, camera_direction
 
 
 # ### Controller integration tests ###
@@ -237,6 +272,345 @@ class SlopedCeilingMainTests(unittest.TestCase):
         return (
             float(np.linalg.norm(corners[1] - corners[0])),
             float(np.linalg.norm(corners[3] - corners[0])),
+        )
+
+    def _use_unequal_parallel_wall_fixture(self) -> tuple[SlopedCeilingEditTarget, ...]:
+        """Expose two unequal reversed walls through the production controller."""
+
+        return self._use_parallel_wall_fixture(
+            _build_unequal_reversed_parallel_wall_level()
+        )
+
+    def _use_parallel_wall_fixture(
+        self,
+        level: LevelData,
+    ) -> tuple[SlopedCeilingEditTarget, ...]:
+        """Install real plan edges and their production slope targets."""
+
+        self.level = level
+        self.workspace.levels = [self.level]
+        self.workspace.current_level_index = 0
+        self.workspace._reset_viewer_doorway_snapshots()
+        self.workspace._sync_level_controls()
+        self.workspace._sync_canvas_to_current_level()
+        self.surfaces = tuple(build_fixed_surfaces((self.level,)))
+        self.workspace._set_canvas_viewer_targets(self.surfaces)
+        self.workspace._canvas_viewer_preview_revision = (
+            self.workspace._viewer_preview_revision
+        )
+        return tuple(
+            target
+            for target in self.workspace._sloped_ceiling_edit_targets_by_key.values()
+            if target.slope_id is None
+        )
+
+    def _drag_slope_handle(
+        self,
+        target: SlopedCeilingEditTarget,
+        handle: SlopedCeilingEditHandle,
+        displacement_meters: float,
+    ) -> None:
+        """Exercise the viewer gesture and its connected controller signals."""
+
+        with patch.object(
+            self.workspace.viewer.view,
+            "build_camera_ray",
+            return_value=_slope_handle_camera_ray(handle, 0.0),
+        ):
+            self.assertTrue(
+                self.workspace.viewer._begin_sloped_ceiling_edit_drag(
+                    target,
+                    handle,
+                    QPointF(),
+                )
+            )
+        with patch.object(
+            self.workspace.viewer.view,
+            "build_camera_ray",
+            return_value=_slope_handle_camera_ray(handle, displacement_meters),
+        ):
+            self.assertTrue(
+                self.workspace.viewer._finish_sloped_ceiling_edit_drag(QPointF())
+            )
+
+    def test_one_wall_creation_selects_peer_and_commits_one_joined_undo(self) -> None:
+        """Starting one green handle must reuse the delayed two-wall workflow."""
+
+        targets = self._use_unequal_parallel_wall_fixture()
+        self.assertEqual(len(targets), 2)
+        target = targets[0]
+        handle = target.handles[0]
+        wall_ids = {item.wall_surface_id for item in targets}
+        viewer = self.workspace.viewer
+        viewer.select_canvas_surface_target(target.wall_surface_id)
+        self.workspace._canvas_undo_stack.clear()
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (target.wall_surface_id,),
+        )
+
+        with patch.object(
+            self.workspace, "_schedule_viewer_preview_refresh"
+        ) as refresh:
+            with patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_slope_handle_camera_ray(handle, 0.0),
+            ):
+                self.assertTrue(
+                    viewer._begin_sloped_ceiling_edit_drag(target, handle, QPointF())
+                )
+            self.assertEqual(set(viewer.get_selected_canvas_surface_ids()), wall_ids)
+            self.assertEqual(
+                viewer.get_active_canvas_surface_id(), target.wall_surface_id
+            )
+            self.assertEqual(set(self.workspace._desired_canvas_surface_ids), wall_ids)
+            self.assertEqual(len(self.workspace._active_sloped_ceiling_edits), 2)
+
+            with patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_slope_handle_camera_ray(handle, 0.8),
+            ):
+                self.assertTrue(viewer._update_sloped_ceiling_edit_drag(QPointF()))
+                self.assertEqual(self.level.sloped_ceilings, [])
+                self.assertEqual(len(viewer._sloped_ceiling_preview_meshes), 2)
+                self.assertTrue(viewer._finish_sloped_ceiling_edit_drag(QPointF()))
+
+            self.assertEqual(len(self.level.sloped_ceilings), 2)
+            group_ids = {slope.joined_group_id for slope in self.level.sloped_ceilings}
+            self.assertEqual(len(group_ids), 1)
+            self.assertNotIn(None, group_ids)
+            self.assertTrue(self.workspace._sloped_ceiling_mesh_update_timer.isActive())
+            self.assertEqual(self.workspace._canvas_undo_stack, [])
+            self.assertEqual(
+                self.workspace._build_viewer_preview_levels()[0].sloped_ceilings,
+                [],
+            )
+            refresh.assert_not_called()
+
+            lengths = {
+                item.wall_surface_id: float(
+                    np.linalg.norm(
+                        np.asarray(item.wall_end_world)
+                        - np.asarray(item.wall_start_world)
+                    )
+                )
+                for item in targets
+            }
+            np.testing.assert_allclose(
+                [
+                    (slope.end_ratio - slope.start_ratio)
+                    * lengths[slope.wall_surface_id]
+                    for slope in self.level.sloped_ceilings
+                ],
+                (4.0, 4.0),
+            )
+            self.workspace._commit_pending_sloped_ceiling_mesh_update()
+            refresh.assert_called_once_with(preserve_camera=True)
+
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+        self.surfaces = tuple(build_fixed_surfaces((self.level,)))
+        self.workspace._set_canvas_viewer_targets(self.surfaces)
+        self.assertEqual(set(viewer.get_selected_canvas_surface_ids()), wall_ids)
+        self.assertEqual(viewer.get_active_canvas_surface_id(), target.wall_surface_id)
+        self.assertEqual(
+            sum(
+                item.slope_id is not None
+                for item in viewer._get_displayed_sloped_ceiling_targets()
+            ),
+            1,
+        )
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self.workspace._handle_canvas_undo_requested()
+        self.assertEqual(self.level.sloped_ceilings, [])
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
+    def test_close_wall_outlines_preview_and_commit_after_actual_delay(self) -> None:
+        """Wall winding must not leave its back outline out of a real gesture."""
+
+        for reverse_second in (False, True):
+            with self.subTest(reverse_second=reverse_second):
+                targets = self._use_parallel_wall_fixture(
+                    _build_close_parallel_wall_level(reverse_second=reverse_second)
+                )
+                self.assertEqual(len(targets), 2)
+                target = targets[0]
+                handle = target.handles[0]
+                wall_ids = {item.wall_surface_id for item in targets}
+                baseline_wall_vertices = {
+                    surface.surface_id: set(
+                        map(tuple, np.round(surface.mesh.vertices, decimals=9))
+                    )
+                    for surface in self.surfaces
+                    if surface.surface_id in wall_ids
+                }
+                self.assertEqual(set(baseline_wall_vertices), wall_ids)
+                viewer = self.workspace.viewer
+                viewer.select_canvas_surface_target(target.wall_surface_id)
+                self.workspace._canvas_undo_stack.clear()
+                self.workspace._set_mesh_edit_update_delay_seconds(0.02)
+
+                with patch.object(
+                    self.workspace, "_schedule_viewer_preview_refresh"
+                ) as refresh:
+                    with patch.object(
+                        viewer.view,
+                        "build_camera_ray",
+                        return_value=_slope_handle_camera_ray(handle, 0.0),
+                    ):
+                        self.assertTrue(
+                            viewer._begin_sloped_ceiling_edit_drag(
+                                target, handle, QPointF()
+                            )
+                        )
+                    self.assertEqual(
+                        set(viewer.get_selected_canvas_surface_ids()), wall_ids
+                    )
+                    self.assertEqual(
+                        len(self.workspace._active_sloped_ceiling_edits), 2
+                    )
+                    with patch.object(
+                        viewer.view,
+                        "build_camera_ray",
+                        return_value=_slope_handle_camera_ray(handle, 0.15),
+                    ):
+                        self.assertTrue(
+                            viewer._update_sloped_ceiling_edit_drag(QPointF())
+                        )
+                        self.assertEqual(self.level.sloped_ceilings, [])
+                        self.assertEqual(
+                            len(viewer._sloped_ceiling_preview_meshes), 2
+                        )
+                        self.assertTrue(
+                            viewer._finish_sloped_ceiling_edit_drag(QPointF())
+                        )
+
+                    self.assertEqual(len(self.level.sloped_ceilings), 2)
+                    self.assertTrue(
+                        self.workspace._sloped_ceiling_mesh_update_timer.isActive()
+                    )
+                    self.assertEqual(self.workspace._canvas_undo_stack, [])
+                    self.assertEqual(
+                        self.workspace._build_viewer_preview_levels()[0].sloped_ceilings,
+                        [],
+                    )
+                    refresh.assert_not_called()
+
+                    # Exercise the connected QTimer, not the private commit helper.
+                    QTest.qWait(100)
+
+                    self.assertFalse(
+                        self.workspace._sloped_ceiling_mesh_update_timer.isActive()
+                    )
+                    self.assertIsNone(
+                        self.workspace._pending_sloped_ceiling_undo_state
+                    )
+                    self.assertFalse(viewer._sloped_ceiling_preview_meshes)
+                    self.assertEqual(
+                        self.workspace._build_viewer_preview_levels()[0].sloped_ceilings,
+                        self.level.sloped_ceilings,
+                    )
+                    refresh.assert_called_once_with(preserve_camera=True)
+
+                self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+                group_ids = {
+                    slope.joined_group_id for slope in self.level.sloped_ceilings
+                }
+                self.assertEqual(len(group_ids), 1)
+                self.assertNotIn(None, group_ids)
+                self.surfaces = tuple(build_fixed_surfaces((self.level,)))
+                updated_wall_vertices = {
+                    surface.surface_id: set(
+                        map(tuple, np.round(surface.mesh.vertices, decimals=9))
+                    )
+                    for surface in self.surfaces
+                    if surface.surface_id in wall_ids
+                }
+                self.assertEqual(set(updated_wall_vertices), wall_ids)
+                for wall_id in wall_ids:
+                    self.assertNotEqual(
+                        updated_wall_vertices[wall_id], baseline_wall_vertices[wall_id]
+                    )
+                self.workspace._set_canvas_viewer_targets(self.surfaces)
+                self.assertEqual(
+                    set(viewer.get_selected_canvas_surface_ids()), wall_ids
+                )
+                self.assertEqual(
+                    sum(
+                        item.slope_id is not None
+                        for item in viewer._get_displayed_sloped_ceiling_targets()
+                    ),
+                    1,
+                )
+                with patch.object(
+                    self.workspace, "_schedule_viewer_preview_refresh"
+                ):
+                    self.workspace._handle_canvas_undo_requested()
+                self.assertEqual(self.level.sloped_ceilings, [])
+
+    def test_one_wall_creation_can_auto_pair_a_second_free_slope_span(self) -> None:
+        """A later green handle must still form a joined pair after rebuilding."""
+
+        targets = self._use_unequal_parallel_wall_fixture()
+        first_target = targets[0]
+        viewer = self.workspace.viewer
+        viewer.select_canvas_surface_target(first_target.wall_surface_id)
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._drag_slope_handle(first_target, first_target.handles[0], 0.8)
+            self.workspace._commit_pending_sloped_ceiling_mesh_update()
+
+            existing_target = next(
+                item
+                for item in self.workspace._sloped_ceiling_edit_targets_by_key.values()
+                if item.wall_surface_id == first_target.wall_surface_id
+                and item.slope_id is not None
+            )
+            lateral_handle = next(
+                item
+                for item in existing_target.handles
+                if item.handle_kind == SLOPED_CEILING_HANDLE_START
+            )
+            self._drag_slope_handle(
+                existing_target,
+                lateral_handle,
+                (0.25 - lateral_handle.value) / lateral_handle.value_per_meter,
+            )
+            self.workspace._commit_pending_sloped_ceiling_mesh_update()
+
+        self.surfaces = tuple(build_fixed_surfaces((self.level,)))
+        self.workspace._set_canvas_viewer_targets(self.surfaces)
+        viewer.select_canvas_surface_target(first_target.wall_surface_id)
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (first_target.wall_surface_id,),
+        )
+        second_target = next(
+            item
+            for item in self.workspace._sloped_ceiling_edit_targets_by_key.values()
+            if item.wall_surface_id == first_target.wall_surface_id
+            and item.slope_id is None
+        )
+        with patch.object(self.workspace, "_schedule_viewer_preview_refresh"):
+            self._drag_slope_handle(second_target, second_target.handles[0], 0.55)
+            self.workspace._commit_pending_sloped_ceiling_mesh_update()
+
+        self.assertEqual(len(self.level.sloped_ceilings), 4)
+        group_ids = {slope.joined_group_id for slope in self.level.sloped_ceilings}
+        self.assertEqual(len(group_ids), 2)
+        self.assertNotIn(None, group_ids)
+        self.assertEqual(
+            set(viewer.get_selected_canvas_surface_ids()),
+            {item.wall_surface_id for item in targets},
+        )
+        self.surfaces = tuple(build_fixed_surfaces((self.level,)))
+        self.workspace._set_canvas_viewer_targets(self.surfaces)
+        self.assertEqual(
+            sum(
+                item.slope_id is not None
+                for item in viewer._get_displayed_sloped_ceiling_targets()
+            ),
+            2,
         )
 
     def test_creation_uses_lightweight_preview_until_delayed_commit(self) -> None:
@@ -1035,7 +1409,7 @@ class SlopedCeilingMainTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(self.workspace.viewer._sloped_ceiling_edit_drag)
-        self.assertTrue(self.workspace._active_sloped_ceiling_edits)
+        self.assertEqual(len(self.workspace._active_sloped_ceiling_edits), 2)
         self.assertIsNone(self.workspace._pending_sloped_ceiling_undo_state)
 
         with patch.object(
@@ -1051,7 +1425,7 @@ class SlopedCeilingMainTests(unittest.TestCase):
             )
 
         self.assertFalse(self.workspace._active_sloped_ceiling_edits)
-        self.assertEqual(len(self.level.sloped_ceilings), 2)
+        self.assertEqual(len(self.level.sloped_ceilings), 3)
 
     def test_second_double_slope_drag_survives_pending_first_pair(self) -> None:
         creation_targets = tuple(

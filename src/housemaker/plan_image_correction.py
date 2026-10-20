@@ -24,10 +24,17 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
+from housemaker.openai_batch import (
+    OpenAIBatchCancelled,
+    OpenAIBatchError,
+    request_luna_batch_response,
+    to_openai_model,
+)
 from housemaker.plan_correction_models import (
     DEFAULT_PLAN_CORRECTION_MODEL,
     OPENAI_PLAN_CORRECTION_MODELS,
     PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+    PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
     PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
     PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
     PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
@@ -235,6 +242,7 @@ def _create_plan_image_editor(model: str) -> ImageEditor:
         return openai_image_edit
     if model in {
         PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+        PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
         PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
     }:
         return partial(openai_responses_image_edit, model=model)
@@ -279,12 +287,15 @@ def _run_correction_pass(
     }
     try:
         if (
-            selected_model == PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
-            and not editor_was_injected
+            selected_model == PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH
+            or (
+                selected_model == PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
+                and not editor_was_injected
+            )
         ):
-            # sd-cli owns a child process and a global inference lock. Keep it
-            # in this QThread so cancellation cannot finish the worker before
-            # the child has terminated and the lock is released.
+            # These backends own cancellable work: a native child/lock or a
+            # remote Batch job. Keep them in this QThread until their cleanup
+            # finishes, including the remote cancellation request for Batch.
             payload = editor(editor_input, **editor_arguments)
         else:
             # Remote calls and explicitly injected editors can be detached so
@@ -372,6 +383,13 @@ def correct_plan_image(
     prepared = _prepare_editor_image(source, output_size)
     key = str(api_key or "").strip()
     active_editor = image_editor or _create_plan_image_editor(selected_model)
+    if selected_model == PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH and image_editor is None:
+        active_editor = partial(
+            active_editor,
+            progress_callback=lambda message, percent: reporter.emit(
+                STAGE_AI_CORRECTION, 20 + round(percent * 0.5), message
+            ),
+        )
     if (
         selected_model in OPENAI_PLAN_CORRECTION_MODELS
         and not key
@@ -699,30 +717,24 @@ def openai_image_edit(
         ) from None
 
 
-def openai_responses_image_edit(
+def build_openai_responses_image_edit_body(
     image_bytes: bytes,
     *,
     model: str,
-    api_key: str,
     prompt: str,
-    output_size: tuple[int, int],
-    cancellation_check: CancellationCheck | None,
+    output_size: tuple[int, int] = (1024, 1024),
     background: str | None = None,
     action: str = "edit",
-) -> bytes:
-    """Use a GPT-5.6 model to direct an image-generation request."""
+) -> dict:
+    """Build the same Responses image body for standard and Batch requests."""
 
     if model not in {
         PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+        PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH,
         PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
     }:
         raise PlanImageCorrectionInferenceError(
             "The selected OpenAI plan correction model is unsupported."
-        )
-    key = str(api_key).strip()
-    if not key:
-        raise PlanImageCorrectionInferenceError(
-            "OpenAI image correction is not configured."
         )
     _validate_output_size(output_size)
     if background not in {None, "auto", "opaque", "transparent"}:
@@ -733,7 +745,6 @@ def openai_responses_image_edit(
         raise PlanImageCorrectionInferenceError(
             "The requested OpenAI image action is unsupported."
         )
-    _raise_if_cancelled(cancellation_check)
     encoded_input = base64.b64encode(bytes(image_bytes)).decode("ascii")
     image_tool = {
         "type": "image_generation",
@@ -745,28 +756,77 @@ def openai_responses_image_edit(
     }
     if background is not None:
         image_tool["background"] = background
-    request_body = json.dumps(
-        {
-            "model": model,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/png;base64,{encoded_input}",
-                            "detail": "original",
-                        },
-                    ],
-                }
-            ],
-            "tools": [image_tool],
-            "tool_choice": {"type": "image_generation"},
-            "store": False,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return {
+        "model": to_openai_model(model),
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{encoded_input}",
+                        "detail": "original",
+                    },
+                ],
+            }
+        ],
+        "tools": [image_tool],
+        "tool_choice": {"type": "image_generation"},
+        "store": False,
+    }
+
+
+def openai_responses_image_edit(
+    image_bytes: bytes,
+    *,
+    model: str,
+    api_key: str,
+    prompt: str,
+    output_size: tuple[int, int],
+    cancellation_check: CancellationCheck | None,
+    background: str | None = None,
+    action: str = "edit",
+    progress_callback: Callable[[str, int], None] | None = None,
+) -> bytes:
+    """Use a GPT-5.6 model through the chosen standard or Batch transport."""
+
+    key = str(api_key).strip()
+    if not key:
+        raise PlanImageCorrectionInferenceError(
+            "OpenAI image correction is not configured."
+        )
+    _raise_if_cancelled(cancellation_check)
+    body = build_openai_responses_image_edit_body(
+        image_bytes,
+        model=model,
+        prompt=prompt,
+        output_size=output_size,
+        background=background,
+        action=action,
+    )
+    if model == PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH:
+        try:
+            parsed = request_luna_batch_response(
+                body,
+                api_key=key,
+                cancellation_check=cancellation_check,
+                progress_callback=(
+                    (lambda message: progress_callback(message, 40))
+                    if progress_callback is not None else None
+                ),
+            )
+            _raise_if_cancelled(cancellation_check)
+            return _decode_openai_image_generation_result(parsed, secrets=(key, prompt))
+        except OpenAIBatchCancelled as error:
+            raise PlanImageCorrectionCancelled(str(error)) from None
+        except OpenAIBatchError as error:
+            raise PlanImageCorrectionInferenceError(str(error)) from None
+        except (UnicodeError, ValueError, KeyError, TypeError):
+            raise PlanImageCorrectionInferenceError(
+                "The Luna Batch image request did not return a usable image."
+            ) from None
+    request_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
     request = Request(
         OPENAI_RESPONSES_URL,
         data=request_body,

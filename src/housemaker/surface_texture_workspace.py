@@ -47,6 +47,7 @@ from housemaker.local_work_scheduler import (
     run_bounded_local_work,
 )
 from housemaker.models import LevelData
+from housemaker.openai_batch import LUNA_BATCH_MODEL
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_LABELS,
@@ -691,8 +692,9 @@ class SurfaceTextureWorker(QObject):
                 )
                 self._request = request
             _raise_surface_worker_cancelled(self._cancel_event)
-            result = _run_interruptible_stage(
-                lambda: _invoke_provider(
+
+            def generate_texture() -> object:
+                return _invoke_provider(
                     self._provider,
                     request,
                     lambda message: self.progress.emit(
@@ -701,6 +703,14 @@ class SurfaceTextureWorker(QObject):
                     ),
                     self._cancel_event,
                 )
+
+            # Batch already runs on this background QThread and cooperatively
+            # cancels its remote job. Keep ownership until that cancellation
+            # completes instead of abandoning it in an interruptible daemon.
+            result = (
+                generate_texture()
+                if request.provider == LUNA_BATCH_MODEL
+                else _run_interruptible_stage(generate_texture)
             )
             if not isinstance(result, SurfaceTextureResult):
                 raise TypeError("The texture provider returned an invalid result.")
@@ -3251,9 +3261,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 thread.quit()
         for job_id, thread in active_jobs:
             while is_valid_qt_object(thread) and thread.isRunning():
-                # Provider calls are isolated in interruptible daemon threads.
-                # Work left directly on this QThread is finite image/file work,
-                # so retain its QObject and wait until it is safe to destroy.
+                # Standard providers are isolated in daemon threads; Batch
+                # finishes its bounded remote cancellation on this QThread.
+                # Retain its QObject until cleanup/image/file work is done.
                 thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
             worker = self._generation_workers.get(job_id)
             if worker is not None and is_valid_qt_object(worker):
@@ -3322,6 +3332,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_texture_provider_combo = QComboBox()
         self.surface_texture_provider_combo.setObjectName(
             "surface_texture_provider_combo"
+        )
+        self.surface_texture_provider_combo.setToolTip(
+            "Luna (Batch API) uses the same OpenAI API key with a 24-hour "
+            "completion window and discounted token rates. It is not an "
+            "interactive-speed request. Image-generation tool charges also apply."
         )
         for label, provider_id in SURFACE_TEXTURE_PROVIDER_OPTIONS:
             self.surface_texture_provider_combo.addItem(label, provider_id)
@@ -5389,6 +5404,7 @@ def _get_provider_display_name(provider: str) -> str:
         "meshy": "Meshy",
         "gpt-4o-mini": "GPT-4o-mini",
         "gpt-5.6-luna": "GPT-5.6 Luna",
+        "gpt-5.6-luna-batch": "GPT-5.6 Luna (Batch API)",
         "gpt-5.6-terra": "GPT-5.6 Terra",
     }
     return names.get(str(provider), str(provider))

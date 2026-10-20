@@ -83,6 +83,7 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.models import LevelData
+from housemaker.openai_batch import LUNA_BATCH_MODEL
 from housemaker.plan_correction_models import PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
 from housemaker.plan_metric_state import (
     PlanMetricCalibration,
@@ -96,7 +97,13 @@ from housemaker.reference_generation_batch import (
     LocalReferenceBatchItem,
 )
 from housemaker.reference_generation_batch import (
+    APIReferenceBatchThread as _APIReferenceBatchThread,
+)
+from housemaker.reference_generation_batch import (
     LocalReferenceBatchThread as _LocalReferenceBatchThread,
+)
+from housemaker.reference_generation_batch import (
+    OpenAIReferenceBatchThread as _OpenAIReferenceBatchThread,
 )
 from housemaker.reference_generation_models import (
     DEFAULT_REFERENCE_NEGATIVE_PROMPT,
@@ -172,6 +179,7 @@ class _CeilingHeightInferenceThread(QThread):
     """Analyze sampled video frames with an independent background reader."""
 
     progress_changed = Signal(int, int, int)
+    status_changed = Signal(str)
 
     def __init__(
         self,
@@ -203,6 +211,11 @@ class _CeilingHeightInferenceThread(QThread):
     def run(self) -> None:  # type: ignore[override]
         try:
             try:
+                from housemaker.openai_batch import LUNA_BATCH_MODEL
+
+                if self._model == LUNA_BATCH_MODEL and self._estimator is None:
+                    self.result = self._run_batch_analysis()
+                    return
                 frame_estimates: list[tuple[int, int, CeilingHeightEstimate]] = []
                 previous_frame: np.ndarray | None = None
                 previous_range_index: int | None = None
@@ -323,6 +336,87 @@ class _CeilingHeightInferenceThread(QThread):
         finally:
             self._api_key = ""
             self._video_path = ""
+
+    def _run_batch_analysis(self) -> CeilingHeightAnalysisResult:
+        """Queue every explicit frame pair together, not one 24-hour job per pair."""
+
+        from housemaker.ceiling_height_estimation import (
+            build_ceiling_height_batch_request,
+            infer_ceiling_height_batch,
+        )
+
+        contexts = dict(self._level_plan_contexts)
+        plan_images: dict[int, str] = {}
+        for source in self._level_plan_sources:
+            if self.isInterruptionRequested():
+                raise CeilingHeightEstimationCancelled("Cancelled")
+            try:
+                plan_images[source.level_index] = build_ceiling_height_plan_image_data_uri(
+                    source.image_path, source.calibration
+                )
+            except CeilingHeightEstimationError:
+                continue
+        requests = {}
+        previous_frame: np.ndarray | None = None
+        previous_range: int | None = None
+        total = len(self._frame_samples)
+        with VideoFrameSource(self._video_path) as source:
+            for prepared, (frame_index, level_index) in enumerate(self._frame_samples, 1):
+                if self.isInterruptionRequested():
+                    raise CeilingHeightEstimationCancelled("Cancelled")
+                current_frame = source.get_frame(frame_index)
+                range_index = next(
+                    index for index, interval in enumerate(self._marked_ranges)
+                    if interval.level_index == level_index
+                    and interval.start_frame <= frame_index <= interval.end_frame
+                )
+                if range_index != previous_range:
+                    previous_frame = None
+                plan_image = plan_images.get(level_index)
+                requests[str(prepared)] = build_ceiling_height_batch_request(
+                    current_frame,
+                    previous_frame_bgr=previous_frame,
+                    plan_context=contexts.get(level_index, "") if plan_image else "",
+                    plan_image_data_uri=plan_image,
+                )
+                previous_frame = current_frame
+                previous_range = range_index
+                self.status_changed.emit(
+                    f"Preparing GPT-5.6 Luna Batch API frame intervals {prepared} of {total}"
+                )
+        results = infer_ceiling_height_batch(
+            requests,
+            api_key=self._api_key,
+            cancellation_check=self.isInterruptionRequested,
+            progress_callback=self.status_changed.emit,
+        )
+        frame_estimates = []
+        consecutive_failures = 0
+        for completed, (frame_index, level_index) in enumerate(self._frame_samples, 1):
+            if self.isInterruptionRequested():
+                raise CeilingHeightEstimationCancelled("Cancelled")
+            estimate = results.get(str(completed))
+            if isinstance(estimate, CeilingHeightEstimationError):
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_CEILING_HEIGHT_FRAME_FAILURES:
+                    raise estimate
+                estimate = CeilingHeightEstimate(
+                    status="insufficient_evidence", estimate_m=None,
+                    minimum_m=None, maximum_m=None, confidence="low",
+                    basis=f"This sampled frame could not be analysed: {estimate}",
+                    level_movement="uncertain", movement_confidence="low",
+                )
+            elif estimate is None:
+                raise CeilingHeightEstimationError(
+                    "GPT-5.6 Luna Batch API omitted a sampled frame interval."
+                )
+            else:
+                consecutive_failures = 0
+            frame_estimates.append((level_index, frame_index, estimate))
+            self.progress_changed.emit(completed, total, frame_index)
+        return aggregate_marked_level_ceiling_height_estimates(
+            frame_estimates, levels=self._level_options
+        )
 
 
 @dataclass
@@ -1879,8 +1973,9 @@ class MergedGenerationWorkspace(QWidget):
         single_signature = self._reference_generation_context_signature() if single_retry is not None else None
         if self._reference_generation_model in {
             PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1, REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
-        }:
-            self._start_local_reference_batch(inputs, prompt, api_key, single_retry, single_signature, reference_options)
+            LUNA_BATCH_MODEL,
+        } or self._reference_symmetry_model() == LUNA_BATCH_MODEL:
+            self._start_shared_reference_batch(inputs, prompt, api_key, single_retry, single_signature, reference_options)
             return
         for ordinal, (key, current_source) in enumerate(inputs, start=1):
             retry = self._batch_reference_retry_sources.get(key)
@@ -2057,13 +2152,17 @@ class MergedGenerationWorkspace(QWidget):
             self._update_batch_reference_status()
             self._sync_reference_generation_controls()
 
-    # ### Resident local batch integration ###
-    def _start_local_reference_batch(
+    # ### Resident local and remote OpenAI batch integration ###
+    def _start_shared_reference_batch(
         self, inputs, prompt, api_key, single_retry, single_signature, reference_options,
     ) -> None:
-        """Snapshot all inputs, then let one worker own both model phases."""
+        """Snapshot all inputs for one shared local session or remote batch."""
 
         objects = self.object_workspace
+        remote_batch = self._reference_generation_model == LUNA_BATCH_MODEL
+        local_images = self._reference_generation_model in {
+            PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1, REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
+        }
         queued = []
         for ordinal, (key, current_source) in enumerate(inputs, start=1):
             retry = self._batch_reference_retry_sources.get(key)
@@ -2076,10 +2175,18 @@ class MergedGenerationWorkspace(QWidget):
             job = self.job_manager.create_job(
                 kind=REFERENCE_GENERATION_JOB_KIND, requested_name="",
                 default_name=f"Object reference {ordinal} (frame {key[0] + 1})",
-                stage="Queued local reference generation",
+                stage=(
+                    "Queued OpenAI Batch reference generation (up to 24 hours)"
+                    if remote_batch else "Queued reference generation"
+                ),
             )
             queued.append((job.job_id, key, np.ascontiguousarray(source).copy(), current_source))
-        thread = _LocalReferenceBatchThread(
+        worker_class = (
+            _OpenAIReferenceBatchThread if remote_batch
+            else _LocalReferenceBatchThread if local_images
+            else _APIReferenceBatchThread
+        )
+        thread = worker_class(
             tuple(LocalReferenceBatchItem(job_id, source, reference_options[key][0])
                   for job_id, key, source, _ in queued),
             self._reference_generation_model, self._reference_symmetry_model(),
@@ -2106,13 +2213,24 @@ class MergedGenerationWorkspace(QWidget):
             if thread.symmetry_model is not None else "symmetry inference disabled"
         )
         self.reference_generation_status_label.setText(
-            f"Queued {len(queued)} local references; {phases}."
+            (
+                f"Queued {len(queued)} OpenAI Batch references (up to 24 hours); "
+                "keep the app open. Cancelling one item ignores its result; "
+                "submitted requests may still be billed. Cancel all requests remote cancellation."
+                if remote_batch
+                else (
+                    f"Queued {len(queued)} references; symmetry uses OpenAI Batch "
+                    "(up to 24 hours). Keep the app open."
+                    if thread.symmetry_model == LUNA_BATCH_MODEL
+                    else f"Queued {len(queued)} local references; {phases}."
+                )
+            )
         )
         self._sync_reference_generation_controls()
         try:
             thread.start()
         except RuntimeError as error:
-            thread.error_message = f"The local reference worker could not start: {error}"
+            thread.error_message = f"The reference batch worker could not start: {error}"
             self._handle_local_reference_batch_finished(thread)
 
     def _matching_local_reference_runtime(self, job_id):
@@ -2917,7 +3035,11 @@ class MergedGenerationWorkspace(QWidget):
         initial_stage = (
             "Loading local Qwen model"
             if uses_local_model
-            else f"Analysing 0 of {len(frame_indices):,} frame intervals"
+            else (
+                "Preparing OpenAI Batch analysis (up to 24 hours; keep the app open)"
+                if model == LUNA_BATCH_MODEL
+                else f"Analysing 0 of {len(frame_indices):,} frame intervals"
+            )
         )
         job = self.job_manager.create_job(
             kind=CEILING_HEIGHT_JOB_KIND,
@@ -2955,6 +3077,12 @@ class MergedGenerationWorkspace(QWidget):
                 thread,
             )
         )
+        status_signal = getattr(thread, "status_changed", None)
+        if status_signal is not None:
+            status_signal.connect(partial(
+                self._handle_ceiling_height_inference_status,
+                job.job_id, thread,
+            ))
         self.ceiling_height_result_label.setText(
             "Ceiling height: Loading local Qwen model..."
             if uses_local_model
@@ -3013,6 +3141,19 @@ class MergedGenerationWorkspace(QWidget):
                 total_frames,
                 current_frame=current_frame,
             )
+
+    def _handle_ceiling_height_inference_status(
+        self, job_id: str, thread: _CeilingHeightInferenceThread, stage: str,
+    ) -> None:
+        """Expose remote Batch queuing and progress without blocking the editor."""
+
+        runtime = self._ceiling_height_runtime
+        if runtime is None or runtime.job_id != job_id or runtime.thread is not thread:
+            return
+        self.job_manager.update_job(job_id, stage=stage)
+        self.ceiling_height_result_label.setText(f"Ceiling height: {stage}")
+        if self._ceiling_height_dialog is not None:
+            self._ceiling_height_dialog.set_result(stage)
 
     def _handle_ceiling_height_inference_finished(
         self,

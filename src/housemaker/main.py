@@ -863,6 +863,8 @@ class _PlanWallPreviewSession:
 class _WallVerificationThread(QThread):
     """Review an immutable confirmed wall layout without blocking the GUI."""
 
+    progress_changed = Signal(str)
+
     def __init__(
         self,
         image_path: Path,
@@ -895,6 +897,7 @@ class _WallVerificationThread(QThread):
                 model=self._model,
                 excluded_polygons=self._excluded_polygons,
                 cancellation_check=self.isInterruptionRequested,
+                progress_callback=self.progress_changed.emit,
             )
         except Exception as error:  # noqa: BLE001 - worker boundary.
             if self.isInterruptionRequested():
@@ -22041,6 +22044,9 @@ class BlueprintWorkspace(QWidget):
         self._wall_verification_runtimes[job.job_id] = runtime
         self._wall_verification_active_job_id = job.job_id
         self.job_manager.set_cancel_callback(job.job_id, self._dismiss_wall_verification)
+        thread.progress_changed.connect(
+            partial(self._handle_wall_verification_progress, job.job_id, thread)
+        )
         thread.finished.connect(
             partial(self._handle_wall_verification_finished, job.job_id, thread)
         )
@@ -22051,6 +22057,30 @@ class BlueprintWorkspace(QWidget):
         self._update_plan_wall_generation_controls_state()
         self._update_image_correction_button_state()
         thread.start()
+
+    def _handle_wall_verification_progress(
+        self,
+        job_id: str,
+        thread: _WallVerificationThread,
+        message: str,
+    ) -> None:
+        """Keep queued Batch status visible without reviving stale reviews."""
+
+        runtime = self._wall_verification_runtimes.get(job_id)
+        if (
+            self._is_shutdown
+            or runtime is None
+            or runtime.thread is not thread
+            or runtime.cancel_requested
+            or job_id != self._wall_verification_active_job_id
+            or not self._wall_verification_context_is_current(runtime)
+        ):
+            return
+        stage = str(message).strip()
+        if not stage:
+            return
+        self.job_manager.update_job(job_id, stage=stage)
+        self.plan_wall_generation_status_label.setText(stage)
 
     def _handle_wall_verification_finished(
         self,

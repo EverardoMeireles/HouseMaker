@@ -27,6 +27,12 @@ from housemaker.wall_llm_verification import (
 
 
 # ### Test doubles ###
+class _FakeProgressSignal(wall_fixtures._FakeSignal):
+    def emit(self, message: str) -> None:
+        for slot in tuple(self._slots):
+            slot(message)
+
+
 class _FakeVerificationThread(wall_fixtures._FakeWallDetectionThread):
     """A controllable semantic review that never calls a paid provider."""
 
@@ -48,6 +54,7 @@ class _FakeVerificationThread(wall_fixtures._FakeWallDetectionThread):
         self.model = model
         self.excluded_polygons = excluded_polygons
         self.result: WallVerificationResult | None = None
+        self.progress_changed = _FakeProgressSignal()
 
 
 # ### Main-workspace integration tests ###
@@ -86,6 +93,28 @@ class WallVerificationMainTests(unittest.TestCase):
         self.workspace._handle_generate_walls_clicked()
         self.assertEqual(len(_FakeVerificationThread.instances), 1)
         return _FakeVerificationThread.instances[0]
+
+    def test_batch_progress_updates_active_job_and_status(self) -> None:
+        thread = self._confirm_with_review()
+        job_id = self.workspace._wall_verification_active_job_id
+
+        thread.progress_changed.emit("Luna Batch: in_progress; completion window up to 24 hours.")
+
+        self.assertIn("24 hours", self.workspace.job_manager.get_job(job_id).stage)
+        self.assertIn("24 hours", self.workspace.plan_wall_generation_status_label.text())
+
+    def test_old_batch_progress_cannot_replace_a_new_review(self) -> None:
+        old_thread = self._confirm_with_review()
+        self.workspace._dismiss_wall_verification()
+        self.workspace._start_wall_verification()
+        next_job_id = self.workspace._wall_verification_active_job_id
+        stage = self.workspace.job_manager.get_job(next_job_id).stage
+        label = self.workspace.plan_wall_generation_status_label.text()
+
+        old_thread.progress_changed.emit("Stale Batch progress")
+
+        self.assertEqual(self.workspace.job_manager.get_job(next_job_id).stage, stage)
+        self.assertEqual(self.workspace.plan_wall_generation_status_label.text(), label)
 
     def _result(self, thread: _FakeVerificationThread) -> WallVerificationResult:
         first, second = thread.vertex_data.vertices[-2:]

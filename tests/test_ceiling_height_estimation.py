@@ -539,6 +539,7 @@ class CeilingHeightRequestTests(unittest.TestCase):
             CEILING_HEIGHT_MODEL_OPTIONS,
             (
                 ("GPT-5.6 Luna", "gpt-5.6-luna"),
+                ("GPT-5.6 Luna (Batch API)", "gpt-5.6-luna-batch"),
                 ("GPT-5.6 Terra", "gpt-5.6-terra"),
                 ("Qwen3-VL 8B (Local)", LOCAL_QWEN_CEILING_HEIGHT_MODEL),
             ),

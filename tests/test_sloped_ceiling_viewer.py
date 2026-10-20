@@ -33,7 +33,11 @@ from housemaker.sloped_ceiling import (
     SlopedCeilingEditTarget,
 )
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
-from housemaker.viewer import SLOPED_CEILING_HANDLE_COLORS, GlbViewerWidget
+from housemaker.viewer import (
+    SLOPED_CEILING_HANDLE_COLORS,
+    GlbViewerWidget,
+    _get_sloped_ceiling_creation_peer_distance,
+)
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -264,6 +268,107 @@ def _ray_at_z(z: float) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _build_parallel_wall_target(
+    surface_id: str,
+    y: float,
+    *,
+    inward_y: float,
+    existing: bool = False,
+) -> tuple[FixedSurface, SlopedCeilingEditTarget]:
+    """Place a realistic parallel wall and its controls across the room."""
+
+    source = _build_wall(surface_id)
+    mesh = source.mesh.copy()
+    mesh.apply_translation((0.0, y, 0.0))
+    wall = replace(
+        source,
+        mesh=mesh,
+        wall_start_world=(0.0, y, 0.0),
+        wall_end_world=(4.0, y, 0.0),
+    )
+    target = _build_target(wall, existing=existing)
+    target = replace(
+        target,
+        wall_start_world=wall.wall_start_world,
+        wall_end_world=wall.wall_end_world,
+        inward_world=(0.0, inward_y, 0.0),
+        selection_edge_start_world=(0.0, y, 3.0),
+        selection_edge_end_world=(4.0, y, 3.0),
+        handles=tuple(
+            replace(handle, origin_world=(2.0, y, 3.0), axis_world=(0.0, inward_y, 0.0))
+            for handle in target.handles
+        ),
+    )
+    return wall, target
+
+
+# ### Automatic slope pairing geometry tests ###
+class SlopedCeilingCreationPeerTests(unittest.TestCase):
+    def test_only_parallel_same_level_overlapping_walls_are_eligible(
+        self,
+    ) -> None:
+        _wall, reference = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        _wall, peer = _build_parallel_wall_target("wall:second", 2.0, inward_y=-1.0)
+        self.assertEqual(
+            _get_sloped_ceiling_creation_peer_distance(reference, peer), 2.0
+        )
+        rejected = {
+            "existing slope": replace(peer, slope_id="existing"),
+            "other level": replace(peer, level_index=1),
+            "different ceiling": replace(peer, ceiling_z_meters=4.0),
+            "different base": replace(
+                peer,
+                wall_start_world=(0.0, 2.0, 1.0),
+                wall_end_world=(4.0, 2.0, 1.0),
+            ),
+            "collinear": replace(
+                peer,
+                wall_start_world=(0.0, 0.0, 0.0),
+                wall_end_world=(4.0, 0.0, 0.0),
+            ),
+            "perpendicular": replace(peer, wall_end_world=(0.0, 6.0, 0.0)),
+            "disjoint span": replace(
+                peer,
+                selection_edge_start_world=(5.0, 2.0, 3.0),
+                selection_edge_end_world=(9.0, 2.0, 3.0),
+            ),
+        }
+        for name, candidate in rejected.items():
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    _get_sloped_ceiling_creation_peer_distance(reference, candidate)
+                )
+
+    def test_physical_back_wall_is_eligible_regardless_of_inward_sign_or_winding(
+        self,
+    ) -> None:
+        _wall, reference = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        for y in (-0.075, 0.075):
+            for inward_y in (-1.0, 1.0):
+                with self.subTest(y=y, inward_y=inward_y):
+                    _wall, peer = _build_parallel_wall_target(
+                        "wall:back", y, inward_y=inward_y
+                    )
+                    self.assertAlmostEqual(
+                        _get_sloped_ceiling_creation_peer_distance(reference, peer),
+                        0.075,
+                    )
+
+    def test_reversed_unequal_walls_remain_eligible(self) -> None:
+        _wall, reference = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        _wall, peer = _build_parallel_wall_target("wall:second", 2.0, inward_y=-1.0)
+        peer = replace(
+            peer,
+            wall_start_world=(5.0, 2.0, 0.0),
+            wall_end_world=(0.0, 2.0, 0.0),
+            selection_edge_start_world=(5.0, 2.0, 3.0),
+            selection_edge_end_world=(0.0, 2.0, 3.0),
+        )
+        self.assertEqual(
+            _get_sloped_ceiling_creation_peer_distance(reference, peer), 2.0
+        )
+
+
 # ### Viewer tests ###
 class SlopedCeilingViewerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -294,6 +399,139 @@ class SlopedCeilingViewerTests(unittest.TestCase):
         self.assertEqual(
             SLOPED_CEILING_HANDLE_COLORS[SLOPED_CEILING_HANDLE_DEPTH],
             SLOPED_CEILING_HANDLE_COLORS[SLOPED_CEILING_HANDLE_WALL_DROP],
+        )
+
+    def test_one_wall_green_drag_selects_nearest_peer_and_keeps_primary_active(
+        self,
+    ) -> None:
+        wall, target = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        near_wall, near_target = _build_parallel_wall_target(
+            "wall:near", -0.075, inward_y=1.0
+        )
+        far_wall, far_target = _build_parallel_wall_target(
+            "wall:far", 4.0, inward_y=-1.0
+        )
+        viewer = self._build_viewer(target)
+        viewer.set_wall_targets((wall, far_wall, near_wall))
+        viewer.set_sloped_ceiling_edit_targets((target, far_target, near_target))
+        viewer.set_selected_canvas_surface_ids((wall.surface_id,))
+        started: list[object] = []
+        finished: list[object] = []
+        viewer.sloped_ceiling_edit_started.connect(started.append)
+        viewer.sloped_ceiling_edit_finished.connect(
+            lambda edits, _changed: finished.append(edits)
+        )
+        self.assertEqual(viewer.get_selected_canvas_surface_ids(), (wall.surface_id,))
+        handle = target.handles[0]
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(np.asarray((2.0, 0.0, 5.0)), np.asarray((0.0, 0.0, -1.0))),
+        ):
+            self.assertTrue(
+                viewer._begin_sloped_ceiling_edit_drag(target, handle, QPointF())
+            )
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (near_wall.surface_id, wall.surface_id),
+        )
+        self.assertEqual(
+            viewer.get_selected_sloped_ceiling_wall_surface_id(), wall.surface_id
+        )
+        self.assertEqual(len(started[0]), 2)
+        self.assertEqual(viewer._get_displayed_sloped_ceiling_targets(), (target,))
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=(np.asarray((2.0, 0.7, 5.0)), np.asarray((0.0, 0.0, -1.0))),
+        ):
+            self.assertTrue(viewer._finish_sloped_ceiling_edit_drag(QPointF()))
+        self.assertEqual(len(finished[0]), 2)
+        np.testing.assert_allclose([edit.value for edit in finished[0]], (1.2, 1.2))
+
+    def test_auto_pair_prefers_largest_overlap_on_nearest_wall_plane(self) -> None:
+        wall, target = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        stub_wall, stub = _build_parallel_wall_target(
+            "wall:aaa-stub", -0.075, inward_y=1.0
+        )
+        stub = replace(
+            stub,
+            wall_end_world=(0.05, -0.075, 0.0),
+            selection_edge_end_world=(0.05, -0.075, 3.0),
+        )
+        peer_wall, peer = _build_parallel_wall_target(
+            "wall:zzz-main", -0.07500000001, inward_y=1.0
+        )
+        viewer = self._build_viewer(target)
+        viewer.set_wall_targets((wall, stub_wall, peer_wall))
+        viewer.set_sloped_ceiling_edit_targets((target, stub, peer))
+        viewer.set_selected_canvas_surface_ids((wall.surface_id,))
+        viewer._select_sloped_ceiling_creation_peer(target, target.handles[0])
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (peer_wall.surface_id, wall.surface_id),
+        )
+
+    def test_auto_pair_does_not_expand_existing_or_manual_multiwall_selection(
+        self,
+    ) -> None:
+        wall, target = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        peer_wall, peer = _build_parallel_wall_target("wall:peer", 2.0, inward_y=-1.0)
+        far_wall, far = _build_parallel_wall_target("wall:far", 4.0, inward_y=-1.0)
+        viewer = self._build_viewer(target)
+        viewer.set_wall_targets((wall, peer_wall, far_wall))
+        viewer.set_sloped_ceiling_edit_targets((target, peer, far))
+        viewer.set_selected_canvas_surface_ids((wall.surface_id, far_wall.surface_id))
+        viewer._select_sloped_ceiling_creation_peer(target, target.handles[0])
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (wall.surface_id, far_wall.surface_id),
+        )
+        existing = _build_target(wall, existing=True)
+        viewer.set_sloped_ceiling_edit_targets((existing, peer, far))
+        viewer.set_selected_canvas_surface_ids((wall.surface_id,))
+        viewer._select_sloped_ceiling_creation_peer(existing, existing.handles[0])
+        self.assertEqual(viewer.get_selected_canvas_surface_ids(), (wall.surface_id,))
+
+    def test_failed_gizmo_pick_does_not_select_a_peer(self) -> None:
+        wall, target = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        peer_wall, peer = _build_parallel_wall_target("wall:peer", 2.0, inward_y=-1.0)
+        viewer = self._build_viewer(target)
+        viewer.set_wall_targets((wall, peer_wall))
+        viewer.set_sloped_ceiling_edit_targets((target, peer))
+        viewer.set_selected_canvas_surface_ids((wall.surface_id,))
+        with patch.object(viewer.view, "build_camera_ray", return_value=None):
+            self.assertFalse(
+                viewer._begin_sloped_ceiling_edit_drag(
+                    target, target.handles[0], QPointF()
+                )
+            )
+        self.assertEqual(viewer.get_selected_canvas_surface_ids(), (wall.surface_id,))
+
+    def test_auto_pair_keeps_selected_child_active_and_skips_invisible_walls(self) -> None:
+        wall, target = _build_parallel_wall_target("wall:first", 0.0, inward_y=1.0)
+        child = _build_child_wall(wall)
+        hidden_wall, hidden_target = _build_parallel_wall_target(
+            "wall:hidden", 1.0, inward_y=-1.0
+        )
+        peer_wall, peer = _build_parallel_wall_target("wall:peer", 2.0, inward_y=-1.0)
+        viewer = self._build_viewer(target)
+        viewer.set_wall_targets((wall, child, hidden_wall, peer_wall))
+        viewer.set_sloped_ceiling_edit_targets((target, hidden_target, peer))
+        viewer.select_canvas_surface_target(child.surface_id)
+        with patch.object(
+            viewer,
+            "_canvas_surface_is_visible",
+            side_effect=lambda surface: surface.surface_id != hidden_wall.surface_id,
+        ):
+            viewer._select_sloped_ceiling_creation_peer(target, target.handles[0])
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (peer_wall.surface_id, child.surface_id),
+        )
+        self.assertEqual(viewer.get_active_canvas_surface_id(), child.surface_id)
+        self.assertEqual(
+            viewer.get_selected_sloped_ceiling_wall_surface_id(), wall.surface_id
         )
 
     def test_wall_body_selection_immediately_exposes_creation_handle(self) -> None:

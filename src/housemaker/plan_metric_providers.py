@@ -10,6 +10,13 @@ from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from housemaker.openai_batch import (
+    LUNA_BATCH_MODEL,
+    OpenAIBatchCancelled,
+    OpenAIBatchError,
+    request_luna_batch_response,
+    to_openai_model,
+)
 from housemaker.plan_correction_models import (
     PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
     PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
@@ -89,6 +96,7 @@ def plan_measurement_model_for_correction_model(
         return PLAN_CORRECTION_MODEL_GPT_5_6_LUNA
     if selected_model in {
         PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+        LUNA_BATCH_MODEL,
         PLAN_CORRECTION_MODEL_GPT_5_6_TERRA,
         PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
     }:
@@ -186,6 +194,13 @@ class OpenAIPlanMeasurementAnalyzer:
             result_schema=result_schema,
             model=self._model,
         )
+        if self._model == LUNA_BATCH_MODEL:
+            return _request_batch_measurements(
+                request_body,
+                api_key=self._api_key,
+                cancellation_check=cancellation_check,
+                opener=self._opener,
+            )
         transport_cancelled = threading.Event()
 
         def request_measurements() -> object:
@@ -239,6 +254,13 @@ class OpenAIMultiPlanMeasurementAnalyzer:
             result_schema=result_schema,
             model=self._model,
         )
+        if self._model == LUNA_BATCH_MODEL:
+            return _request_batch_measurements(
+                request_body,
+                api_key=self._api_key,
+                cancellation_check=cancellation_check,
+                opener=self._opener,
+            )
         transport_cancelled = threading.Event()
 
         def request_measurements() -> object:
@@ -604,7 +626,7 @@ def _build_openai_request_body(
     )
     _append_openai_detail_images(content, detail_images)
     return {
-        "model": model,
+        "model": to_openai_model(model),
         "store": False,
         "reasoning": {"effort": "none"},
         "input": [
@@ -719,7 +741,7 @@ def _build_openai_multi_plan_request_body(
         )
         _append_openai_detail_images(content, pair.detail_images, plan_id=pair.plan_id)
     return {
-        "model": str(model).strip(),
+        "model": to_openai_model(str(model).strip()),
         "store": False,
         "reasoning": {"effort": "none"},
         "input": [{"role": "user", "content": content}],
@@ -773,6 +795,38 @@ def _append_openai_detail_images(
 
 
 # ### OpenAI transport ###
+def _request_batch_measurements(
+    request_body: Mapping[str, Any],
+    *,
+    api_key: str,
+    cancellation_check: CancellationCheck | None,
+    opener: UrlOpenFunction,
+) -> object:
+    """Keep the Batch wait cancellable without a regular transport lock."""
+
+    try:
+        envelope = request_luna_batch_response(
+            request_body,
+            api_key=api_key,
+            cancellation_check=cancellation_check,
+            opener=opener,
+        )
+        result = json.loads(_extract_openai_output_text(envelope))
+        if not isinstance(result, Mapping):
+            raise PlanMetricCalibrationInferenceError(
+                "GPT-5.6 Luna Batch API returned an invalid plan transcription."
+            )
+        return result
+    except OpenAIBatchCancelled as error:
+        raise PlanMetricCalibrationCancelled(str(error)) from None
+    except OpenAIBatchError as error:
+        raise PlanMetricCalibrationInferenceError(str(error)) from None
+    except (ValueError, TypeError):
+        raise PlanMetricCalibrationInferenceError(
+            "GPT-5.6 Luna Batch API returned unusable plan transcription JSON."
+        ) from None
+
+
 def _request_openai_measurements(
     request_body: Mapping[str, Any],
     *,

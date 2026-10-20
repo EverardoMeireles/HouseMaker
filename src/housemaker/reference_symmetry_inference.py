@@ -17,14 +17,24 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
+from housemaker.openai_batch import (
+    LUNA_BATCH_MODEL,
+    OpenAIBatchCancelled,
+    OpenAIBatchError,
+    request_luna_batch_response,
+    run_responses_batch,
+)
+
 # ### Constants ###
 SYMMETRY_MODEL_QWEN = "qwen3-vl-8b-local"
 SYMMETRY_MODEL_REFLECT3D = "reflect3d-local"
 SYMMETRY_MODEL_LUNA = "gpt-5.6-luna"
+SYMMETRY_MODEL_LUNA_BATCH = LUNA_BATCH_MODEL
 SYMMETRY_INFERENCE_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Local Qwen", SYMMETRY_MODEL_QWEN),
     ("Reflect3D", SYMMETRY_MODEL_REFLECT3D),
     ("GPT-5.6 Luna", SYMMETRY_MODEL_LUNA),
+    ("GPT-5.6 Luna (Batch API)", SYMMETRY_MODEL_LUNA_BATCH),
 )
 DEFAULT_SYMMETRY_INFERENCE_MODEL = SYMMETRY_MODEL_REFLECT3D
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -146,6 +156,8 @@ def infer_reference_symmetry(
                     image_data_uri,
                     api_key=api_key,
                     cancellation_check=cancellation_check,
+                    model=model,
+                    progress_callback=progress_callback,
                 )
         _raise_if_cancelled(cancellation_check)
         result = parse_symmetry_result(payload, model=model)
@@ -166,6 +178,62 @@ def infer_reference_symmetry(
         raise SymmetryInferenceError(
             f"{model} symmetric division inference failed. No other model was used."
         ) from None
+
+
+# ### Grouped Batch API inference ###
+def infer_reference_symmetry_batch(
+    images: Mapping[str, np.ndarray],
+    *,
+    api_key: str,
+    cancellation_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, SymmetryInferenceResult | SymmetryInferenceError]:
+    """Review all generated references in one Luna Batch API submission."""
+
+    _raise_if_cancelled(cancellation_check)
+    requests = {}
+    for identifier, image in images.items():
+        _raise_if_cancelled(cancellation_check)
+        requests[identifier] = build_symmetry_request_body(
+            _encode_image_data_uri(_normalize_image(image))
+        )
+    started = time.monotonic()
+    try:
+        responses = run_responses_batch(
+            requests,
+            api_key=api_key,
+            cancellation_check=cancellation_check,
+            progress_callback=progress_callback,
+        )
+    except OpenAIBatchCancelled as error:
+        raise SymmetryInferenceCancelled(str(error)) from None
+    except OpenAIBatchError as error:
+        raise SymmetryInferenceError(_redact_secrets(str(error), api_key)) from None
+    results: dict[str, SymmetryInferenceResult | SymmetryInferenceError] = {}
+    for identifier, response in responses.items():
+        _raise_if_cancelled(cancellation_check)
+        if response.error:
+            results[identifier] = SymmetryInferenceError(
+                _redact_secrets(str(response.error), api_key)
+            )
+            continue
+        try:
+            result = parse_symmetry_result(
+                json.loads(_extract_luna_text(response.body)),
+                model=SYMMETRY_MODEL_LUNA_BATCH,
+            )
+            results[identifier] = replace(
+                result,
+                reason=_redact_secrets(result.reason, api_key),
+                elapsed_seconds=max(0.0, time.monotonic() - started),
+            )
+        except SymmetryInferenceError as error:
+            results[identifier] = error
+        except (ValueError, TypeError):
+            results[identifier] = SymmetryInferenceError(
+                "GPT-5.6 Luna Batch API returned unusable symmetry JSON."
+            )
+    return results
 
 
 # ### Reusable local model sessions ###
@@ -293,6 +361,8 @@ class ReferenceSymmetrySession:
             _encode_image_data_uri(image),
             api_key=self._api_key,
             cancellation_check=self._is_cancelled,
+            model=self.model,
+            progress_callback=self._report_progress,
         )
 
     def _infer_qwen(self, image: np.ndarray) -> object:
@@ -527,6 +597,8 @@ def _infer_with_luna(
     *,
     api_key: str,
     cancellation_check: Callable[[], bool] | None,
+    model: str = SYMMETRY_MODEL_LUNA,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> object:
     key = str(api_key).strip()
     if not key:
@@ -535,6 +607,23 @@ def _infer_with_luna(
             "for symmetric division inference."
         )
     request_body = build_symmetry_request_body(image_data_uri)
+    if model == SYMMETRY_MODEL_LUNA_BATCH:
+        try:
+            envelope = request_luna_batch_response(
+                request_body,
+                api_key=key,
+                cancellation_check=cancellation_check,
+                progress_callback=progress_callback,
+            )
+            return json.loads(_extract_luna_text(envelope))
+        except OpenAIBatchCancelled as error:
+            raise SymmetryInferenceCancelled(str(error)) from None
+        except OpenAIBatchError as error:
+            raise SymmetryInferenceError(_redact_secrets(str(error), key)) from None
+        except (ValueError, TypeError):
+            raise SymmetryInferenceError(
+                "GPT-5.6 Luna Batch API returned unusable symmetry JSON."
+            ) from None
     transport_cancelled = threading.Event()
 
     def operation() -> object:
