@@ -114,6 +114,7 @@ from housemaker.glb import (
     PreviewTexturedWall,
     remove_covered_surface_faces,
 )
+from housemaker.global_scale import GlobalScale
 from housemaker.landing_geometry import build_landing_meshes, landing_world_transform
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
@@ -1242,6 +1243,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     first_person_camera_pose_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        self._global_scale = GlobalScale()
         super().__init__(parent)
         self.click_press_position = QPointF()
         self._is_middle_navigation_active = False
@@ -1291,6 +1293,138 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.setMouseTracking(True)
         self._update_navigation_tooltip()
 
+    # ### Global building scale and canonical edit coordinates ###
+    def get_global_scale(self) -> GlobalScale:
+        """Return the building transform; editable geometry remains unscaled."""
+
+        return self._global_scale
+
+    def set_global_scale(self, scale: GlobalScale) -> None:
+        """Scale rendering once while keeping picking in canonical coordinates."""
+
+        if not isinstance(scale, GlobalScale):
+            raise TypeError("Global scale must be a GlobalScale.")
+        if scale == self._global_scale:
+            return
+        self._global_scale = scale
+        self.apply_navigation_camera()
+        self.update()
+
+    def viewMatrix(self):  # type: ignore[override]
+        """Compose physical camera placement with the canonical building scale."""
+
+        matrix = super().viewMatrix()
+        factors = np.asarray(self._global_scale.factors, dtype=float)
+        center = self.opts["center"]
+        # The orbit pivot belongs to the building, while distance and camera
+        # angles remain physical. Every GL item and CPU projection shares this.
+        matrix.translate(
+            center.x() * (1.0 - factors[0]),
+            center.y() * (1.0 - factors[1]),
+            center.z() * (1.0 - factors[2]),
+        )
+        matrix.scale(*[float(value) for value in factors])
+        return matrix
+
+    def cameraPosition(self):  # type: ignore[override]
+        """Return the physical camera expressed in canonical edit coordinates."""
+
+        position = super().cameraPosition()
+        center = self.opts["center"]
+        factors = self._global_scale.factors
+        return type(position)(
+            center.x() + (position.x() - center.x()) / factors[0],
+            center.y() + (position.y() - center.y()) / factors[1],
+            center.z() + (position.z() - center.z()) / factors[2],
+        )
+
+    def pixelSize(self, pos):  # type: ignore[override]
+        """Approximate a pixel in canonical units for screen-sized edit handles."""
+
+        factors = np.asarray(self._global_scale.factors, dtype=float)
+        if np.all(factors == 1.0):
+            return super().pixelSize(pos)
+        camera = self.cameraPosition()
+        camera_array = np.asarray((camera.x(), camera.y(), camera.z()), dtype=float)
+        positions = (
+            pos
+            if isinstance(pos, np.ndarray)
+            else np.asarray((pos.x(), pos.y(), pos.z()), dtype=float)
+        )
+        physical_distance = np.linalg.norm(
+            (positions - camera_array) * factors, axis=-1
+        )
+        pixel_distance = (
+            physical_distance
+            * 2.0
+            * math.tan(math.radians(float(self.opts["fov"])) * 0.5)
+            / max(self.width(), 1)
+        )
+        inverse, invertible = self.viewMatrix().inverted()
+        if not invertible:
+            return pixel_distance / float(np.min(factors))
+        right = inverse.mapVector(QVector3D(1.0, 0.0, 0.0)).length()
+        up = inverse.mapVector(QVector3D(0.0, 1.0, 0.0)).length()
+        return pixel_distance * (right + up) * 0.5
+
+    def pan(self, dx, dy, dz, relative="global") -> None:  # type: ignore[override]
+        """Pan in physical screen units, then convert the motion back to editing."""
+
+        factors = np.asarray(self._global_scale.factors, dtype=float)
+        if np.all(factors == 1.0):
+            super().pan(dx, dy, dz, relative=relative)
+            return
+        if relative == "global":
+            delta = np.asarray((dx, dy, dz), dtype=float) / factors
+        else:
+            physical_pixel = (
+                float(self.opts["distance"])
+                * 2.0
+                * math.tan(math.radians(float(self.opts["fov"])) * 0.5)
+                / max(self.width(), 1)
+            )
+            if relative == "view-upright":
+                center = self.opts["center"]
+                camera = self.cameraPosition()
+                forward = QVector3D(
+                    (center.x() - camera.x()) * factors[0],
+                    (center.y() - camera.y()) * factors[1],
+                    (center.z() - camera.z()) * factors[2],
+                )
+                up = QVector3D(0.0, 0.0, 1.0)
+                right = QVector3D.crossProduct(up, forward).normalized()
+                horizontal = QVector3D.crossProduct(right, up).normalized()
+                offset = (right * dx + horizontal * dy + up * dz) * physical_pixel
+            elif relative == "view":
+                if self.opts["rotationMethod"] == "quaternion":
+                    rotation = self.opts["rotation"].conjugated()
+                    offset = (
+                        rotation.rotatedVector(QVector3D(-dx, dy, dz)) * physical_pixel
+                    )
+                else:
+                    elevation = math.radians(float(self.opts["elevation"]))
+                    azimuth = math.radians(float(self.opts["azimuth"]))
+                    offset = (
+                        QVector3D(
+                            math.sin(azimuth) * dx
+                            - math.sin(elevation) * math.cos(azimuth) * dy,
+                            -math.cos(azimuth) * dx
+                            - math.sin(elevation) * math.sin(azimuth) * dy,
+                            math.cos(elevation) * dy,
+                        )
+                        * physical_pixel
+                    )
+            else:
+                raise ValueError(
+                    "relative argument must be global, view, or view-upright"
+                )
+            delta = (
+                np.asarray((offset.x(), offset.y(), offset.z()), dtype=float) / factors
+            )
+        self.opts["center"] += QVector3D(*[float(value) for value in delta])
+        self.update()
+
+    # ### Rendering ###
     def paintGL(self) -> None:  # type: ignore[override]
         """Update billboards and establish the depth baseline for every frame."""
 
@@ -1714,18 +1848,31 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         normalized_x = 2.0 * float(position.x()) / width - 1.0
         normalized_y = 1.0 - 2.0 * float(position.y()) / height
         viewport = (0, 0, int(width), int(height))
-        inverse, invertible = (
-            self.projectionMatrix(viewport, viewport) * self.viewMatrix()
-        ).inverted()
-        if not invertible:
-            return None
-        near = inverse.map(QVector3D(normalized_x, normalized_y, -1.0))
-        far = inverse.map(QVector3D(normalized_x, normalized_y, 1.0))
-        origin = np.asarray((near.x(), near.y(), near.z()), dtype=float)
-        direction = np.asarray(
-            (far.x() - near.x(), far.y() - near.y(), far.z() - near.z()),
-            dtype=float,
+        view_projection = self.projectionMatrix(viewport, viewport) * self.viewMatrix()
+        # Double precision keeps picking stable when the building is stretched
+        # or the canonical camera is far from the coordinate origin.
+        matrix = np.asarray(view_projection.data(), dtype=float).reshape(
+            (4, 4), order="F"
         )
+        try:
+            inverse = np.linalg.inv(matrix)
+        except np.linalg.LinAlgError:
+            return None
+        points = (
+            inverse
+            @ np.asarray(
+                (
+                    (normalized_x, normalized_y, -1.0, 1.0),
+                    (normalized_x, normalized_y, 0.0, 1.0),
+                ),
+                dtype=float,
+            ).T
+        )
+        if not np.all(np.isfinite(points)) or np.any(np.abs(points[3]) <= 1e-12):
+            return None
+        points = points[:3] / points[3]
+        origin = points[:, 0]
+        direction = points[:, 1] - origin
         length = float(np.linalg.norm(direction))
         if not np.isfinite(length) or length <= 1e-12:
             return None
@@ -1847,13 +1994,19 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         right_x = math.sin(yaw_radians)
         right_y = -math.cos(yaw_radians)
         distance = self._move_speed * elapsed
+        scale_x, scale_y, scale_z = self._global_scale.factors
         self._set_first_person_camera_pose(
             CameraPose(
                 x=pose.x
-                + (forward_x * forward_amount + right_x * right_amount) * distance,
+                + (forward_x * forward_amount + right_x * right_amount)
+                * distance
+                / scale_x,
                 y=pose.y
-                + (forward_y * forward_amount + right_y * right_amount) * distance,
-                z=pose.z + (forward_z * forward_amount + vertical_amount) * distance,
+                + (forward_y * forward_amount + right_y * right_amount)
+                * distance
+                / scale_y,
+                z=pose.z
+                + (forward_z * forward_amount + vertical_amount) * distance / scale_z,
                 yaw_degrees=pose.yaw_degrees,
                 pitch_degrees=pose.pitch_degrees,
                 roll_degrees=pose.roll_degrees,
@@ -2567,7 +2720,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             ),
             dtype=float,
         )
-        target = np.array((pose.x, pose.y, pose.z), dtype=float) + forward
+        target = np.array((pose.x, pose.y, pose.z), dtype=float) + forward / np.asarray(
+            self._global_scale.factors, dtype=float
+        )
         self.opts["center"] = QVector3D(*target.tolist())
         self.opts["distance"] = FIRST_PERSON_LOOK_DISTANCE_METERS
         self.opts["azimuth"] = pose.yaw_degrees + 180.0
@@ -6143,7 +6298,8 @@ class GlbViewerWidget(QWidget):
             )
         else:
             target = _normalize_tour_point(camera_target)
-        camera_delta = resolved_camera_position - target
+        scale_factors = np.asarray(self.view.get_global_scale().factors, dtype=float)
+        camera_delta = (resolved_camera_position - target) * scale_factors
         distance = float(np.linalg.norm(camera_delta))
         if not math.isfinite(distance) or distance <= 1e-9:
             target = _derive_tour_camera_target(
@@ -6151,12 +6307,12 @@ class GlbViewerWidget(QWidget):
                 normalized_progress,
                 selected_overlay.tension,
             )
-            camera_delta = resolved_camera_position - target
+            camera_delta = (resolved_camera_position - target) * scale_factors
             distance = float(np.linalg.norm(camera_delta))
         if not math.isfinite(distance) or distance <= 1e-9:
             target = resolved_camera_position + np.asarray((0.0, 1.0, 0.0))
-            camera_delta = resolved_camera_position - target
-            distance = 1.0
+            camera_delta = (resolved_camera_position - target) * scale_factors
+            distance = float(np.linalg.norm(camera_delta))
         if self._tour_camera_state_before_preview is None:
             self._tour_camera_state_before_preview = self._capture_camera_state()
         if self.get_navigation_mode() != NAVIGATION_MODE_ORBIT:
@@ -6268,7 +6424,12 @@ class GlbViewerWidget(QWidget):
         normalized_forward = _normalize_vector(forward)
         if normalized_forward is None:
             raise RuntimeError("The camera forward direction is invalid.")
-        return tuple(float(value) for value in origin + normalized_forward * distance)
+        physical_length = float(
+            np.linalg.norm(normalized_forward * self.view.get_global_scale().factors)
+        )
+        return tuple(
+            float(value) for value in origin + normalized_forward * distance / physical_length
+        )
 
     def get_tour_screen_center_world_point(
         self,
@@ -6295,8 +6456,11 @@ class GlbViewerWidget(QWidget):
             if origin is None or direction is None:
                 raise RuntimeError("The tour preview camera ray is invalid.")
         hit = self._pick_nearest_tour_scene_hit(origin, direction)
+        physical_direction_length = float(
+            np.linalg.norm(direction * self.view.get_global_scale().factors)
+        )
         point = (
-            origin + direction * fallback_distance
+            origin + direction * fallback_distance / physical_direction_length
             if hit is None
             else np.asarray(hit[0], dtype=float)
         )
@@ -6744,6 +6908,81 @@ class GlbViewerWidget(QWidget):
         self.canvas_tools_panel = panel
         self.window_tools_panel = panel
         return panel
+
+    # ### Global building scale API ###
+    def get_global_scale(self) -> GlobalScale:
+        """Return the display scale shared by the building and its edit overlays."""
+
+        return self.view.get_global_scale()
+
+    def set_global_scale(
+        self,
+        scale: GlobalScale,
+        *,
+        floor_z: float | None = None,
+    ) -> None:
+        """Scale a building without changing its canonical geometry or assets.
+
+        ``floor_z`` is the current canonical floor-top elevation. Supplying it
+        preserves the first-person camera's physical height above that floor.
+        Tour viewers omit it so their authored camera points follow the scale.
+        """
+
+        previous = self.view.get_global_scale()
+        if scale == previous:
+            return
+        if floor_z is not None and not math.isfinite(float(floor_z)):
+            raise ValueError("The camera floor elevation must be finite.")
+        pose = self.view.get_first_person_camera_pose()
+        tour_camera_delta = None
+        if (
+            self._tour_camera_state_before_preview is not None
+            and not self.view.is_first_person_active
+        ):
+            # Preserve the actual canonical tour viewpoint, including a user's
+            # manual orbit after scrubbing, without requiring another scrub.
+            camera = self.view.cameraPosition()
+            target = self.view.opts["center"]
+            tour_camera_delta = np.asarray(
+                (
+                    camera.x() - target.x(),
+                    camera.y() - target.y(),
+                    camera.z() - target.z(),
+                ),
+                dtype=float,
+            )
+        self.view.set_global_scale(scale)
+        if tour_camera_delta is not None:
+            physical_delta = tour_camera_delta * scale.factors
+            distance = float(np.linalg.norm(physical_delta))
+            if distance > 1e-9:
+                self.view.setCameraPosition(
+                    distance=distance,
+                    elevation=math.degrees(
+                        math.asin(float(physical_delta[2]) / distance)
+                    ),
+                    azimuth=math.degrees(
+                        math.atan2(float(physical_delta[1]), float(physical_delta[0]))
+                    ),
+                )
+                self.view.remember_orbit_camera_state()
+        if floor_z is not None:
+            canonical_floor = float(floor_z)
+            adjusted = replace(
+                pose,
+                z=canonical_floor + (pose.z - canonical_floor) * previous.z / scale.z,
+            )
+            self.view._set_first_person_camera_pose(
+                adjusted,
+                is_custom=self.view.has_custom_first_person_camera_pose,
+            )
+        elif (
+            not self.view.has_custom_first_person_camera_pose and self.model is not None
+        ):
+            self._set_default_first_person_camera_pose_from_bounding_box(
+                self.model.mesh.bounding_box
+            )
+        self.view.update()
 
     # ### Canvas scene visibility API ###
     def set_canvas_scene_levels(
@@ -18301,7 +18540,9 @@ class GlbViewerWidget(QWidget):
         minimum = np.min(combined, axis=0)
         maximum = np.max(combined, axis=0)
         center = (minimum + maximum) / 2.0
-        extent = float(max(np.max(maximum - minimum), 1.0))
+        extent = float(
+            max(np.max((maximum - minimum) * self.view.get_global_scale().factors), 1.0)
+        )
         self.view.opts["center"] = QVector3D(
             float(center[0]),
             float(center[1]),
@@ -19572,7 +19813,9 @@ class GlbViewerWidget(QWidget):
 
         bounding_box = self.model.mesh.bounding_box
         center = np.asarray(bounding_box.centroid, dtype=float)
-        extent = float(max(bounding_box.extents.max(), 1.0))
+        extent = float(
+            max(np.max(bounding_box.extents * self.view.get_global_scale().factors), 1.0)
+        )
 
         self.view.opts["center"] = QVector3D(
             float(center[0]),
@@ -23360,7 +23603,8 @@ class GlbViewerWidget(QWidget):
             return
         minimum, maximum = bounds
         center = (minimum + maximum) / 2.0
-        height = max(0.0, float(maximum[2] - minimum[2]))
+        scale_z = self.view.get_global_scale().z
+        height = max(0.0, float(maximum[2] - minimum[2]) * scale_z)
         eye_height = (
             DEFAULT_FIRST_PERSON_HEIGHT_METERS
             if height <= 0.0
@@ -23373,7 +23617,7 @@ class GlbViewerWidget(QWidget):
             CameraPose(
                 x=float(center[0]),
                 y=float(center[1]),
-                z=float(minimum[2] + eye_height),
+                z=float(minimum[2] + eye_height / scale_z),
             )
         )
 

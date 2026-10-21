@@ -50,6 +50,7 @@ from housemaker.doorway_topology import (
     find_doorway_fit,
     move_doorway_corner_vertices,
 )
+from housemaker.global_scale import GlobalScale
 from housemaker.landing_geometry import (
     create_landing,
     find_landing_snap,
@@ -705,6 +706,7 @@ class BlueprintCanvas(QWidget):
         self.blueprint_path: str | None = None
         self._blueprint_image_revision: tuple[object, ...] | None = None
         self.canvas_level_scale = DEFAULT_CANVAS_LEVEL_SCALE
+        self._global_scale = GlobalScale()
         self.canvas_offset_x_pixels = DEFAULT_CANVAS_OFFSET_PIXELS
         self.canvas_offset_y_pixels = DEFAULT_CANVAS_OFFSET_PIXELS
         self._level_comparison_overlay: (
@@ -1139,6 +1141,21 @@ class BlueprintCanvas(QWidget):
         """Return the file revision validated for the displayed pixels."""
 
         return self._blueprint_image_revision
+
+    # ### Project-wide scale ###
+    def set_global_scale(self, scale: GlobalScale) -> bool:
+        """Transform the plan and its overlays without modifying image coordinates."""
+
+        if not isinstance(scale, GlobalScale):
+            raise TypeError("Canvas global scale must use GlobalScale.")
+        if self._global_scale == scale:
+            return False
+        self._global_scale = scale
+        self.update()
+        return True
+
+    def get_global_scale(self) -> GlobalScale:
+        return self._global_scale
 
     # ### Canvas-only level scale and comparison overlay ###
     def set_canvas_level_scale(self, scale: float) -> bool:
@@ -4674,8 +4691,8 @@ class BlueprintCanvas(QWidget):
             center_image = level_world_to_image_xy(level, pose.x, pose.y)
             direction_image = level_world_to_image_xy(
                 level,
-                pose.x + math.cos(yaw_radians),
-                pose.y + math.sin(yaw_radians),
+                pose.x + math.cos(yaw_radians) / self._global_scale.x,
+                pose.y + math.sin(yaw_radians) / self._global_scale.y,
             )
         except (TypeError, ValueError, OverflowError):
             return None
@@ -8614,7 +8631,11 @@ class BlueprintCanvas(QWidget):
         self.update()
 
     def _start_panning(self, widget_point: QPointF) -> None:
-        effective_scale = self.zoom_scale * self.canvas_level_scale
+        effective_scale = (
+            self.zoom_scale
+            * self.canvas_level_scale
+            * max(self._global_scale.x, self._global_scale.y)
+        )
         if effective_scale <= MIN_ZOOM_SCALE:
             return
 
@@ -8944,7 +8965,10 @@ class BlueprintCanvas(QWidget):
             return screen_distance
 
         display_rect = self._image_display_rect()
-        scale = display_rect.width() / float(self.blueprint_image.width())
+        scale = min(
+            display_rect.width() / float(self.blueprint_image.width()),
+            display_rect.height() / float(self.blueprint_image.height()),
+        )
         if scale <= 0.0:
             return screen_distance
 
@@ -9000,7 +9024,7 @@ class BlueprintCanvas(QWidget):
         canvas_offset_x_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
         canvas_offset_y_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
     ) -> QRectF:
-        """Fit and Canvas-scale one plan around the shared viewport center."""
+        """Fit one plan, then apply level and global scales around the viewport."""
 
         available_rect = self._available_image_rect()
 
@@ -9011,11 +9035,11 @@ class BlueprintCanvas(QWidget):
             available_rect.height() / image_height,
         )
 
-        display_width = image_width * scale * canvas_level_scale
-        display_height = image_height * scale * canvas_level_scale
+        display_width = image_width * scale * canvas_level_scale * self._global_scale.x
+        display_height = image_height * scale * canvas_level_scale * self._global_scale.y
         display_center = available_rect.center() + QPointF(
-            _normalize_canvas_offset_pixels(canvas_offset_x_pixels),
-            _normalize_canvas_offset_pixels(canvas_offset_y_pixels),
+            _normalize_canvas_offset_pixels(canvas_offset_x_pixels) * self._global_scale.x,
+            _normalize_canvas_offset_pixels(canvas_offset_y_pixels) * self._global_scale.y,
         )
         display_x = display_center.x() - display_width / 2.0
         display_y = display_center.y() - display_height / 2.0

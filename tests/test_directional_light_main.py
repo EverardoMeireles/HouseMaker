@@ -261,6 +261,7 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
             tours=(),
             door_body_reconstructions=(),
             directional_lights=(light,),
+            global_scale=self.workspace.global_scale,
         )
 
 

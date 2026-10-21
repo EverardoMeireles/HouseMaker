@@ -18,6 +18,7 @@ from housemaker.directional_light_state import (
 )
 from housemaker.door_state import DoorLibraryData
 from housemaker.generation_state import GenerationData
+from housemaker.global_scale import GlobalScale
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
     DEFAULT_CANVAS_OFFSET_PIXELS,
@@ -122,6 +123,7 @@ class ProjectData:
     plan_wall_generation: PlanWallDetectionOptions = field(
         default_factory=PlanWallDetectionOptions
     )
+    global_scale: GlobalScale = field(default_factory=GlobalScale)
 
     def __post_init__(self) -> None:
         if not self.doorway_presets:
@@ -152,6 +154,7 @@ def save_project(
     doors: DoorLibraryData | None = None,
     directional_lights: Iterable[DirectionalLightData] | None = None,
     plan_wall_generation: PlanWallDetectionOptions | None = None,
+    global_scale: GlobalScale | None = None,
 ) -> Path:
     export_path = Path(path)
     resolved_outer_wall_marks = reconcile_outer_wall_marks(
@@ -162,6 +165,7 @@ def save_project(
         "project_version": PROJECT_FILE_VERSION,
         "blueprint_path": None,
         "current_level_index": int(current_level_index),
+        "global_scale": (global_scale or GlobalScale()).to_dict(),
         "plan_wall_generation": (
             plan_wall_generation or PlanWallDetectionOptions()
         ).to_dict(),
@@ -456,6 +460,7 @@ def load_project(path: str | Path) -> ProjectData:
         plan_wall_generation=PlanWallDetectionOptions.from_dict(
             payload.get("plan_wall_generation")
         ),
+        global_scale=GlobalScale.from_dict(payload.get("global_scale")),
     )
 
 

@@ -252,6 +252,11 @@ from housemaker.glb import (
     export_glb_file,
     import_generated_glb,
 )
+from housemaker.global_scale import GlobalScale
+from housemaker.global_scale_workspace import (
+    CanvasGlobalScaleUndoState,
+    GlobalScaleWorkspaceMixin,
+)
 from housemaker.landing_geometry import find_landing_snap, stair_section_landing_z
 from housemaker.landing_workspace import CanvasLandingUndoState, LandingWorkspaceMixin
 from housemaker.level_coordinates import (
@@ -1731,6 +1736,7 @@ _CanvasUndoState = (
     | _CanvasPlacedObjectGroupUndoState
     | _CanvasStairsUndoState
     | CanvasLandingUndoState
+    | CanvasGlobalScaleUndoState
     | _SurfaceTextureTilingUndoState
     | _SurfaceTextureColorBalanceUndoState
 )
@@ -1899,7 +1905,7 @@ class StairEditorHeightFilter(QObject):
         self._sync_height()
 
 
-class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
+class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidget):
     _progressive_texture_result_ready = Signal(int, object)
 
     def __init__(
@@ -1914,6 +1920,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             else ApplicationSettingsStore()
         )
         self.current_project_path: str | None = None
+        self.global_scale = GlobalScale()
         self.levels: list[LevelData] = create_default_levels()
         self.outer_wall_marks: tuple[OuterWallMark, ...] = ()
         self._staged_outer_wall_marks: tuple[OuterWallMark, ...] | None = None
@@ -3334,6 +3341,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             "Floor thickness",
             self.floor_thickness_spinbox,
         )
+        self._build_global_scale_controls(level_dimensions_layout)
         right_side_layout.addWidget(self.level_dimensions_group)
         self.highlight_non_right_angles_checkbox = QCheckBox(
             "Highlight non 90° angles and dead-end vertices."
@@ -5190,9 +5198,11 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         changed_updates = [
-            (level, height_meters)
+            (level, height_meters / self.global_scale.z)
             for level, height_meters, _summary in detected_updates
-            if not math.isclose(level.height_meters, height_meters)
+            if not math.isclose(
+                level.height_meters * self.global_scale.z, height_meters
+            )
         ]
         if not changed_updates:
             return
@@ -8883,6 +8893,8 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
                 skipped_texture_bindings = self._restore_canvas_stairs_undo_state(state)
             elif isinstance(state, CanvasLandingUndoState):
                 self._restore_landing_undo_state(state)
+            elif isinstance(state, CanvasGlobalScaleUndoState):
+                self._restore_global_scale_undo_state(state)
             elif isinstance(state, _SurfaceTextureTilingUndoState):
                 self._restore_surface_texture_tiling_undo_state(state)
             elif isinstance(state, _SurfaceTextureColorBalanceUndoState):
@@ -10641,8 +10653,10 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         self.canvas.update()
         self._is_syncing_level_controls = True
         try:
-            self.height_level_spinbox.setValue(level.height_meters)
-            self.floor_thickness_spinbox.setValue(level.floor_thickness_meters)
+            self.height_level_spinbox.setValue(level.height_meters * self.global_scale.z)
+            self.floor_thickness_spinbox.setValue(
+                level.floor_thickness_meters * self.global_scale.z
+            )
             level_x_slider_value = round(
                 level.offset_x_meters * LEVEL_OFFSET_SLIDER_FACTOR
             )
@@ -10726,7 +10740,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         self._pending_canvas_surface_mesh_update = True
         self._is_syncing_level_controls = True
         try:
-            self.floor_thickness_spinbox.setValue(next_thickness)
+            self.floor_thickness_spinbox.setValue(next_thickness * self.global_scale.z)
         finally:
             self._is_syncing_level_controls = False
 
@@ -12773,6 +12787,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             tour_html_tooltips_enabled=True,
         )
         viewer.setObjectName("tour_preview_viewer")
+        viewer.set_global_scale(self.global_scale)
         viewer.set_ambient_light_intensity(0.5)
         enabled_maps = tuple(
             map_type
@@ -13441,6 +13456,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
                 tours=self.tour_workspace.tours(),
                 door_body_reconstructions=door_body_reconstructions,
                 directional_lights=self.directional_lights,
+                global_scale=self.global_scale,
             )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
@@ -21721,6 +21737,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
                 doors=self.doors_workspace.data(),
                 directional_lights=self.directional_lights,
                 plan_wall_generation=self._build_plan_wall_detection_options(),
+                global_scale=self.global_scale,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -24150,7 +24167,9 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             self.stair_actual_rise_label.setText("—")
             return
         self.stair_calculated_step_count_label.setText(str(step_count))
-        self.stair_actual_rise_label.setText(f"{actual_rise * 100.0:.1f} cm")
+        self.stair_actual_rise_label.setText(
+            f"{actual_rise * self.global_scale.z * 100.0:.1f} cm"
+        )
 
     def _refresh_stair_editor_geometry(self) -> None:
         """Rebuild selected-stair preview data after scene geometry changes."""
@@ -24406,8 +24425,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             self._get_displayed_level_transform(self.current_level)
         )
         self._is_syncing_level_controls = True
-        self.height_level_spinbox.setValue(self.current_level.height_meters)
-        self.floor_thickness_spinbox.setValue(self.current_level.floor_thickness_meters)
+        self._sync_scaled_level_dimensions()
         self.level_scale_slider.setValue(round(level_scale * LEVEL_SCALE_SLIDER_FACTOR))
         self._update_level_scale_value_label(level_scale)
         self.canvas_level_scale_slider.setValue(
@@ -24516,7 +24534,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         if self._is_syncing_level_controls:
             return
 
-        next_value = float(value)
+        next_value = float(value) / self.global_scale.z
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         if next_value == self.current_level.height_meters:
@@ -24553,7 +24571,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         self._commit_pending_level_transform_update()
         self._stage_floor_thickness_mesh_update(
             self.current_level,
-            float(value),
+            float(value) / self.global_scale.z,
         )
 
     # ### Open-space controls ###
@@ -30685,6 +30703,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             doors=project_data.doors,
             directional_lights=project_data.directional_lights,
             plan_wall_generation=project_data.plan_wall_generation,
+            global_scale=project_data.global_scale,
         )
 
     def _apply_project_state(
@@ -30702,6 +30721,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
         plan_wall_generation: PlanWallDetectionOptions | None = None,
+        global_scale: GlobalScale | None = None,
     ) -> None:
         """Install one project while coalescing expensive dependent refreshes."""
 
@@ -30728,6 +30748,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
                 doors=doors,
                 directional_lights=directional_lights,
                 plan_wall_generation=plan_wall_generation,
+                global_scale=global_scale,
             )
             apply_completed = True
         finally:
@@ -30787,6 +30808,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         doors: DoorLibraryData | None = None,
         directional_lights: Sequence[DirectionalLightData] | None = None,
         plan_wall_generation: PlanWallDetectionOptions | None = None,
+        global_scale: GlobalScale | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -30869,6 +30891,7 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
         self.viewer.cancel_landing_placement()
         self.generation.clear_landing_editing_target()
         self.levels = levels
+        self.global_scale = global_scale if global_scale is not None else GlobalScale()
         self.outer_wall_marks = reconcile_outer_wall_marks(
             self.levels,
             outer_wall_marks or (),
@@ -30909,6 +30932,8 @@ class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
             max(current_level_index, 0),
             len(self.levels) - 1,
         )
+        self._sync_global_scale_controls()
+        self._sync_global_scale_views()
         self._refresh_doorway_preset_list(
             selected_index=0 if self.doorway_presets else -1
         )

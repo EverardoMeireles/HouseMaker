@@ -1489,6 +1489,7 @@ class TourMainIntegrationTests(unittest.TestCase):
             tours=(tour,),
             door_body_reconstructions=(),
             directional_lights=(),
+            global_scale=self.workspace.global_scale,
         )
 
 

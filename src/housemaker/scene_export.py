@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import trimesh
 
 from housemaker.directional_light_state import (
     DirectionalLightData,
@@ -27,11 +28,13 @@ from housemaker.glb import (
     PlacedGeneratedModel,
     build_placed_generated_model_gltf_transform,
 )
+from housemaker.global_scale import GlobalScale
 from housemaker.tour_state import TourData, tours_to_runtime_dicts
 
 # ### Constants ###
 RUNTIME_SCENE_FORMAT = "housemaker-r3f-scene"
 RUNTIME_SCENE_VERSION = 9
+RUNTIME_SCALED_SCENE_VERSION = 10
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 GLB_JSON_CHUNK_TYPE = b"JSON"
@@ -39,6 +42,8 @@ GLB_BINARY_CHUNK_TYPE = b"BIN\0"
 GLB_HEADER_BYTE_COUNT = 12
 GLB_CHUNK_HEADER_BYTE_COUNT = 8
 INSTANCE_SOURCE_SCENE_NAME = "HouseMaker Instance Sources"
+GLOBAL_SCALE_NODE_NAME = "HouseMaker Global Scale"
+GLOBAL_SCALE_METADATA_KEY = "housemakerGlobalScale"
 
 
 # ### Runtime door reconstruction models ###
@@ -112,6 +117,7 @@ def write_runtime_scene_manifest(
     tours: Sequence[TourData] = (),
     door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
     directional_lights: Sequence[DirectionalLightData] = (),
+    global_scale: GlobalScale | None = None,
 ) -> Path:
     """Write the R3F runtime companion JSON next to an exported GLB."""
 
@@ -135,8 +141,7 @@ def write_runtime_scene_manifest(
         original_glb_bytes,
         source_groups,
     )
-    if glb_bytes != original_glb_bytes:
-        _write_bytes_atomically(normalized_glb_path, glb_bytes)
+    glb_bytes = _apply_global_scale_to_glb(glb_bytes, global_scale)
     manifest = build_runtime_scene_manifest(
         glb_name=normalized_glb_path.name,
         glb_bytes=glb_bytes,
@@ -145,7 +150,10 @@ def write_runtime_scene_manifest(
         tours=tours,
         door_body_reconstructions=door_body_reconstructions,
         directional_lights=directional_lights,
+        global_scale=global_scale,
     )
+    if glb_bytes != original_glb_bytes:
+        _write_bytes_atomically(normalized_glb_path, glb_bytes)
     manifest_path = normalized_glb_path.with_suffix(".json")
     _write_json_atomically(manifest_path, manifest)
     return manifest_path
@@ -160,6 +168,7 @@ def build_runtime_scene_manifest(
     tours: Sequence[TourData] = (),
     door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
     directional_lights: Sequence[DirectionalLightData] = (),
+    global_scale: GlobalScale | None = None,
 ) -> dict[str, object]:
     """Build a versioned runtime manifest for scene runtime-only features."""
 
@@ -191,16 +200,14 @@ def build_runtime_scene_manifest(
             )
         ]
         group: dict[str, object] = {
-            "sourceNodeName": _get_instance_source_node_name(
-                source_model_placement
-            ),
+            "sourceNodeName": _get_instance_source_node_name(source_model_placement),
             "instances": group_instances,
         }
         if _get_instance_source_symmetry(source_model_placement) is not None:
             group[HALF_MESH_EXTRAS_KEY] = True
         groups.append(group)
 
-    return {
+    manifest = {
         "format": RUNTIME_SCENE_FORMAT,
         "version": RUNTIME_SCENE_VERSION,
         "coordinateSystem": "gltf-y-up",
@@ -215,10 +222,178 @@ def build_runtime_scene_manifest(
             for reconstruction in normalized_door_reconstructions
         ],
         "tours": tours_to_runtime_dicts(tours),
-        "directionalLights": directional_lights_to_runtime_dicts(
-            directional_lights
-        ),
+        "directionalLights": directional_lights_to_runtime_dicts(directional_lights),
     }
+    _apply_global_scale_to_manifest(manifest, global_scale)
+    return manifest
+
+
+# ### Global scene scaling ###
+def _global_scale_gltf_factors(global_scale: GlobalScale | None) -> np.ndarray:
+    """Map plan X/Y and vertical Z multipliers to the exported Y-up axes."""
+
+    if global_scale is None:
+        return np.ones(3, dtype=float)
+    if not isinstance(global_scale, GlobalScale):
+        raise TypeError("Scene scaling requires a GlobalScale value.")
+    return np.asarray((global_scale.x, global_scale.z, global_scale.y), dtype=float)
+
+
+def _apply_global_scale_to_glb(
+    glb_bytes: bytes,
+    global_scale: GlobalScale | None,
+) -> bytes:
+    """Scale the rendered scene once, leaving detached prototypes canonical.
+
+    Updating the tagged wrapper makes repeated writes idempotent. Geometry,
+    UVs, source-local mirror planes and the binary payload remain untouched.
+    """
+
+    factors = _global_scale_gltf_factors(global_scale)
+    identity = np.array_equal(factors, np.ones(3))
+    document, binary_payload = _parse_glb(glb_bytes, "The exported GLB is invalid.")
+    scenes = _get_gltf_collection(document, "scenes")
+    nodes = _get_gltf_collection(document, "nodes", create=True)
+    if not scenes:
+        if identity:
+            return glb_bytes
+        raise ValueError("The exported GLB has no rendered scene to scale.")
+    scene_index = _require_gltf_index(document.get("scene", 0), len(scenes))
+    scene = scenes[scene_index]
+    if not isinstance(scene, dict) or not isinstance(scene.get("nodes", []), list):
+        raise TypeError("The exported GLB contains an invalid rendered scene.")
+    root_indices = list(scene.get("nodes", []))
+    wrappers = []
+    for root_index in root_indices:
+        node = nodes[_require_gltf_index(root_index, len(nodes))]
+        if not isinstance(node, dict):
+            raise TypeError("The exported GLB contains an invalid scene root.")
+        extras = node.get("extras", {})
+        if isinstance(extras, Mapping) and extras.get(GLOBAL_SCALE_METADATA_KEY):
+            wrappers.append(node)
+    if len(wrappers) > 1:
+        raise ValueError("The exported GLB has more than one global scale root.")
+    if wrappers:
+        if len(root_indices) != 1:
+            raise ValueError(
+                "The global scale root must contain the whole rendered scene."
+            )
+        wrapper = wrappers[0]
+        if wrapper.get("scale") == factors.tolist():
+            return glb_bytes
+        wrapper["scale"] = factors.tolist()
+    else:
+        if identity:
+            return glb_bytes
+        scene["nodes"] = [len(nodes)]
+        nodes.append(
+            {
+                "name": GLOBAL_SCALE_NODE_NAME,
+                "children": root_indices,
+                "scale": factors.tolist(),
+                "extras": {GLOBAL_SCALE_METADATA_KEY: True},
+            }
+        )
+    return _serialize_glb(document, binary_payload)
+
+
+def _apply_global_scale_to_manifest(
+    manifest: dict[str, object],
+    global_scale: GlobalScale | None,
+) -> None:
+    """Bake physical coordinates while recording exact affine reconstructions.
+
+    Version 10's ``globalScale`` is diagnostic: its matrix is already applied
+    to GLB roots and runtime coordinates and MUST NOT be applied a second time.
+    For unequal factors, door ``mirrorMatrix`` replaces plane reflection;
+    text ``worldMatrix`` replaces its position/rotation transform while keeping
+    the authored ``sizePoints``; idle ``offsetScale`` multiplies animation
+    offsets evaluated in the original, unscaled coordinate system. These
+    additions preserve shear and elliptical motion that scalars cannot express.
+    Uniform exports retain the ordinary text-size and idle-radius semantics.
+    """
+
+    factors = _global_scale_gltf_factors(global_scale)
+    if np.array_equal(factors, np.ones(3)):
+        return
+    matrix = np.diag((*factors, 1.0))
+    inverse_matrix = np.diag((*(1.0 / factors), 1.0))
+    uniform = bool(np.all(factors == factors[0]))
+    manifest["version"] = RUNTIME_SCALED_SCENE_VERSION
+    manifest["globalScale"] = {
+        "matrix": _matrix_to_column_major(matrix),
+        "coordinateSystem": "gltf-y-up",
+        "appliedToGlb": True,
+        "appliedToRuntimeData": True,
+    }
+    for group in manifest["instanceGroups"]:
+        for instance in group["instances"]:
+            original = np.asarray(instance["worldMatrix"], dtype=float).reshape(4, 4).T
+            instance["worldMatrix"] = _matrix_to_column_major(matrix @ original)
+    for reconstruction in manifest["doorBodyReconstructions"]:
+        duplication = reconstruction["sideDuplication"]
+        plane = duplication["mirrorPlane"]
+        point = np.asarray(plane["point"], dtype=float)
+        normal = np.asarray(plane["normal"], dtype=float)
+        normal /= np.linalg.norm(normal)
+        if not uniform:
+            reflection = np.eye(4)
+            reflection[:3, :3] -= 2.0 * np.outer(normal, normal)
+            reflection[:3, 3] = 2.0 * float(np.dot(normal, point)) * normal
+            duplication["mirrorMatrix"] = _matrix_to_column_major(
+                matrix @ reflection @ inverse_matrix
+            )
+        transformed_normal = normal / factors
+        transformed_normal /= np.linalg.norm(transformed_normal)
+        plane["point"] = (point * factors).tolist()
+        plane["normal"] = transformed_normal.tolist()
+    for light in manifest["directionalLights"]:
+        for key in ("position", "target"):
+            light[key] = _scaled_runtime_point(light[key], factors)
+    for tour in manifest["tours"]:
+        tour["triggerPoint"] = _scaled_runtime_point(tour["triggerPoint"], factors)
+        area = tour["triggerArea"]
+        area["center"] = _scaled_runtime_point(area["center"], factors)
+        area["sizeMeters"] = (
+            np.asarray(area["sizeMeters"], dtype=float) * factors[[0, 2]]
+        ).tolist()
+        tour["curve"]["points"] = [
+            _scaled_runtime_point(point, factors) for point in tour["curve"]["points"]
+        ]
+        for step in tour["steps"]:
+            step["cameraTarget"] = _scaled_runtime_point(step["cameraTarget"], factors)
+            for action in step["actions"]:
+                _scale_runtime_tour_action(action, factors, matrix, uniform=uniform)
+
+
+def _scale_runtime_tour_action(
+    action: dict[str, object],
+    factors: np.ndarray,
+    matrix: np.ndarray,
+    *,
+    uniform: bool,
+) -> None:
+    if action["type"] == "text3d":
+        if uniform:
+            action["sizePoints"] *= float(factors[0])
+        else:
+            radians = np.radians(action["rotationDegrees"])
+            transform = trimesh.transformations.euler_matrix(*radians, axes="sxyz")
+            transform[:3, 3] = action["position"]
+            action["worldMatrix"] = _matrix_to_column_major(matrix @ transform)
+        action["position"] = _scaled_runtime_point(action["position"], factors)
+    elif action["type"] == "idleCameraAnimation":
+        action["pivotPoint"] = _scaled_runtime_point(action["pivotPoint"], factors)
+        if uniform:
+            action["radiusMeters"] *= float(factors[0])
+        else:
+            action["offsetScale"] = factors.tolist()
+    elif action["type"] == "floatingTooltip":
+        action["anchorPoint"] = _scaled_runtime_point(action["anchorPoint"], factors)
+
+
+def _scaled_runtime_point(point: object, factors: np.ndarray) -> list[float]:
+    return (np.asarray(point, dtype=float) * factors).tolist()
 
 
 # ### Validation helpers ###
@@ -473,18 +648,22 @@ def _move_instance_sources_to_library_scene(
         _detach_instance_source_root(document, source_root_index)
         source_root_indices.append(source_root_index)
     scenes = _get_gltf_collection(document, "scenes", create=True)
-    if any(
-        isinstance(scene, Mapping)
-        and scene.get("name") == INSTANCE_SOURCE_SCENE_NAME
+    source_scenes = [
+        scene
         for scene in scenes
-    ):
-        raise ValueError("The exported GLB already has an instance-source scene.")
-    scenes.append(
-        {
-            "name": INSTANCE_SOURCE_SCENE_NAME,
-            "nodes": source_root_indices,
-        }
-    )
+        if isinstance(scene, dict) and scene.get("name") == INSTANCE_SOURCE_SCENE_NAME
+    ]
+    if len(source_scenes) > 1:
+        raise ValueError("The exported GLB has duplicate instance-source scenes.")
+    if source_scenes:
+        source_scenes[0]["nodes"] = source_root_indices
+    else:
+        scenes.append(
+            {
+                "name": INSTANCE_SOURCE_SCENE_NAME,
+                "nodes": source_root_indices,
+            }
+        )
     return _serialize_glb(document, binary_payload)
 
 
@@ -728,4 +907,3 @@ def _write_bytes_atomically(path: Path, payload: bytes) -> None:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise
-
