@@ -1367,7 +1367,7 @@ class StairMainIntegrationTests(unittest.TestCase):
                 for section in draft.intermediate_sections  # type: ignore[union-attr]
             ],
         )
-        self.assertEqual(self.workspace.add_stairs_button.text(), "Add stairs")
+        self.assertEqual(self.workspace.add_stairs_button.text(), "Add stair points")
 
     def test_completed_stair_refits_the_3d_preview(self) -> None:
         placement = type(

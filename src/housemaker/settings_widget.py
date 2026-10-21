@@ -1563,7 +1563,9 @@ class SettingsWidget(QWidget):
         )
         self.reference_generation_model_combo.setToolTip(
             "Choose the model used to generate object reference images. "
-            "OpenAI models use the configured API key; Qwen and Stable "
+            "Meshy (Nano Banana) uses the Meshy API key and Meshy credits. "
+            "Canceling stops local waiting; a started Meshy task may still consume credits. "
+            "OpenAI models use the OpenAI API key; Qwen and Stable "
             "Diffusion run locally. Luna (Batch API) queues requests with "
             "a 24-hour completion window and discounted token rates. Stable "
             "Diffusion downloads its model "

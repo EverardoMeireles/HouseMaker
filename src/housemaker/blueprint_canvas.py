@@ -50,6 +50,13 @@ from housemaker.doorway_topology import (
     find_doorway_fit,
     move_doorway_corner_vertices,
 )
+from housemaker.landing_geometry import (
+    create_landing,
+    find_landing_snap,
+    landing_attachment_for_image_point,
+    landing_image_footprint,
+    resolve_landing_attachment,
+)
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
@@ -73,6 +80,8 @@ from housemaker.models import (
     DoorwayData,
     DoorwayPreset,
     Edge,
+    LandingAttachment,
+    LandingData,
     LevelData,
     OpenSpaceData,
     RoomData,
@@ -173,6 +182,9 @@ WINDOW_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 12.0
 # Keep the fixed outward wall edges nonzero at a linked opening's limits.
 WINDOW_LINKED_BOUNDARY_CLEARANCE_PIXELS = 1e-4
+LANDING_FILL_COLOR = QColor(140, 225, 155, 90)
+LANDING_EDGE_COLOR = QColor("#91e6a3")
+LANDING_ROTATION_HANDLE_DISTANCE_SCREEN = 28.0
 DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
 DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
@@ -399,6 +411,8 @@ class PendingStairPlacement:
     start_b_y: float
     start_a_vertex_id: int | None = None
     start_b_vertex_id: int | None = None
+    start_a_landing: LandingAttachment | None = None
+    start_b_landing: LandingAttachment | None = None
 
     @property
     def start_x(self) -> float:
@@ -424,6 +438,8 @@ class StairSectionPlacement:
     b_y: float
     a_vertex_id: int | None = None
     b_vertex_id: int | None = None
+    a_landing: LandingAttachment | None = None
+    b_landing: LandingAttachment | None = None
 
 
 @dataclass(frozen=True)
@@ -446,6 +462,10 @@ class StairPlacement:
     start_b_vertex_id: int | None = None
     end_a_vertex_id: int | None = None
     end_b_vertex_id: int | None = None
+    start_a_landing: LandingAttachment | None = None
+    start_b_landing: LandingAttachment | None = None
+    end_a_landing: LandingAttachment | None = None
+    end_b_landing: LandingAttachment | None = None
 
     @property
     def start_x(self) -> float:
@@ -479,6 +499,7 @@ class StairPointTarget:
     point: tuple[float, float]
     guides: list[SnapGuide]
     vertex_id: int | None = None
+    landing_attachment: LandingAttachment | None = None
 
 
 @dataclass(frozen=True)
@@ -489,6 +510,7 @@ class PendingStairPoint:
     x: float
     y: float
     vertex_id: int | None = None
+    landing_attachment: LandingAttachment | None = None
 
 
 @dataclass(frozen=True)
@@ -585,8 +607,27 @@ class _PlacedObjectEditDrag:
     active: bool = False
 
 
+@dataclass
+class _LandingCanvasDrag:
+    landing: LandingData
+    press_point: tuple[float, float]
+    operation: str
+    preview: LandingData
+    active: bool = False
+
+
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
+    landing_placement_requested = Signal(float, float)
+    landing_placement_changed = Signal(bool)
+    landing_placement_cancelled = Signal()
+    landing_selection_requested = Signal(object)
+    landing_edit_started = Signal(str)
+    landing_transform_preview_changed = Signal(str, object)
+    landing_edit_finished = Signal(str, bool)
+    landing_edit_cancelled = Signal(str)
+    landing_deletion_requested = Signal(str)
+    landing_generation_requested = Signal(str)
     geometry_changed = Signal()
     wall_vertex_added = Signal()
     wall_vertices_deleted = Signal(object)
@@ -763,6 +804,10 @@ class BlueprintCanvas(QWidget):
         self._selected_placed_object_ids: tuple[str, ...] = ()
         self._active_placed_object_id: str | None = None
         self._placed_object_edit_drag: _PlacedObjectEditDrag | None = None
+        self._landing_placement_active = False
+        self._landing_hover_point: tuple[float, float] | None = None
+        self.selected_landing_id: str | None = None
+        self._landing_drag: _LandingCanvasDrag | None = None
         self.selected_open_space_id: str | None = None
         self._open_space_placement_active = False
         self._open_space_drag_start_image: QPointF | None = None
@@ -1452,12 +1497,232 @@ class BlueprintCanvas(QWidget):
 
         return self._camera_indicator_pose
 
+    # ### Landing placement and transforms ###
+    def begin_landing_placement(self) -> bool:
+        if self.blueprint_image is None or self.level_context is None:
+            return False
+        self.cancel_window_placement()
+        self.cancel_directional_light_placement()
+        self.cancel_open_space_placement()
+        self._cancel_stair_placement_for_other_mode()
+        self._reset_doorway_placement()
+        self.stop_plan_image_erasing()
+        self._cancel_landing_drag()
+        self._clear_active_vertex_chain_for_selection()
+        self._landing_placement_active = True
+        self._landing_hover_point = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.landing_placement_changed.emit(True)
+        self.update()
+        return True
+
+    def cancel_landing_placement(self, *, notify: bool = True) -> bool:
+        if not self._landing_placement_active:
+            return False
+        self._landing_placement_active = False
+        self._landing_hover_point = None
+        self.unsetCursor()
+        self.landing_placement_changed.emit(False)
+        if notify:
+            self.landing_placement_cancelled.emit()
+        self.update()
+        return True
+
+    def is_landing_placement_active(self) -> bool:
+        return self._landing_placement_active
+
+    def select_landing(self, landing_id: str | None) -> bool:
+        normalized = None if landing_id is None else str(landing_id)
+        if normalized is not None and self._find_landing(normalized) is None:
+            return False
+        changed = normalized != self.selected_landing_id
+        self.selected_landing_id = normalized
+        if normalized is not None:
+            self._set_selected_window_id(None, notify=False)
+            self._set_selected_doorway_index(None)
+            self.selected_stair_index = None
+            self.selected_vertex_id = None
+        self.update()
+        return changed
+
+    def _find_landing(self, landing_id: str):
+        level = self.level_context
+        return next(
+            (
+                item
+                for item in getattr(level, "landings", ())
+                if item.landing_id == landing_id
+            ),
+            None,
+        )
+
+    def _landing_widget_polygon(self, landing: LandingData) -> QPolygonF:
+        return QPolygonF(
+            [
+                self._image_to_widget(*point)
+                for point in landing_image_footprint(self.level_context, landing)
+            ]
+        )
+
+    def _landing_rotation_handle(self, landing: LandingData) -> QPointF:
+        polygon = self._landing_widget_polygon(landing)
+        center = self._image_to_widget(landing.center_x, landing.center_y)
+        radius = max(
+            (
+                math.hypot(point.x() - center.x(), point.y() - center.y())
+                for point in polygon
+            ),
+            default=0.0,
+        )
+        angle = math.radians(landing.rotation_degrees)
+        return center + QPointF(math.cos(angle), math.sin(angle)) * (
+            radius + LANDING_ROTATION_HANDLE_DISTANCE_SCREEN
+        )
+
+    def _begin_landing_pointer_drag(self, widget_point: QPointF) -> bool:
+        level = self.level_context
+        if level is None:
+            return False
+        if self._find_stair_hit(widget_point) is not None:
+            # A connected stair endpoint remains draggable where it touches
+            # the landing; the supporting slab must not swallow its handle.
+            return False
+        selected = self._find_landing(self.selected_landing_id or "")
+        landing, operation = None, "move"
+        if selected is not None:
+            handle = self._landing_rotation_handle(selected)
+            if (
+                math.hypot(widget_point.x() - handle.x(), widget_point.y() - handle.y())
+                <= 12.0
+            ):
+                landing, operation = selected, "rotate"
+        if landing is None:
+            landing = next(
+                (
+                    item
+                    for item in reversed(level.landings)
+                    if self._landing_widget_polygon(item).containsPoint(
+                        widget_point, Qt.FillRule.OddEvenFill
+                    )
+                ),
+                None,
+            )
+        if landing is None:
+            return False
+        self.select_landing(landing.landing_id)
+        self.landing_selection_requested.emit(landing.landing_id)
+        point = self._widget_to_image_clamped(widget_point)
+        self._landing_drag = _LandingCanvasDrag(
+            landing, (point.x(), point.y()), operation, landing
+        )
+        return True
+
+    def _update_landing_pointer_drag(self, widget_point: QPointF) -> bool:
+        drag = self._landing_drag
+        if drag is None:
+            return False
+        point = self._widget_to_image_clamped(widget_point)
+        if not drag.active:
+            press = self._image_to_widget(*drag.press_point)
+            if (
+                math.hypot(widget_point.x() - press.x(), widget_point.y() - press.y())
+                < DRAG_THRESHOLD_SCREEN
+            ):
+                return True
+            drag.active = True
+            self.landing_edit_started.emit(drag.landing.landing_id)
+        if drag.operation == "move":
+            preview = replace(
+                drag.landing,
+                center_x=drag.landing.center_x + point.x() - drag.press_point[0],
+                center_y=drag.landing.center_y + point.y() - drag.press_point[1],
+            )
+        else:
+            center = drag.landing.center_x, drag.landing.center_y
+            before = math.atan2(
+                drag.press_point[1] - center[1], drag.press_point[0] - center[0]
+            )
+            after = math.atan2(point.y() - center[1], point.x() - center[0])
+            preview = replace(
+                drag.landing,
+                rotation_degrees=drag.landing.rotation_degrees
+                + math.degrees(after - before),
+            )
+        if preview != drag.preview:
+            drag.preview = preview
+            self.landing_transform_preview_changed.emit(
+                preview.landing_id,
+                {
+                    "center_x": preview.center_x,
+                    "center_y": preview.center_y,
+                    "rotation_degrees": preview.rotation_degrees,
+                },
+            )
+            self.update()
+        return True
+
+    def _finish_landing_drag(self, widget_point: QPointF) -> bool:
+        drag = self._landing_drag
+        if drag is None:
+            return False
+        self._update_landing_pointer_drag(widget_point)
+        self._landing_drag = None
+        if drag.active:
+            self.landing_edit_finished.emit(
+                drag.landing.landing_id, drag.preview != drag.landing
+            )
+        self.update()
+        return True
+
+    def _cancel_landing_drag(self) -> bool:
+        drag = self._landing_drag
+        if drag is None:
+            return False
+        self._landing_drag = None
+        if drag.active:
+            self.landing_edit_cancelled.emit(drag.landing.landing_id)
+        self.update()
+        return True
+
+    def _paint_landings(self, painter: QPainter) -> None:
+        level = self.level_context
+        if level is None:
+            return
+        painter.save()
+        for landing in level.landings:
+            if (
+                self._landing_drag is not None
+                and self._landing_drag.landing.landing_id == landing.landing_id
+            ):
+                landing = self._landing_drag.preview
+            selected = landing.landing_id == self.selected_landing_id
+            pen = QPen(
+                SELECTED_WINDOW_EDGE_COLOR if selected else LANDING_EDGE_COLOR, 2.0
+            )
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(LANDING_FILL_COLOR)
+            painter.drawPolygon(self._landing_widget_polygon(landing))
+            if selected:
+                center = self._image_to_widget(landing.center_x, landing.center_y)
+                handle = self._landing_rotation_handle(landing)
+                painter.drawLine(center, handle)
+                painter.drawEllipse(handle, 6.0, 6.0)
+        if self._landing_placement_active and self._landing_hover_point is not None:
+            preview = create_landing(level, *self._landing_hover_point)
+            painter.setPen(QPen(LANDING_EDGE_COLOR, 2.0, Qt.PenStyle.DashLine))
+            painter.setBrush(LANDING_FILL_COLOR)
+            painter.drawPolygon(self._landing_widget_polygon(preview))
+        painter.restore()
+
     # ### Directional-light placement and profiles ###
     def start_directional_light_placement(self) -> bool:
         """Arm a one-shot directional-light point placement on the plan."""
 
         if self.blueprint_image is None:
             return False
+        self.cancel_landing_placement()
         self.cancel_window_placement()
         self.stop_plan_image_erasing()
         self.cancel_open_space_placement()
@@ -1747,6 +2012,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Plan-image erasing ###
     def start_plan_image_erasing(self, output_path: str | Path) -> bool:
+        self.cancel_landing_placement()
         """Enter persistent erase mode with one owner-provided output revision."""
 
         if self.blueprint_image is None or self.blueprint_path is None:
@@ -2062,6 +2328,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Open-space placement ###
     def start_open_space_placement(self) -> bool:
+        self.cancel_landing_placement()
         """Start a one-shot rectangle drag for the current level."""
 
         if self.blueprint_image is None:
@@ -2155,6 +2422,7 @@ class BlueprintCanvas(QWidget):
     ) -> None:
         """Start endpoint placement followed by optional curve refinement."""
 
+        self.cancel_landing_placement()
         self.cancel_window_placement()
         self.cancel_directional_light_placement()
         self.stop_plan_image_erasing()
@@ -2310,6 +2578,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Window placement ###
     def start_window_placement(self) -> bool:
+        self.cancel_landing_placement()
         """Arm one-click placement of a centered window on the nearest wall."""
 
         if self.blueprint_image is None or len(self.vertex_data.vertices) < 2:
@@ -2372,6 +2641,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Doorway placement ###
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
+        self.cancel_landing_placement()
         """Begin placing one doorway using the selected hole dimensions."""
         self._cancel_window_pointer_state(restore_initial=True)
         self._set_selected_window_id(None)
@@ -2412,6 +2682,9 @@ class BlueprintCanvas(QWidget):
         blueprint_revision: tuple[object, ...] | None,
         preserve_view: bool = False,
     ) -> None:
+        self.cancel_landing_placement()
+        self._cancel_landing_drag()
+        self.selected_landing_id = None
         self._cancel_window_pointer_state(restore_initial=True)
         self._cancel_placed_object_edit_drag(restore_initial=True)
         self.cancel_window_placement()
@@ -2537,6 +2810,15 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Escape and (
+            self.cancel_landing_placement() or self._cancel_landing_drag()
+        ):
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Delete and self.selected_landing_id is not None:
+            self.landing_deletion_requested.emit(self.selected_landing_id)
+            event.accept()
+            return
         if (
             event.key() == Qt.Key.Key_Control
             and not event.isAutoRepeat()
@@ -2823,6 +3105,11 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton and (
+            self.cancel_landing_placement() or self._cancel_landing_drag()
+        ):
+            event.accept()
+            return
         self.setFocus(Qt.FocusReason.MouseFocusReason)
 
         if (
@@ -2957,6 +3244,14 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if self._landing_placement_active:
+            point = self._widget_to_image(event.position())
+            if point is not None:
+                self.cancel_landing_placement(notify=False)
+                self.landing_placement_requested.emit(point.x(), point.y())
+            event.accept()
+            return
+
         if self._window_placement_active:
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
@@ -3050,6 +3345,13 @@ class BlueprintCanvas(QWidget):
         ):
             event.accept()
             return
+
+        if self._begin_landing_pointer_drag(event.position()):
+            event.accept()
+            return
+        if self.selected_landing_id is not None:
+            self.select_landing(None)
+            self.landing_selection_requested.emit(None)
 
         self._clear_placed_object_selection_for_structural_interaction()
 
@@ -3213,6 +3515,16 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._landing_drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._update_landing_pointer_drag(event.position())
+            event.accept()
+            return
+        if self._landing_placement_active:
+            point = self._widget_to_image(event.position())
+            self._landing_hover_point = None if point is None else (point.x(), point.y())
+            self.update()
+            event.accept()
+            return
         if self.blueprint_image is None:
             super().mouseMoveEvent(event)
             return
@@ -3428,6 +3740,9 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton and self._finish_landing_drag(event.position()):
+            event.accept()
+            return
         finish_wall_interaction = (
             event.button() == Qt.MouseButton.LeftButton
             and self._is_wall_vertex_interaction_active
@@ -3751,6 +4066,7 @@ class BlueprintCanvas(QWidget):
         self._paint_camera_indicator(painter)
         self._paint_level_comparison_overlay(painter)
         self._paint_placed_object_profiles(painter)
+        self._paint_landings(painter)
         self._paint_directional_light_profiles(painter)
         self._paint_directional_light_hover(painter)
         self._paint_outer_wall_reference_points(painter)
@@ -4652,6 +4968,7 @@ class BlueprintCanvas(QWidget):
             and pending_draft is None
             and pending_point is None
             and pending_placement.start_level_index == level.index
+            and not level.landings
         ):
             return None
 
@@ -4693,6 +5010,7 @@ class BlueprintCanvas(QWidget):
             and pending_draft is None
             and pending_point is None
             and level.index == pending_placement.start_level_index
+            and not level.landings
         ):
             self.stair_placement_invalid_endpoint.emit(
                 "Choose a different level for the stair end segment."
@@ -4731,6 +5049,7 @@ class BlueprintCanvas(QWidget):
                 x=point_x,
                 y=point_y,
                 vertex_id=target.vertex_id,
+                landing_attachment=target.landing_attachment,
             )
             self.pending_stair_preview_point = None
             self.pending_stair_preview_guides = []
@@ -4747,6 +5066,8 @@ class BlueprintCanvas(QWidget):
                 start_b_y=point_y,
                 start_a_vertex_id=pending_point.vertex_id,
                 start_b_vertex_id=target.vertex_id,
+                start_a_landing=pending_point.landing_attachment,
+                start_b_landing=target.landing_attachment,
             )
             self.pending_stair_placement = pending_placement
             self.pending_stair_point = None
@@ -4773,6 +5094,10 @@ class BlueprintCanvas(QWidget):
                 start_b_vertex_id=pending_placement.start_b_vertex_id,
                 end_a_vertex_id=pending_point.vertex_id,
                 end_b_vertex_id=target.vertex_id,
+                start_a_landing=pending_placement.start_a_landing,
+                start_b_landing=pending_placement.start_b_landing,
+                end_a_landing=pending_point.landing_attachment,
+                end_b_landing=target.landing_attachment,
             )
         else:
             intermediate_section = StairSectionPlacement(
@@ -4783,6 +5108,8 @@ class BlueprintCanvas(QWidget):
                 b_y=point_y,
                 a_vertex_id=pending_point.vertex_id,
                 b_vertex_id=target.vertex_id,
+                a_landing=pending_point.landing_attachment,
+                b_landing=target.landing_attachment,
             )
             pending_draft = replace(
                 pending_draft,
@@ -4813,6 +5140,34 @@ class BlueprintCanvas(QWidget):
                 point=(hit_vertex.x, hit_vertex.y),
                 guides=[],
                 vertex_id=hit_vertex.id,
+            )
+
+        level = self.level_context
+        if level is not None:
+            corners = [
+                (math.dist((image_point.x(), image_point.y()), point), point, landing)
+                for landing in level.landings
+                for point in landing_image_footprint(level, landing)
+            ]
+            if corners:
+                distance, point, landing = min(corners, key=lambda item: item[0])
+                if distance <= self._screen_distance_to_image(VERTEX_HIT_RADIUS_SCREEN):
+                    return StairPointTarget(
+                        point=point,
+                        guides=[],
+                        landing_attachment=landing_attachment_for_image_point(level, landing, point),
+                    )
+        landing_snap = None if level is None else find_landing_snap(
+            level,
+            (image_point.x(), image_point.y()),
+            self._screen_distance_to_image(AXIS_SNAP_TOLERANCE_SCREEN),
+        )
+        if landing_snap is not None:
+            point, attachment = landing_snap
+            return StairPointTarget(
+                point=point,
+                guides=[SnapGuide(source_vertex_id=None, source_point=point, axis=axis) for axis in ("x", "y")],
+                landing_attachment=attachment,
             )
 
         hit_edge = self._find_edge_at(widget_point)
@@ -4964,11 +5319,13 @@ class BlueprintCanvas(QWidget):
                             section.a_x,
                             section.a_y,
                             section.a_vertex_id,
+                            section.a_landing,
                         ),
                         self._resolve_stair_canvas_point(
                             section.b_x,
                             section.b_y,
                             section.b_vertex_id,
+                            section.b_landing,
                         ),
                     )
                 )
@@ -4985,11 +5342,13 @@ class BlueprintCanvas(QWidget):
                         pending_placement.start_a_x,
                         pending_placement.start_a_y,
                         pending_placement.start_a_vertex_id,
+                        pending_placement.start_a_landing,
                     ),
                     self._resolve_stair_canvas_point(
                         pending_placement.start_b_x,
                         pending_placement.start_b_y,
                         pending_placement.start_b_vertex_id,
+                        pending_placement.start_b_landing,
                     ),
                 )
             )
@@ -5020,6 +5379,7 @@ class BlueprintCanvas(QWidget):
                         point_x,
                         point_y,
                         vertex_id,
+                        getattr(section, f"{point_name}_landing"),
                     )
                     endpoint_point = self._image_to_widget(
                         resolved_x,
@@ -5054,6 +5414,7 @@ class BlueprintCanvas(QWidget):
                     getattr(section, f"{point_name}_x"),
                     getattr(section, f"{point_name}_y"),
                     getattr(section, f"{point_name}_vertex_id"),
+                    getattr(section, f"{point_name}_landing"),
                 )
         return None
 
@@ -5078,6 +5439,7 @@ class BlueprintCanvas(QWidget):
                     f"{section_name}_{point_name}_x": preview[0],
                     f"{section_name}_{point_name}_y": preview[1],
                     f"{section_name}_{point_name}_vertex_id": None,
+                    f"{section_name}_{point_name}_landing": None,
                 },
             )
         if not section_name.startswith("intermediate_"):
@@ -5095,6 +5457,7 @@ class BlueprintCanvas(QWidget):
                 f"{point_name}_x": preview[0],
                 f"{point_name}_y": preview[1],
                 f"{point_name}_vertex_id": None,
+                f"{point_name}_landing": None,
             },
         )
         return replace(placement, intermediate_sections=tuple(sections))
@@ -5129,17 +5492,25 @@ class BlueprintCanvas(QWidget):
         self,
         widget_point: QPointF,
     ) -> tuple[float, float]:
-        """Snap a dragged stair point only to walls on the displayed level."""
+        """Snap a dragged stair point to current walls or landing boundaries."""
 
         hit_vertex = self._find_vertex_at(widget_point)
         if hit_vertex is not None:
             return hit_vertex.x, hit_vertex.y
 
+        image_point = self._widget_to_image_clamped(widget_point)
+        level = self.level_context
+        if level is not None:
+            target = self._build_stair_point_target(
+                image_point, Qt.KeyboardModifier.NoModifier, widget_point
+            )
+            if target.landing_attachment is not None:
+                return target.point
+
         hit_edge = self._find_edge_at(widget_point)
         if hit_edge is not None:
             return hit_edge.point
 
-        image_point = self._widget_to_image_clamped(widget_point)
         return image_point.x(), image_point.y()
 
     def _finish_stair_drag(self) -> None:
@@ -5171,9 +5542,16 @@ class BlueprintCanvas(QWidget):
         saved_x: float,
         saved_y: float,
         vertex_id: int | None,
+        landing_attachment: LandingAttachment | None = None,
     ) -> tuple[float, float]:
         """Use a live bound vertex, falling back to the stair's saved point."""
 
+        level = self.level_context
+        if landing_attachment is not None and level is not None:
+            try:
+                return resolve_landing_attachment(level, landing_attachment, (level,))[0]
+            except ValueError:
+                pass
         if vertex_id is not None:
             bound_vertex = self.vertex_data.get_vertex(vertex_id)
             if bound_vertex is not None:
@@ -9286,11 +9664,13 @@ class BlueprintCanvas(QWidget):
                     section.a_x,
                     section.a_y,
                     section.a_vertex_id,
+                    section.a_landing,
                 )
                 point_b_x, point_b_y = self._resolve_stair_canvas_point(
                     section.b_x,
                     section.b_y,
                     section.b_vertex_id,
+                    section.b_landing,
                 )
                 if section_name == "start":
                     label = (
@@ -9358,11 +9738,13 @@ class BlueprintCanvas(QWidget):
                     section.a_x,
                     section.a_y,
                     section.a_vertex_id,
+                    section.a_landing,
                 )
                 point_b_x, point_b_y = self._resolve_stair_canvas_point(
                     section.b_x,
                     section.b_y,
                     section.b_vertex_id,
+                    section.b_landing,
                 )
                 label = (
                     "Stair start - add curve sections or confirm"
@@ -9552,11 +9934,13 @@ class BlueprintCanvas(QWidget):
             section.a_x,
             section.a_y,
             section.a_vertex_id,
+            section.a_landing,
         )
         point_b_x, point_b_y = self._resolve_stair_canvas_point(
             section.b_x,
             section.b_y,
             section.b_vertex_id,
+            section.b_landing,
         )
         return (
             self._image_to_widget(point_a_x, point_a_y)
@@ -10081,6 +10465,8 @@ def _get_stair_sections(
         b_y=placement.start_b_y,
         a_vertex_id=placement.start_a_vertex_id,
         b_vertex_id=placement.start_b_vertex_id,
+        a_landing=placement.start_a_landing,
+        b_landing=placement.start_b_landing,
     )
     end_section = StairSectionPlacement(
         level_index=placement.end_level_index,
@@ -10090,6 +10476,8 @@ def _get_stair_sections(
         b_y=placement.end_b_y,
         a_vertex_id=placement.end_a_vertex_id,
         b_vertex_id=placement.end_b_vertex_id,
+        a_landing=placement.end_a_landing,
+        b_landing=placement.end_b_landing,
     )
     named_intermediate_sections = tuple(
         (f"intermediate_{section_index}", section)
@@ -10171,6 +10559,8 @@ def _coerce_pending_stair_placement(
         start_b_vertex_id=_coerce_optional_stair_vertex_id(
             _get_stair_value(raw_placement, "start_b_vertex_id")
         ),
+        start_a_landing=_coerce_landing_attachment(_get_stair_value(raw_placement, "start_a_landing")),
+        start_b_landing=_coerce_landing_attachment(_get_stair_value(raw_placement, "start_b_landing")),
     )
 
 
@@ -10259,6 +10649,10 @@ def _coerce_stair_placement(raw_stair: object) -> StairPlacement | None:
         end_b_vertex_id=_coerce_optional_stair_vertex_id(
             _get_stair_value(raw_stair, "end_b_vertex_id")
         ),
+        start_a_landing=_coerce_landing_attachment(_get_stair_value(raw_stair, "start_a_landing")),
+        start_b_landing=_coerce_landing_attachment(_get_stair_value(raw_stair, "start_b_landing")),
+        end_a_landing=_coerce_landing_attachment(_get_stair_value(raw_stair, "end_a_landing")),
+        end_b_landing=_coerce_landing_attachment(_get_stair_value(raw_stair, "end_b_landing")),
     )
 
 
@@ -10313,7 +10707,20 @@ def _coerce_stair_section(
         b_vertex_id=_coerce_optional_stair_vertex_id(
             _get_stair_value(raw_section, "b_vertex_id")
         ),
+        a_landing=_coerce_landing_attachment(_get_stair_value(raw_section, "a_landing")),
+        b_landing=_coerce_landing_attachment(_get_stair_value(raw_section, "b_landing")),
     )
+
+
+def _coerce_landing_attachment(value: object) -> LandingAttachment | None:
+    if isinstance(value, LandingAttachment):
+        return value
+    if value is None:
+        return None
+    try:
+        return LandingAttachment.from_dict(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _get_stair_value(raw_stair: object, field_name: str) -> object | None:

@@ -36,13 +36,15 @@ class LocalReferenceBatchThread(QThread):
 
     def __init__(
         self, items, model, symmetry_model, *, api_key, prompt, strength,
-        negative_prompt=DEFAULT_REFERENCE_NEGATIVE_PROMPT, parent=None,
+        negative_prompt=DEFAULT_REFERENCE_NEGATIVE_PROMPT, symmetry_api_key=None,
+        parent=None,
     ) -> None:
         super().__init__(parent)
         self.items = tuple(items)
         self.model = model
         self.symmetry_model = symmetry_model
         self._api_key = api_key
+        self._symmetry_api_key = api_key if symmetry_api_key is None else symmetry_api_key
         self._prompt = prompt
         self._strength = strength
         self._negative_prompt = negative_prompt
@@ -58,14 +60,17 @@ class LocalReferenceBatchThread(QThread):
     def _is_cancelled(self, job_id: str) -> bool:
         return self.isInterruptionRequested() or self._cancelled[job_id].is_set()
 
-    def _error_text(self, error: Exception) -> str:
+    def _error_text(self, error: Exception | str) -> str:
         message = str(error) or type(error).__name__
-        return message.replace(self._api_key, "[redacted]") if self._api_key else message
+        for secret in sorted({self._api_key, self._symmetry_api_key}, key=len, reverse=True):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        return message
 
     def _finish(self, job_id, result=None, error="", cancelled=False) -> None:
         if job_id not in self._finished_items:
             self._finished_items.add(job_id)
-            self.item_finished.emit(job_id, result, error, cancelled)
+            self.item_finished.emit(job_id, result, self._error_text(error) if error else "", cancelled)
 
     def run(self) -> None:  # type: ignore[override]
         """Close the image model before opening any local symmetry model."""
@@ -87,6 +92,7 @@ class LocalReferenceBatchThread(QThread):
                     cancelled=self._is_cancelled(item.job_id),
                 )
             self._api_key = ""
+            self._symmetry_api_key = ""
 
     # ### Image-generation phase ###
     def _reference_session(self):
@@ -135,7 +141,7 @@ class LocalReferenceBatchThread(QThread):
         )
 
         with open_reference_symmetry_session(
-            self.symmetry_model, api_key=self._api_key,
+            self.symmetry_model, api_key=self._symmetry_api_key,
             cancellation_check=self.isInterruptionRequested,
         ) as session:
             for job_id in tuple(generated):
@@ -177,7 +183,7 @@ class LocalReferenceBatchThread(QThread):
                     self.item_progress.emit(job_id, stage, 90)
 
         results = infer_reference_symmetry_batch(
-            pending, api_key=self._api_key,
+            pending, api_key=self._symmetry_api_key,
             cancellation_check=lambda: all(self._is_cancelled(key) for key in pending),
             progress_callback=progress,
         )
@@ -277,7 +283,7 @@ class OpenAIReferenceBatchThread(LocalReferenceBatchThread):
             try:
                 image = _decode_generated_reference(
                     _decode_openai_image_generation_result(
-                        outcome.body, secrets=(self._api_key,),
+                        outcome.body, secrets=(self._api_key, self._symmetry_api_key),
                     )
                 )
                 generated[job_id] = image

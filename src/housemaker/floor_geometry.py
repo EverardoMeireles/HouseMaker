@@ -11,6 +11,7 @@ from shapely import LineString, Point, Polygon, STRtree
 from shapely.geometry.base import BaseGeometry
 
 from housemaker.doorway_connections import get_level_structural_edges
+from housemaker.landing_geometry import landing_image_footprint
 from housemaker.models import LevelData
 
 # ### Constants ###
@@ -122,6 +123,17 @@ def build_level_floor_footprint(
             point_to_world_xy,
         )
     )
+    # A landing perimeter is authored structural linework too. It may close
+    # an interrupted wall shell without relying on an artificial stair cut.
+    for landing in level.landings:
+        points = [
+            point_to_world_xy(point, blueprint_size_pixels)
+            for point in landing_image_footprint(level, landing)
+        ]
+        structural_lines.extend(
+            LineString((first, second))
+            for first, second in zip(points, (*points[1:], points[0]))
+        )
     if not structural_lines:
         return None
     explicit_opening_geometry = build_level_open_space_geometry(

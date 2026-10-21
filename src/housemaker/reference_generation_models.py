@@ -9,8 +9,10 @@ from housemaker.plan_correction_models import (
 # ### Model identifiers ###
 REFERENCE_GENERATION_MODEL_SETTINGS_KEY = "generation/reference_generation_model"
 REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION = "stable-diffusion-xl-img2img"
+REFERENCE_GENERATION_MODEL_MESHY = "meshy-image-to-image"
 REFERENCE_GENERATION_MODEL_OPTIONS = (
     *PLAN_CORRECTION_MODEL_OPTIONS,
+    ("Meshy (Nano Banana)", REFERENCE_GENERATION_MODEL_MESHY),
     ("Stable Diffusion XL (img2img, Local)", REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION),
 )
 REFERENCE_GENERATION_MODELS = frozenset(

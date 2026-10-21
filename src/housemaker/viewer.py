@@ -114,6 +114,8 @@ from housemaker.glb import (
     PreviewTexturedWall,
     remove_covered_surface_faces,
 )
+from housemaker.landing_geometry import build_landing_meshes, landing_world_transform
+from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
     ARCHITECTURAL_TRIM_KINDS,
     DOORWAY_SHAPE_ARCH,
@@ -123,6 +125,7 @@ from housemaker.models import (
     TRIM_KIND_CORNICE,
     TRIM_KIND_EDGING_STRIP,
     TRIM_KIND_SKIRTING_BOARD,
+    LevelData,
 )
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
@@ -284,6 +287,7 @@ DOOR_PLACEMENT_PREVIEW_COLORS = {
 DOOR_PLACEMENT_PREVIEW_EDGE_ALPHA = 0.96
 OPENING_FIXTURE_PLACEMENT_ORIENTATION_COUNT = 4
 TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
+TRANSFORM_GIZMO_MIN_PROJECTED_AXIS_RATIO = 0.10
 TRANSFORM_GIZMO_RING_RADIUS_RATIO = 0.72
 TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
 TRANSFORM_GIZMO_SCALE_CUBE_SIZE_RATIO = 0.16
@@ -297,6 +301,16 @@ PLACED_OBJECT_INSTANCE_PREVIEW_COLOR = (0.52, 1.0, 0.72, 0.82)
 TRANSFORM_GIZMO_TRANSLATE = "translate"
 TRANSFORM_GIZMO_ROTATE = "rotate"
 TRANSFORM_GIZMO_SCALE = "scale"
+TRANSFORM_GIZMO_UNIFORM_SCALE = "uniform_scale"
+LANDING_UNIFORM_SCALE_GIZMO_COLOR = (0.72, 0.26, 1.0, 1.0)
+LANDING_GENERATION_CONTROL_SIZE_PIXELS = 36.0
+LANDING_GENERATION_CONTROL_HOVER_SIZE_PIXELS = 40.0
+LANDING_GENERATION_CONTROL_HIT_RADIUS_PIXELS = 24.0
+LANDING_GENERATION_CONTROL_ICON_RADIUS_PIXELS = 9.0
+LANDING_GENERATION_CONTROL_OFFSET_PIXELS = (-80.0, 80.0)
+LANDING_GENERATION_CONTROL_COLOR = (1.0, 0.84, 0.20, 1.0)
+LANDING_GENERATION_CONTROL_HOVER_COLOR = (1.0, 0.96, 0.56, 1.0)
+LANDING_GENERATION_CONTROL_ICON_COLOR = (0.12, 0.10, 0.04, 1.0)
 PLACED_OBJECT_GIZMO_TRANSFORM = "transform"
 PLACED_OBJECT_GIZMO_SCALE = "scale"
 PLACED_OBJECT_ROTATION_SNAP_DEGREES = 10.0
@@ -917,7 +931,7 @@ class _CanvasSceneLevelMesh:
 
 @dataclass(frozen=True)
 class _TransformGizmoHandle:
-    """One translation, rotation, or local-axis scale handle."""
+    """One translation, rotation, axis scale, or landing uniform-scale handle."""
 
     kind: str
     axis_index: int
@@ -927,9 +941,13 @@ class _TransformGizmoHandle:
             TRANSFORM_GIZMO_TRANSLATE,
             TRANSFORM_GIZMO_ROTATE,
             TRANSFORM_GIZMO_SCALE,
+            TRANSFORM_GIZMO_UNIFORM_SCALE,
         }:
             raise ValueError("Unknown placed-object gizmo handle kind.")
-        if self.axis_index not in {0, 1, 2}:
+        if self.kind == TRANSFORM_GIZMO_UNIFORM_SCALE:
+            if self.axis_index != -1:
+                raise ValueError("Uniform scaling has no individual axis.")
+        elif self.axis_index not in {0, 1, 2}:
             raise ValueError("Placed-object gizmo axes must be X, Y, or Z.")
 
 
@@ -1186,6 +1204,7 @@ class _FirstPersonFrameOverlay(QWidget):
 class SelectableGLViewWidget(gl.GLViewWidget):
     """3D viewport with selectable items and two explicit navigation modes."""
 
+    frame_about_to_render = Signal()
     items_clicked = Signal(object)
     viewport_clicked = Signal(object)
     viewport_double_clicked = Signal(object)
@@ -1273,8 +1292,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._update_navigation_tooltip()
 
     def paintGL(self) -> None:  # type: ignore[override]
-        """Establish the renderer-owned depth baseline for every frame."""
+        """Update billboards and establish the depth baseline for every frame."""
 
+        self.frame_about_to_render.emit()
         GL.glDepthFunc(GL.GL_LESS)
         super().paintGL()
 
@@ -3869,6 +3889,11 @@ class _PlacedObjectMeshRender:
     mesh_item: _WireframeOverlayMeshItem
 
 
+@dataclass(frozen=True)
+class _LandingStaticGeometry:
+    mesh: trimesh.Trimesh
+
+
 @dataclass
 class _PlacedObjectRenderGroup:
     """One independently transformable placed-object preview hierarchy."""
@@ -3901,6 +3926,7 @@ class _PlacedObjectTransformDrag:
     preview_world_position: tuple[float, float, float] | None = None
     preview_rotation_degrees: tuple[float, float, float] | None = None
     preview_axis_scales: tuple[float, float, float] | None = None
+    start_gizmo_size: float = 1.0
 
 
 @dataclass
@@ -4565,6 +4591,16 @@ def build_scene_object_placement_group_candidate(
 
 
 class GlbViewerWidget(QWidget):
+    landing_placement_requested = Signal(object)
+    landing_placement_changed = Signal(bool)
+    landing_placement_cancelled = Signal()
+    landing_selection_requested = Signal(object)
+    landing_edit_started = Signal(str)
+    landing_transform_preview_changed = Signal(str, object)
+    landing_edit_finished = Signal(str, bool)
+    landing_edit_cancelled = Signal(str)
+    landing_deletion_requested = Signal(str)
+    landing_generation_requested = Signal(str)
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
     window_placement_requested = Signal(object)
@@ -4792,6 +4828,26 @@ class GlbViewerWidget(QWidget):
             str,
             _PlacedObjectRenderGroup,
         ] = {}
+        self._landing_levels: tuple[LevelData, ...] = ()
+        self._landing_previews: dict[str, PreviewPlacedObject] = {}
+        self._landing_records: dict[str, tuple[LevelData, object]] = {}
+        self._landing_source_geometry: tuple[_LandingStaticGeometry, ...] = ()
+        self._landing_source_model = None
+        self._landing_filtered_mesh_cache = None
+        self._selected_landing_id: str | None = None
+        self._landing_placement_active = False
+        self._landing_placement_plane_z = 0.0
+        self._landing_placement_hover: tuple[float, float, float] | None = None
+        self._landing_placement_pressed = False
+        self._landing_placement_item: GLGraphicsItem | None = None
+        self._landing_generation_items: list[GLGraphicsItem] = []
+        self._landing_generation_center: np.ndarray | None = None
+        self._landing_generation_hit_radius = 0.0
+        self._landing_generation_geometry_key: tuple[float, ...] | None = None
+        self._landing_generation_press_id: str | None = None
+        self._landing_generation_hovered = False
+        self._landing_generation_previous_cursor: QCursor | None = None
+        self._landing_generation_previous_cursor_explicit = False
         self._selected_placed_object_ids: tuple[str, ...] = ()
         self._selected_placed_object_id: str | None = None
         self._placed_object_transform_drag: _PlacedObjectTransformDrag | None = None
@@ -5146,6 +5202,375 @@ class GlbViewerWidget(QWidget):
         )
         self._populate_scene()
 
+    # ### Structural landing authoring ###
+    def set_landing_context(
+        self, levels: Sequence[LevelData], selected_id: str | None = None
+    ) -> None:
+        """Retain independent editable proxies; never add them to export data."""
+
+        previous_geometry = {
+            landing_id: (
+                landing.generated_model_path,
+                landing.footprint_meters,
+                landing.thickness_meters,
+            )
+            for landing_id, (_level, landing) in self._landing_records.items()
+        }
+        self._landing_levels = tuple(levels)
+        self._landing_records = {
+            landing.landing_id: (level, landing)
+            for level in levels
+            for landing in level.landings
+        }
+        drag = self._placed_object_transform_drag
+        if drag is not None and drag.object_id.startswith("landing:"):
+            return
+        self._refresh_landing_previews()
+        source_changed = self._refresh_landing_source_geometry()
+        if source_changed and self.model is not None:
+            self._populate_scene()
+        else:
+            for object_id, group in tuple(self._placed_object_render_groups.items()):
+                if not object_id.startswith("landing:"):
+                    continue
+                preview = self._landing_previews.get(object_id)
+                record = self._landing_records.get(object_id.removeprefix("landing:"))
+                geometry_changed = record is not None and previous_geometry.get(
+                    record[1].landing_id
+                ) != (
+                    record[1].generated_model_path,
+                    record[1].footprint_meters,
+                    record[1].thickness_meters,
+                )
+                if preview is None or geometry_changed:
+                    # A new Meshy revision needs new render buffers/materials.
+                    # Ordinary transform previews keep their existing buffers.
+                    if group.root_item in self.view.items:
+                        self.view.removeItem(group.root_item)
+                    del self._placed_object_render_groups[object_id]
+                    continue
+                group.preview = preview
+                group.current_transform = np.asarray(preview.placement_transform).copy()
+                group.root_item.setTransform(
+                    _numpy_transform_to_qt(group.current_transform)
+                )
+            self._add_placed_object_items()
+        if selected_id is not None or self._selected_landing_id is not None:
+            self.select_landing(selected_id)
+        self._sync_placed_object_selection_rendering()
+        self.view.update()
+
+    def _refresh_landing_previews(self) -> None:
+        previews = {}
+        for landing_id, (level, landing) in self._landing_records.items():
+            physical = landing_world_transform(level, landing, self._landing_levels)
+            position = tuple(float(value) for value in physical[:3, 3])
+            rotation = (0.0, 0.0, -landing.rotation_degrees)
+            scales = (
+                level.scale * landing.scale_x,
+                level.scale * landing.scale_y,
+                landing.scale_z,
+            )
+            transform = np.eye(4)
+            transform[:3, :3] = _build_placed_object_scaled_rotation(
+                rotation, 1.0, scales
+            )
+            transform[:3, 3] = position
+            meshes = build_landing_meshes(level, landing, self._landing_levels)
+            for mesh in meshes:
+                mesh.apply_transform(np.linalg.inv(transform))
+                if landing.generated_model_path is None:
+                    mesh.visual.face_colors = (150, 190, 155, 255)
+            object_id = f"landing:{landing_id}"
+            previews[object_id] = PreviewPlacedObject(
+                object_id, meshes, transform, position, rotation, axis_scales=scales
+            )
+        self._landing_previews = previews
+
+    def _refresh_landing_source_geometry(self) -> bool:
+        if self.model is self._landing_source_model:
+            return False
+        self._landing_source_model = self.model
+        self._landing_filtered_mesh_cache = None
+        sources = []
+        if self.model is not None and not self.model.scene.metadata.get(
+            "housemaker_landing_preview"
+        ):
+            for node in self.model.scene.graph.nodes_geometry:
+                transform, geometry_name = self.model.scene.graph.get(node)
+                mesh = self.model.scene.geometry[geometry_name]
+                if not (
+                    mesh.metadata.get("landing_id") is not None
+                    or "landing:" in str(node)
+                    or "landing:" in str(geometry_name)
+                ):
+                    continue
+                world_mesh = mesh.copy()
+                world_mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM @ transform)
+                sources.append(_LandingStaticGeometry(world_mesh))
+        self._landing_source_geometry = tuple(sources)
+        return True
+
+    def select_landing(self, landing_id: str | None) -> bool:
+        if landing_id is None and self._selected_landing_id is None:
+            return False
+        object_id = None if landing_id is None else f"landing:{landing_id}"
+        if object_id is not None and object_id not in self._landing_previews:
+            return False
+        return self.select_placed_object(object_id)
+
+    def begin_landing_placement(self, *, fallback_plane_z: float = 0.0) -> bool:
+        if not math.isfinite(float(fallback_plane_z)):
+            raise ValueError("Landing placement height must be finite.")
+        self.cancel_landing_placement(notify=False)
+        self.cancel_directional_light_placement()
+        self.cancel_tour_point_placement()
+        self.cancel_object_placement()
+        self.cancel_door_placement()
+        self.cancel_architectural_trim_placement()
+        self.cancel_window_placement(status_message=None)
+        self.cancel_surface_vertex_placement()
+        self._cancel_canvas_gizmo_drag()
+        self._landing_placement_active = True
+        self._landing_placement_plane_z = float(fallback_plane_z)
+        self._landing_placement_hover = None
+        self._landing_placement_pressed = False
+        self.view.set_primary_pointer_tool_active(True)
+        self._sync_primary_pointer_input_state()
+        self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.landing_placement_changed.emit(True)
+        return True
+
+    def cancel_landing_placement(self, *, notify: bool = True) -> bool:
+        if not self._landing_placement_active:
+            return False
+        self._landing_placement_active = False
+        self._landing_placement_hover = None
+        self._landing_placement_pressed = False
+        self.view.cancel_primary_pointer_drag()
+        self.view.set_primary_pointer_tool_active(False)
+        self._remove_landing_placement_item()
+        self.view.unsetCursor()
+        self._sync_primary_pointer_input_state()
+        self.landing_placement_changed.emit(False)
+        if notify:
+            self.landing_placement_cancelled.emit()
+        return True
+
+    def is_landing_placement_active(self) -> bool:
+        return self._landing_placement_active
+
+    def _update_landing_placement_hover(self, position: QPointF) -> bool:
+        ray = self.view.build_camera_ray(position)
+        point = (
+            None
+            if ray is None
+            else _intersect_ray_with_plane(
+                np.asarray(ray[0]),
+                np.asarray(ray[1]),
+                np.asarray((0.0, 0.0, self._landing_placement_plane_z)),
+                np.asarray((0.0, 0.0, 1.0)),
+            )
+        )
+        self._landing_placement_hover = (
+            None if point is None else tuple(float(value) for value in point)
+        )
+        self._remove_landing_placement_item()
+        if point is None:
+            return False
+        mesh = trimesh.creation.box(extents=(1.5, 1.5, 0.15))
+        mesh.apply_translation((point[0], point[1], point[2] + 0.08))
+        item = gl.GLMeshItem(
+            vertexes=np.asarray(mesh.vertices, dtype=np.float32),
+            faces=np.asarray(mesh.faces, dtype=np.int32),
+            color=(0.55, 0.9, 0.6, 0.45),
+            smooth=False,
+            drawEdges=True,
+        )
+        item.setGLOptions("translucent")
+        self.view.addItem(item)
+        self._landing_placement_item = item
+        return True
+
+    def _remove_landing_placement_item(self) -> None:
+        item = self._landing_placement_item
+        if item is not None and item in self.view.items:
+            self.view.removeItem(item)
+        self._landing_placement_item = None
+
+    def _landing_transform_payload(self, object_id, position, rotation, scales):
+        landing_id = object_id.removeprefix("landing:")
+        level, landing = self._landing_records[landing_id]
+        center = level_world_to_image_xy(level, position[0], position[1])
+        floor_z = (
+            landing_world_transform(level, landing, self._landing_levels)[2, 3]
+            - landing.elevation_meters
+        )
+        return {
+            "center_x": center[0],
+            "center_y": center[1],
+            "elevation_meters": float(position[2] - floor_z),
+            "rotation_degrees": -float(rotation[2]),
+            "scale_x": float(scales[0] / level.scale),
+            "scale_y": float(scales[1] / level.scale),
+            "scale_z": float(scales[2]),
+        }
+
+    # ### Landing generation button ###
+    def _sync_landing_generation_control(self) -> None:
+        """Show a font-independent, always-on-top asterisk for one landing."""
+
+        self._clear_landing_generation_hover()
+        for item in self._landing_generation_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._landing_generation_items = []
+        self._landing_generation_center = None
+        self._landing_generation_hit_radius = 0.0
+        self._landing_generation_geometry_key = None
+        object_id = self._selected_placed_object_id or ""
+        if not object_id.startswith("landing:"):
+            return
+        group = self._placed_object_render_groups.get(object_id)
+        if group is None:
+            return
+        background = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3), dtype=float),
+            color=LANDING_GENERATION_CONTROL_COLOR,
+            size=LANDING_GENERATION_CONTROL_SIZE_PIXELS,
+            pxMode=True,
+        )
+        icon = gl.GLLinePlotItem(
+            pos=np.zeros((6, 3), dtype=float),
+            color=LANDING_GENERATION_CONTROL_ICON_COLOR,
+            width=3.0,
+            antialias=True,
+            mode="lines",
+        )
+        for item in (background, icon):
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 30.0)
+            self.view.addItem(item)
+            self._landing_generation_items.append(item)
+        self._update_landing_generation_control_geometry()
+
+    def _update_landing_generation_control_geometry(self) -> None:
+        """Keep the button facing the camera, clear of the transform handles."""
+
+        if not self._landing_generation_items:
+            return
+        group = self._placed_object_render_groups.get(
+            self._selected_placed_object_id
+        )
+        if group is None:
+            return
+        pivot = _get_render_group_world_pivot(group)
+        inverse_view, invertible = self.view.viewMatrix().inverted()
+        if not invertible:
+            return
+        right_vector = inverse_view.mapVector(QVector3D(1.0, 0.0, 0.0))
+        up_vector = inverse_view.mapVector(QVector3D(0.0, 1.0, 0.0))
+        right = np.asarray((right_vector.x(), right_vector.y(), right_vector.z()))
+        up = np.asarray((up_vector.x(), up_vector.y(), up_vector.z()))
+        try:
+            pixel_size = float(self.view.pixelSize(QVector3D(*pivot)))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if not math.isfinite(pixel_size) or pixel_size <= 0.0:
+            pixel_size = self._transform_gizmo_size / TRANSFORM_GIZMO_SCREEN_SIZE_PIXELS
+        geometry_key = (*pivot, *right, *up, pixel_size)
+        if geometry_key == self._landing_generation_geometry_key:
+            return
+        self._landing_generation_geometry_key = geometry_key
+        offset_x, offset_y = LANDING_GENERATION_CONTROL_OFFSET_PIXELS
+        center = pivot + pixel_size * (right * offset_x + up * offset_y)
+        radius = pixel_size * LANDING_GENERATION_CONTROL_ICON_RADIUS_PIXELS
+        icon_positions = np.asarray(
+            [
+                center + sign * radius * (math.cos(angle) * right + math.sin(angle) * up)
+                for angle in (math.pi / 2.0, math.pi / 6.0, -math.pi / 6.0)
+                for sign in (-1.0, 1.0)
+            ],
+            dtype=float,
+        )
+        self._landing_generation_center = center
+        self._landing_generation_hit_radius = (
+            pixel_size * LANDING_GENERATION_CONTROL_HIT_RADIUS_PIXELS
+        )
+        self._landing_generation_items[0].setData(pos=center[np.newaxis, :])
+        self._landing_generation_items[1].setData(pos=icon_positions)
+
+    def _pick_landing_generation_control(self, ray) -> bool:
+        """Pick the same screen-sized button that is actually being rendered."""
+
+        self._update_landing_generation_control_geometry()
+        if self._landing_generation_center is None:
+            return False
+        hit = _get_ray_point_distance(*ray, self._landing_generation_center)
+        return hit is not None and hit[0] <= self._landing_generation_hit_radius
+
+    # ### Landing generation hover feedback ###
+    def _handle_landing_generation_pointer_hovered(self, position: QPointF) -> None:
+        """Highlight only the available button, without scene or mesh picking."""
+
+        if (
+            not self._landing_generation_items
+            or self.view.is_primary_pointer_drag_reserved
+            or self.view.is_first_person_pointer_captured
+            or self._landing_placement_active
+            or self.is_directional_light_placement_active
+            or self.is_tour_point_placement_active
+            or self.is_object_placement_active
+            or self.is_opening_fixture_placement_active
+            or self.is_architectural_trim_placement_active
+            or self.is_window_placement_active()
+            or self.is_surface_vertex_placement_active()
+        ):
+            self._clear_landing_generation_hover()
+            return
+        ray = self.view.build_camera_ray(position)
+        self._set_landing_generation_hovered(
+            ray is not None and self._pick_landing_generation_control(ray)
+        )
+
+    def _clear_landing_generation_hover(self, *_args: object) -> None:
+        self._set_landing_generation_hovered(False)
+
+    def _set_landing_generation_hovered(self, hovered: bool) -> None:
+        """Update retained overlay styles and temporarily own the hand cursor."""
+
+        hovered = bool(hovered and self._landing_generation_items)
+        if hovered == self._landing_generation_hovered:
+            return
+        self._landing_generation_hovered = hovered
+        if self._landing_generation_items:
+            self._landing_generation_items[0].setData(
+                color=(
+                    LANDING_GENERATION_CONTROL_HOVER_COLOR if hovered
+                    else LANDING_GENERATION_CONTROL_COLOR
+                ),
+                size=(
+                    LANDING_GENERATION_CONTROL_HOVER_SIZE_PIXELS if hovered
+                    else LANDING_GENERATION_CONTROL_SIZE_PIXELS
+                ),
+            )
+            self._landing_generation_items[1].setData(width=4.0 if hovered else 3.0)
+        if hovered:
+            self._landing_generation_previous_cursor = QCursor(self.view.cursor())
+            self._landing_generation_previous_cursor_explicit = self.view.testAttribute(
+                Qt.WidgetAttribute.WA_SetCursor
+            )
+            self.view.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            # Do not replace a crosshair/hidden cursor claimed by another tool.
+            if self.view.cursor().shape() == Qt.CursorShape.PointingHandCursor:
+                if self._landing_generation_previous_cursor_explicit:
+                    self.view.setCursor(self._landing_generation_previous_cursor)
+                else:
+                    self.view.unsetCursor()
+            self._landing_generation_previous_cursor = None
+            self._landing_generation_previous_cursor_explicit = False
+
     # ### Directional-light overlay API ###
     def set_directional_lights(
         self,
@@ -5190,6 +5615,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm one scene-hit point placement for a directional light."""
 
+        self.cancel_landing_placement()
         normalized_fallback = (
             None if fallback_plane_z is None else float(fallback_plane_z)
         )
@@ -5303,6 +5729,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm scene-hit point placement without coupling the viewer to tour state."""
 
+        self.cancel_landing_placement()
         normalized_kind = str(kind).strip().lower()
         if normalized_kind not in TOUR_POINT_KINDS:
             return False
@@ -5988,6 +6415,9 @@ class GlbViewerWidget(QWidget):
         layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
 
         self.view = SelectableGLViewWidget()
+        self.view.frame_about_to_render.connect(
+            self._update_landing_generation_control_geometry
+        )
         self.view.setBackgroundColor((24, 24, 28))
         self.view.set_item_click_selection_enabled(False)
         self.view.set_viewport_click_selection_enabled(
@@ -8112,6 +8542,7 @@ class GlbViewerWidget(QWidget):
         )
 
     def begin_surface_vertex_placement(self) -> bool:
+        self.cancel_landing_placement()
         """Arm continuous vertex-and-edge drawing on Canvas surfaces."""
 
         self._surface_tools_status_override = None
@@ -8873,6 +9304,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm shared colored placement feedback for one opening kind."""
 
+        self.cancel_landing_placement()
         if not self._window_editing_enabled:
             return False
         normalized_fixture_id = str(fixture_id).strip()
@@ -9360,6 +9792,9 @@ class GlbViewerWidget(QWidget):
         return True
 
     def _handle_view_delete_requested(self) -> None:
+        if self._selected_landing_id is not None:
+            self.landing_deletion_requested.emit(self._selected_landing_id)
+            return
         """Route Delete to Canvas placement removal or the generic consumer."""
 
         self._invalidate_external_canvas_rectangle_selection()
@@ -9503,6 +9938,11 @@ class GlbViewerWidget(QWidget):
             for object_id in known_ids
             if object_id not in self._placed_door_opening_references
         )
+        landing_ids = tuple(value for value in normalized_ids if value.startswith("landing:"))
+        if landing_ids:
+            # Structural landings have one dedicated edit owner, not an atlas
+            # multi-object selection or a generated-object instance group.
+            normalized_ids = (landing_ids[-1],)
         if door_references and not normalized_ids:
             reference = door_references[-1]
             target = self._canvas_opening_targets.get(reference.key)
@@ -9528,6 +9968,7 @@ class GlbViewerWidget(QWidget):
                 else (normalized_ids[-1] if normalized_ids else None)
             )
 
+        had_landing_selection = self._selected_landing_id is not None
         selection_changed = normalized_ids != self._selected_placed_object_ids
         active_changed = normalized_active_id != self._selected_placed_object_id
         if not selection_changed and not active_changed:
@@ -9543,9 +9984,9 @@ class GlbViewerWidget(QWidget):
                 PLACED_OBJECT_GIZMO_TRANSFORM
             )
         self._sync_placed_object_selection_rendering()
-        if selection_changed:
-            self.placed_object_selection_set_changed.emit(normalized_ids)
-        if active_changed:
+        if selection_changed and (normalized_ids or not had_landing_selection) and not any(value.startswith("landing:") for value in normalized_ids):
+            self.placed_object_selection_set_changed.emit(tuple(value for value in normalized_ids if not value.startswith("landing:")))
+        if active_changed and (normalized_active_id is not None or not had_landing_selection) and (normalized_active_id is None or not normalized_active_id.startswith("landing:")):
             self.placed_object_selection_changed.emit(normalized_active_id)
         return True
 
@@ -9573,6 +10014,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm floor-hover placement with actual meshes or cube placeholders."""
 
+        self.cancel_landing_placement()
         normalized_request_id = str(request_id).strip()
         if not self._window_editing_enabled or not normalized_request_id:
             return False
@@ -9778,6 +10220,7 @@ class GlbViewerWidget(QWidget):
         return self._architectural_trim_placement_kind is not None
 
     def begin_architectural_trim_placement(self, kind: str) -> bool:
+        self.cancel_landing_placement()
         """Arm one mutually exclusive wall-edge trim insertion mode."""
 
         normalized_kind = str(kind).strip().lower()
@@ -10128,6 +10571,7 @@ class GlbViewerWidget(QWidget):
         return True
 
     def begin_window_placement(self) -> bool:
+        self.cancel_landing_placement()
         """Arm rectangle drawing on any visible wall or planar ceiling slope."""
 
         if (
@@ -10211,6 +10655,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm a normalized X/Z rectangle on one transformed preview body."""
 
+        self.cancel_landing_placement()
         normalized_kind = str(asset_kind).strip().lower()
         normalized_asset_id = str(asset_id).strip()
         normalized_body_id = str(body_object_id).strip()
@@ -12011,6 +12456,7 @@ class GlbViewerWidget(QWidget):
                 or self.is_tour_point_placement_active
                 or self.is_directional_light_placement_active
                 or self._selected_directional_light_id is not None
+                or self._landing_placement_active
             )
         )
 
@@ -13100,6 +13546,14 @@ class GlbViewerWidget(QWidget):
         self.view.primary_pointer_hovered.connect(
             self._handle_surface_vertex_pointer_hovered
         )
+        self.view.primary_pointer_hovered.connect(
+            self._handle_landing_generation_pointer_hovered
+        )
+        self.view.primary_pointer_left.connect(self._clear_landing_generation_hover)
+        self.view.first_person_pointer_capture_changed.connect(
+            self._clear_landing_generation_hover
+        )
+        self.navigation_mode_changed.connect(self._clear_landing_generation_hover)
         self.view.primary_pointer_left.connect(self._handle_surface_vertex_pointer_left)
         self.view.control_modifier_changed.connect(
             self._handle_surface_vertex_snap_modifier_changed
@@ -13158,6 +13612,8 @@ class GlbViewerWidget(QWidget):
         *,
         additive: bool | None = None,
     ) -> None:
+        if self._landing_placement_active:
+            return
         if self.is_opening_fixture_placement_active:
             self._handle_door_placement_pick(position)
             return
@@ -13207,7 +13663,7 @@ class GlbViewerWidget(QWidget):
                     placement_transform=group.current_transform,
                 )
                 for group in self._placed_object_render_groups.values()
-                if self._canvas_objects_are_visible()
+                if self._canvas_objects_are_visible() or group.preview.object_id.startswith("landing:")
             ),
             ray_origin,
             ray_direction,
@@ -13563,6 +14019,18 @@ class GlbViewerWidget(QWidget):
         return None if hit is None else hit[0].object_id
 
     def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
+        if self._landing_placement_active:
+            self._update_landing_placement_hover(position)
+            self._landing_placement_pressed = self._landing_placement_hover is not None
+            if self._landing_placement_pressed:
+                self.view.reserve_primary_pointer_drag()
+            return
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is not None and self._pick_landing_generation_control(camera_ray):
+            self._landing_generation_press_id = self._selected_landing_id
+            self.view.reserve_primary_pointer_drag()
+            return
+        self._clear_landing_generation_hover()
         if (
             self.is_directional_light_placement_active
             or self._directional_light_placement_pointer_pressed
@@ -13648,13 +14116,22 @@ class GlbViewerWidget(QWidget):
             return
         handle = self._pick_transform_gizmo_handle(*camera_ray)
         if handle is not None:
-            self._begin_placed_object_gizmo_drag(handle, position)
+            self.view.reserve_primary_pointer_drag()
+            if not self._begin_placed_object_gizmo_drag(handle, position):
+                # A handle click must not fall through to the expensive scene
+                # selection pass if its drag plane is temporarily unavailable.
+                self.view.cancel_primary_pointer_drag()
             return
         self._begin_canvas_rectangle_selection(position)
 
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
 
+        if self._landing_placement_active:
+            self._update_landing_placement_hover(position)
+            return
+        if self._landing_generation_press_id is not None:
+            return
         if self._directional_light_drag is not None:
             self._update_directional_light_gizmo_drag(position)
             return
@@ -13700,6 +14177,21 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
         """Finish the one Canvas gizmo that currently owns the pointer."""
 
+        if self._landing_placement_active and self._landing_placement_pressed:
+            self._update_landing_placement_hover(position)
+            point = self._landing_placement_hover
+            self.cancel_landing_placement(notify=False)
+            if point is not None:
+                self.landing_placement_requested.emit(point)
+            return
+        if self._landing_generation_press_id is not None:
+            landing_id = self._landing_generation_press_id
+            self._landing_generation_press_id = None
+            self.view.release_primary_pointer_drag()
+            ray = self.view.build_camera_ray(position)
+            if ray is not None and self._pick_landing_generation_control(ray):
+                self.landing_generation_requested.emit(landing_id)
+            return
         if self._directional_light_drag is not None:
             self._finish_directional_light_gizmo_drag(position)
             return
@@ -13761,6 +14253,12 @@ class GlbViewerWidget(QWidget):
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
         """Cancel the Canvas gizmo that owns the pointer before navigation."""
 
+        if self.cancel_landing_placement():
+            return
+        if self._landing_generation_press_id is not None:
+            self._landing_generation_press_id = None
+            self.view.cancel_primary_pointer_drag()
+            return
         if self._directional_light_drag is not None:
             self._cancel_directional_light_drag()
             return
@@ -14370,6 +14868,8 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Show a preview only for the currently armed pointer tool."""
 
+        if self._landing_placement_active:
+            return self._update_landing_placement_hover(position)
         if self.is_directional_light_placement_active:
             return self._update_directional_light_placement_hover(position)
         if self.is_opening_fixture_placement_active:
@@ -16499,6 +16999,8 @@ class GlbViewerWidget(QWidget):
         )
         self._texture_edit_mask = None
         self.model = model
+        self._refresh_landing_previews()
+        self._refresh_landing_source_geometry()
         self._rebuild_canvas_scene_level_mesh_cache()
         self._populate_scene()
         if camera_state is not None:
@@ -19126,6 +19628,12 @@ class GlbViewerWidget(QWidget):
         """Return the base mesh after Canvas visibility filtering."""
 
         display_mesh = self._get_unfiltered_display_mesh()
+        if display_mesh is not None and self._landing_source_geometry:
+            cache = self._landing_filtered_mesh_cache
+            if cache is None or cache[0] is not display_mesh:
+                filtered = remove_covered_surface_faces(display_mesh, self._landing_source_geometry)
+                self._landing_filtered_mesh_cache = (display_mesh, filtered)
+            display_mesh = self._landing_filtered_mesh_cache[1]
         if display_mesh is None or not self._window_editing_enabled:
             return display_mesh
         focus_type = self._canvas_surface_focus_type
@@ -19341,10 +19849,14 @@ class GlbViewerWidget(QWidget):
     def _add_placed_object_items(self) -> None:
         """Render each Canvas object below one independently movable root."""
 
-        if self.model is None or not self._canvas_objects_are_visible():
+        if self.model is None:
             return
         has_symmetric_preview = False
-        for preview in self.model.preview_placed_objects:
+        previews = (
+            *(self.model.preview_placed_objects if self._canvas_objects_are_visible() else ()),
+            *(preview for preview in self._landing_previews.values() if self._canvas_level_is_visible(self._landing_records[preview.object_id.removeprefix("landing:")][0].index)),
+        )
+        for preview in previews:
             if not self._canvas_placed_object_is_visible(preview.object_id):
                 continue
             if preview.object_id in self._placed_object_render_groups:
@@ -21644,6 +22156,7 @@ class GlbViewerWidget(QWidget):
 
     # ### Placed-object selection and gizmo rendering ###
     def _sync_placed_object_selection_rendering(self) -> None:
+        had_landing_selection = self._selected_landing_id is not None
         available_ids = self._placed_object_render_groups.keys()
         selected_ids = tuple(
             object_id
@@ -21658,13 +22171,18 @@ class GlbViewerWidget(QWidget):
             selected_id = selected_ids[-1] if selected_ids else None
         active_changed = selected_id != self._selected_placed_object_id
         self._selected_placed_object_id = selected_id
+        landing_id = selected_id.removeprefix("landing:") if selected_id is not None and selected_id.startswith("landing:") else None
+        if landing_id != self._selected_landing_id:
+            self._selected_landing_id = landing_id
+            self.landing_selection_requested.emit(landing_id)
+        self._sync_landing_generation_control()
         if active_changed:
             self._placed_object_gizmo_mode = self._resolve_placed_object_gizmo_mode(
                 PLACED_OBJECT_GIZMO_TRANSFORM
             )
-        if selection_changed:
-            self.placed_object_selection_set_changed.emit(selected_ids)
-        if active_changed:
+        if selection_changed and (selected_ids or not had_landing_selection) and not any(value.startswith("landing:") for value in selected_ids):
+            self.placed_object_selection_set_changed.emit(tuple(value for value in selected_ids if not value.startswith("landing:")))
+        if active_changed and (selected_id is not None or not had_landing_selection) and (selected_id is None or not selected_id.startswith("landing:")):
             self.placed_object_selection_changed.emit(selected_id)
         selected_id_set = set(selected_ids)
         for object_id, group in self._placed_object_render_groups.items():
@@ -21694,6 +22212,7 @@ class GlbViewerWidget(QWidget):
         self._build_placed_object_gizmo_items(
             self._placed_object_render_groups[selected_id]
         )
+        self._sync_landing_generation_control()
         if self.object_transform_status_label is not None:
             if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
                 suffix = (
@@ -21730,6 +22249,7 @@ class GlbViewerWidget(QWidget):
                 self._placed_object_editing_enabled
                 and self._placed_object_auxiliary_controls_enabled
                 and self._selected_placed_object_ids
+                and self._selected_landing_id is None
                 and self._level_transform_preview_level_index is None
                 and self._placed_object_transform_drag is None
                 and self._placed_object_instance_drag is None
@@ -21747,6 +22267,7 @@ class GlbViewerWidget(QWidget):
         normalized_steps = int(steps)
         if (
             normalized_steps == 0
+            or self._selected_landing_id is not None
             or not self._placed_object_auxiliary_controls_enabled
             or self._placed_object_transform_drag is not None
             or self._placed_object_instance_drag is not None
@@ -21822,7 +22343,7 @@ class GlbViewerWidget(QWidget):
         elif self._placed_object_axis_scale_gizmos_enabled:
             self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_SCALE
             self._build_scale_gizmo_items(group)
-        if self._placed_object_auxiliary_controls_enabled:
+        if self._placed_object_auxiliary_controls_enabled and not group.preview.object_id.startswith("landing:"):
             self._build_placed_object_instance_gizmo_items(group)
 
     def _calculate_transform_gizmo_size(
@@ -21882,6 +22403,9 @@ class GlbViewerWidget(QWidget):
             )
             self._add_transform_gizmo_overlay_item(endpoint_item)
 
+            if group.preview.object_id.startswith("landing:") and axis_index != 2:
+                continue
+
             ring_positions = _build_rotation_ring_positions(
                 pivot,
                 axis_index,
@@ -21930,6 +22454,24 @@ class GlbViewerWidget(QWidget):
                 shader="shaded",
             )
             self._add_transform_gizmo_overlay_item(cube_item)
+
+        if group.preview.object_id.startswith("landing:"):
+            cube = trimesh.creation.box(extents=(cube_size,) * 3)
+            cube.apply_translation(
+                _get_landing_uniform_scale_handle_position(group, gizmo_size)
+            )
+            self._add_transform_gizmo_overlay_item(
+                gl.GLMeshItem(
+                    vertexes=np.asarray(cube.vertices, dtype=np.float32),
+                    faces=np.asarray(cube.faces, dtype=np.int32),
+                    color=LANDING_UNIFORM_SCALE_GIZMO_COLOR,
+                    smooth=False,
+                    drawFaces=True,
+                    drawEdges=True,
+                    edgeColor=LANDING_UNIFORM_SCALE_GIZMO_COLOR,
+                    shader="shaded",
+                )
+            )
 
     def _add_transform_gizmo_overlay_item(
         self,
@@ -22056,12 +22598,16 @@ class GlbViewerWidget(QWidget):
             else tuple(np.eye(3, dtype=float))
         )
         for axis_index, axis in enumerate(axes):
+            # An almost end-on shaft projects onto the pivot and can steal
+            # clicks from the other axes, but has no usable drag plane.
+            axis_draggable = (
+                float(np.linalg.norm(np.cross(axis, direction)))
+                > TRANSFORM_GIZMO_MIN_PROJECTED_AXIS_RATIO
+            )
             segment_end = pivot + axis * self._transform_gizmo_size
-            segment_distance = _get_ray_segment_distance(
-                origin,
-                direction,
-                pivot,
-                segment_end,
+            segment_distance = (
+                _get_ray_segment_distance(origin, direction, pivot, segment_end)
+                if axis_draggable else None
             )
             axis_tolerance = self._transform_gizmo_size * TRANSFORM_GIZMO_AXIS_HIT_RATIO
             if segment_distance is not None and segment_distance <= axis_tolerance:
@@ -22080,6 +22626,8 @@ class GlbViewerWidget(QWidget):
                 )
 
             if scale_mode:
+                if not axis_draggable:
+                    continue
                 point_hit = _get_ray_point_distance(
                     origin,
                     direction,
@@ -22100,6 +22648,8 @@ class GlbViewerWidget(QWidget):
                     )
                 continue
 
+            if group.preview.object_id.startswith("landing:") and axis_index != 2:
+                continue
             ring_hit = _intersect_ray_with_plane(
                 origin,
                 direction,
@@ -22121,6 +22671,22 @@ class GlbViewerWidget(QWidget):
                         ),
                     )
                 )
+        if scale_mode and group.preview.object_id.startswith("landing:"):
+            uniform_hit = _get_ray_point_distance(
+                origin,
+                direction,
+                _get_landing_uniform_scale_handle_position(
+                    group, self._transform_gizmo_size
+                ),
+            )
+            tolerance = self._transform_gizmo_size * TRANSFORM_GIZMO_SCALE_CUBE_HIT_RATIO
+            if uniform_hit is not None and uniform_hit[0] <= tolerance:
+                candidates.append(
+                    (
+                        uniform_hit[0] / max(tolerance, 1e-12),
+                        _TransformGizmoHandle(TRANSFORM_GIZMO_UNIFORM_SCALE, -1),
+                    )
+                )
         if not candidates:
             return None
         return min(
@@ -22137,6 +22703,8 @@ class GlbViewerWidget(QWidget):
         """Start a horizontal drag without modifying the selected source."""
 
         selected_id = self._selected_placed_object_id
+        if selected_id is not None and selected_id.startswith("landing:"):
+            return False
         group = self._placed_object_render_groups.get(selected_id or "")
         camera_ray = self.view.build_camera_ray(position)
         if group is None or camera_ray is None:
@@ -22275,12 +22843,30 @@ class GlbViewerWidget(QWidget):
         camera_ray = self.view.build_camera_ray(position)
         if group is None or camera_ray is None:
             return False
-        origin, direction = camera_ray
-        axis = (
-            _get_placed_object_scale_world_axis(group, handle.axis_index)
-            if handle.kind == TRANSFORM_GIZMO_SCALE
-            else np.eye(3, dtype=float)[handle.axis_index]
-        )
+        origin, direction = _normalize_ray(*camera_ray)
+        if origin is None or direction is None:
+            return False
+        if handle.kind == TRANSFORM_GIZMO_UNIFORM_SCALE:
+            if not group.preview.object_id.startswith("landing:"):
+                return False
+            axis = _get_landing_uniform_scale_world_axis(group)
+            if (
+                float(np.linalg.norm(np.cross(axis, direction)))
+                <= TRANSFORM_GIZMO_MIN_PROJECTED_AXIS_RATIO
+            ):
+                # Uniform scaling has no preferred axis. Use screen-up when
+                # its diagonal points into the camera, so it remains usable.
+                inverse_view, invertible = self.view.viewMatrix().inverted()
+                if not invertible:
+                    return False
+                up = inverse_view.mapVector(QVector3D(0.0, 1.0, 0.0))
+                axis = np.asarray((up.x(), up.y(), up.z()), dtype=float)
+        else:
+            axis = (
+                _get_placed_object_scale_world_axis(group, handle.axis_index)
+                if handle.kind == TRANSFORM_GIZMO_SCALE
+                else np.eye(3, dtype=float)[handle.axis_index]
+            )
         pivot = _get_render_group_world_pivot(group)
         start_transform = np.asarray(group.current_transform, dtype=float).copy()
         try:
@@ -22293,6 +22879,7 @@ class GlbViewerWidget(QWidget):
         if handle.kind in {
             TRANSFORM_GIZMO_TRANSLATE,
             TRANSFORM_GIZMO_SCALE,
+            TRANSFORM_GIZMO_UNIFORM_SCALE,
         }:
             drag_plane_normal = _build_axis_drag_plane_normal(axis, direction)
             hit = _intersect_ray_with_plane(
@@ -22337,7 +22924,10 @@ class GlbViewerWidget(QWidget):
             preview_world_position=group.preview.world_position,
             preview_rotation_degrees=group.preview.rotation_degrees,
             preview_axis_scales=group.preview.axis_scales,
+            start_gizmo_size=self._transform_gizmo_size,
         )
+        if group.preview.object_id.startswith("landing:"):
+            self.landing_edit_started.emit(group.preview.object_id.removeprefix("landing:"))
         self._sync_placed_object_scale_input_state()
         self.view.reserve_primary_pointer_drag()
         if self.object_transform_status_label is not None:
@@ -22345,9 +22935,14 @@ class GlbViewerWidget(QWidget):
                 TRANSFORM_GIZMO_TRANSLATE: "Moving",
                 TRANSFORM_GIZMO_ROTATE: "Rotating",
                 TRANSFORM_GIZMO_SCALE: "Scaling",
+                TRANSFORM_GIZMO_UNIFORM_SCALE: "Scaling uniformly",
             }[handle.kind]
+            axis_label = (
+                "XYZ" if handle.kind == TRANSFORM_GIZMO_UNIFORM_SCALE
+                else "XYZ"[handle.axis_index]
+            )
             self.object_transform_status_label.setText(
-                f"{action} on {'XYZ'[handle.axis_index]}. "
+                f"{action} on {axis_label}. "
                 "Release to save; Escape cancels."
             )
         return True
@@ -22381,24 +22976,40 @@ class GlbViewerWidget(QWidget):
             transform[:3, 3] = delta
             transform = transform @ drag.start_transform
             axis_scales = drag.start_axis_scales
-        elif drag.handle.kind == TRANSFORM_GIZMO_SCALE:
+        elif drag.handle.kind in {TRANSFORM_GIZMO_SCALE, TRANSFORM_GIZMO_UNIFORM_SCALE}:
             assert drag.start_axis_parameter is not None
             parameter = float(np.dot(hit - pivot, drag.axis))
+            handle_size = drag.start_gizmo_size
+            if drag.handle.kind == TRANSFORM_GIZMO_UNIFORM_SCALE:
+                handle_size /= math.sqrt(3.0)
             scale_factor = 1.0 + (parameter - drag.start_axis_parameter) / max(
-                self._transform_gizmo_size, 1e-12
+                handle_size, 1e-12
             )
             uniform_scale = float(group.preview.scale)
-            start_axis_scale = drag.start_axis_scales[drag.handle.axis_index]
-            next_axis_scale = min(
-                PLACED_OBJECT_MAX_SCALE,
-                max(
-                    PLACED_OBJECT_MIN_SCALE,
-                    start_axis_scale * scale_factor,
-                ),
-            )
-            mutable_axis_scales = list(drag.start_axis_scales)
-            mutable_axis_scales[drag.handle.axis_index] = next_axis_scale
-            axis_scales = tuple(float(value) for value in mutable_axis_scales)
+            if drag.handle.kind == TRANSFORM_GIZMO_UNIFORM_SCALE:
+                # Clamp the shared factor, not each axis independently, to
+                # preserve existing proportions even at the scale limits.
+                minimum_factor = min(
+                    1.0,
+                    max(PLACED_OBJECT_MIN_SCALE / value for value in drag.start_axis_scales),
+                )
+                maximum_factor = max(
+                    1.0,
+                    min(PLACED_OBJECT_MAX_SCALE / value for value in drag.start_axis_scales),
+                )
+                scale_factor = min(max(scale_factor, minimum_factor), maximum_factor)
+                axis_scales = tuple(
+                    value * scale_factor for value in drag.start_axis_scales
+                )
+            else:
+                start_axis_scale = drag.start_axis_scales[drag.handle.axis_index]
+                next_axis_scale = min(
+                    PLACED_OBJECT_MAX_SCALE,
+                    max(PLACED_OBJECT_MIN_SCALE, start_axis_scale * scale_factor),
+                )
+                mutable_axis_scales = list(drag.start_axis_scales)
+                mutable_axis_scales[drag.handle.axis_index] = next_axis_scale
+                axis_scales = tuple(float(value) for value in mutable_axis_scales)
             world_position = drag.start_world_position
             rotation_degrees = drag.start_rotation_degrees
             scaled_rotation = _build_placed_object_scaled_rotation(
@@ -22459,12 +23070,18 @@ class GlbViewerWidget(QWidget):
             float(value) for value in rotation_degrees
         )
         drag.preview_axis_scales = tuple(float(value) for value in axis_scales)
-        self.placed_object_transform_preview_changed.emit(
-            drag.object_id,
-            drag.preview_world_position,
-            drag.preview_rotation_degrees,
-            drag.preview_axis_scales,
-        )
+        if drag.object_id.startswith("landing:"):
+            self.landing_transform_preview_changed.emit(
+                drag.object_id.removeprefix("landing:"),
+                self._landing_transform_payload(drag.object_id, drag.preview_world_position, drag.preview_rotation_degrees, drag.preview_axis_scales),
+            )
+        else:
+            self.placed_object_transform_preview_changed.emit(
+                drag.object_id,
+                drag.preview_world_position,
+                drag.preview_rotation_degrees,
+                drag.preview_axis_scales,
+            )
         if drag.handle.kind == TRANSFORM_GIZMO_ROTATE and (
             previous_preview_rotation is None
             or not np.allclose(
@@ -22474,10 +23091,11 @@ class GlbViewerWidget(QWidget):
                 rtol=0.0,
             )
         ):
-            self.placed_object_rotation_preview_changed.emit(
-                drag.object_id,
-                drag.preview_rotation_degrees,
-            )
+            if not drag.object_id.startswith("landing:"):
+                self.placed_object_rotation_preview_changed.emit(
+                    drag.object_id,
+                    drag.preview_rotation_degrees,
+                )
             if self.object_transform_status_label is not None:
                 self.object_transform_status_label.setText(
                     _format_placed_object_rotation_status(
@@ -22488,6 +23106,7 @@ class GlbViewerWidget(QWidget):
         self._remove_transform_gizmo_items()
         self._remove_placed_object_instance_gizmo_items()
         self._build_placed_object_gizmo_items(group)
+        self._sync_landing_generation_control()
         self.view.update()
         return True
 
@@ -22545,14 +23164,17 @@ class GlbViewerWidget(QWidget):
                     axis_scales,
                 )
                 committed = True
-        if transform_changed and committed:
+        is_landing = drag.object_id.startswith("landing:")
+        if is_landing:
+            self.landing_edit_finished.emit(drag.object_id.removeprefix("landing:"), committed)
+        if transform_changed and committed and not is_landing:
             assert world_position is not None and rotation_degrees is not None
             self.placed_object_transform_changed.emit(
                 drag.object_id,
                 world_position,
                 rotation_degrees,
             )
-        if axis_scale_changed and committed:
+        if axis_scale_changed and committed and not is_landing:
             assert axis_scales is not None
             self.placed_object_axis_scales_changed.emit(
                 drag.object_id,
@@ -22584,6 +23206,9 @@ class GlbViewerWidget(QWidget):
             preview.placement_transform,
             dtype=float,
         ).copy()
+        if preview.object_id.startswith("landing:"):
+            self._landing_previews[preview.object_id] = preview
+            return
         if self.model is None:
             return
         self.model.preview_placed_objects = [
@@ -22606,6 +23231,10 @@ class GlbViewerWidget(QWidget):
                     drag.object_id,
                     group.current_transform,
                 )
+                if drag.object_id.startswith("landing:"):
+                    self.landing_edit_cancelled.emit(drag.object_id.removeprefix("landing:"))
+                    self._sync_placed_object_selection_rendering()
+                    return
                 if drag.handle.kind == TRANSFORM_GIZMO_ROTATE:
                     self.placed_object_rotation_preview_changed.emit(
                         drag.object_id,
@@ -22752,6 +23381,7 @@ class GlbViewerWidget(QWidget):
         if not hasattr(self, "view"):
             return
 
+        self._clear_landing_generation_hover()
         self._cancel_canvas_opening_creation_press()
         self._cancel_placed_object_instance_drag()
         self._symmetric_preview_timer.stop()
@@ -28971,6 +29601,27 @@ def _build_uniform_scale_about_point(
     return move_back @ scale @ move_to_origin @ matrix
 
 
+def _get_landing_uniform_scale_world_axis(group: _PlacedObjectRenderGroup) -> np.ndarray:
+    """Return the local diagonal through the three scale-cube tips."""
+
+    diagonal = sum(
+        (_get_placed_object_scale_world_axis(group, index) for index in range(3)),
+        np.zeros(3, dtype=float),
+    )
+    return diagonal / np.linalg.norm(diagonal)
+
+
+def _get_landing_uniform_scale_handle_position(
+    group: _PlacedObjectRenderGroup, gizmo_size: float
+) -> np.ndarray:
+    """Place uniform scaling at the centroid of the three axis handles."""
+
+    return (
+        _get_render_group_world_pivot(group)
+        + _get_landing_uniform_scale_world_axis(group) * gizmo_size / math.sqrt(3.0)
+    )
+
+
 def _get_render_group_world_pivot(
     group: _PlacedObjectRenderGroup,
 ) -> np.ndarray:
@@ -30234,7 +30885,7 @@ def _iter_material_leaves(material: object) -> tuple[object, ...]:
 def _build_model_material_preview_meshes(
     model: GeneratedModel,
 ) -> tuple[trimesh.Trimesh, ...]:
-    """Return separated Z-up scene primitives when prefab glass is present."""
+    """Keep separate materials for prefab glass and generated landing previews."""
 
     if (
         model.preview_placed_objects
@@ -30257,7 +30908,9 @@ def _build_model_material_preview_meshes(
             )
         )
         source_parts.append((np.asarray(node_transform, dtype=float), source_mesh))
-    if not contains_prefab_glass:
+    if not contains_prefab_glass and not model.scene.metadata.get(
+        "housemaker_landing_preview"
+    ):
         return ()
 
     preview_meshes: list[trimesh.Trimesh] = []

@@ -107,6 +107,7 @@ from housemaker.reference_generation_batch import (
 )
 from housemaker.reference_generation_models import (
     DEFAULT_REFERENCE_NEGATIVE_PROMPT,
+    REFERENCE_GENERATION_MODEL_MESHY,
     REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
     REFERENCE_GENERATION_MODELS,
 )
@@ -545,6 +546,7 @@ class _ReferenceGenerationThread(QThread):
         api_key: str,
         strength: float,
         negative_prompt: str = DEFAULT_REFERENCE_NEGATIVE_PROMPT,
+        symmetry_api_key: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -552,6 +554,9 @@ class _ReferenceGenerationThread(QThread):
         self._prompt = str(prompt)
         self._model = str(model)
         self._api_key = str(api_key)
+        self._symmetry_api_key = (
+            self._api_key if symmetry_api_key is None else str(symmetry_api_key)
+        )
         self._strength = float(strength)
         self._negative_prompt = str(negative_prompt)
         self.result: np.ndarray | None = None
@@ -581,17 +586,18 @@ class _ReferenceGenerationThread(QThread):
         except Exception as error:  # noqa: BLE001 - report provider failures on the GUI thread.
             self.was_cancelled = self.isInterruptionRequested()
             if not self.was_cancelled:
-                self.error_message = (
-                    str(error).replace(self._api_key, "[redacted]")
-                    if self._api_key
-                    else str(error)
-                )
+                self.error_message = self._analysis_error(error)
         finally:
             self._api_key = ""
+            self._symmetry_api_key = ""
 
     # ### Post-generation symmetry analysis ###
     def _analysis_error(self, error) -> str:
-        return str(error).replace(self._api_key, "[redacted]") if self._api_key else str(error)
+        message = str(error)
+        for secret in sorted({self._api_key, self._symmetry_api_key}, key=len, reverse=True):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        return message
 
     def _infer_generated_symmetry(self) -> None:
         if self.symmetry_model is None or self.was_cancelled:
@@ -608,7 +614,7 @@ class _ReferenceGenerationThread(QThread):
                 "progress_callback": lambda message: self.progress_changed.emit(message, 95),
             }
             self.symmetry_result = infer_reference_symmetry(
-                self.result, self.symmetry_model, api_key=self._api_key, **arguments,
+                self.result, self.symmetry_model, api_key=self._symmetry_api_key, **arguments,
             )
         except SymmetryInferenceCancelled:
             self.was_cancelled = True
@@ -1305,9 +1311,23 @@ class MergedGenerationWorkspace(QWidget):
                 key, *updated_preferences(preferences)
             )
         self._reference_view_presets = updated_presets
+        if (
+            objects.get_landing_editing_target() is not None
+            and previous_prompts.get(selected_id) != updated_prompts.get(selected_id)
+        ):
+            self._invalidate_landing_reference_view()
+            if (
+                selected_id in updated_prompts
+                and self.reference_generation_prompt_edit.text()
+                == previous_prompts.get(selected_id)
+            ):
+                with QSignalBlocker(self.reference_generation_prompt_edit):
+                    self.reference_generation_prompt_edit.setText(updated_prompts[selected_id])
         self._populate_reference_generation_views(selected_id)
         self._displayed_reference_view_scope = None
         self._sync_reference_generation_controls()
+        if objects.get_landing_editing_target() is not None:
+            self._sync_object_reference_preview()
         if objects.current_inpaint_reference_key() is None:
             self._handle_reference_generation_preferences_changed()
 
@@ -1315,6 +1335,9 @@ class MergedGenerationWorkspace(QWidget):
     def _handle_reference_generation_view_changed(self, _index: int) -> None:
         """Use a preset as an editable starting point for this object only."""
 
+        landing_mode = self.object_workspace.get_landing_editing_target() is not None
+        if landing_mode:
+            self._invalidate_landing_reference_view()
         selected_id = self.reference_generation_view_combo.currentData()
         preset = next(
             (view for view in self._reference_view_presets if view.preset_id == selected_id),
@@ -1324,6 +1347,20 @@ class MergedGenerationWorkspace(QWidget):
             with QSignalBlocker(self.reference_generation_prompt_edit):
                 self.reference_generation_prompt_edit.setText(preset.prompt)
         self._handle_reference_generation_preferences_changed()
+        if landing_mode:
+            self._handle_landing_references_changed()
+
+    def _invalidate_landing_reference_view(self) -> None:
+        """Never submit a reference for a different selected landing view."""
+
+        objects = self.object_workspace
+        objects.cancel_landing_generation()
+        objects._landing_references = ()
+        objects._landing_reference_signature = None
+        objects.status_label.setText(
+            "Landing reference view changed. Generate reference for the selected view."
+        )
+        objects._sync_controls()
 
     def _selected_reference_generation_prompt(self) -> str:
         """Use the visible prompt, with optional furniture-emptying instructions."""
@@ -1446,6 +1483,25 @@ class MergedGenerationWorkspace(QWidget):
             return default
         return self._application_settings.get(key, default)
 
+    def _reference_generation_api_key(self) -> str:
+        """Keep image-provider credentials separate from OpenAI analysis keys."""
+
+        settings = self.object_workspace.get_runtime_settings()
+        return (
+            settings.meshy_api_key
+            if self._reference_generation_model == REFERENCE_GENERATION_MODEL_MESHY
+            else settings.openai_api_key
+        ).strip()
+
+    def _reference_symmetry_credentials(self) -> dict[str, str]:
+        """Override analysis credentials only when the image provider differs."""
+
+        if self._reference_generation_model != REFERENCE_GENERATION_MODEL_MESHY:
+            return {}
+        return {
+            "symmetry_api_key": self.object_workspace.get_runtime_settings().openai_api_key.strip()
+        }
+
     @Slot()
     def _handle_reference_generation_preferences_changed(
         self, *_arguments: object
@@ -1467,11 +1523,22 @@ class MergedGenerationWorkspace(QWidget):
                 ),
             ]
             if self.object_workspace.current_inpaint_reference_key() is None:
-                preferences.extend((
-                    (REFERENCE_GENERATION_PROMPT_SETTINGS_KEY, self.reference_generation_prompt_edit.text()),
-                    (REFERENCE_GENERATION_VIEW_SETTINGS_KEY, self.reference_generation_view_combo.currentData()),
-                    (REMOVE_OBJECTS_FROM_FURNITURE_SETTINGS_KEY, self.remove_objects_from_furniture_checkbox.isChecked()),
-                ))
+                preferences.extend(
+                    (
+                        (
+                            REFERENCE_GENERATION_PROMPT_SETTINGS_KEY,
+                            self.reference_generation_prompt_edit.text(),
+                        ),
+                        (
+                            REFERENCE_GENERATION_VIEW_SETTINGS_KEY,
+                            self.reference_generation_view_combo.currentData(),
+                        ),
+                        (
+                            REMOVE_OBJECTS_FROM_FURNITURE_SETTINGS_KEY,
+                            self.remove_objects_from_furniture_checkbox.isChecked(),
+                        ),
+                    )
+                )
             for key, value in preferences:
                 self._application_settings.set(key, value)
         self._sync_reference_generation_controls()
@@ -1479,6 +1546,38 @@ class MergedGenerationWorkspace(QWidget):
     def _sync_reference_generation_controls(self) -> None:
         """Keep local-only options and the cancellable action coherent."""
 
+        if self.object_workspace.get_landing_editing_target() is not None:
+            running = self.object_workspace.is_landing_generating
+            self.generate_reference_button.setText(
+                "Cancel" if running else "Generate reference"
+            )
+            self.generate_reference_button.setEnabled(
+                not self._is_shutdown
+                and (
+                    running
+                    or bool(self._selected_reference_generation_prompt())
+                    and self.object_workspace._has_current_object_generation_reference()
+                )
+            )
+            self.generate_all_references_button.setVisible(False)
+            self.reference_generation_view_combo.setEnabled(not running)
+            self.reference_generation_prompt_edit.setEnabled(not running)
+            self.reference_generation_strength_spinbox.setEnabled(not running)
+            self.reference_generation_negative_prompt_edit.setEnabled(not running)
+            self.remove_objects_from_furniture_checkbox.setEnabled(False)
+            self.reference_generation_status_label.setText(
+                self.object_workspace.status_label.text()
+            )
+            self.reference_generation_strength_control.setVisible(
+                self._reference_generation_model
+                == REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
+            )
+            self.reference_generation_negative_prompt_control.setVisible(
+                self._reference_generation_model
+                == REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
+            )
+            return
+        self.generate_all_references_button.setVisible(True)
         self._sync_inpaint_reference_preferences()
         self._make_default_reference_negative_prompt_view_compatible()
         self._cancel_batch_references_if_source_changed()
@@ -1596,6 +1695,35 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_generate_reference_clicked(self) -> None:
+        if self.object_workspace.get_landing_editing_target() is not None:
+            if self.object_workspace.is_landing_generating:
+                self.object_workspace.cancel_landing_generation()
+            else:
+                prompt = self._selected_reference_generation_prompt()
+                if not prompt:
+                    self.reference_generation_status_label.setText(
+                        "Choose a reference view or write a custom reference prompt first."
+                    )
+                    return
+                selected_id = self.reference_generation_view_combo.currentData()
+                preset = next(
+                    (view for view in self._reference_view_presets
+                     if view.preset_id == selected_id), None
+                )
+                view = ReferenceViewPreset(
+                    preset.preset_id if preset is not None else "landing-custom",
+                    preset.name if preset is not None else "Custom prompt",
+                    prompt,
+                )
+                self.object_workspace.generate_landing_references(
+                    (view,),
+                    model=self._reference_generation_model,
+                    api_key=self._reference_generation_api_key(),
+                    strength=self.reference_generation_strength_spinbox.value(),
+                    negative_prompt=self.reference_generation_negative_prompt_edit.text(),
+                )
+            self._sync_reference_generation_controls()
+            return
         runtime = self._reference_generation_runtime
         if runtime is not None:
             self.job_manager.cancel_job(runtime.job_id)
@@ -1622,9 +1750,7 @@ class MergedGenerationWorkspace(QWidget):
             if self._batch_retry_source_matches(batch_retry, source):
                 source = batch_retry.source_bgra.copy()
         model = self._reference_generation_model
-        api_key = (
-            self.object_workspace.get_runtime_settings().openai_api_key.strip()
-        )
+        api_key = self._reference_generation_api_key()
         thread = _ReferenceGenerationThread(
             source,
             prompt,
@@ -1633,6 +1759,7 @@ class MergedGenerationWorkspace(QWidget):
             strength=self.reference_generation_strength_spinbox.value(),
             negative_prompt=self.reference_generation_negative_prompt_edit.text(),
             parent=self,
+            **self._reference_symmetry_credentials(),
         )
         thread.symmetry_model = self._reference_symmetry_model()
         job = self.job_manager.create_job(
@@ -1941,6 +2068,9 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_generate_all_references_clicked(self) -> None:
+        if self.object_workspace.get_landing_editing_target() is not None:
+            self._handle_generate_reference_clicked()
+            return
         if self._batch_reference_generation_runtimes or self._local_reference_batch_thread is not None:
             self._cancel_all_reference_generations()
             return
@@ -1968,7 +2098,7 @@ class MergedGenerationWorkspace(QWidget):
             return
         self._cancel_batch_references_if_source_changed()
         self._reference_batch_scope = objects._data, objects._video_source
-        api_key = objects.get_runtime_settings().openai_api_key.strip()
+        api_key = self._reference_generation_api_key()
         single_retry = self._reference_generation_retry_source
         single_signature = self._reference_generation_context_signature() if single_retry is not None else None
         if self._reference_generation_model in {
@@ -1991,6 +2121,7 @@ class MergedGenerationWorkspace(QWidget):
                 strength=self.reference_generation_strength_spinbox.value(),
                 negative_prompt=self.reference_generation_negative_prompt_edit.text(),
                 parent=self,
+                **self._reference_symmetry_credentials(),
             )
             thread.symmetry_model = self._reference_symmetry_model()
             job = self.job_manager.create_job(
@@ -2193,6 +2324,7 @@ class MergedGenerationWorkspace(QWidget):
             api_key=api_key, prompt=prompt,
             strength=self.reference_generation_strength_spinbox.value(),
             negative_prompt=self.reference_generation_negative_prompt_edit.text(), parent=self,
+            **self._reference_symmetry_credentials(),
         )
         self._local_reference_batch_thread = thread
         for job_id, key, source, current_source in queued:
@@ -2222,7 +2354,7 @@ class MergedGenerationWorkspace(QWidget):
                     f"Queued {len(queued)} references; symmetry uses OpenAI Batch "
                     "(up to 24 hours). Keep the app open."
                     if thread.symmetry_model == LUNA_BATCH_MODEL
-                    else f"Queued {len(queued)} local references; {phases}."
+                    else f"Queued {len(queued)} references; {phases}."
                 )
             )
         )
@@ -2413,6 +2545,17 @@ class MergedGenerationWorkspace(QWidget):
         navigation_layout.addStretch(1)
         creation_layout.addWidget(self.inpaint_navigation_control)
 
+        self.landing_mode_label = QLabel(
+            "Landing mode — generate the selected Reference view, then use Meshy "
+            "to generate geometry or the complete textured model. This one "
+            "reference guides both geometry and texturing."
+        )
+        self.landing_mode_label.setObjectName("landing_generation_mode_label")
+        self.landing_mode_label.setWordWrap(True)
+        self.landing_mode_label.setStyleSheet("color: #ffd166; font-weight: 600;")
+        self.landing_mode_label.hide()
+        creation_layout.addWidget(self.landing_mode_label)
+
         generation_settings = QWidget()
         generation_settings.setObjectName(
             "merged_generation_object_generation_settings"
@@ -2600,6 +2743,8 @@ class MergedGenerationWorkspace(QWidget):
         objects.architectural_trim_editing_changed.connect(
             self._handle_architectural_trim_editing_changed
         )
+        objects.landing_editing_changed.connect(self._handle_landing_editing_changed)
+        objects.landing_references_changed.connect(self._handle_landing_references_changed)
         surface.data_changed.connect(
             self._handle_surface_generation_context_changed
         )
@@ -2798,6 +2943,7 @@ class MergedGenerationWorkspace(QWidget):
         )
         use_surface_texture_pipeline = bool(
             surface_is_selected and not trim_is_selected
+            and self.object_workspace.get_landing_editing_target() is None
         )
         self.object_workspace.set_external_surface_generation_target_selected(
             use_surface_texture_pipeline
@@ -2808,6 +2954,25 @@ class MergedGenerationWorkspace(QWidget):
             else self.object_workspace.generate_texture_button
         )
         self.generate_texture_stack.setCurrentWidget(target_button)
+        self._sync_generation_action_buttons()
+
+    @Slot(bool)
+    def _handle_landing_editing_changed(self, active: bool) -> None:
+        """Keep normal reference workers out of the landing's separate context."""
+
+        self._cancel_all_reference_generations()
+        if active:
+            self.surface_workspace.set_scene_surface_selection(())
+        self._handle_landing_references_changed()
+
+    @Slot()
+    def _handle_landing_references_changed(self) -> None:
+        self.landing_mode_label.setVisible(
+            self.object_workspace.get_landing_editing_target() is not None
+        )
+        self._sync_object_reference_preview()
+        self._sync_reference_generation_controls()
+        self._sync_generation_texture_context()
         self._sync_generation_action_buttons()
 
     @Slot(str)
@@ -3543,6 +3708,23 @@ class MergedGenerationWorkspace(QWidget):
     def _sync_object_reference_preview(self) -> None:
         """Render the authoritative override, or restore the ordinary frame."""
 
+        if self.object_workspace.get_landing_editing_target() is not None:
+            references = self.object_workspace._landing_references
+            source = self.object_workspace.get_current_object_generation_reference()
+            if references and source is not None:
+                from housemaker.landing_generation import landing_reference_signature
+
+                references_are_current = (
+                    self.object_workspace._landing_reference_signature
+                    == landing_reference_signature(source)
+                )
+            else:
+                references_are_current = False
+            if references_are_current:
+                selected_id = self.reference_generation_view_combo.currentData()
+                reference = next((item for item in references if item.view_id == selected_id), references[0])
+                self.video_view.set_reference_preview_bgra(reference.image_bgra)
+                return
         temporary_reference = (
             self.object_workspace.get_temporary_object_reference()
         )

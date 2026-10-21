@@ -21,6 +21,7 @@ from housemaker.plan_correction_models import (
 )
 from housemaker.reference_generation_models import (
     DEFAULT_REFERENCE_NEGATIVE_PROMPT,
+    REFERENCE_GENERATION_MODEL_MESHY,
     REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
     REFERENCE_GENERATION_MODELS,
 )
@@ -209,6 +210,8 @@ def generate_object_reference(
         raise ReferenceGenerationError("Select a supported reference generation model.")
     if model in OPENAI_PLAN_CORRECTION_MODELS and not str(api_key).strip():
         raise ReferenceGenerationError("Add an OpenAI API key in Settings to use this model.")
+    if model == REFERENCE_GENERATION_MODEL_MESHY and not str(api_key).strip():
+        raise ReferenceGenerationError("Add a Meshy API key in Settings to use this model.")
     prepared_prompt = build_reference_generation_prompt(prompt, model=model)
     if progress_callback is not None:
         progress_callback("Preparing the masked object reference", 5)
@@ -235,6 +238,26 @@ def generate_object_reference(
         except StableDiffusionReferenceCancelled as error:
             raise ReferenceGenerationCancelled(str(error)) from None
         except StableDiffusionReferenceError as error:
+            raise ReferenceGenerationError(str(error)) from None
+    elif model == REFERENCE_GENERATION_MODEL_MESHY:
+        from housemaker.meshy_reference_generation import (
+            MeshyReferenceGenerationCancelled,
+            MeshyReferenceGenerationError,
+            request_meshy_reference_image,
+        )
+
+        try:
+            generated = request_meshy_reference_image(
+                prepared_image,
+                api_key=str(api_key).strip(),
+                prompt=prepared_prompt,
+                output_size=REFERENCE_IMAGE_SIZE,
+                cancellation_check=cancellation_check,
+                progress_callback=progress_callback,
+            )
+        except MeshyReferenceGenerationCancelled as error:
+            raise ReferenceGenerationCancelled(str(error)) from None
+        except MeshyReferenceGenerationError as error:
             raise ReferenceGenerationError(str(error)) from None
     else:
         from housemaker.plan_image_correction import (

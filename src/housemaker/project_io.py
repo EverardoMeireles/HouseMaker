@@ -8,7 +8,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from housemaker.directional_light_state import (
@@ -62,6 +62,7 @@ from housemaker.models import (
     EditableSurfaceFaceData,
     EditableSurfaceMeshData,
     EditableSurfaceVertexData,
+    LandingData,
     LevelData,
     OpenSpaceData,
     RoomData,
@@ -233,6 +234,7 @@ def save_project(
                 "rooms": [_serialize_room(room) for room in level.rooms],
                 "doorways": [_serialize_doorway(doorway) for doorway in level.doorways],
                 "windows": [window.to_dict() for window in level.windows],
+                "landings": [_serialize_landing(landing) for landing in level.landings],
                 "open_spaces": [
                     open_space.to_dict() for open_space in level.open_spaces
                 ],
@@ -369,6 +371,9 @@ def load_project(path: str | Path) -> ProjectData:
             level_index=level.index,
         )
         level.open_spaces = _deserialize_open_spaces(raw_level.get("open_spaces", []))
+        level.landings = _deserialize_landings(
+            raw_level.get("landings", []), project_directory=project_path.parent
+        )
         level.editable_surfaces = _deserialize_editable_surfaces(
             raw_level.get("editable_surfaces", []),
             level_index=level.index,
@@ -1067,6 +1072,40 @@ def _deserialize_doorway_rotation_degrees(raw_rotation_degrees: object) -> float
         return 0.0
 
     return rotation_degrees % 360.0
+
+
+# ### Landing serialization helpers ###
+def _serialize_landing(landing: LandingData) -> dict[str, object]:
+    payload = landing.to_dict()
+    if landing.generated_model_path is not None:
+        payload["generated_model_path"] = _normalize_optional_path(
+            landing.generated_model_path
+        )
+    return payload
+
+
+def _deserialize_landings(
+    raw_landings: object, *, project_directory: Path | None = None
+) -> list[LandingData]:
+    if not isinstance(raw_landings, list | tuple):
+        raise ValueError("Level landings must contain a list.")
+    landings = [LandingData.from_dict(item) for item in raw_landings]
+    if project_directory is not None:
+        landings = [
+            replace(
+                landing,
+                generated_model_path=str(
+                    (project_directory / landing.generated_model_path).resolve()
+                ),
+            )
+            if landing.generated_model_path is not None
+            and not Path(landing.generated_model_path).is_absolute()
+            else landing
+            for landing in landings
+        ]
+    if len({landing.landing_id for landing in landings}) != len(landings):
+        raise ValueError("Landing identifiers must be unique within a level.")
+    return landings
 
 
 # ### Window serialization helpers ###

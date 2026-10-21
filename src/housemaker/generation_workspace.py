@@ -111,6 +111,11 @@ from housemaker.glb import (
     import_generated_glb,
     import_generated_glb_preview,
 )
+from housemaker.landing_generation import (
+    LandingGenerationThread,
+    LandingMeshGenerationResult,
+    landing_reference_signature,
+)
 from housemaker.local_work_scheduler import (
     MAX_CONCURRENT_LOCAL_STAGES,
     LocalWorkCancelled,
@@ -118,6 +123,7 @@ from housemaker.local_work_scheduler import (
 )
 from housemaker.meshy_generation import (
     MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS,
+    MAX_RETEXTURE_REFERENCE_IMAGES,
     MeshyGenerationResult,
     normalize_image_to_3d_texture_prompt,
     request_image_to_3d_model,
@@ -128,6 +134,7 @@ from housemaker.models import (
     TRIM_KIND_CORNICE,
     TRIM_KIND_EDGING_STRIP,
     TRIM_KIND_SKIRTING_BOARD,
+    LandingData,
 )
 from housemaker.object_face_edit import (
     ObjectFaceAdditionResult,
@@ -1135,6 +1142,29 @@ def _validate_architectural_trim_uv_texture_domain(
     return texture_domain
 
 
+# ### Shared multiview texture references ###
+def _normalize_generation_reference_images(
+    images: Sequence[np.ndarray],
+) -> tuple[np.ndarray, ...]:
+    """Own up to Meshy's supported four texture views without mutating callers."""
+
+    if len(images) > MAX_RETEXTURE_REFERENCE_IMAGES:
+        raise ValueError("Meshy accepts at most four texture reference views.")
+    normalized = []
+    for image in images:
+        pixels = np.asarray(image)
+        if (
+            pixels.dtype != np.uint8
+            or pixels.ndim != 3
+            or pixels.shape[2] != 4
+            or not pixels.size
+        ):
+            raise ValueError("A Meshy reference view must be a non-empty BGRA image.")
+        normalized.append(np.ascontiguousarray(pixels).copy())
+    return tuple(normalized)
+
+
+# ### Owned generation requests ###
 class GenerationRequest:
     """Owned selected-object input passed to Meshy Image-to-3D."""
 
@@ -1144,6 +1174,7 @@ class GenerationRequest:
         frame_index: int,
         selected_object_bgra: np.ndarray,
         settings: GenerationServiceSettings,
+        reference_images_bgra: Sequence[np.ndarray] = (),
         geometry_only: bool = False,
         symmetric_division_enabled: bool = False,
         symmetric_division_orientation: str = (
@@ -1168,6 +1199,9 @@ class GenerationRequest:
             selected_object_bgra
         ).copy()
         self.settings = settings
+        self.reference_images_bgra = _normalize_generation_reference_images(
+            reference_images_bgra
+        )
         self.geometry_only = bool(geometry_only)
         self.symmetric_division_enabled = bool(symmetric_division_enabled)
         normalized_orientation = str(
@@ -1269,8 +1303,14 @@ class TextureRegenerationRequest:
     architectural_trim_repeat_layout: ArchitecturalTrimRepeatLayout | None = None
     architectural_trim_kind: str | None = None
     cornice_uv_texture_domain: str = CORNICE_UV_TEXTURE_DOMAIN_FULL
+    reference_images_bgra: tuple[np.ndarray, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "reference_images_bgra",
+            _normalize_generation_reference_images(self.reference_images_bgra),
+        )
         normalized_object_id = str(self.object_id).strip()
         if not normalized_object_id:
             raise ValueError("Texture regeneration requires an object ID.")
@@ -2595,6 +2635,7 @@ class MeshyImagePlanner:
             not request.geometry_only
             and not use_unused_face_removal
             and request.architectural_trim_fit_dimensions is None
+            and len(request.reference_images_bgra) <= 1
         ):
             _raise_if_generation_cancelled(cancel_event)
             provider_result = request_image_to_3d_model(
@@ -2811,7 +2852,11 @@ class MeshyImagePlanner:
         textured_result = request_retextured_model(
             api_key=request.settings.meshy_api_key,
             model_glb=processed_glb_bytes,
-            reference_images_png=(image_png,),
+            reference_images_png=(
+                tuple(_encode_png(image) for image in request.reference_images_bgra)
+                if request.reference_images_bgra
+                else (image_png,)
+            ),
             enable_original_uv=uses_segmented_trim_uv,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
@@ -2980,7 +3025,12 @@ class MeshyTextureRegenerator:
         if not request.settings.meshy_api_key:
             raise ValueError("Set a Meshy AI API key before generating texture.")
 
-        reference_png = _encode_png(request.reference_image_bgra)
+        reference_pngs = tuple(
+            _encode_png(image)
+            for image in (
+                request.reference_images_bgra or (request.reference_image_bgra,)
+            )
+        )
 
         def report_texture_progress(status: str, progress: int) -> None:
             if progress_callback is None:
@@ -3001,7 +3051,7 @@ class MeshyTextureRegenerator:
         return request_retextured_model(
             api_key=request.settings.meshy_api_key,
             model_glb=request.model_glb,
-            reference_images_png=(reference_png,),
+            reference_images_png=reference_pngs,
             enable_original_uv=request.enable_original_uv,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
@@ -4536,6 +4586,9 @@ class GenerationWorkspace(QWidget):
     opening_component_generation_completed = Signal(object, object)
     door_slot_editing_changed = Signal(bool)
     architectural_trim_editing_changed = Signal(bool)
+    landing_editing_changed = Signal(bool)
+    landing_generation_completed = Signal(str, object)
+    landing_references_changed = Signal()
     door_slot_generation_status_changed = Signal(str)
     door_side_duplication_changed = Signal(str, object)
     opening_generate_displacement_changed = Signal(str, str, bool)
@@ -4664,6 +4717,12 @@ class GenerationWorkspace(QWidget):
         self._is_emitting_texture_repair = False
         self._selected_object_id: str | None = None
         self._door_slot_editing_target: _DoorSlotEditingTarget | None = None
+        self._landing_editing_target: LandingData | None = None
+        self._landing_references = ()
+        self._landing_reference_signature = None
+        self._landing_generation_token = 0
+        self._landing_thread: LandingGenerationThread | None = None
+        self._landing_runtimes: dict[LandingGenerationThread, tuple[int, tuple[str, ...]]] = {}
         self._architectural_trim_editing_target: (
             _ArchitecturalTrimEditingTarget | None
         ) = None
@@ -4780,6 +4839,7 @@ class GenerationWorkspace(QWidget):
         if (
             self._door_slot_editing_target is not None
             or self._architectural_trim_editing_target is not None
+            or self._landing_editing_target is not None
         ):
             return None
         signature = (
@@ -4874,6 +4934,7 @@ class GenerationWorkspace(QWidget):
         if (
             self._door_slot_editing_target is not None
             or self._architectural_trim_editing_target is not None
+            or self._landing_editing_target is not None
         ):
             return ()
         keys = self._current_inpaint_keys()
@@ -5244,6 +5305,7 @@ class GenerationWorkspace(QWidget):
         if (
             self._door_slot_editing_target is not None
             or self._architectural_trim_editing_target is not None
+            or self._landing_editing_target is not None
         ):
             return False
         key = self.current_inpaint_reference_key()
@@ -5265,6 +5327,7 @@ class GenerationWorkspace(QWidget):
             self._is_restoring_inpaint_selection
             or self._door_slot_editing_target is not None
             or self._architectural_trim_editing_target is not None
+            or self._landing_editing_target is not None
         ):
             return
         key = self.current_inpaint_reference_key()
@@ -5693,6 +5756,7 @@ class GenerationWorkspace(QWidget):
             self._door_slot_generation_prompt_visible = True
         if self._architectural_trim_editing_target is not None:
             self.clear_architectural_trim_editing_target()
+        self.clear_landing_editing_target()
         self._door_slot_editing_target = next_target
         if entering_generation_mode:
             self._set_all_pbr_maps_enabled()
@@ -5749,6 +5813,7 @@ class GenerationWorkspace(QWidget):
             return False
         if self._door_slot_editing_target is not None:
             self.clear_door_slot_editing_target()
+        self.clear_landing_editing_target()
         self._architectural_trim_editing_target = target
         symmetric_division_blocker = QSignalBlocker(
             self.symmetric_division_checkbox
@@ -5831,6 +5896,290 @@ class GenerationWorkspace(QWidget):
         self.result_view.set_selected_placed_object_ids(())
         self._select_generated_object(None)
         self.architectural_trim_editing_changed.emit(False)
+
+    # ### Landing generation context ###
+    def set_landing_editing_target(
+        self,
+        landing: LandingData,
+        preview_model: GeneratedModel | None = None,
+    ) -> bool:
+        """Preview one authored landing without adding an object-library record."""
+
+        if not isinstance(landing, LandingData):
+            return False
+        current = self._landing_editing_target
+        if current is None or current.landing_id != landing.landing_id:
+            self.clear_landing_editing_target()
+            self._landing_generation_token += 1
+            self._landing_references = ()
+            self._landing_reference_signature = None
+        self.clear_door_slot_editing_target()
+        self.clear_architectural_trim_editing_target()
+        self._landing_editing_target = copy.deepcopy(landing)
+        self._selected_object_id = None
+        self._external_surface_generation_target_selected = False
+        self.result_view.cancel_transient_pointer_interactions()
+        self.result_view.set_selected_placed_object_ids(())
+        self.result_view.set_face_editing_enabled(False)
+        if preview_model is not None:
+            self._generated_model = preview_model
+            self._displayed_object_snapshot = None
+            self.result_view.set_model(
+                preview_model, preserve_camera=current is not None
+            )
+            self._sync_model_statistics(preview_model)
+        else:
+            self._clear_generated_object_display()
+        self.status_label.setText(
+            "Landing generation: paint, paste or load a reference, then Generate reference "
+            "for the selected Reference view. Meshy uses this image for geometry and texture."
+        )
+        self._sync_controls()
+        self.landing_editing_changed.emit(True)
+        return True
+
+    def get_landing_editing_target(self) -> LandingData | None:
+        return self._landing_editing_target
+
+    def update_landing_editing_preview(
+        self, landing: LandingData, preview_model: GeneratedModel,
+    ) -> bool:
+        """Refresh the selected landing without resetting its reference session.
+
+        Generation, undo and scene transforms can change this same landing's
+        mesh. They must not behave like selecting a new generation target.
+        """
+
+        current = self._landing_editing_target
+        if (
+            not isinstance(landing, LandingData)
+            or not isinstance(preview_model, GeneratedModel)
+            or current is None
+            or current.landing_id != landing.landing_id
+        ):
+            return False
+        self._landing_editing_target = copy.deepcopy(landing)
+        self._generated_model = preview_model
+        self._displayed_object_snapshot = None
+        self.result_view.set_model(preview_model, preserve_camera=True)
+        self._sync_model_statistics(preview_model)
+        self._sync_controls()
+        return True
+
+    def clear_landing_editing_target(self) -> None:
+        if self._landing_editing_target is None:
+            return
+        self.cancel_landing_generation()
+        self._landing_editing_target = None
+        self._landing_references = ()
+        self._landing_reference_signature = None
+        self._landing_generation_token += 1
+        self._clear_generated_object_display()
+        self._sync_controls()
+        self.landing_editing_changed.emit(False)
+
+    @property
+    def is_landing_generating(self) -> bool:
+        return self._landing_thread is not None
+
+    def generate_landing_references(
+        self,
+        views,
+        *,
+        model,
+        api_key="",
+        prompt="",
+        strength=0.45,
+        negative_prompt="",
+    ) -> bool:
+        views = tuple(views)
+        if len(views) != 1:
+            self.status_label.setText("Select exactly one landing reference view.")
+            return False
+        return self._start_landing_generation(
+            "references",
+            views=views,
+            model=model,
+            api_key=api_key,
+            prompt=prompt,
+            strength=strength,
+            negative_prompt=negative_prompt,
+        )
+
+    def _start_landing_generation(self, action: str, **options) -> bool:
+        landing = self._landing_editing_target
+        if landing is None or self.is_landing_generating:
+            return False
+        source = self.get_current_object_generation_reference()
+        if source is None:
+            self.status_label.setText(
+                "Paint a landing mask, paste or load a reference image first."
+            )
+            return False
+        if action != "references" and (
+            len(self._landing_references) != 1
+            or landing_reference_signature(source) != self._landing_reference_signature
+        ):
+            self.status_label.setText(
+                "Generate the landing reference for the selected view and current image first."
+            )
+            return False
+        if action != "references":
+            request = self._build_landing_mesh_request(action)
+            if request is None:
+                return False
+            options.update(
+                mesh_request=request,
+                planner=self._meshy_planner,
+                executor=self._meshy_executor,
+                texture_regenerator=self._meshy_texture_regenerator,
+            )
+        self._landing_generation_token += 1
+        token = self._landing_generation_token
+        thread = LandingGenerationThread(
+            copy.deepcopy(landing),
+            source,
+            action=action,
+            references=self._landing_references,
+            parent=self,
+            **options,
+        )
+        jobs = ()
+        if self._job_manager is not None:
+            job = self._job_manager.create_job(
+                kind="Landing reference"
+                if action == "references"
+                else ("Landing texture" if action == "texture" else "Landing generation"),
+                requested_name="",
+                default_name="Landing",
+                stage="Queued",
+                cancel_callback=self.cancel_landing_generation,
+            )
+            jobs = (job.job_id,)
+        self._landing_runtimes[thread] = token, jobs
+        self._landing_thread = thread
+        thread.progress.connect(self._handle_landing_generation_progress)
+        thread.finished.connect(self._handle_landing_generation_finished)
+        self._sync_controls()
+        self.landing_references_changed.emit()
+        thread.start()
+        return True
+
+    def _build_landing_mesh_request(
+        self, action: str,
+    ) -> GenerationRequest | TextureRegenerationRequest | None:
+        """Snapshot the regular Meshy settings without creating a library object."""
+
+        images = tuple(
+            reference.image_bgra
+            for reference in self._landing_references[:1]
+        )
+        if not images:
+            return None
+        if action == "texture":
+            if self._generated_model is None:
+                self.status_label.setText("Generate the landing geometry first.")
+                return None
+            percentages = self.object_3d_panel.get_projection_camera_percentages()
+            if sum(percentages) != 100:
+                self.status_label.setText(
+                    "Projection camera texture allocations must total 100%."
+                )
+                return None
+            return TextureRegenerationRequest(
+                object_id=f"landing:{self._landing_editing_target.landing_id}",
+                reference_frame_index=self._data.current_frame_index,
+                reference_image_bgra=images[0],
+                reference_images_bgra=images,
+                model_glb=self._generated_model.glb_bytes,
+                settings=self._settings,
+                enabled_pbr_maps=self._get_enabled_pbr_maps(),
+                projection_camera_percentages=percentages,
+            )
+        request = self._build_generation_request(
+            geometry_only=action == "geometry", reference_bgra=images[0]
+        )
+        if request is not None:
+            request.symmetric_division_enabled = False
+            request.reference_images_bgra = _normalize_generation_reference_images(images)
+        return request
+
+    def cancel_landing_generation(self) -> bool:
+        thread = self._landing_thread
+        if thread is None:
+            return False
+        thread.requestInterruption()
+        self._landing_generation_token += 1
+        self.status_label.setText("Cancelling landing generation...")
+        return True
+
+    @Slot(str, int)
+    def _handle_landing_generation_progress(self, stage, progress):
+        thread = self.sender()
+        if (
+            thread is not self._landing_thread
+            or self._landing_runtimes.get(thread, (None,))[0]
+            != self._landing_generation_token
+        ):
+            return
+        self.status_label.setText(stage)
+        if self._job_manager is not None:
+            for job_id in self._landing_runtimes.get(thread, (0, ()))[1]:
+                self._job_manager.update_job(job_id, stage=stage, progress=progress)
+        self.landing_references_changed.emit()
+
+    @Slot()
+    def _handle_landing_generation_finished(self):
+        thread = self.sender()
+        runtime = self._landing_runtimes.pop(thread, None)
+        if runtime is None:
+            return
+        token, jobs = runtime
+        if thread is self._landing_thread:
+            self._landing_thread = None
+        landing = self._landing_editing_target
+        source = self.get_current_object_generation_reference()
+        stale = (
+            token != self._landing_generation_token
+            or landing is None
+            or landing.landing_id != thread.landing.landing_id
+            or source is None
+            or landing_reference_signature(source) != thread.source_signature
+        )
+        manager = self._job_manager
+        if stale or thread.was_cancelled:
+            for job_id in jobs:
+                if manager is not None:
+                    manager.mark_cancelled(
+                        job_id, "Landing generation cancelled or selection changed"
+                    )
+        elif thread.error_message:
+            self.status_label.setText(
+                "Landing generation failed: " + thread.error_message
+            )
+            for job_id in jobs:
+                if manager is not None:
+                    manager.fail_job(job_id, thread.error_message)
+        else:
+            if thread.action == "references":
+                self._landing_references = thread.result
+                self._landing_reference_signature = thread.source_signature
+                self.status_label.setText(
+                    "The selected landing reference is ready. "
+                    "Generate geometry or Generate sends the landing to Meshy."
+                )
+            else:
+                if isinstance(thread.result, LandingMeshGenerationResult):
+                    self.status_label.setText("Landing generated with Meshy.")
+                    self.landing_generation_completed.emit(
+                        landing.landing_id, thread.result
+                    )
+            for job_id in jobs:
+                if manager is not None:
+                    manager.complete_job(job_id)
+        thread.deleteLater()
+        self._sync_controls()
+        self.landing_references_changed.emit()
 
     def import_external_glb(
         self,
@@ -6028,6 +6377,8 @@ class GenerationWorkspace(QWidget):
         normalized_object_id = (
             None if object_id is None else str(object_id).strip() or None
         )
+        if normalized_object_id is not None:
+            self.clear_landing_editing_target()
         if (
             self._door_slot_editing_target is not None
             and normalized_object_id != self._door_slot_editing_target.object_id
@@ -6311,7 +6662,10 @@ class GenerationWorkspace(QWidget):
     def refresh_file_backed_previews(self) -> None:
         """Reload the selected Object preview only after an asset revision."""
 
-        if self._door_slot_editing_target is not None:
+        if (
+            self._door_slot_editing_target is not None
+            or self._landing_editing_target is not None
+        ):
             return
         record = self._find_generated_object_record(self._selected_object_id)
         if record is None:
@@ -6593,6 +6947,7 @@ class GenerationWorkspace(QWidget):
 
         if self.is_generating or self._external_glb_import_runtimes:
             raise RuntimeError("Cannot replace Generation data while generating.")
+        self.clear_landing_editing_target()
         self._finish_existing_object_placement_request()
         self._door_slot_editing_target = None
         self._architectural_trim_editing_target = None
@@ -7551,7 +7906,7 @@ class GenerationWorkspace(QWidget):
 
     @property
     def is_generating(self) -> bool:
-        return bool(self._object_job_runtimes) or (
+        return self.is_landing_generating or bool(self._object_job_runtimes) or (
             self._generation_thread is not None
             and not self._object_job_runtimes
         )
@@ -7882,6 +8237,8 @@ class GenerationWorkspace(QWidget):
     def cancel_current_operation(self) -> bool:
         """Request an idempotent rollback of the active object operation."""
 
+        if self.is_landing_generating:
+            return self.cancel_landing_generation()
         runtime = self._legacy_active_job_runtime()
         if runtime is None:
             return False
@@ -8047,6 +8404,8 @@ class GenerationWorkspace(QWidget):
     def generate_selected_object_texture(self) -> bool:
         """Generate the selected object's texture from the current mask."""
 
+        if self._landing_editing_target is not None:
+            return self._start_landing_generation("texture")
         if self._has_matching_inpaint_generation_batch():
             return self._generate_inpaint_batch_textures()
         trim_target = self._architectural_trim_editing_target
@@ -8632,6 +8991,9 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
 
     def generate(self) -> None:
+        if self._landing_editing_target is not None:
+            self._start_landing_generation("generate")
+            return
         trim_target = self._architectural_trim_editing_target
         if trim_target is not None:
             self._start_architectural_trim_model_generation(
@@ -8661,6 +9023,9 @@ class GenerationWorkspace(QWidget):
     def generate_geometry(self) -> None:
         """Generate and locally process geometry without submitting Retexture."""
 
+        if self._landing_editing_target is not None:
+            self._start_landing_generation("geometry")
+            return
         trim_target = self._architectural_trim_editing_target
         if trim_target is not None:
             self._start_architectural_trim_model_generation(
@@ -9362,6 +9727,17 @@ class GenerationWorkspace(QWidget):
         manager.mark_cancelled(runtime.managed_job_id, stage=stage)
 
     def shutdown(self) -> None:
+        self._landing_generation_token += 1
+        for landing_thread in tuple(self._landing_runtimes):
+            landing_thread.requestInterruption()
+        for landing_thread, (_token, jobs) in tuple(self._landing_runtimes.items()):
+            while is_valid_qt_object(landing_thread) and landing_thread.isRunning():
+                landing_thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
+            for job_id in jobs:
+                if self._job_manager is not None:
+                    self._job_manager.mark_cancelled(job_id, "Cancelled during shutdown")
+        self._landing_runtimes.clear()
+        self._landing_thread = None
         self._existing_object_placement_request = None
         import_runtimes = tuple(self._external_glb_import_runtimes.values())
         for import_runtime in import_runtimes:
@@ -12605,7 +12981,8 @@ class GenerationWorkspace(QWidget):
         architectural_trim_mode = (
             self._architectural_trim_editing_target is not None
         )
-        component_mode = door_slot_mode or architectural_trim_mode
+        landing_mode = self._landing_editing_target is not None
+        component_mode = door_slot_mode or architectural_trim_mode or landing_mode
         door_body_slot_mode = bool(
             self._door_slot_editing_target is not None
             and is_door_body_slot(self._door_slot_editing_target.slot_id)
@@ -12872,6 +13249,20 @@ class GenerationWorkspace(QWidget):
         )
         if not self._shared_control_state_managed_externally:
             self.video_view.set_interaction_enabled(mask_tool_is_available)
+        if landing_mode:
+            source = self.get_current_object_generation_reference()
+            landing_ready = bool(
+                source is not None and len(self._landing_references) == 1
+                and self._landing_reference_signature == landing_reference_signature(source)
+                and not self.is_landing_generating
+            )
+            self.generate_button.setEnabled(landing_ready)
+            self.generate_geometry_button.setEnabled(landing_ready)
+            self.regenerate_texture_button.setEnabled(
+                landing_ready and self._generated_model is not None
+            )
+            self.symmetric_division_checkbox.setEnabled(False)
+            self.meshy_target_polycount_spinbox.setEnabled(not self.is_landing_generating)
         self.controls_synced.emit()
 
     def _selected_object_has_complete_texture_uvs(

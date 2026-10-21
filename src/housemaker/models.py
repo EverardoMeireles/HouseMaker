@@ -936,6 +936,154 @@ class EditableSurfaceMeshData:
         object.__setattr__(self, "edges", edges)
 
 
+# ### Landing models ###
+@dataclass(frozen=True)
+class LandingData:
+    """A landing and its canonical mesh; elevation is above the finished floor."""
+
+    center_x: float
+    center_y: float
+    landing_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    footprint_meters: tuple[tuple[float, float], ...] = (
+        (-0.75, -0.75),
+        (0.75, -0.75),
+        (0.75, 0.75),
+        (-0.75, 0.75),
+    )
+    thickness_meters: float = 0.15
+    elevation_meters: float = 0.0
+    rotation_degrees: float = 0.0
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    scale_z: float = 1.0
+    generated_model_path: str | None = None
+    walk_height_meters: float | None = None
+
+    def __post_init__(self) -> None:
+        from shapely.geometry import Polygon
+
+        object.__setattr__(self, "landing_id", _normalize_landing_id(self.landing_id))
+        if self.generated_model_path is not None:
+            model_path = str(self.generated_model_path).strip()
+            if not model_path or "\x00" in model_path:
+                raise ValueError("A generated landing requires a valid mesh path.")
+            object.__setattr__(self, "generated_model_path", model_path)
+        if self.walk_height_meters is not None:
+            walk_height = _normalize_finite_float(
+                self.walk_height_meters, "landing walk height"
+            )
+            if walk_height <= 0.0:
+                raise ValueError("A landing's walk height must be positive.")
+            object.__setattr__(self, "walk_height_meters", walk_height)
+        for name in ("center_x", "center_y", "elevation_meters", "rotation_degrees"):
+            object.__setattr__(
+                self, name, _normalize_finite_float(getattr(self, name), name)
+            )
+        for name in ("thickness_meters", "scale_x", "scale_y", "scale_z"):
+            value = _normalize_finite_float(getattr(self, name), name)
+            if value <= 0.0:
+                raise ValueError(f"Landing {name} must be positive.")
+            object.__setattr__(self, name, value)
+        try:
+            points = tuple(
+                tuple(
+                    _normalize_finite_float(value, "landing coordinate")
+                    for value in point
+                )
+                for point in self.footprint_meters
+            )
+        except TypeError as error:
+            raise ValueError(
+                "A landing footprint requires a polygon of XY points."
+            ) from error
+        if len(points) > 1 and points[-1] == points[0]:
+            points = points[:-1]
+        if not 3 <= len(points) <= 512 or any(len(point) != 2 for point in points):
+            raise ValueError("A landing footprint requires 3 to 512 XY points.")
+        polygon = Polygon(points)
+        if not polygon.is_valid or polygon.area <= 1e-10:
+            raise ValueError(
+                "A landing footprint must be a simple polygon with positive area."
+            )
+        object.__setattr__(self, "footprint_meters", points)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "landing_id": self.landing_id,
+            "center_x": self.center_x,
+            "center_y": self.center_y,
+            "footprint_meters": [list(point) for point in self.footprint_meters],
+            **{
+                name: getattr(self, name)
+                for name in (
+                    "thickness_meters",
+                    "elevation_meters",
+                    "rotation_degrees",
+                    "scale_x",
+                    "scale_y",
+                    "scale_z",
+                )
+            },
+            **(
+                {"generated_model_path": self.generated_model_path}
+                if self.generated_model_path is not None
+                else {}
+            ),
+            **(
+                {"walk_height_meters": self.walk_height_meters}
+                if self.walk_height_meters is not None
+                else {}
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> LandingData:
+        if not isinstance(payload, dict):
+            raise ValueError("Landing JSON must contain an object.")
+        values = dict(payload)
+        return cls(
+            **{
+                name: values[name]
+                for name in cls.__dataclass_fields__
+                if name in values
+            }
+        )
+
+
+@dataclass(frozen=True)
+class LandingAttachment:
+    """A stable point in the landing's unscaled local meter coordinates."""
+
+    landing_id: str
+    local_x_meters: float
+    local_y_meters: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "landing_id", _normalize_landing_id(self.landing_id))
+        for name in ("local_x_meters", "local_y_meters"):
+            object.__setattr__(
+                self, name, _normalize_finite_float(getattr(self, name), name)
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "landing_id": self.landing_id,
+            "local_x_meters": self.local_x_meters,
+            "local_y_meters": self.local_y_meters,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> LandingAttachment:
+        if not isinstance(payload, dict):
+            raise ValueError("Landing attachment JSON must contain an object.")
+        return cls(
+            payload.get("landing_id"),
+            payload.get("local_x_meters"),
+            payload.get("local_y_meters"),
+        )
+
+
+# ### Stair models ###
 @dataclass(frozen=True, init=False)
 class StairSectionData:
     """One locally stored two-point cross-section along a stair route."""
@@ -947,6 +1095,8 @@ class StairSectionData:
     b_y: float
     a_vertex_id: int | None = None
     b_vertex_id: int | None = None
+    a_landing: LandingAttachment | None = None
+    b_landing: LandingAttachment | None = None
 
     def __init__(
         self,
@@ -957,6 +1107,8 @@ class StairSectionData:
         b_y: object,
         a_vertex_id: object = None,
         b_vertex_id: object = None,
+        a_landing: object = None,
+        b_landing: object = None,
     ) -> None:
         _validate_stair_level_index(level_index, "section")
         normalized_coordinates = {
@@ -981,6 +1133,8 @@ class StairSectionData:
         object.__setattr__(self, "a_y", normalized_coordinates["a y"])
         object.__setattr__(self, "b_x", normalized_coordinates["b x"])
         object.__setattr__(self, "b_y", normalized_coordinates["b y"])
+        object.__setattr__(self, "a_landing", _normalize_landing_attachment(a_landing))
+        object.__setattr__(self, "b_landing", _normalize_landing_attachment(b_landing))
         object.__setattr__(
             self,
             "a_vertex_id",
@@ -1004,7 +1158,7 @@ class StairSectionData:
     def center_y(self) -> float:
         return (self.a_y + self.b_y) / 2.0
 
-    def to_dict(self) -> dict[str, int | float | None]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "level_index": int(self.level_index),
             "a_x": float(self.a_x),
@@ -1013,6 +1167,11 @@ class StairSectionData:
             "b_y": float(self.b_y),
             "a_vertex_id": self.a_vertex_id,
             "b_vertex_id": self.b_vertex_id,
+            **{
+                name: getattr(self, name).to_dict()
+                for name in ("a_landing", "b_landing")
+                if getattr(self, name) is not None
+            },
         }
 
     @classmethod
@@ -1027,6 +1186,8 @@ class StairSectionData:
             b_y=payload.get("b_y"),
             a_vertex_id=payload.get("a_vertex_id"),
             b_vertex_id=payload.get("b_vertex_id"),
+            a_landing=payload.get("a_landing"),
+            b_landing=payload.get("b_landing"),
         )
 
 
@@ -1078,6 +1239,10 @@ class StairData:
     start_b_vertex_id: int | None = None
     end_a_vertex_id: int | None = None
     end_b_vertex_id: int | None = None
+    start_a_landing: LandingAttachment | None = None
+    start_b_landing: LandingAttachment | None = None
+    end_a_landing: LandingAttachment | None = None
+    end_b_landing: LandingAttachment | None = None
     intermediate_sections: tuple[StairSectionData, ...] = ()
     removed_face_indices: tuple[tuple[str, int], ...] = ()
     removed_face_topology_fingerprints: tuple[tuple[str, str], ...] = ()
@@ -1104,6 +1269,10 @@ class StairData:
         start_b_vertex_id: object = None,
         end_a_vertex_id: object = None,
         end_b_vertex_id: object = None,
+        start_a_landing: object = None,
+        start_b_landing: object = None,
+        end_a_landing: object = None,
+        end_b_landing: object = None,
         intermediate_sections: object = (),
         removed_face_indices: object = (),
         removed_face_topology_fingerprints: object = (),
@@ -1119,15 +1288,21 @@ class StairData:
         starting_step_edge_radius_meters: object = (
             DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS
         ),
-        starting_step_edge_points: object = (
-            DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS
-        ),
+        starting_step_edge_points: object = (DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS),
         stringer_placement: object = None,
         legacy_part_layout: object = _INFER_STAIR_LEGACY_PART_LAYOUT,
     ) -> None:
         _validate_stair_level_index(start_level_index, "start")
         _validate_stair_level_index(end_level_index, "end")
-        if start_level_index == end_level_index:
+        if start_level_index == end_level_index and not any(
+            value is not None
+            for value in (
+                start_a_landing,
+                start_b_landing,
+                end_a_landing,
+                end_b_landing,
+            )
+        ):
             raise ValueError("Stair endpoints must belong to different levels.")
 
         canonical_coordinates = (
@@ -1197,6 +1372,13 @@ class StairData:
 
         object.__setattr__(self, "start_level_index", start_level_index)
         object.__setattr__(self, "end_level_index", end_level_index)
+        for name, value in (
+            ("start_a_landing", start_a_landing),
+            ("start_b_landing", start_b_landing),
+            ("end_a_landing", end_a_landing),
+            ("end_b_landing", end_b_landing),
+        ):
+            object.__setattr__(self, name, _normalize_landing_attachment(value))
         for name, value in normalized_coordinates.items():
             object.__setattr__(self, name, value)
         normalized_stair_type, normalized_style = _normalize_stair_type_and_style(
@@ -1369,6 +1551,8 @@ class StairData:
             b_y=self.start_b_y,
             a_vertex_id=self.start_a_vertex_id,
             b_vertex_id=self.start_b_vertex_id,
+            a_landing=self.start_a_landing,
+            b_landing=self.start_b_landing,
         )
 
     @property
@@ -1381,6 +1565,8 @@ class StairData:
             b_y=self.end_b_y,
             a_vertex_id=self.end_a_vertex_id,
             b_vertex_id=self.end_b_vertex_id,
+            a_landing=self.end_a_landing,
+            b_landing=self.end_b_landing,
         )
 
     @property
@@ -1478,6 +1664,16 @@ class StairData:
             "start_b_vertex_id": self.start_b_vertex_id,
             "end_a_vertex_id": self.end_a_vertex_id,
             "end_b_vertex_id": self.end_b_vertex_id,
+            **{
+                name: getattr(self, name).to_dict()
+                for name in (
+                    "start_a_landing",
+                    "start_b_landing",
+                    "end_a_landing",
+                    "end_b_landing",
+                )
+                if getattr(self, name) is not None
+            },
             "intermediate_sections": [
                 section.to_dict() for section in self.intermediate_sections
             ],
@@ -1493,9 +1689,7 @@ class StairData:
                     "part_kind": part_kind,
                     "fingerprint": fingerprint,
                 }
-                for part_kind, fingerprint in (
-                    self.removed_face_topology_fingerprints
-                )
+                for part_kind, fingerprint in (self.removed_face_topology_fingerprints)
             ],
         }
 
@@ -1559,6 +1753,15 @@ class StairData:
             "start_b_vertex_id": payload.get("start_b_vertex_id"),
             "end_a_vertex_id": payload.get("end_a_vertex_id"),
             "end_b_vertex_id": payload.get("end_b_vertex_id"),
+            **{
+                name: payload.get(name)
+                for name in (
+                    "start_a_landing",
+                    "start_b_landing",
+                    "end_a_landing",
+                    "end_b_landing",
+                )
+            },
             "intermediate_sections": payload.get("intermediate_sections", ()),
             "removed_face_indices": payload.get("removed_face_indices", ()),
             "removed_face_topology_fingerprints": payload.get(
@@ -1955,6 +2158,7 @@ class LevelData:
     sloped_ceilings: list[SlopedCeilingData] = field(default_factory=list)
     plan_meters_per_pixel: float | None = None
     external_plan_correction: ExternalPlanCorrection | None = None
+    landings: list[LandingData] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -1984,6 +2188,20 @@ class LevelData:
         ):
             raise ValueError("Plan metres per pixel must be a finite positive number.")
         return density
+
+
+# ### Landing validation helpers ###
+def _normalize_landing_id(value: object) -> str:
+    try:
+        return uuid.UUID(str(value)).hex
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError("A landing requires a stable UUID identifier.") from error
+
+
+def _normalize_landing_attachment(value: object) -> LandingAttachment | None:
+    if value is None or isinstance(value, LandingAttachment):
+        return value
+    return LandingAttachment.from_dict(value)
 
 
 # ### Doorway validation helpers ###

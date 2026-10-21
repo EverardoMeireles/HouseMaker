@@ -252,6 +252,8 @@ from housemaker.glb import (
     export_glb_file,
     import_generated_glb,
 )
+from housemaker.landing_geometry import find_landing_snap, stair_section_landing_z
+from housemaker.landing_workspace import CanvasLandingUndoState, LandingWorkspaceMixin
 from housemaker.level_coordinates import (
     build_doorway_world_outline_positions,
     build_level_base_z_lookup,
@@ -318,6 +320,7 @@ from housemaker.models import (
     DoorwayPreset,
     Edge,
     EditableSurfaceMeshData,
+    LandingAttachment,
     LevelData,
     SlopedCeilingData,
     StairData,
@@ -1727,6 +1730,7 @@ _CanvasUndoState = (
     | _CanvasPlacedObjectUndoState
     | _CanvasPlacedObjectGroupUndoState
     | _CanvasStairsUndoState
+    | CanvasLandingUndoState
     | _SurfaceTextureTilingUndoState
     | _SurfaceTextureColorBalanceUndoState
 )
@@ -1895,7 +1899,7 @@ class StairEditorHeightFilter(QObject):
         self._sync_height()
 
 
-class BlueprintWorkspace(QWidget):
+class BlueprintWorkspace(LandingWorkspaceMixin, QWidget):
     _progressive_texture_result_ready = Signal(int, object)
 
     def __init__(
@@ -2005,6 +2009,7 @@ class BlueprintWorkspace(QWidget):
         ] = {}
         self._reset_viewer_doorway_snapshots()
         self._mesh_edit_update_delay_seconds = DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
+        self._init_landing_state()
         self._pending_wall_vertex_mesh_update = False
         self._pending_wall_vertex_doorway_level_indices: set[int] = set()
         self._pending_open_space_corner_mesh_update = False
@@ -2332,6 +2337,7 @@ class BlueprintWorkspace(QWidget):
         self._clear_pending_architectural_trim_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        self._landing_mesh_update_timer.stop()
         self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_plan_wall_detections()
         self._shutdown_progressive_texture_loads()
@@ -4208,10 +4214,15 @@ class BlueprintWorkspace(QWidget):
         self.stair_status_label.setWordWrap(True)
         stairs_layout.addWidget(self.stair_status_label)
 
-        self.add_stairs_button = QPushButton("Add stairs")
+        self.add_stairs_button = QPushButton("Add stair points")
         self.add_stairs_button.setMinimumHeight(40)
         self.add_stairs_button.clicked.connect(self._handle_add_stairs_clicked)
-        stairs_layout.addWidget(self.add_stairs_button)
+        stair_placement_buttons = QHBoxLayout()
+        stair_placement_buttons.addWidget(self.add_stairs_button)
+        self.add_landing_button = QPushButton("Add landing")
+        self.add_landing_button.setMinimumHeight(40)
+        stair_placement_buttons.addWidget(self.add_landing_button)
+        stairs_layout.addLayout(stair_placement_buttons)
         # The local scroll area protects readable field widths if the entire
         # application is resized narrower than the editor can reflow.
         minimum_stair_form_width = max(
@@ -5029,6 +5040,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.stair_point_drag_finished.connect(
             self._handle_stair_point_drag_finished
         )
+        self._connect_landing_controls()
         self._update_outer_wall_marking_controls()
         self._refresh_levels_list()
         self._update_stair_button_state()
@@ -6152,6 +6164,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_selected_canvas_wall_highlight(
             self.viewer.get_active_canvas_surface_id()
         )
+        self._sync_landing_views()
 
     # ### Canvas stair editor ###
     def _sync_canvas_stair_semantic_targets(
@@ -8403,6 +8416,8 @@ class BlueprintWorkspace(QWidget):
             self._commit_pending_sloped_ceiling_mesh_update()
         if commit_pending_architectural_trim_edit:
             self._commit_pending_architectural_trim_mesh_update()
+        if not isinstance(state, CanvasLandingUndoState):
+            self._commit_landing_mesh_update()
         self._canvas_undo_stack.append(state)
 
     def _clear_canvas_undo_history(self) -> None:
@@ -8866,6 +8881,8 @@ class BlueprintWorkspace(QWidget):
                 )
             elif isinstance(state, _CanvasStairsUndoState):
                 skipped_texture_bindings = self._restore_canvas_stairs_undo_state(state)
+            elif isinstance(state, CanvasLandingUndoState):
+                self._restore_landing_undo_state(state)
             elif isinstance(state, _SurfaceTextureTilingUndoState):
                 self._restore_surface_texture_tiling_undo_state(state)
             elif isinstance(state, _SurfaceTextureColorBalanceUndoState):
@@ -11840,6 +11857,8 @@ class BlueprintWorkspace(QWidget):
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
+            or self._pending_landing_mesh_update
+            or self._active_landing_undo_state is not None
             or self._pending_doorway_bridge_topology_change
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
@@ -13385,6 +13404,7 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_level_transform_update()
         self._commit_pending_doorway_mesh_update()
 
+        self._commit_landing_mesh_update()
         export_path = Path(file_path)
         if export_path.suffix.lower() != ".glb":
             export_path = export_path.with_suffix(".glb")
@@ -18673,7 +18693,10 @@ class BlueprintWorkspace(QWidget):
             for wall_key, texture_data in sorted(room.wall_textures.items())
         )
         return (
-            room_texture_signature,
+            room_texture_signature + tuple(
+                ("landing", level.index, landing)
+                for level in self.levels for landing in level.landings
+            ),
             self.generation.get_placed_preview_dependency_signature(),
             self.surface_texture_generation.get_preview_dependency_signature(),
             self.generation.get_architectural_trim_component_dependency_signature(),
@@ -18876,6 +18899,7 @@ class BlueprintWorkspace(QWidget):
         self._reset_viewer_window_snapshots()
         self._reset_viewer_floor_thickness_snapshots()
         self._reset_viewer_sloped_ceiling_snapshots()
+        self._reset_viewer_landing_snapshots()
 
     def _reset_viewer_window_snapshots(self) -> None:
         """Make every rendered window snapshot match the loaded project."""
@@ -18973,6 +18997,9 @@ class BlueprintWorkspace(QWidget):
                     slope_snapshot
                 )
             preview_level.sloped_ceilings = list(copy.deepcopy(slope_snapshot))
+            preview_level.landings = list(
+                self._viewer_landings_by_level_index.setdefault(level.index, tuple(level.landings))
+            )
             preview_levels.append(preview_level)
         return preview_levels
 
@@ -19121,6 +19148,7 @@ class BlueprintWorkspace(QWidget):
             self._level_transform_mesh_update_timer,
             self._stair_point_mesh_update_timer,
             self._wall_vertex_update_timer,
+            self._landing_mesh_update_timer,
         )
         active_timers = tuple(timer.isActive() for timer in timers)
         self._mesh_edit_update_delay_seconds = normalized_delay
@@ -21419,6 +21447,7 @@ class BlueprintWorkspace(QWidget):
             or self._pending_wall_vertex_mesh_update
             or self._pending_doorway_bridge_topology_change
             or self._pending_stair_point_mesh_update
+            or self._pending_landing_mesh_update
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
         ):
@@ -21583,6 +21612,7 @@ class BlueprintWorkspace(QWidget):
             or self._pending_wall_vertex_mesh_update
             or self._pending_doorway_bridge_topology_change
             or self._pending_stair_point_mesh_update
+            or self._pending_landing_mesh_update
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
         ):
@@ -21641,6 +21671,7 @@ class BlueprintWorkspace(QWidget):
             or self._pending_wall_vertex_mesh_update
             or self._pending_doorway_bridge_topology_change
             or self._pending_stair_point_mesh_update
+            or self._pending_landing_mesh_update
             or self._active_architectural_trim_undo_state is not None
             or self._pending_architectural_trim_undo_state is not None
         ):
@@ -21673,6 +21704,7 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_wall_vertex_update()
         self._commit_pending_stair_point_mesh_update()
 
+        self._commit_landing_mesh_update()
         try:
             save_project(
                 path=file_path,
@@ -24097,9 +24129,17 @@ class BlueprintWorkspace(QWidget):
             return
         try:
             base_z_by_level = build_level_base_z_lookup(self.levels)
+            levels_by_index = {level.index: level for level in self.levels}
+            start_section, end_section = stair.sections[0], stair.sections[-1]
+            start_z = stair_section_landing_z(
+                levels_by_index[start_section.level_index], start_section, self.levels
+            )
+            end_z = stair_section_landing_z(
+                levels_by_index[end_section.level_index], end_section, self.levels
+            )
             total_rise = abs(
-                float(base_z_by_level[stair.end_level_index])
-                - float(base_z_by_level[stair.start_level_index])
+                (float(base_z_by_level[stair.end_level_index]) if end_z is None else end_z)
+                - (float(base_z_by_level[stair.start_level_index]) if start_z is None else start_z)
             )
             step_count, actual_rise = calculate_stair_step_layout(
                 total_rise,
@@ -24314,7 +24354,7 @@ class BlueprintWorkspace(QWidget):
             button_text = "Confirm stairs"
             button_enabled = True
         else:
-            button_text = "Add stairs"
+            button_text = "Add stair points"
             button_enabled = not placement_active
         self.add_stairs_button.setText(button_text)
         self.add_stairs_button.setEnabled(button_enabled)
@@ -30033,7 +30073,12 @@ class BlueprintWorkspace(QWidget):
             f"{side}_x": image_x,
             f"{side}_y": image_y,
             f"{side}_vertex_id": None,
+            f"{side}_landing": None,
         }
+        landing_snap = find_landing_snap(self.current_level, (image_x, image_y), 1e-4)
+        if landing_snap is not None:
+            point, attachment = landing_snap
+            coordinates.update({f"{side}_x": point[0], f"{side}_y": point[1], f"{side}_landing": attachment})
         try:
             if section_name in ("start", "end"):
                 candidate = replace(
@@ -30815,6 +30860,14 @@ class BlueprintWorkspace(QWidget):
         self._clear_canvas_undo_history()
         self._clear_door_undo_history()
         self.viewer.set_window_undo_available(False)
+        self._landing_mesh_update_timer.stop()
+        self._pending_landing_mesh_update = False
+        self._active_landing_undo_state = None
+        self._landing_edit_had_pending_mesh_update = False
+        self._selected_landing_id = None
+        self.canvas.cancel_landing_placement()
+        self.viewer.cancel_landing_placement()
+        self.generation.clear_landing_editing_target()
         self.levels = levels
         self.outer_wall_marks = reconcile_outer_wall_marks(
             self.levels,
@@ -31098,6 +31151,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_selected_canvas_wall_highlight(
             self.viewer.get_active_canvas_surface_id()
         )
+        self._sync_landing_views()
         self._update_blueprint_name_label()
         self._update_open_space_controls()
         self._update_plan_wall_generation_controls_state()
@@ -31397,7 +31451,18 @@ def _build_stair_section_data(section: object) -> StairSectionData:
         b_y=float(_get_stair_placement_value(section, "b_y")),
         a_vertex_id=_get_optional_stair_vertex_id(section, "a_vertex_id"),
         b_vertex_id=_get_optional_stair_vertex_id(section, "b_vertex_id"),
+        a_landing=_get_optional_stair_landing(section, "a_landing"),
+        b_landing=_get_optional_stair_landing(section, "b_landing"),
     )
+
+
+def _get_optional_stair_landing(payload: object, name: str) -> LandingAttachment | None:
+    """Accept old drafts without attachments and new stable landing anchors."""
+
+    raw = payload.get(name) if isinstance(payload, Mapping) else getattr(payload, name, None)
+    if raw is None or isinstance(raw, LandingAttachment):
+        return raw
+    return LandingAttachment.from_dict(raw)
 
 
 def _build_stair_data_from_placement(
@@ -31436,6 +31501,10 @@ def _build_stair_data_from_placement(
             placement,
             "end_b_vertex_id",
         ),
+        **{
+            f"{end}_{side}_landing": _get_optional_stair_landing(placement, f"{end}_{side}_landing")
+            for end in ("start", "end") for side in ("a", "b")
+        },
         intermediate_sections=tuple(
             _build_stair_section_data(section)
             for section in _get_stair_intermediate_section_payloads(placement)

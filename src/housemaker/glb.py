@@ -10,7 +10,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
 from io import BytesIO
-from itertools import permutations
+from itertools import pairwise, permutations
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +42,11 @@ from housemaker.doorway_geometry import (
     build_doorway_cross_section_outline,
 )
 from housemaker.floor_geometry import build_level_floor_mesh
+from housemaker.landing_geometry import (
+    build_landing_meshes,
+    resolve_stair_section_image_points,
+    stair_section_landing_z,
+)
 from housemaker.level_coordinates import (
     build_level_base_z_lookup,
     build_level_floor_base_z_lookup,
@@ -169,6 +174,7 @@ GLTF_CLAMP_TO_EDGE_WRAP = 33071
 NAMED_MESH_ROLE_SURFACE = "surface"
 NAMED_MESH_ROLE_OPENING_REVEAL = "opening_reveal"
 NAMED_MESH_ROLE_STAIR = "stair"
+NAMED_MESH_ROLE_LANDING = "landing"
 NAMED_MESH_ROLE_ARCHITECTURAL_TRIM = "architectural_trim"
 STAIR_PART_TREADS = "treads"
 STAIR_PART_SUPPORT = "support"
@@ -2696,6 +2702,8 @@ def _slugify_scene_name(raw_name: object) -> str:
 def build_stair_slab_openings_by_level(
     levels: Sequence[LevelData],
     stairs: Sequence[StairData],
+    *,
+    _landing_flights_resolved: bool = False,
 ) -> dict[int, BaseGeometry]:
     """Return world-space stair corridors owned by every crossed upper slab.
 
@@ -2708,6 +2716,22 @@ def build_stair_slab_openings_by_level(
 
     if not stairs:
         return {}
+
+    if not _landing_flights_resolved and any(
+        section.a_landing is not None or section.b_landing is not None
+        for stair in stairs
+        for section in stair.intermediate_sections
+    ):
+        lookup = {level.index: level for level in levels}
+        return build_stair_slab_openings_by_level(
+            levels,
+            [
+                flight
+                for stair in stairs
+                for flight in _split_landing_stair_flights(stair, lookup)
+            ],
+            _landing_flights_resolved=True,
+        )
 
     level_lookup = {level.index: level for level in levels}
     base_z_by_level_index = build_level_base_z_lookup(levels)
@@ -2723,33 +2747,28 @@ def build_stair_slab_openings_by_level(
         )
         if any(level is None for level in route_levels):
             continue
-        if any(not level.include_in_export for level in route_levels if level is not None):
+        if any(
+            not level.include_in_export for level in route_levels if level is not None
+        ):
             continue
 
         route_sections = _resolve_stair_route_sections(stair, level_lookup)
-        start_z = _get_stair_endpoint_base_z(
-            base_z_by_level_index,
-            stair.start_level_index,
-            "start",
+        start_z = _get_stair_section_elevation(
+            stair.start_section, level_lookup, base_z_by_level_index
         )
-        end_z = _get_stair_endpoint_base_z(
-            base_z_by_level_index,
-            stair.end_level_index,
-            "end",
+        end_z = _get_stair_section_elevation(
+            stair.end_section, level_lookup, base_z_by_level_index
         )
         lower_z, upper_z = sorted((start_z, end_z))
         if start_z > end_z:
             route_sections.reverse()
             route_sections = _normalize_stair_rail_correspondence(route_sections)
-        sampled_sections, cumulative_distances = (
-            _get_smoothed_stair_route_geometry(route_sections)
+        sampled_sections, cumulative_distances = _get_smoothed_stair_route_geometry(
+            route_sections
         )
         total_run = cumulative_distances[-1]
         total_rise = upper_z - lower_z
-        if (
-            total_run <= STAIR_GEOMETRY_EPSILON
-            or total_rise <= STAIR_GEOMETRY_EPSILON
-        ):
+        if total_run <= STAIR_GEOMETRY_EPSILON or total_rise <= STAIR_GEOMETRY_EPSILON:
             continue
 
         previous_z = lower_z
@@ -2769,9 +2788,7 @@ def build_stair_slab_openings_by_level(
                 interval_start,
                 interval_end,
             )
-            openings_by_level.setdefault(owner_level.index, []).extend(
-                opening_parts
-            )
+            openings_by_level.setdefault(owner_level.index, []).extend(opening_parts)
             previous_z = owner_z
 
     return {
@@ -2993,17 +3010,34 @@ def _build_stair_part_meshes(
     stair: StairData,
     level_lookup: Mapping[int, LevelData],
     base_z_by_level_index: Mapping[int, float],
+    *,
+    _decompose_landings: bool = True,
 ) -> dict[str, trimesh.Trimesh]:
+    if _decompose_landings and any(
+        section.a_landing is not None or section.b_landing is not None
+        for section in stair.intermediate_sections
+    ):
+        grouped: dict[str, list[trimesh.Trimesh]] = {}
+        for flight in _split_landing_stair_flights(stair, level_lookup):
+            parts = _build_stair_part_meshes(
+                replace(
+                    flight,
+                    removed_face_indices=(),
+                    removed_face_topology_fingerprints=(),
+                ),
+                level_lookup,
+                base_z_by_level_index,
+                _decompose_landings=False,
+            )
+            for kind, mesh in parts.items():
+                grouped.setdefault(kind, []).append(mesh)
+        return _finalize_stair_part_meshes(stair, grouped)
     route_sections = _resolve_stair_route_sections(stair, level_lookup)
-    start_z_meters = _get_stair_endpoint_base_z(
-        base_z_by_level_index,
-        stair.start_level_index,
-        "start",
+    start_z_meters = _get_stair_section_elevation(
+        stair.start_section, level_lookup, base_z_by_level_index
     )
-    end_z_meters = _get_stair_endpoint_base_z(
-        base_z_by_level_index,
-        stair.end_level_index,
-        "end",
+    end_z_meters = _get_stair_section_elevation(
+        stair.end_section, level_lookup, base_z_by_level_index
     )
     height_difference_meters = end_z_meters - start_z_meters
     if abs(height_difference_meters) <= STAIR_GEOMETRY_EPSILON:
@@ -3310,6 +3344,12 @@ def _build_stair_part_meshes(
             tread_thickness_meters,
         )
 
+    return _finalize_stair_part_meshes(stair, part_meshes)
+
+
+def _finalize_stair_part_meshes(stair, part_meshes):
+    """Combine flights before applying stable per-part face-edit metadata."""
+
     removed_faces_by_part: dict[str, set[int]] = {}
     for part_kind, face_index in stair.removed_face_indices:
         removed_faces_by_part.setdefault(part_kind, set()).add(face_index)
@@ -3410,6 +3450,81 @@ def _resolve_stair_route_sections(
         frozen_route_sections
     )
     return _thaw_stair_route_sections(cached_route_sections)
+
+
+def _get_stair_section_elevation(section, level_lookup, base_z_by_level_index):
+    level = _get_stair_endpoint_level(level_lookup, section.level_index, "section")
+    landing_z = stair_section_landing_z(level, section, tuple(level_lookup.values()))
+    if landing_z is not None:
+        return landing_z
+    return _get_stair_endpoint_base_z(
+        base_z_by_level_index, section.level_index, "section"
+    )
+
+
+def _split_landing_stair_flights(stair, level_lookup):
+    """Pin flights to platform tops and leave same-platform crossings flat."""
+
+    sections = stair.sections
+    anchors = [
+        0,
+        *(
+            index
+            for index, section in enumerate(sections[1:-1], start=1)
+            if section.a_landing is not None or section.b_landing is not None
+        ),
+        len(sections) - 1,
+    ]
+    base_z = build_level_base_z_lookup(tuple(level_lookup.values()))
+    flights = []
+    for first_index, last_index in pairwise(anchors):
+        first, last = sections[first_index], sections[last_index]
+        first_z = _get_stair_section_elevation(first, level_lookup, base_z)
+        last_z = _get_stair_section_elevation(last, level_lookup, base_z)
+        if abs(first_z - last_z) <= STAIR_GEOMETRY_EPSILON:
+            first_ids = {
+                item.landing_id
+                for item in (first.a_landing, first.b_landing)
+                if item is not None
+            }
+            last_ids = {
+                item.landing_id
+                for item in (last.a_landing, last.b_landing)
+                if item is not None
+            }
+            if first_ids.intersection(last_ids):
+                continue
+            raise ValueError(
+                "A stair flight must join sections at different elevations."
+            )
+        flights.append(
+            replace(
+                stair,
+                start_level_index=first.level_index,
+                end_level_index=last.level_index,
+                start_a_x=first.a_x,
+                start_a_y=first.a_y,
+                start_b_x=first.b_x,
+                start_b_y=first.b_y,
+                end_a_x=last.a_x,
+                end_a_y=last.a_y,
+                end_b_x=last.b_x,
+                end_b_y=last.b_y,
+                start_a_vertex_id=first.a_vertex_id,
+                start_b_vertex_id=first.b_vertex_id,
+                end_a_vertex_id=last.a_vertex_id,
+                end_b_vertex_id=last.b_vertex_id,
+                start_a_landing=first.a_landing,
+                start_b_landing=first.b_landing,
+                end_a_landing=last.a_landing,
+                end_b_landing=last.b_landing,
+                intermediate_sections=sections[first_index + 1 : last_index],
+                starting_step=stair.starting_step
+                if first_index == 0
+                else STAIR_STARTING_STEP_NONE,
+            )
+        )
+    return flights
 
 
 @lru_cache(maxsize=STAIR_ROUTE_CACHE_MAX_ENTRIES)
@@ -3673,19 +3788,9 @@ def _resolve_stair_section_points(
     section: StairSectionData,
     level: LevelData,
 ) -> tuple[np.ndarray, np.ndarray]:
-    return (
-        _resolve_stair_control_point(
-            level,
-            section.a_x,
-            section.a_y,
-            section.a_vertex_id,
-        ),
-        _resolve_stair_control_point(
-            level,
-            section.b_x,
-            section.b_y,
-            section.b_vertex_id,
-        ),
+    return tuple(
+        np.asarray(level_image_to_world_xy(level, *point), dtype=float)
+        for point in resolve_stair_section_image_points(level, section)
     )
 
 
@@ -5350,29 +5455,6 @@ def _build_stair_riser_prism(
         bottom_z_meters=bottom_z_meters,
         top_z_meters=top_z_meters,
     )
-
-
-def _resolve_stair_control_point(
-    level: LevelData,
-    fallback_x: float,
-    fallback_y: float,
-    vertex_id: int | None,
-) -> np.ndarray:
-    source_x = fallback_x
-    source_y = fallback_y
-    if vertex_id is not None:
-        bound_vertex = level.vertex_data.get_vertex(vertex_id)
-        if bound_vertex is not None:
-            source_x = bound_vertex.x
-            source_y = bound_vertex.y
-
-    point = np.asarray(
-        level_image_to_world_xy(level, source_x, source_y),
-        dtype=float,
-    )
-    if not np.all(np.isfinite(point)):
-        raise ValueError("Stair control points must have finite world coordinates.")
-    return point
 
 
 def _normalize_stair_rail_correspondence(
@@ -7367,6 +7449,21 @@ def _build_multi_level_meshes(
             blueprint_size_pixels=blueprint_size_pixels,
             stair_opening_geometry=stair_openings_by_level.get(level.index),
         )
+        for landing in level.landings:
+            level_named_meshes.extend(
+                NamedMesh(
+                    name=(
+                        f"landing:{landing.landing_id}"
+                        if index == 0
+                        else f"landing:{landing.landing_id}:part:{index}"
+                    ),
+                    mesh=mesh,
+                    export_role=NAMED_MESH_ROLE_LANDING,
+                )
+                for index, mesh in enumerate(
+                    build_landing_meshes(level, landing, sorted_levels)
+                )
+            )
         if not level_named_meshes:
             continue
 
