@@ -112,9 +112,6 @@ AUTOMATIC_ATLAS_CREATION_SETTING_KEY = "atlas/automatic_creation"
 AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY = (
     "atlas/automatic_texture_sort_by_pbr"
 )
-USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY = (
-    "atlas/use_half_mesh_texture_prefix"
-)
 AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY = (
     "atlas/automatic_texture_resolution"
 )
@@ -193,7 +190,6 @@ DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_STEP = 0.1
 AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS = (512, 1024)
 DEFAULT_AUTOMATIC_ATLAS_CREATION = False
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR = False
-DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX = False
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION = 512
 MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
@@ -288,9 +284,6 @@ class GenerationServiceSettings:
     )
     automatic_atlas_texture_sort_by_pbr: bool = (
         DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR
-    )
-    use_half_mesh_texture_prefix: bool = (
-        DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX
     )
     atlas_display_screen_id: str | None = None
     snap_middle_equal_angle_only: bool = (
@@ -403,10 +396,6 @@ class GenerationServiceSettings:
         if not isinstance(self.automatic_atlas_creation, bool):
             raise ValueError(
                 "Automatic atlas creation must be enabled or disabled."
-            )
-        if not isinstance(self.use_half_mesh_texture_prefix, bool):
-            raise ValueError(
-                "Half-mesh texture prefix must be enabled or disabled."
             )
         if not isinstance(self.automatic_atlas_texture_sort_by_pbr, bool):
             raise ValueError(
@@ -702,9 +691,6 @@ class SettingsWidget(QWidget):
             ),
             automatic_atlas_texture_sort_by_pbr=(
                 self.automatic_atlas_texture_sort_by_pbr_checkbox.isChecked()
-            ),
-            use_half_mesh_texture_prefix=(
-                self.use_half_mesh_texture_prefix_checkbox.isChecked()
             ),
             automatic_atlas_texture_resolution=int(
                 self.automatic_atlas_texture_resolution_combo.currentData()
@@ -1086,8 +1072,8 @@ class SettingsWidget(QWidget):
             "automatic_atlas_creation_checkbox"
         )
         self.automatic_atlas_creation_checkbox.setToolTip(
-            "Create another Atlas automatically when scene textures do not "
-            "fit in the currently selected Atlas."
+            "Create [OBJECT] Atlases automatically when object textures need "
+            "more space. [SURFACE] Atlases are always created as needed."
         )
         self.automatic_atlas_creation_checkbox.toggled.connect(
             self._handle_automatic_atlas_creation_changed
@@ -1111,22 +1097,6 @@ class SettingsWidget(QWidget):
         atlas_automation_form.addRow(
             "Automatic Atlas texture sort by PBR",
             self.automatic_atlas_texture_sort_by_pbr_checkbox,
-        )
-
-        self.use_half_mesh_texture_prefix_checkbox = QCheckBox()
-        self.use_half_mesh_texture_prefix_checkbox.setObjectName(
-            "use_half_mesh_texture_prefix_checkbox"
-        )
-        self.use_half_mesh_texture_prefix_checkbox.setToolTip(
-            "Automatically place symmetric half-mesh textures in Atlases "
-            "whose names start with [HALF]."
-        )
-        self.use_half_mesh_texture_prefix_checkbox.toggled.connect(
-            self._handle_use_half_mesh_texture_prefix_changed
-        )
-        atlas_automation_form.addRow(
-            "Use [HALF] half-mesh texture prefix",
-            self.use_half_mesh_texture_prefix_checkbox,
         )
 
         self.automatic_atlas_texture_resolution_combo = QComboBox()
@@ -1223,7 +1193,8 @@ class SettingsWidget(QWidget):
         self.first_person_speed_slider.setSingleStep(1)
         self.first_person_speed_slider.setPageStep(10)
         self.first_person_speed_slider.setToolTip(
-            "Set first-person movement speed in meters per second."
+            "Adjust how fast the FPS camera moves, in meters per second. "
+            "Changes apply immediately to walking and noclip navigation."
         )
         self.first_person_speed_value_label = QLabel()
         self.first_person_speed_value_label.setObjectName(
@@ -1244,7 +1215,7 @@ class SettingsWidget(QWidget):
             self._handle_first_person_speed_changed
         )
         canvas_form.addRow(
-            "First person speed",
+            "Fps mode speed",
             self.first_person_speed_control,
         )
 
@@ -1966,9 +1937,6 @@ class SettingsWidget(QWidget):
                 self._application_settings
             )
         )
-        self.use_half_mesh_texture_prefix_checkbox.setChecked(
-            read_use_half_mesh_texture_prefix(self._application_settings)
-        )
         automatic_atlas_resolution = read_automatic_atlas_texture_resolution(
             self._application_settings
         )
@@ -2567,20 +2535,6 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
-    def _handle_use_half_mesh_texture_prefix_changed(
-        self,
-        checked: bool,
-    ) -> None:
-        """Persist whether half meshes use dedicated prefixed Atlases."""
-
-        if self._is_loading_settings:
-            return
-        self._application_settings.set(
-            USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
-            bool(checked),
-        )
-        self.settings_changed.emit()
-
     def _selected_canvas_3d_navigation_toggle_hotkey(self) -> str:
         hotkey = _hotkey_from_key_sequence(
             self.canvas_3d_navigation_toggle_hotkey_edit.keySequence()
@@ -2972,20 +2926,6 @@ def read_automatic_atlas_texture_sort_by_pbr(
     if isinstance(value, bool):
         return value
     return DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR
-
-
-def read_use_half_mesh_texture_prefix(
-    application_settings: ApplicationSettingsStore,
-) -> bool:
-    """Read the persisted half-mesh Atlas routing policy safely."""
-
-    value = application_settings.get(
-        USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
-        DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
-    )
-    if isinstance(value, bool):
-        return value
-    return DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX
 
 
 def read_automatic_atlas_texture_resolution(

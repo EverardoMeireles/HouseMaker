@@ -573,6 +573,7 @@ class CeilingHeightAnalysisDialog(QDialog):
         player_row.addStretch(1)
         root.addLayout(player_row)
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self.seek_slider.setSingleStep(2)
         self.seek_slider.setObjectName("ceiling_height_video_seek_slider")
         root.addWidget(self.seek_slider)
         self.range_timeline = CeilingHeightRangeTimeline()

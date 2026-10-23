@@ -45,6 +45,8 @@ from housemaker.texture_atlas_state import (
     ATLAS_SLOT_QUADRANT_ORDER,
     ATLAS_SLOT_QUADRANT_TOP_LEFT,
     ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+    ATLAS_TYPE_OBJECT,
+    ATLAS_TYPE_SURFACE,
     TextureAtlasData,
     TextureAtlasRecord,
     atlas_placement_pixel_regions,
@@ -2446,6 +2448,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             set(materialized.to_dict()),
             {
                 "atlas_id",
+                "atlas_type",
                 "name",
                 "resolution",
                 "image_path",
@@ -3553,7 +3556,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         data = self.workspace.get_data()
         self.assertEqual(len(data.atlases), 1)
-        self.assertEqual(data.atlases[0].name, "Furniture")
+        self.assertEqual(data.atlases[0].name, "[OBJECT] Furniture")
         self.assertEqual(data.atlases[0].resolution, 4096)
         self.assertEqual(data.selected_atlas_id, data.atlases[0].atlas_id)
         self.assertIsNone(data.atlases[0].image_path)
@@ -3949,8 +3952,12 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             self.workspace.assign_source_to_selected_atlas(wall_source.object_id)
         )
 
-        packed = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        packed = self.workspace.selected_atlas
         assert packed is not None
+        self.assertEqual(packed.atlas_type, ATLAS_TYPE_SURFACE)
+        self.assertEqual(
+            self.workspace.get_data().atlas_by_id(atlas.atlas_id).placements, [],
+        )
         placement = packed.placement_for_object(wall_source.object_id)
         assert placement is not None
         self.assertEqual(placement.texture_resolution, 512)
@@ -5367,6 +5374,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             ),
             selectability_resolver=lambda _object_id, _resolution: True,
         )
+        before_data = self.workspace.get_data()
         callbacks: list[str] = []
         data_changes: list[TextureAtlasData] = []
         resolution_changes: list[tuple[str, int]] = []
@@ -5385,7 +5393,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(callbacks, ["accepted"])
-        self.assertEqual(self.workspace.get_data(), data)
+        self.assertEqual(self.workspace.get_data(), before_data)
         self.assertEqual(data_changes, [])
         self.assertEqual(resolution_changes, [])
 
@@ -6090,7 +6098,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         assert loaded is not None
         self.assertIsNotNone(loaded.placement_for_object("deleted-chair"))
         self.assertIn("retained", self.workspace.status_label.text())
-        self.assertIn("without an available", self.workspace.status_label.text())
+        self.assertIn("sources are unavailable", self.workspace.status_label.text())
         self.assertEqual(self.workspace.object_list.count(), 1)
         self.assertEqual(
             self.workspace.object_list.item(0).text(),
@@ -6657,7 +6665,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         callback.assert_called_once_with()
         selected_atlas = self.workspace.selected_atlas
         assert selected_atlas is not None
-        self.assertEqual(selected_atlas.name, "Atlas 3")
+        self.assertEqual(selected_atlas.name, "[OBJECT] Atlas 3")
         self.assertEqual(selected_atlas.resolution, 2048)
         self.assertIsNotNone(selected_atlas.placement_for_object(source.object_id))
         self.assertTrue(
@@ -8320,7 +8328,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(changes.call_count, 1)
         self.assertEqual(self.workspace.get_unpacked_scene_texture_source_ids(), ())
 
-    def test_texture_only_2048_halves_pair_without_half_mesh_routing(
+    def test_texture_only_2048_halves_pair_in_object_atlas(
         self,
     ) -> None:
         sources = tuple(
@@ -8356,7 +8364,6 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         with patch.object(self.workspace, "_materialize_atlas"):
             assigned = self.workspace.auto_assign_scene_texture_sources(
                 2048,
-                use_half_mesh_texture_prefix=True,
             )
 
         self.assertEqual(
@@ -8381,7 +8388,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
         )
 
-    def test_half_prefix_routing_reuses_prefixed_atlas_and_preserves_selection(
+    def test_half_meshes_use_same_object_atlas_and_preserve_selection(
         self,
     ) -> None:
         ordinary_source = _source(
@@ -8425,7 +8432,6 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         with patch.object(self.workspace, "_materialize_atlas"):
             assigned = self.workspace.auto_assign_scene_texture_sources(
                 512,
-                use_half_mesh_texture_prefix=True,
             )
 
         self.assertEqual(
@@ -8446,25 +8452,27 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                packed_selected.placement_for_object(source.object_id) is None
+                packed_selected.placement_for_object(source.object_id) is not None
                 for source in half_sources
             )
         )
         half_placements = [
-            packed_half.placement_for_object(source.object_id)
+            packed_selected.placement_for_object(source.object_id)
             for source in half_sources
         ]
         self.assertTrue(all(placement is not None for placement in half_placements))
         self.assertEqual(
             {(placement.x, placement.y) for placement in half_placements},
-            {(0, 0)},
+            {(512, 0)},
         )
         self.assertEqual(
             {placement.slot_half for placement in half_placements},
             {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
         )
+        self.assertEqual(packed_half.placements, [])
+        self.assertEqual(packed_selected.atlas_type, ATLAS_TYPE_OBJECT)
 
-    def test_half_prefix_routing_tries_next_prefixed_atlas_when_first_is_full(
+    def test_object_routing_skips_surface_and_full_object_atlases(
         self,
     ) -> None:
         existing_sources = tuple(
@@ -8488,6 +8496,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             "Selected Atlas",
             2048,
             atlas_id="selected-atlas",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         full_half_atlas = data.create_atlas(
             "[HALF] Full",
@@ -8517,7 +8526,6 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         with patch.object(self.workspace, "_materialize_atlas"):
             assigned = self.workspace.auto_assign_scene_texture_sources(
                 1024,
-                use_half_mesh_texture_prefix=True,
             )
 
         self.assertEqual(assigned, (half_source.object_id,))
@@ -8533,7 +8541,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(len(packed_data.atlases), 3)
 
-    def test_half_prefix_routing_creates_selected_4096_atlas_when_none_exist(
+    def test_object_routing_creates_selected_atlas_when_creation_is_enabled(
         self,
     ) -> None:
         half_source = _source(
@@ -8552,19 +8560,19 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         with patch.object(self.workspace, "_materialize_atlas"):
             assigned = self.workspace.auto_assign_scene_texture_sources(
                 512,
-                use_half_mesh_texture_prefix=True,
+                allow_atlas_creation=True,
             )
 
         self.assertEqual(assigned, (half_source.object_id,))
         packed_data = self.workspace.get_data()
         self.assertEqual(len(packed_data.atlases), 1)
         created_atlas = packed_data.atlases[0]
-        self.assertEqual(created_atlas.name, "[HALF] Atlas")
-        self.assertEqual(created_atlas.resolution, 4096)
+        self.assertEqual(created_atlas.name, "[OBJECT] Atlas")
+        self.assertEqual(created_atlas.resolution, 2048)
         self.assertEqual(packed_data.selected_atlas_id, created_atlas.atlas_id)
         self.assertIsNotNone(created_atlas.placement_for_object(half_source.object_id))
 
-    def test_half_prefix_routing_creates_unique_4096_atlas_when_all_are_full(
+    def test_object_routing_creates_unique_matching_size_atlas_when_full(
         self,
     ) -> None:
         existing_sources = tuple(
@@ -8588,6 +8596,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             "Selected Atlas",
             2048,
             atlas_id="selected-atlas",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         full_half_atlas = data.create_atlas(
             "[HALF] Atlas",
@@ -8612,20 +8621,20 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         with patch.object(self.workspace, "_materialize_atlas"):
             assigned = self.workspace.auto_assign_scene_texture_sources(
                 1024,
-                use_half_mesh_texture_prefix=True,
+                allow_atlas_creation=True,
             )
 
         self.assertEqual(assigned, (half_source.object_id,))
         packed_data = self.workspace.get_data()
-        self.assertEqual(packed_data.selected_atlas_id, selected_atlas.atlas_id)
         self.assertEqual(len(packed_data.atlases), 3)
         created_atlas = next(
             atlas
             for atlas in packed_data.atlases
             if atlas.atlas_id not in {selected_atlas.atlas_id, full_half_atlas.atlas_id}
         )
-        self.assertEqual(created_atlas.name, "[HALF] Atlas 2")
-        self.assertEqual(created_atlas.resolution, 4096)
+        self.assertEqual(created_atlas.name, "[OBJECT] Atlas 2")
+        self.assertEqual(created_atlas.resolution, 2048)
+        self.assertEqual(packed_data.selected_atlas_id, created_atlas.atlas_id)
         self.assertIsNotNone(created_atlas.placement_for_object(half_source.object_id))
 
     def test_pbr_sort_creates_non_pbr_atlas_beside_selected_pbr_atlas(
@@ -8681,7 +8690,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             for atlas in packed_data.atlases
             if atlas.atlas_id != selected_atlas.atlas_id
         )
-        self.assertEqual(non_pbr_atlas.name, "[NON-PBR] Atlas")
+        self.assertEqual(non_pbr_atlas.name, "[OBJECT] [NON-PBR] Atlas")
         self.assertIsNotNone(
             non_pbr_atlas.placement_for_object(non_pbr_source.object_id)
         )
@@ -8959,7 +8968,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             for atlas in packed_data.atlases
             if atlas.atlas_id not in {selected_atlas.atlas_id, full_safe_atlas.atlas_id}
         )
-        self.assertEqual(created_atlas.name, "[NON-PBR] Atlas 2")
+        self.assertEqual(created_atlas.name, "[OBJECT] [NON-PBR] Atlas 2")
         self.assertEqual(created_atlas.resolution, 4096)
         self.assertIsNotNone(
             created_atlas.placement_for_object(pending_plain.object_id)
@@ -8987,7 +8996,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         packed_data = self.workspace.get_data()
         self.assertEqual(len(packed_data.atlases), 1)
         created_atlas = packed_data.atlases[0]
-        self.assertEqual(created_atlas.name, "[NON-PBR] Atlas")
+        self.assertEqual(created_atlas.name, "[OBJECT] [NON-PBR] Atlas")
         self.assertEqual(created_atlas.resolution, 2048)
         self.assertEqual(packed_data.selected_atlas_id, created_atlas.atlas_id)
         self.assertIsNotNone(created_atlas.placement_for_object(source.object_id))
@@ -9282,7 +9291,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             for atlas in packed_data.atlases
             if atlas.atlas_id != selected_atlas.atlas_id
         )
-        self.assertEqual(overflow_atlas.name, "Atlas")
+        self.assertEqual(overflow_atlas.name, "[OBJECT] Atlas")
         self.assertEqual(overflow_atlas.resolution, selected_atlas.resolution)
         self.assertIsNotNone(overflow_atlas.placement_for_object("pending-1"))
         self.assertEqual(packed_data.selected_atlas_id, overflow_atlas.atlas_id)
@@ -9377,7 +9386,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(assigned, (source.object_id,))
         self.assertEqual(len(self.workspace.get_data().atlases), 1)
-        self.assertEqual(self.workspace.selected_atlas.name, "Atlas")
+        self.assertEqual(self.workspace.selected_atlas.name, "[OBJECT] Atlas")
         self.assertEqual(self.workspace.selected_atlas.resolution, 2048)
         self.assertIsNotNone(
             self.workspace.selected_atlas.placement_for_object(source.object_id)
@@ -9472,10 +9481,66 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.remove_atlas_button.click()
 
         self.assertEqual(len(selected), 4)
-        self.assertEqual(selected[0].name, "First")
-        self.assertEqual(selected[1].name, "Second")
-        self.assertEqual(selected[2].name, "First")
-        self.assertEqual(selected[3].name, "Second")
+        self.assertEqual(selected[0].name, "[OBJECT] First")
+        self.assertEqual(selected[1].name, "[OBJECT] Second")
+        self.assertEqual(selected[2].name, "[OBJECT] First")
+        self.assertEqual(selected[3].name, "[OBJECT] Second")
+
+
+    # ### Explicit typed atlas controls and idempotent assignment ###
+    def test_surface_type_creation_and_rename_keep_surface_prefix(self) -> None:
+        self.workspace.atlas_type_combo.setCurrentIndex(
+            self.workspace.atlas_type_combo.findData(ATLAS_TYPE_SURFACE)
+        )
+        self.workspace.atlas_name_edit.setText("Building")
+        self.workspace.create_atlas_button.click()
+        self.assertEqual(self.workspace.selected_atlas.atlas_type, ATLAS_TYPE_SURFACE)
+        self.assertEqual(self.workspace.selected_atlas.name, "[SURFACE] Building")
+
+        self.workspace.selected_atlas_name_edit.setText("[OBJECT] Renamed")
+        self.assertTrue(self.workspace._apply_selected_atlas_changes())
+
+        self.assertEqual(self.workspace.selected_atlas.name, "[SURFACE] Renamed")
+        self.assertEqual(self.workspace.selected_atlas.atlas_type, ATLAS_TYPE_SURFACE)
+
+    def test_ensure_already_typed_assignment_does_not_repack_and_rejects_atomically(
+        self,
+    ) -> None:
+        source = _wall_source("brick", directory=self._temporary_directory.name)
+        self.workspace.set_object_texture_sources((source,))
+        data = TextureAtlasData()
+        objects = data.create_atlas(
+            "Furniture", 2048, atlas_type=ATLAS_TYPE_OBJECT,
+        )
+        surfaces = data.create_atlas(
+            "Walls", 2048, atlas_type=ATLAS_TYPE_SURFACE,
+        )
+        placement = data.assign_object(
+            surfaces.atlas_id, source.object_id, source.texture_path,
+            source.texture_resolution, source.packing_mode,
+        )
+        data.select_atlas(objects.atlas_id)
+        self.workspace.set_data(data)
+        before = self.workspace.get_data()
+        changes = Mock()
+        self.workspace.selected_atlas_changed.connect(changes)
+
+        with patch.object(self.workspace, "_materialize_atlas") as materialize:
+            self.assertFalse(self.workspace.ensure_source_in_typed_atlas(
+                source.object_id, lambda: False,
+            ))
+            self.assertEqual(self.workspace.get_data(), before)
+            changes.assert_not_called()
+            self.assertTrue(self.workspace.ensure_source_in_typed_atlas(
+                source.object_id, lambda: True,
+            ))
+            materialize.assert_not_called()
+
+        self.assertEqual(self.workspace.selected_atlas.atlas_id, surfaces.atlas_id)
+        self.assertEqual(
+            self.workspace.selected_atlas.placement_for_object(source.object_id), placement,
+        )
+        changes.assert_called_once()
 
 
 # ### Test entry point ###

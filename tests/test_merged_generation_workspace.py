@@ -19,9 +19,9 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import trimesh
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeySequence
-from PySide6.QtTest import QSignalSpy
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtGui import QKeySequence, QMouseEvent
+from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -1194,6 +1194,8 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.workspace.resize(1_600, 900)
         self.workspace.show()
         _qt_application.processEvents()
+        # First-show row sizing posts a second scroll-area layout pass.
+        _qt_application.processEvents()
 
         video_width = self.workspace.views_splitter.widget(0).width()
         object_width = self.workspace.views_splitter.widget(1).width()
@@ -1244,6 +1246,55 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             controls_layout.getContentsMargins(),
             (GENERATION_CONTROLS_PADDING,) * 4,
         )
+
+    # ### Interactive preview/control row sizing ###
+    def test_vertical_splitter_handle_resizes_preview_and_controls(self) -> None:
+        self.workspace.resize(1_600, 1_000)
+        self.workspace.show()
+        _qt_application.processEvents()
+        splitter = self.workspace.rows_splitter
+        self.assertEqual(splitter.orientation(), Qt.Orientation.Vertical)
+        self.assertIs(splitter.widget(0), self.workspace.preview_row)
+        self.assertIs(splitter.widget(1), self.workspace.controls_scroll)
+        self.assertTrue(self.workspace.preview_row.isAncestorOf(self.workspace.views_splitter))
+        self.assertTrue(self.workspace.preview_row.isAncestorOf(self.workspace.seekbar))
+        before_preview, before_controls = splitter.sizes()
+        self.assertGreater(before_controls, 180)
+        handle = splitter.handle(1)
+        start = handle.rect().center()
+        end = start + QPoint(0, 120)
+        QTest.mousePress(handle, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(handle, end)
+        move = QMouseEvent(
+            QEvent.Type.MouseMove, end, handle.mapToGlobal(end),
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(handle, move)
+        QTest.mouseRelease(handle, Qt.MouseButton.LeftButton, pos=end)
+        _qt_application.processEvents()
+        after_preview, after_controls = splitter.sizes()
+        self.assertGreater(after_preview, before_preview + 50)
+        self.assertLess(after_controls, before_controls - 50)
+
+    def test_shrunk_controls_scroll_to_reach_the_bottom_actions(self) -> None:
+        self.workspace.resize(1_600, 1_000)
+        self.workspace.show()
+        _qt_application.processEvents()
+        splitter = self.workspace.rows_splitter
+        scroll = self.workspace.controls_scroll
+        self.assertEqual(scroll.minimumHeight(), 96)
+        self.assertEqual(scroll.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        splitter.setSizes([splitter.height() - 96, 96])
+        _qt_application.processEvents()
+        self.assertLess(splitter.sizes()[1], self.workspace.controls_row.sizeHint().height())
+        self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+        scroll.ensureWidgetVisible(self.objects.place_button)
+        _qt_application.processEvents()
+        action_center = self.objects.place_button.mapTo(
+            scroll.viewport(), self.objects.place_button.rect().center(),
+        )
+        self.assertTrue(scroll.viewport().rect().contains(action_center))
 
     def test_reference_generation_is_directly_below_reference_media_buttons(self) -> None:
         shared_column = self.workspace.findChild(
@@ -1509,17 +1560,19 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             )
         )
         self.assertIs(creation_layout.itemAt(1).widget(), self.workspace.inpaint_navigation_control)
-        self.assertIs(creation_layout.itemAt(2).widget(), generation_settings)
-        self.assertIs(
-            creation_layout.itemAt(3).widget(),
+        ordered_controls = (
+            self.workspace.inpaint_navigation_control,
+            generation_settings,
             self.objects.meshy_target_polycount_control,
-        )
-        self.assertIs(
-            creation_layout.itemAt(4).widget(),
+            self.workspace.geometry_resolution_control,
+            self.workspace.geometry_provider_control,
             self.workspace.texture_provider_control,
+            primary_actions,
+            generation_actions,
         )
-        self.assertIs(creation_layout.itemAt(5).widget(), primary_actions)
-        self.assertIs(creation_layout.itemAt(6).widget(), generation_actions)
+        positions = [creation_layout.indexOf(control) for control in ordered_controls]
+        self.assertTrue(all(position >= 0 for position in positions))
+        self.assertEqual(positions, sorted(positions))
 
     def test_surface_controls_are_folded_into_contextual_object_actions(
         self,
@@ -1538,7 +1591,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         provider_label = self.workspace.texture_provider_control.findChild(QLabel)
         self.assertIsNotNone(provider_label)
         assert provider_label is not None
-        self.assertEqual(provider_label.text(), "Texture provider")
+        self.assertEqual(provider_label.text(), "Surface texture provider")
 
         reference = np.full((8, 8, 4), 255, dtype=np.uint8)
         settings = replace(

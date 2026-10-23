@@ -90,6 +90,12 @@ from housemaker.generation_views import (
     _build_masked_frame_crop,
     rasterize_mask_strokes,
 )
+from housemaker.geometry_generation_models import (
+    DEFAULT_GEOMETRY_MODEL,
+    GEOMETRY_MODEL_7_1,
+    normalize_geometry_model,
+    normalize_geometry_resolution,
+)
 from housemaker.glass_material import (
     DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED,
     HOUSEMAKER_GLASS_MATERIAL_NAME,
@@ -1175,6 +1181,8 @@ class GenerationRequest:
         selected_object_bgra: np.ndarray,
         settings: GenerationServiceSettings,
         reference_images_bgra: Sequence[np.ndarray] = (),
+        geometry_model: str = DEFAULT_GEOMETRY_MODEL,
+        geometry_resolution: str = "standard",
         geometry_only: bool = False,
         symmetric_division_enabled: bool = False,
         symmetric_division_orientation: str = (
@@ -1202,6 +1210,11 @@ class GenerationRequest:
         self.reference_images_bgra = _normalize_generation_reference_images(
             reference_images_bgra
         )
+        self.geometry_model = normalize_geometry_model(geometry_model)
+        self.geometry_resolution = normalize_geometry_resolution(geometry_resolution)
+        if self.geometry_model != GEOMETRY_MODEL_7_1:
+            if self.geometry_resolution != "standard":
+                raise ValueError("Ultra geometry resolution requires Meshy 7.1.")
         self.geometry_only = bool(geometry_only)
         self.symmetric_division_enabled = bool(symmetric_division_enabled)
         normalized_orientation = str(
@@ -2600,6 +2613,20 @@ def _canonicalize_world_triangles(triangles: np.ndarray) -> np.ndarray:
 
 
 # ### Default adapters ###
+def _geometry_provider_request_options(request: GenerationRequest) -> dict[str, object]:
+    """Keep legacy defaults stable while selecting a single-image provider."""
+    if (
+        request.geometry_model == DEFAULT_GEOMETRY_MODEL
+        and request.geometry_resolution == "standard"
+    ):
+        return {}
+    options: dict[str, object] = {
+        "ai_model": request.geometry_model,
+        "geometry_resolution": request.geometry_resolution,
+    }
+    return options
+
+
 class MeshyImagePlanner:
     """Submit only the isolated object crop to Meshy Image-to-3D."""
 
@@ -2646,6 +2673,7 @@ class MeshyImagePlanner:
                 cancel_event=cancel_event,
                 enable_pbr=bool(request.enabled_pbr_maps),
                 texture_prompt=request.ai_prompt,
+                **_geometry_provider_request_options(request),
             )
             provider_result, _duplicate_cleanup = (
                 _remove_safe_duplicates_from_meshy_result(
@@ -2671,6 +2699,7 @@ class MeshyImagePlanner:
             progress_callback=report_generation_progress,
             cancel_event=cancel_event,
             should_texture=False,
+            **_geometry_provider_request_options(request),
         )
 
         cleaned_geometry_result, geometry_duplicate_cleanup = (
@@ -4722,7 +4751,9 @@ class GenerationWorkspace(QWidget):
         self._landing_reference_signature = None
         self._landing_generation_token = 0
         self._landing_thread: LandingGenerationThread | None = None
-        self._landing_runtimes: dict[LandingGenerationThread, tuple[int, tuple[str, ...]]] = {}
+        self._landing_runtimes: dict[
+            LandingGenerationThread, tuple[int, tuple[str, ...]]
+        ] = {}
         self._architectural_trim_editing_target: (
             _ArchitecturalTrimEditingTarget | None
         ) = None
@@ -4735,6 +4766,38 @@ class GenerationWorkspace(QWidget):
         self._store_current_frame_strokes()
         return self._data.clone()
 
+    # ### Geometry provider options ###
+    def geometry_generation_options(self) -> tuple[str, str]:
+        return self._data.geometry_model, self._data.geometry_resolution
+
+    def set_geometry_generation_options(self, model: str, resolution: str) -> None:
+        model = normalize_geometry_model(model)
+        resolution = normalize_geometry_resolution(resolution)
+        if (model, resolution) == self.geometry_generation_options():
+            return
+        self._data.geometry_model, self._data.geometry_resolution = model, resolution
+        self._emit_data_changed()
+        self._sync_controls()
+
+    # ### Component generation contexts ###
+    def _generation_component_targets(
+        self,
+    ) -> tuple[_DoorSlotEditingTarget | None, _ArchitecturalTrimEditingTarget | None]:
+        """A restored library preview does not authorize component generation."""
+
+        opening = self._door_slot_editing_target
+        trim = self._architectural_trim_editing_target
+        return (
+            opening if opening is not None and opening.generation_ready else None,
+            trim if trim is not None and trim.generation_ready else None,
+        )
+
+    @property
+    def component_generation_active(self) -> bool:
+        opening, trim = self._generation_component_targets()
+        return bool(opening or trim or self._landing_editing_target is not None)
+
+    # ### External reference images ###
     def set_temporary_object_reference(
         self,
         reference_bgra: np.ndarray,
@@ -4836,11 +4899,7 @@ class GenerationWorkspace(QWidget):
     def current_inpaint_reference_key(self) -> tuple[int, str] | None:
         """Identify a painted object independently of its temporary list index."""
 
-        if (
-            self._door_slot_editing_target is not None
-            or self._architectural_trim_editing_target is not None
-            or self._landing_editing_target is not None
-        ):
+        if self.component_generation_active:
             return None
         signature = (
             self._data.current_frame_index,
@@ -4931,11 +4990,7 @@ class GenerationWorkspace(QWidget):
     ) -> tuple[tuple[tuple[int, str], np.ndarray], ...]:
         """Own every queued reference image without changing the visible selection."""
 
-        if (
-            self._door_slot_editing_target is not None
-            or self._architectural_trim_editing_target is not None
-            or self._landing_editing_target is not None
-        ):
+        if self.component_generation_active:
             return ()
         keys = self._current_inpaint_keys()
         inputs: list[tuple[tuple[int, str], np.ndarray]] = []
@@ -5302,11 +5357,7 @@ class GenerationWorkspace(QWidget):
     def _select_current_inpaint_generated_object(self) -> bool:
         """Display the newest completed result next to the selected blob's reference."""
 
-        if (
-            self._door_slot_editing_target is not None
-            or self._architectural_trim_editing_target is not None
-            or self._landing_editing_target is not None
-        ):
+        if self.component_generation_active:
             return False
         key = self.current_inpaint_reference_key()
         record = next(
@@ -5325,9 +5376,7 @@ class GenerationWorkspace(QWidget):
 
         if (
             self._is_restoring_inpaint_selection
-            or self._door_slot_editing_target is not None
-            or self._architectural_trim_editing_target is not None
-            or self._landing_editing_target is not None
+            or self.component_generation_active
         ):
             return
         key = self.current_inpaint_reference_key()
@@ -5870,7 +5919,7 @@ class GenerationWorkspace(QWidget):
     def active_opening_component_kind(self) -> str | None:
         """Return whether Generation currently edits a door or window part."""
 
-        target = self._door_slot_editing_target
+        target, _trim = self._generation_component_targets()
         return None if target is None else target.asset_kind
 
     def clear_door_slot_editing_target(self) -> None:
@@ -6756,8 +6805,10 @@ class GenerationWorkspace(QWidget):
         self,
         source_object_id: str,
         placement: GeneratedObjectPlacement,
+        *,
+        emit_change_signals: bool = True,
     ) -> GeneratedObjectInstance | None:
-        """Create one persistent instance linked to an available source object."""
+        """Create a persistent instance, optionally deferring scene notifications."""
 
         normalized_source_id = str(source_object_id).strip()
         source_record = self._find_generated_object_record(normalized_source_id)
@@ -6780,10 +6831,11 @@ class GenerationWorkspace(QWidget):
             placement=placement,
         )
         self._data.object_instances.append(instance)
-        self._emit_data_changed()
-        self.generated_object_instances_changed.emit(
-            self.get_generated_object_instances()
-        )
+        if emit_change_signals:
+            self._emit_data_changed()
+            self.generated_object_instances_changed.emit(
+                self.get_generated_object_instances()
+            )
         return instance
 
     def update_generated_object_instance(
@@ -7976,8 +8028,14 @@ class GenerationWorkspace(QWidget):
         self,
         operation_id: str,
         placement: GeneratedObjectPlacement,
+        *,
+        emit_change_signals: bool = True,
     ) -> bool:
-        """Accept placement only for the exact current request token."""
+        """Persist an exact request, optionally deferring scene/control refresh.
+
+        Silent calls still finish the request and update saved placement data.
+        The caller may publish the normal placement changes after its debounce.
+        """
 
         if not isinstance(placement, GeneratedObjectPlacement):
             return False
@@ -7989,7 +8047,8 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(
                 "Object placement selected. Generation is still in progress."
             )
-            self._emit_placeable_objects_changed()
+            if emit_change_signals:
+                self._emit_placeable_objects_changed()
             return True
 
         request = self._existing_object_placement_request
@@ -8008,7 +8067,8 @@ class GenerationWorkspace(QWidget):
         )
         if record_index is None:
             self._existing_object_placement_request = None
-            self._sync_controls()
+            if emit_change_signals:
+                self._sync_controls()
             return False
 
         record = self._data.generated_objects[record_index]
@@ -8026,9 +8086,10 @@ class GenerationWorkspace(QWidget):
         self._existing_object_placement_request = None
         self._data.generated_objects[record_index] = replacement
         self.status_label.setText(f"Placed: {record.object_name}")
-        self._emit_data_changed()
-        self.generated_object_placement_changed.emit(replacement)
-        self._sync_controls()
+        if emit_change_signals:
+            self._emit_data_changed()
+            self.generated_object_placement_changed.emit(replacement)
+            self._sync_controls()
         return True
 
     def update_generated_object_placement(
@@ -8133,6 +8194,7 @@ class GenerationWorkspace(QWidget):
             for record in changed_records:
                 self.generated_object_placement_changed.emit(record)
         self._emit_placeable_objects_changed()
+        self._sync_controls()
 
     def _set_generated_object_placement(
         self,
@@ -8408,7 +8470,7 @@ class GenerationWorkspace(QWidget):
             return self._start_landing_generation("texture")
         if self._has_matching_inpaint_generation_batch():
             return self._generate_inpaint_batch_textures()
-        trim_target = self._architectural_trim_editing_target
+        target, trim_target = self._generation_component_targets()
         if trim_target is not None:
             trim_record = self._find_generated_object_record(trim_target.object_id)
             if (
@@ -8427,7 +8489,6 @@ class GenerationWorkspace(QWidget):
                     trim_record.object_id,
                     repair_missing_variant=True,
                 )
-        target = self._door_slot_editing_target
         if (
             target is not None
             and self._find_generated_object_record(target.object_id) is None
@@ -8440,8 +8501,7 @@ class GenerationWorkspace(QWidget):
 
     def _has_matching_inpaint_generation_batch(self) -> bool:
         return bool(
-            self._door_slot_editing_target is None
-            and self._architectural_trim_editing_target is None
+            not self.component_generation_active
             and self._latest_generation_batch_inpaint_keys
             and self._latest_generation_batch_requests
             and (
@@ -8516,6 +8576,11 @@ class GenerationWorkspace(QWidget):
     ) -> bool:
         """Generate or replace one eligible door component model."""
 
+        if not target.generation_ready:
+            self.status_label.setText(
+                "Open this door or window slot for generation first."
+            )
+            return False
         side_duplication_rebuild = (
             self._door_body_side_duplication_requires_rebuild(target)
         )
@@ -8994,14 +9059,13 @@ class GenerationWorkspace(QWidget):
         if self._landing_editing_target is not None:
             self._start_landing_generation("generate")
             return
-        trim_target = self._architectural_trim_editing_target
+        target, trim_target = self._generation_component_targets()
         if trim_target is not None:
             self._start_architectural_trim_model_generation(
                 trim_target,
                 geometry_only=False,
             )
             return
-        target = self._door_slot_editing_target
         if target is not None and is_door_body_slot(target.slot_id):
             if (
                 target.generate_displacement
@@ -9026,14 +9090,13 @@ class GenerationWorkspace(QWidget):
         if self._landing_editing_target is not None:
             self._start_landing_generation("geometry")
             return
-        trim_target = self._architectural_trim_editing_target
+        door_slot_target, trim_target = self._generation_component_targets()
         if trim_target is not None:
             self._start_architectural_trim_model_generation(
                 trim_target,
                 geometry_only=True,
             )
             return
-        door_slot_target = self._door_slot_editing_target
         if door_slot_target is not None:
             self._start_door_slot_model_generation(
                 door_slot_target,
@@ -9266,23 +9329,24 @@ class GenerationWorkspace(QWidget):
                 "The selected object no longer exists."
             )
             return False
+        opening_target, trim_target = self._generation_component_targets()
         operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_TEXTURE,
             target_object_id=request.object_id,
             door_slot_target=(
-                self._door_slot_editing_target
+                opening_target
                 if (
-                    self._door_slot_editing_target is not None
-                    and self._door_slot_editing_target.object_id
+                    opening_target is not None
+                    and opening_target.object_id
                     == request.object_id
                 )
                 else None
             ),
             architectural_trim_target=(
-                self._architectural_trim_editing_target
+                trim_target
                 if (
-                    self._architectural_trim_editing_target is not None
-                    and self._architectural_trim_editing_target.object_id
+                    trim_target is not None
+                    and trim_target.object_id
                     == request.object_id
                 )
                 else None
@@ -9870,6 +9934,7 @@ class GenerationWorkspace(QWidget):
         controls_layout.setSpacing(6)
 
         self.seekbar = QSlider(Qt.Orientation.Horizontal)
+        self.seekbar.setSingleStep(2)
         self.seekbar.setRange(0, 0)
         self.seekbar.valueChanged.connect(self._handle_seekbar_changed)
         controls_layout.addWidget(self.seekbar)
@@ -12426,8 +12491,7 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText("The selected object mask is empty.")
             return None
         self._store_current_frame_strokes()
-        door_slot_target = self._door_slot_editing_target
-        architectural_trim_target = self._architectural_trim_editing_target
+        door_slot_target, architectural_trim_target = self._generation_component_targets()
         rebuild_door_body = bool(
             door_slot_target is not None
             and is_door_body_slot(door_slot_target.slot_id)
@@ -12442,7 +12506,7 @@ class GenerationWorkspace(QWidget):
         symmetric_division_requested = (
             not geometry_only
             and self.symmetric_division_checkbox.isChecked()
-            and self._architectural_trim_editing_target is None
+            and architectural_trim_target is None
             and (
                 door_slot_target is None
                 or is_door_body_slot(door_slot_target.slot_id)
@@ -12483,12 +12547,15 @@ class GenerationWorkspace(QWidget):
             projection_camera_percentages = (
                 DEFAULT_PROJECTION_CAMERA_PERCENTAGES
             )
+        geometry_model, geometry_resolution = self.geometry_generation_options()
         return GenerationRequest(
             frame_index=(
                 self._data.current_frame_index
                 if reference_frame_index is None else int(reference_frame_index)
             ),
             selected_object_bgra=selected_crop,
+            geometry_model=geometry_model,
+            geometry_resolution=(geometry_resolution if geometry_model == "meshy-7.1" else "standard"),
             settings=(
                 replace(
                     self._settings,
@@ -12548,11 +12615,7 @@ class GenerationWorkspace(QWidget):
     ) -> tuple[GenerationRequest, ...]:
         """Snapshot all painted objects without navigating away from the live frame."""
 
-        component_mode = bool(
-            self._door_slot_editing_target is not None
-            or self._architectural_trim_editing_target is not None
-        )
-        if component_mode:
+        if self.component_generation_active:
             request = self._build_generation_request(geometry_only=geometry_only)
             return () if request is None else (request,)
         self._store_current_frame_strokes()
@@ -12977,15 +13040,18 @@ class GenerationWorkspace(QWidget):
 
     # ### Control synchronization ###
     def _sync_controls(self) -> None:
-        door_slot_mode = self._door_slot_editing_target is not None
-        architectural_trim_mode = (
-            self._architectural_trim_editing_target is not None
-        )
+        opening_target, trim_target = self._generation_component_targets()
+        door_slot_mode = opening_target is not None
+        architectural_trim_mode = trim_target is not None
         landing_mode = self._landing_editing_target is not None
-        component_mode = door_slot_mode or architectural_trim_mode or landing_mode
-        door_body_slot_mode = bool(
+        component_preview_mode = bool(
             self._door_slot_editing_target is not None
-            and is_door_body_slot(self._door_slot_editing_target.slot_id)
+            or self._architectural_trim_editing_target is not None
+            or landing_mode
+        )
+        door_body_slot_mode = bool(
+            opening_target is not None
+            and is_door_body_slot(opening_target.slot_id)
         )
         has_video = self._video_source is not None
         has_temporary_reference = self.has_temporary_object_reference()
@@ -13062,7 +13128,6 @@ class GenerationWorkspace(QWidget):
         )
         del side_duplication_blocker
 
-        opening_target = self._door_slot_editing_target
         displacement_blocker = QSignalBlocker(
             self.generate_displacement_checkbox
         )
@@ -13099,15 +13164,12 @@ class GenerationWorkspace(QWidget):
             self.paint_mask_button.setEnabled(mask_tool_is_available)
             self.erase_mask_button.setEnabled(mask_tool_is_available)
             self.brush_size_spinbox.setEnabled(mask_tool_is_available)
-            self.clear_mask_button.setEnabled(
-                mask_tool_is_available and has_mask
-            )
+            self.clear_mask_button.setEnabled(mask_tool_is_available and has_mask)
         required_key_is_available = bool(self._settings.meshy_api_key)
         projection_camera_percentages_are_valid = (
             not self._settings.use_uv_raycast_for_object_generation
             or self.object_3d_panel.projection_camera_percentages_are_valid()
         )
-        trim_target = self._architectural_trim_editing_target
         architectural_trim_can_generate_texture = bool(
             trim_target is not None
             and trim_target.generation_ready
@@ -13128,19 +13190,19 @@ class GenerationWorkspace(QWidget):
             self.result_view.get_selected_face_indices()
         )
         face_selection_is_available = (
-            not component_mode
+            not component_preview_mode
             and selected_record is not None
             and self.result_view.face_edit_face_count > 0
             and not selected_object_is_busy
         )
         self.delete_selected_faces_button.setEnabled(
-            not component_mode
+            not component_preview_mode
             and selected_record is not None
             and selected_face_count > 0
             and not selected_object_is_busy
         )
         self.convert_faces_to_glass_button.setEnabled(
-            not component_mode
+            not component_preview_mode
             and selected_record is not None
             and selected_face_count > 0
             and not selected_object_is_busy
@@ -13243,7 +13305,7 @@ class GenerationWorkspace(QWidget):
                 )
             )
         )
-        self.place_button.setEnabled(not component_mode)
+        self.place_button.setEnabled(not component_preview_mode)
         self.object_3d_panel.projection_camera_controls.setEnabled(
             not door_slot_mode
         )
@@ -13319,6 +13381,15 @@ class GenerationWorkspace(QWidget):
     ) -> bool:
         return not (
             record is None
+            or any(
+                target is not None
+                and not target.generation_ready
+                and target.object_id == record.object_id
+                for target in (
+                    self._door_slot_editing_target,
+                    self._architectural_trim_editing_target,
+                )
+            )
             or self._object_has_active_mutation_job(record.object_id)
             or (
                 self._generation_thread is not None
@@ -16922,6 +16993,11 @@ def _prepare_and_persist_object_generation(
     pipeline: dict[str, object] = (
         _build_safe_duplicate_removal_pipeline_metadata(result)
     )
+    if request.geometry_model != DEFAULT_GEOMETRY_MODEL:
+        pipeline.update(
+            geometry_provider=request.geometry_model,
+            geometry_resolution=request.geometry_resolution,
+        )
     persisted_asset_paths: list[str] = []
     symmetry: ObjectSymmetricDivisionMetadata | None = None
     applied_side_duplication: DoorSideDuplicationMetadata | None = None

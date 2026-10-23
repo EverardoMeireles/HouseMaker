@@ -11,6 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+from PySide6.QtCore import QRect
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -31,7 +33,6 @@ from housemaker.settings_widget import (
     read_jobs_window_screen_id,
     resolve_fullscreen_3d_viewer_screen,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -324,6 +325,107 @@ class JobsWindowTests(unittest.TestCase):
             [removed_screen, primary_screen],
         )
         self.assertIsNone(self.window._target_screen)
+
+    # ### Native window geometry ordering ###
+    def test_first_job_targets_screen_before_showing_maximized_directly(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        self.assertIsNotNone(screen)
+        assert screen is not None
+        self.window.set_target_screen(screen)
+        events = []
+        original_set_screen = self.window.setScreen
+        original_maximize = self.window.showMaximized
+
+        def set_screen(target) -> None:
+            self.assertFalse(self.window.isVisible())
+            events.append("screen")
+            original_set_screen(target)
+
+        def maximize() -> None:
+            events.append("maximize")
+            original_maximize()
+
+        with (
+            patch.object(self.window, "screen", return_value=None),
+            patch.object(self.window, "setScreen", side_effect=set_screen),
+            patch.object(self.window, "showMaximized", side_effect=maximize),
+            patch.object(self.window, "show", wraps=self.window.show) as show,
+            patch.object(self.window, "move", wraps=self.window.move) as move,
+        ):
+            self.manager.create_job(
+                kind="Local test", requested_name="", default_name="Test", stage="Queued"
+            )
+            _qt_application.processEvents()
+
+        self.assertEqual(events, ["screen", "maximize"])
+        show.assert_not_called()
+        move.assert_not_called()
+        self.assertTrue(self.window.isMaximized())
+
+    def test_additional_jobs_do_not_reposition_a_visible_maximized_window(self) -> None:
+        self.manager.create_job(
+            kind="Local test", requested_name="", default_name="First", stage="Queued"
+        )
+        _qt_application.processEvents()
+        with (
+            patch.object(self.window, "_move_to_target_screen") as move,
+            patch.object(self.window, "showMaximized", wraps=self.window.showMaximized) as maximize,
+        ):
+            self.manager.create_job(
+                kind="Local test", requested_name="", default_name="Second", stage="Queued"
+            )
+            _qt_application.processEvents()
+        move.assert_not_called()
+        maximize.assert_not_called()
+
+    def test_restore_from_maximized_refits_only_after_native_state_change(self) -> None:
+        self.manager.create_job(
+            kind="Local test", requested_name="", default_name="First", stage="Queued"
+        )
+        _qt_application.processEvents()
+        with patch("housemaker.generation_jobs.fit_normal_window_to_screen") as fit:
+            self.window.showNormal()
+            fit.assert_not_called()
+            _qt_application.processEvents()
+        self.assertTrue(fit.called)
+        self.assertFalse(self.window.isMaximized())
+
+    def test_normal_retarget_is_refitted_again_after_frame_dpi_settles(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        self.assertIsNotNone(screen)
+        assert screen is not None
+        self.window._has_been_shown = True
+        self.window.show()
+        _qt_application.processEvents()
+        with (
+            patch.object(self.window, "screen", return_value=None) as current_screen,
+            patch("housemaker.generation_jobs.fit_normal_window_to_screen") as fit,
+        ):
+            self.assertTrue(self.window._try_move_to_screen(screen))
+            self.assertEqual(fit.call_count, 1)
+            current_screen.return_value = screen
+            _qt_application.processEvents()
+            self.assertEqual(fit.call_count, 2)
+        # The deferred retry must not issue another screen change.
+        self.assertFalse(self.window._normal_window_fit_timer.isActive())
+
+    def test_normal_window_fitting_uses_frame_aware_helper(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        self.assertIsNotNone(screen)
+        assert screen is not None
+        self.window._has_been_shown = True
+        with patch("housemaker.generation_jobs.fit_normal_window_to_screen") as fit:
+            self.assertTrue(self.window._try_move_to_screen(screen))
+        fit.assert_called_once_with(self.window, screen, edge_offset=32, align_right=True)
+
+    def test_unusable_work_area_is_not_used_for_window_placement(self) -> None:
+        class EmptyScreen:
+            def availableGeometry(self):
+                return QRect()
+
+        with patch.object(self.window, "setScreen", wraps=self.window.setScreen) as set_screen:
+            self.assertFalse(self.window._try_move_to_screen(EmptyScreen()))
+        set_screen.assert_not_called()
 
 
 # ### Settings integration tests ###

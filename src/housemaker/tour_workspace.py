@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QStackedLayout,
@@ -872,7 +874,14 @@ class TourWorkspace(QWidget):
         self.content_splitter.setObjectName("tour_content_splitter")
         self.content_splitter.addWidget(self._build_tour_panel())
         self.content_splitter.addWidget(self._build_preview_panel())
-        self.content_splitter.addWidget(self._build_step_panel())
+        self.steps_controls_scroll = QScrollArea()
+        self.steps_controls_scroll.setObjectName("tour_steps_controls_scroll")
+        self.steps_controls_scroll.setWidgetResizable(True)
+        self.steps_controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.steps_controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.steps_controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.steps_controls_scroll.setWidget(self._build_step_panel())
+        self.content_splitter.addWidget(self.steps_controls_scroll)
         self.content_splitter.setStretchFactor(0, 0)
         self.content_splitter.setStretchFactor(1, 3)
         self.content_splitter.setStretchFactor(2, 1)
@@ -963,6 +972,8 @@ class TourWorkspace(QWidget):
     def _build_step_panel(self) -> QWidget:
         panel = QGroupBox("Steps and actions")
         panel.setObjectName("tour_steps_group")
+        # Preserve tool heights without hidden property pages widening the sidebar.
+        panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(panel)
 
         self.step_list = QListWidget()

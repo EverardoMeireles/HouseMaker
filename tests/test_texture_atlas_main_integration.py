@@ -83,6 +83,8 @@ from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     ATLAS_SLOT_HALF_LEFT,
     ATLAS_SLOT_HALF_RIGHT,
+    ATLAS_TYPE_OBJECT,
+    ATLAS_TYPE_SURFACE,
     TextureAtlasData,
 )
 from housemaker.texture_atlas_workspace import (
@@ -428,6 +430,7 @@ def _seed_plain_wall_textures_in_atlas(
         "Delayed walls",
         2048,
         atlas_id=atlas_id,
+        atlas_type=ATLAS_TYPE_SURFACE,
     )
     atlas_workspace = workspace.texture_atlas_workspace
     atlas_workspace.set_data(atlas_data)
@@ -687,7 +690,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
     def test_save_passes_detached_atlas_state_to_project_io(self) -> None:
         atlas_data = TextureAtlasData()
-        atlas_data.create_atlas("Saved Atlas", 2048, atlas_id="atlas-a")
+        atlas_data.create_atlas(
+            "Saved Atlas", 2048, atlas_id="atlas-a", atlas_type=ATLAS_TYPE_OBJECT,
+        )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         save_path = Path(self._temporary_directory.name) / "project.json"
 
@@ -730,7 +735,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         loaded = self.workspace.texture_atlas_workspace.get_data()
         self.assertEqual(len(loaded.atlases), 1)
-        self.assertEqual(loaded.atlases[0].name, "Loaded Atlas")
+        self.assertEqual(loaded.atlases[0].name, "[OBJECT] Loaded Atlas")
+        self.assertEqual(loaded.atlases[0].atlas_type, ATLAS_TYPE_OBJECT)
         self.assertEqual(loaded.atlases[0].resolution, 4096)
         self.assertIsNone(loaded.atlases[0].image_path)
         self.assertIsNone(self.workspace.atlas_object_preview_viewer.model)
@@ -1630,7 +1636,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             color=(30, 110, 190, 255),
         )
         atlas_data = TextureAtlasData()
-        atlas = atlas_data.create_atlas("Surfaces", 2048, atlas_id="surfaces")
+        atlas = atlas_data.create_atlas(
+            "Surfaces", 2048, atlas_id="surfaces", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         surface_data = SurfaceTextureData(
             assignments=[first_assignment, second_assignment]
@@ -1716,7 +1724,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             SurfaceTextureData(assignments=[assignment])
         )
         atlas_data = TextureAtlasData()
-        atlas = atlas_data.create_atlas("Surfaces", 2048, atlas_id="surfaces")
+        atlas = atlas_data.create_atlas(
+            "Surfaces", 2048, atlas_id="surfaces", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         self.workspace._atlas_generation_signature = None
         self.workspace._sync_atlas_object_texture_sources(
@@ -1806,8 +1816,11 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "First",
             2048,
             atlas_id="first",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
-        atlas_data.create_atlas("Second", 2048, atlas_id="second")
+        atlas_data.create_atlas(
+            "Second", 2048, atlas_id="second", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         atlas_data.select_atlas(first_atlas.atlas_id)
         atlas_workspace = self.workspace.texture_atlas_workspace
         atlas_workspace.set_data(atlas_data)
@@ -1881,7 +1894,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             )
         )
         atlas_data = TextureAtlasData()
-        atlas = atlas_data.create_atlas("Full surface", 2048, atlas_id="full")
+        atlas = atlas_data.create_atlas(
+            "Full surface", 2048, atlas_id="full", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         self.workspace._atlas_generation_signature = None
         self.workspace._sync_atlas_object_texture_sources(
@@ -2241,7 +2256,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             SurfaceTextureData(assignments=[assignment])
         )
         atlas_data = TextureAtlasData()
-        atlas = atlas_data.create_atlas("Cleanup", 2048, atlas_id="cleanup")
+        atlas = atlas_data.create_atlas(
+            "Cleanup", 2048, atlas_id="cleanup", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         self.workspace._atlas_generation_signature = None
         self.workspace._sync_atlas_object_texture_sources(
@@ -2303,6 +2320,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Deleted wall",
             2048,
             atlas_id="deleted-wall",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         atlas_workspace = self.workspace.texture_atlas_workspace
         atlas_workspace.set_data(atlas_data)
@@ -2363,6 +2381,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Plain wall",
             2048,
             atlas_id="plain-wall",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         atlas_workspace = self.workspace.texture_atlas_workspace
         atlas_workspace.set_data(atlas_data)
@@ -2578,7 +2597,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         assert updated_atlas is not None
         self.assertIsNone(updated_atlas.placement_for_object(source_id))
 
-    def test_full_atlas_surface_assign_requires_confirmation_before_new_atlas(
+    def test_full_surface_atlas_assign_overflows_without_confirmation_when_creation_disabled(
         self,
     ) -> None:
         wall_id = _add_square_room_to_level(self.workspace.current_level)
@@ -2592,62 +2611,55 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             assignment_id="unused-wall-texture",
             surface_ids=(),
         )
-        surface_data = SurfaceTextureData(assignments=[assignment])
+        filler = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="full-surface-filler",
+            surface_ids=(next(surface.surface_id for surface in surfaces
+                              if surface.surface_type == SURFACE_TYPE_WALL
+                              and surface.surface_id != wall_id),),
+            selected_resolution=2048,
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment, filler])
         self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False,
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        filler_source = atlas_workspace._sources_by_object_id[
+            build_atlas_wall_texture_source_id(filler.assignment_id)
+        ]
 
         atlas_data = TextureAtlasData()
         full_atlas = atlas_data.create_atlas(
             "Full",
             2048,
             atlas_id="full",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         atlas_data.assign_object(
             full_atlas.atlas_id,
-            "occupier",
-            "occupier.png",
+            filler_source.object_id,
+            filler_source.texture_path,
             2048,
         )
-        self.workspace.texture_atlas_workspace.set_data(atlas_data)
-        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+        atlas_workspace.set_data(atlas_data)
         source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
         self.workspace.viewer.select_wall_target(wall_id)
-        self.workspace.texture_atlas_workspace.surface_list.object_clicked.emit(
+        atlas_workspace.surface_list.object_clicked.emit(
             source_id,
             Qt.MouseButton.LeftButton,
         )
-        before_surface_data = (
-            self.workspace.surface_texture_generation.get_data().to_dict()
-        )
-        before_atlas_data = (
-            self.workspace.texture_atlas_workspace.get_data().to_dict()
+        self.assertFalse(
+            self.workspace.settings_widget.get_settings().automatic_atlas_creation
         )
 
         with patch(
             "housemaker.main.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.No,
+            side_effect=AssertionError("Surface assignment must not prompt"),
         ) as question:
-            self.workspace.texture_atlas_workspace.place_assign_button.click()
+            atlas_workspace.place_assign_button.click()
 
-        question.assert_called_once()
-        self.assertEqual(
-            question.call_args.args[2],
-            "not space in atlas for the texture, create a new atlas?",
-        )
-        self.assertEqual(
-            self.workspace.surface_texture_generation.get_data().to_dict(),
-            before_surface_data,
-        )
-        self.assertEqual(
-            self.workspace.texture_atlas_workspace.get_data().to_dict(),
-            before_atlas_data,
-        )
-
-        with patch(
-            "housemaker.main.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.Yes,
-        ):
-            self.workspace.texture_atlas_workspace.place_assign_button.click()
-
+        question.assert_not_called()
         updated_assignment = (
             self.workspace.surface_texture_generation.get_assignment(
                 assignment.assignment_id
@@ -2655,14 +2667,53 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
         assert updated_assignment is not None
         self.assertEqual(updated_assignment.surface_ids, (wall_id,))
-        updated_atlas_data = self.workspace.texture_atlas_workspace.get_data()
+        updated_atlas_data = atlas_workspace.get_data()
         self.assertEqual(len(updated_atlas_data.atlases), 2)
-        selected_atlas = updated_atlas_data.atlas_by_id(
-            updated_atlas_data.selected_atlas_id or ""
+        retained_full = updated_atlas_data.atlas_by_id(full_atlas.atlas_id)
+        assert retained_full is not None
+        self.assertIsNotNone(retained_full.placement_for_object(filler_source.object_id))
+        packed_atlas = next(
+            atlas for atlas in updated_atlas_data.atlases
+            if atlas.placement_for_object(source_id) is not None
         )
-        assert selected_atlas is not None
-        self.assertEqual(selected_atlas.name, "Atlas")
-        self.assertIsNotNone(selected_atlas.placement_for_object(source_id))
+        self.assertNotEqual(packed_atlas.atlas_id, full_atlas.atlas_id)
+        self.assertEqual(packed_atlas.atlas_type, ATLAS_TYPE_SURFACE)
+        self.assertTrue(packed_atlas.name.startswith("[SURFACE]"))
+
+    def test_surface_assign_creates_surface_atlas_when_none_exists(self) -> None:
+        wall_id = _add_square_room_to_level(self.workspace.current_level)
+        self.workspace.surface_texture_generation.set_levels(self.workspace.levels)
+        self.workspace._set_canvas_viewer_targets(build_fixed_surfaces(self.workspace.levels))
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="first-surface-texture", surface_ids=(),
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False,
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(TextureAtlasData())
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        self.workspace.viewer.select_wall_target(wall_id)
+        atlas_workspace.surface_list.object_clicked.emit(
+            source_id, Qt.MouseButton.LeftButton,
+        )
+        with patch("housemaker.main.QMessageBox.question") as question:
+            atlas_workspace.place_assign_button.click()
+
+        question.assert_not_called()
+        data = atlas_workspace.get_data()
+        self.assertEqual(len(data.atlases), 1)
+        self.assertEqual(data.atlases[0].atlas_type, ATLAS_TYPE_SURFACE)
+        self.assertIsNotNone(data.atlases[0].placement_for_object(source_id))
+        retained = self.workspace.surface_texture_generation.get_assignment(
+            assignment.assignment_id
+        )
+        assert retained is not None
+        self.assertEqual(retained.surface_ids, (wall_id,))
 
     def test_placed_object_is_automatically_added_at_settings_resolution(
         self,
@@ -2791,14 +2842,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             overflow_atlas.placement_for_object(placed_record.object_id)
         )
 
-    def test_main_passes_half_mesh_prefix_setting_to_auto_assignment(
+    def test_main_auto_assignment_has_no_obsolete_half_mesh_prefix_option(
         self,
     ) -> None:
-        checkbox = (
-            self.workspace.settings_widget
-            .use_half_mesh_texture_prefix_checkbox
-        )
-        checkbox.setChecked(True)
         self.workspace._last_automatic_atlas_assignment_key = None
 
         with patch.object(
@@ -2809,8 +2855,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.workspace._automatically_assign_scene_textures()
 
         auto_assign.assert_called_once()
-        self.assertTrue(
-            auto_assign.call_args.kwargs["use_half_mesh_texture_prefix"]
+        self.assertNotIn(
+            "use_half_mesh_texture_prefix", auto_assign.call_args.kwargs
         )
 
     def test_main_passes_automatic_atlas_creation_setting_and_retries(
@@ -2838,51 +2884,49 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             auto_assign.call_args_list[1].kwargs["allow_atlas_creation"]
         )
 
-    def test_half_mesh_prefix_setting_change_retries_cached_assignment(
+    def test_placed_object_avoids_selected_surface_atlas(
         self,
     ) -> None:
-        self.workspace._last_automatic_atlas_assignment_key = None
-        checkbox = (
-            self.workspace.settings_widget
-            .use_half_mesh_texture_prefix_checkbox
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_data = TextureAtlasData()
+        surface_atlas = atlas_data.create_atlas(
+            "Walls", 2048, atlas_id="surface-atlas", atlas_type=ATLAS_TYPE_SURFACE,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.workspace.settings_widget.automatic_atlas_creation_checkbox.setChecked(True)
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="typed-chair", object_name="Typed chair",
+            resolutions=(512,), selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                self.workspace.current_level.index, 40.0, 55.0,
+            ),
         )
 
-        with patch.object(
-            self.workspace.texture_atlas_workspace,
-            "auto_assign_scene_texture_sources",
-            return_value=(),
-        ) as auto_assign:
-            self.workspace._automatically_assign_scene_textures()
-            self.workspace._automatically_assign_scene_textures()
-            self.assertEqual(auto_assign.call_count, 1)
+        with patch.object(atlas_workspace, "_materialize_atlas"):
+            self.workspace.generation.set_data(GenerationData(generated_objects=[record]))
 
-            checkbox.setChecked(True)
+        packed_data = atlas_workspace.get_data()
+        retained_surface = packed_data.atlas_by_id(surface_atlas.atlas_id)
+        assert retained_surface is not None
+        self.assertIsNone(retained_surface.placement_for_object(record.object_id))
+        objects = [atlas for atlas in packed_data.atlases
+                   if atlas.placement_for_object(record.object_id) is not None]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0].atlas_type, ATLAS_TYPE_OBJECT)
+        self.assertTrue(objects[0].name.startswith("[OBJECT]"))
 
-        self.assertEqual(auto_assign.call_count, 2)
-        self.assertFalse(
-            auto_assign.call_args_list[0].kwargs[
-                "use_half_mesh_texture_prefix"
-            ]
-        )
-        self.assertTrue(
-            auto_assign.call_args_list[1].kwargs[
-                "use_half_mesh_texture_prefix"
-            ]
-        )
-
-    def test_placed_half_mesh_uses_prefixed_atlas_and_full_mesh_does_not(
+    def test_placed_half_and_full_meshes_share_the_object_atlas(
         self,
     ) -> None:
         settings_widget = self.workspace.settings_widget
-        settings_widget.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
-            True
-        )
-        settings_widget.use_half_mesh_texture_prefix_checkbox.setChecked(True)
+        settings_widget.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(False)
         atlas_data = TextureAtlasData()
         selected_atlas = atlas_data.create_atlas(
             "Placed objects",
             2048,
             atlas_id="placed-objects",
+            atlas_type=ATLAS_TYPE_OBJECT,
         )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         asset_directory = self.settings.path.parent / "generated"
@@ -2941,22 +2985,12 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(
             regular_atlas.placement_for_object(full_record.object_id)
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             regular_atlas.placement_for_object(half_record.object_id)
         )
-        half_atlases = [
-            atlas
-            for atlas in packed_data.atlases
-            if atlas.name.startswith("[HALF]")
-        ]
-        self.assertEqual(len(half_atlases), 1)
-        self.assertEqual(half_atlases[0].resolution, 4096)
-        self.assertIsNotNone(
-            half_atlases[0].placement_for_object(half_record.object_id)
-        )
-        self.assertIsNone(
-            half_atlases[0].placement_for_object(full_record.object_id)
-        )
+        self.assertEqual(len(packed_data.atlases), 1)
+        self.assertEqual(regular_atlas.atlas_type, ATLAS_TYPE_OBJECT)
+        self.assertEqual(regular_atlas.name, "[OBJECT] Placed objects")
 
     def test_pbr_sort_routes_non_pbr_object_to_unique_auxiliary_atlas(
         self,
@@ -3055,7 +3089,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(len(auxiliary_atlases), 1)
         auxiliary_atlas = auxiliary_atlases[0]
-        self.assertTrue(auxiliary_atlas.name.startswith("[NON-PBR]"))
+        self.assertTrue(auxiliary_atlas.name.startswith("[OBJECT] [NON-PBR]"))
+        self.assertEqual(auxiliary_atlas.atlas_type, ATLAS_TYPE_OBJECT)
         self.assertEqual(
             len({atlas.name.casefold() for atlas in packed_data.atlases}),
             len(packed_data.atlases),
@@ -3210,6 +3245,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Included surfaces",
             2048,
             atlas_id="included-surfaces",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         assignment = _wall_texture_assignment_with_variants(
@@ -3265,6 +3301,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Ceiling textures",
             2048,
             atlas_id="ceiling-textures",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         assignment = _wall_texture_assignment_with_variants(
@@ -3311,6 +3348,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Excluded ceiling textures",
             2048,
             atlas_id="excluded-ceiling-textures",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         assignment = _wall_texture_assignment_with_variants(
@@ -3339,23 +3377,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.workspace._build_required_scene_atlas_source_ids(),
         )
 
-    def test_selected_surface_texture_creates_overflow_atlas_when_enabled(
+    def test_selected_surface_texture_creates_typed_overflow_when_creation_disabled(
         self,
     ) -> None:
-        asset_directory = self.settings.path.parent / "generated"
-        filler_records = tuple(
-            _generated_object_record_with_variants(
-                asset_directory,
-                object_id=f"surface-filler-{index}",
-                object_name=f"Surface filler {index}",
-                resolutions=(1024,),
-                selected_resolution=1024,
-            )
-            for index in range(4)
-        )
-        generation_data = GenerationData(generated_objects=list(filler_records))
-        self.workspace.generation.set_data(generation_data)
-        self.workspace.generation.data_changed.emit(generation_data)
         wall_surface_id = _add_square_room_to_level(self.workspace.current_level)
         self.workspace.surface_texture_generation.set_levels(self.workspace.levels)
         assignment = _wall_texture_assignment_with_variants(
@@ -3364,10 +3388,19 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             surface_ids=(),
             selected_resolution=512,
         )
-        empty_surface_data = SurfaceTextureData(assignments=[assignment])
+        filler = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="surface-filler",
+            surface_ids=(next(surface.surface_id
+                              for surface in build_fixed_surfaces(self.workspace.levels)
+                              if surface.surface_type == SURFACE_TYPE_WALL
+                              and surface.surface_id != wall_surface_id),),
+            selected_resolution=2048,
+        )
+        empty_surface_data = SurfaceTextureData(assignments=[assignment, filler])
         self.workspace.surface_texture_generation.set_data(empty_surface_data)
-        self.workspace.surface_texture_generation.data_changed.emit(
-            empty_surface_data
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False,
         )
         atlas_workspace = self.workspace.texture_atlas_workspace
         atlas_data = TextureAtlasData()
@@ -3375,20 +3408,23 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Full Surface Atlas",
             2048,
             atlas_id="full-surface-atlas",
+            atlas_type=ATLAS_TYPE_SURFACE,
         )
-        for record in filler_records:
-            source = atlas_workspace._sources_by_object_id[record.object_id]
-            atlas_data.assign_object(
-                selected_atlas.atlas_id,
-                source.object_id,
-                source.texture_path,
-                source.texture_resolution,
-            )
+        source = atlas_workspace._sources_by_object_id[
+            build_atlas_wall_texture_source_id(filler.assignment_id)
+        ]
+        atlas_data.assign_object(
+            selected_atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
         atlas_workspace.set_data(atlas_data)
-        self.workspace.settings_widget \
-            .automatic_atlas_creation_checkbox.setChecked(True)
+        self.assertFalse(
+            self.workspace.settings_widget.get_settings().automatic_atlas_creation
+        )
         assigned_surface_data = SurfaceTextureData(
-            assignments=[replace(assignment, surface_ids=(wall_surface_id,))]
+            assignments=[replace(assignment, surface_ids=(wall_surface_id,)), filler]
         )
 
         with patch.object(atlas_workspace, "_materialize_atlas"):
@@ -3404,6 +3440,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertEqual(len(packed_data.atlases), 2)
         packed_selected = packed_data.atlas_by_id(selected_atlas.atlas_id)
         assert packed_selected is not None
+        self.assertIsNotNone(packed_selected.placement_for_object(source.object_id))
         self.assertIsNone(packed_selected.placement_for_object(source_id))
         overflow_atlas = next(
             atlas
@@ -3411,6 +3448,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             if atlas.atlas_id != selected_atlas.atlas_id
         )
         self.assertIsNotNone(overflow_atlas.placement_for_object(source_id))
+        self.assertEqual(overflow_atlas.atlas_type, ATLAS_TYPE_SURFACE)
+        self.assertTrue(overflow_atlas.name.startswith("[SURFACE]"))
 
     def test_missing_active_surface_variant_can_switch_to_valid_resolution(
         self,
@@ -3549,6 +3588,61 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             .get_unpacked_scene_texture_source_ids(),
             (record.object_id,),
         )
+
+    def test_export_blocks_required_mixed_or_mistyped_atlas(self) -> None:
+        for atlas_type, required_ids in (
+            (None, ("object-source", "surface-source")),
+            (ATLAS_TYPE_OBJECT, ("surface-source",)),
+            (ATLAS_TYPE_SURFACE, ("object-source",)),
+        ):
+            with self.subTest(atlas_type=atlas_type, required_ids=required_ids):
+                data = TextureAtlasData()
+                atlas = data.create_atlas(
+                    "Unseparated", 2048, atlas_id="unseparated",
+                    atlas_type=atlas_type,
+                )
+                data.assign_object(atlas.atlas_id, "object-source", "object.png", 512)
+                data.assign_object(atlas.atlas_id, "surface-source", "surface.png", 512)
+                with (
+                    patch.object(self.workspace.texture_atlas_workspace,
+                                 "get_data", return_value=data),
+                    patch.object(self.workspace, "_build_required_scene_atlas_source_ids",
+                                 return_value=required_ids),
+                    patch.object(self.workspace, "_is_atlas_surface_texture_source_id",
+                                 side_effect=lambda source_id: source_id == "surface-source"),
+                    patch("housemaker.main.QMessageBox.warning") as warning,
+                ):
+                    self.assertTrue(self.workspace._show_mixed_scene_atlas_export_error())
+                warning.assert_called_once()
+                self.assertEqual(warning.call_args.args[1], "Atlas separation incomplete")
+                self.assertIn(atlas.name, warning.call_args.args[2])
+
+    def test_export_accepts_uniform_legacy_atlas_and_ignores_unused_other_category(self) -> None:
+        for atlas_type, required_ids in (
+            (None, ("object-source",)),
+            (None, ("surface-source",)),
+            (ATLAS_TYPE_OBJECT, ("object-source",)),
+            (ATLAS_TYPE_SURFACE, ("surface-source",)),
+        ):
+            with self.subTest(atlas_type=atlas_type, required_ids=required_ids):
+                data = TextureAtlasData()
+                atlas = data.create_atlas(
+                    "Uniform export", 2048, atlas_id="uniform",
+                    atlas_type=atlas_type,
+                )
+                data.assign_object(atlas.atlas_id, "object-source", "object.png", 512)
+                data.assign_object(atlas.atlas_id, "surface-source", "surface.png", 512)
+                with (
+                    patch.object(self.workspace.texture_atlas_workspace,
+                                 "get_data", return_value=data),
+                    patch.object(self.workspace, "_build_required_scene_atlas_source_ids",
+                                 return_value=required_ids),
+                    patch.object(self.workspace, "_is_atlas_surface_texture_source_id",
+                                 side_effect=lambda source_id: source_id == "surface-source"),
+                    patch("housemaker.main.QMessageBox.warning") as warning,
+                ):
+                    self.assertFalse(self.workspace._show_mixed_scene_atlas_export_error())
+                warning.assert_not_called()
 
     def test_missing_used_object_texture_still_blocks_export(self) -> None:
         record = _generated_object_record_with_variants(
@@ -3690,7 +3784,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.workspace.surface_texture_generation.set_data(surface_data)
         self.workspace.surface_texture_generation.data_changed.emit(surface_data)
         atlas_data = TextureAtlasData()
-        atlas_data.create_atlas("Architecture", 2048, atlas_id="architecture")
+        atlas_data.create_atlas(
+            "Architecture", 2048, atlas_id="architecture", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         self.workspace.texture_atlas_workspace.set_data(atlas_data)
         source_id = build_atlas_wall_texture_source_id(
             assignment.assignment_id
@@ -3727,7 +3823,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             getattr(getattr(mesh.visual, "material", None), "name", "")
             for mesh in result.scene.geometry.values()
         ]
-        self.assertEqual(atlas_materials, ["Architecture"])
+        self.assertEqual(atlas_materials, ["[SURFACE] Architecture"])
 
     def test_canvas_export_preserves_unassigned_materialless_surfaces(self) -> None:
         wall_surface_id = _add_square_room_to_level(
@@ -4005,8 +4101,12 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
         source = atlas_workspace._sources_by_object_id[source_id]
         atlas_data = TextureAtlasData()
-        first = atlas_data.create_atlas("First", 2048, atlas_id="first")
-        second = atlas_data.create_atlas("Second", 2048, atlas_id="second")
+        first = atlas_data.create_atlas(
+            "First", 2048, atlas_id="first", atlas_type=ATLAS_TYPE_SURFACE,
+        )
+        second = atlas_data.create_atlas(
+            "Second", 2048, atlas_id="second", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         for atlas in (first, second):
             atlas_data.assign_object(
                 atlas.atlas_id,
@@ -4138,8 +4238,12 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             source_id
         ]
         atlas_data = TextureAtlasData()
-        first = atlas_data.create_atlas("First", 2048, atlas_id="first")
-        second = atlas_data.create_atlas("Second", 2048, atlas_id="second")
+        first = atlas_data.create_atlas(
+            "First", 2048, atlas_id="first", atlas_type=ATLAS_TYPE_SURFACE,
+        )
+        second = atlas_data.create_atlas(
+            "Second", 2048, atlas_id="second", atlas_type=ATLAS_TYPE_SURFACE,
+        )
         for atlas in (first, second):
             atlas_data.assign_object(
                 atlas.atlas_id,
@@ -5229,9 +5333,14 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.workspace._handle_surface_texture_data_changed_for_atlases(
                 surface_data
             )
+            # Initial automatic packing may also prepare a target-resolution
+            # variant. Measure cache hits after that first transaction settles.
+            source_builder.assert_called()
+            source_builder.reset_mock()
             self.workspace._handle_surface_texture_data_changed_for_atlases(
                 surface_data
             )
+            source_builder.assert_not_called()
             texture_path = (
                 self.settings.path.parent
                 / "surface_textures"
@@ -5252,7 +5361,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 surface_data
             )
 
-        self.assertEqual(source_builder.call_count, 2)
+        source_builder.assert_called_once()
 
     def test_atlas_activation_rematerializes_same_path_wall_pixels(
         self,
@@ -5968,6 +6077,11 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "Tiling transaction",
             2048,
             atlas_id="tiling-transaction",
+            atlas_type=ATLAS_TYPE_SURFACE,
+        )
+        object_atlas = atlas_data.create_atlas(
+            "Tiling neighbour", 2048, atlas_id="tiling-neighbour",
+            atlas_type=ATLAS_TYPE_OBJECT,
         )
         atlas_data.assign_object(
             atlas.atlas_id,
@@ -5976,7 +6090,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             surface_source.texture_resolution,
         )
         atlas_data.assign_object(
-            atlas.atlas_id,
+            object_atlas.atlas_id,
             object_source.object_id,
             object_source.texture_path,
             object_source.texture_resolution,
@@ -5987,7 +6101,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         original_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert original_atlas is not None
         original_surface_placement = original_atlas.placement_for_object(source_id)
-        original_object_placement = original_atlas.placement_for_object(
+        original_object_atlas = atlas_workspace.get_data().atlas_by_id(object_atlas.atlas_id)
+        assert original_object_atlas is not None
+        original_object_placement = original_object_atlas.placement_for_object(
             object_record.object_id
         )
         assert original_surface_placement is not None
@@ -6092,7 +6208,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         repaired_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert repaired_atlas is not None
         repaired_surface_placement = repaired_atlas.placement_for_object(source_id)
-        repaired_object_placement = repaired_atlas.placement_for_object(
+        repaired_object_atlas = atlas_workspace.get_data().atlas_by_id(object_atlas.atlas_id)
+        assert repaired_object_atlas is not None
+        repaired_object_placement = repaired_object_atlas.placement_for_object(
             object_record.object_id
         )
         assert repaired_surface_placement is not None
@@ -6159,7 +6277,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         restored_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert restored_atlas is not None
         restored_surface_placement = restored_atlas.placement_for_object(source_id)
-        restored_object_placement = restored_atlas.placement_for_object(
+        restored_object_atlas = atlas_workspace.get_data().atlas_by_id(object_atlas.atlas_id)
+        assert restored_object_atlas is not None
+        restored_object_placement = restored_object_atlas.placement_for_object(
             object_record.object_id
         )
         assert restored_surface_placement is not None

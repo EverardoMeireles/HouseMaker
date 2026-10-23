@@ -90,7 +90,7 @@ from housemaker.outer_wall_marking import (
 from housemaker.plan_correction_exchange import ExternalPlanCorrection
 from housemaker.plan_metric_state import PlanMetricCalibration
 from housemaker.plan_wall_options import PlanWallDetectionOptions
-from housemaker.surface_texture_state import SurfaceTextureData
+from housemaker.surface_texture_state import SurfaceTextureData, normalize_surface_id
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.tour_state import TourData, tours_from_payload, tours_to_dicts
 
@@ -1390,7 +1390,16 @@ def _deserialize_flipped_surface_ids(
     for raw_surface_id in raw_surface_ids:
         if not isinstance(raw_surface_id, str):
             continue
-        surface_id = raw_surface_id.strip().lower()
+        surface_id = raw_surface_id.strip()
+        if "/opening:" in surface_id.lower():
+            # Opening IDs are opaque, case-sensitive identifiers, unlike the
+            # legacy wall/plane IDs that historically load case-insensitively.
+            try:
+                surface_id = normalize_surface_id(surface_id)
+            except ValueError:
+                continue
+        else:
+            surface_id = surface_id.lower()
         if (
             surface_id.startswith(level_prefix)
             and len(surface_id) > len(level_prefix)

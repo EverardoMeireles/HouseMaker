@@ -339,20 +339,21 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
         ):
             self.assertAlmostEqual(wall.area_square_meters, 6.0)
 
-    def test_doorway_cut_and_connected_reveals_belong_to_owning_wall(self) -> None:
+    def test_doorway_cut_and_reveals_have_independent_surface_identity(self) -> None:
         surfaces = _surface_by_id(_build_square_level(doorway=True))
         doorway_wall = surfaces["level:2/room:5/wall:1:2"]
 
-        self.assertAlmostEqual(doorway_wall.area_square_meters, 5.36)  # type: ignore[attr-defined]
-        self.assertEqual(len(doorway_wall.mesh.faces), 12)  # type: ignore[attr-defined]
+        self.assertAlmostEqual(doorway_wall.area_square_meters, 4.4)
+        self.assertEqual(len(doorway_wall.mesh.faces), 6)
         np.testing.assert_allclose(
-            doorway_wall.mesh.bounds[:, 1],  # type: ignore[attr-defined]
-            np.asarray((-0.1, 0.1)),
+            doorway_wall.mesh.bounds[:, 1],
+            np.asarray((0.0, 0.0)),
             atol=1e-6,
         )
-        lintel_normals = doorway_wall.mesh.face_normals[  # type: ignore[attr-defined]
-            np.abs(doorway_wall.mesh.face_normals[:, 2]) > 0.9  # type: ignore[attr-defined]
-        ]
+        reveals = {item.opening_part: item for item in surfaces.values() if item.opening_id is not None}
+        self.assertEqual(set(reveals), {"left", "right", "header"})
+        self.assertAlmostEqual(sum(item.mesh.area for item in reveals.values()), 0.96)
+        lintel_normals = reveals["header"].mesh.face_normals
         self.assertEqual(len(lintel_normals), 2)
         self.assertTrue(np.all(lintel_normals[:, 2] < -0.9))
         self.assertAlmostEqual(

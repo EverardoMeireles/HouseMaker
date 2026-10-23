@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 
@@ -119,6 +121,24 @@ class SurfaceOrientationPersistenceTests(unittest.TestCase):
             {"level:2/wall:1:2"},
         )
 
+    def test_project_round_trip_preserves_reveal_opening_identifier_case(self) -> None:
+        level = _build_square_level()
+        opening_token = quote("Window A/Left:\N{LATIN SMALL LETTER E WITH ACUTE}", safe="-._~")
+        level.flipped_surface_ids = {
+            f"level:2/opening:{kind}:{opening_token}/reveal:{part}"
+            for kind, part in (("doorway", "header"), ("window", "left"))
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "orientation.housemaker"
+            save_project(project_path, level.index, [level])
+            restored = load_project(project_path)
+
+        restored_level = next(
+            candidate for candidate in restored.levels if candidate.index == level.index
+        )
+        self.assertEqual(restored_level.flipped_surface_ids, level.flipped_surface_ids)
+
 
 # ### Orientation operation tests ###
 class SurfaceOrientationOperationTests(unittest.TestCase):
@@ -175,32 +195,64 @@ class SurfaceOrientationOperationTests(unittest.TestCase):
 
     def test_wall_flip_preserves_connected_doorway_reveal_winding(self) -> None:
         level, surface_id = _build_room_with_doorway_level()
+        original_surfaces = build_fixed_surfaces((level,))
         original = next(
             surface
-            for surface in build_fixed_surfaces((level,))
+            for surface in original_surfaces
             if surface.surface_id == surface_id
         )
-        original_normals = np.asarray(original.mesh.face_normals, dtype=float)
-        wall_faces = np.abs(original_normals[:, 1]) > 0.9
-        reveal_faces = ~wall_faces
-        self.assertTrue(np.any(wall_faces))
-        self.assertTrue(np.any(reveal_faces))
+        original_reveals = {
+            surface.surface_id: surface
+            for surface in original_surfaces
+            if surface.opening_id == level.doorways[0].doorway_id
+        }
+        self.assertTrue(original_reveals)
 
         flip_surface_orientation((level,), surface_id)
+        flipped_surfaces = build_fixed_surfaces((level,))
         flipped = next(
             surface
-            for surface in build_fixed_surfaces((level,))
+            for surface in flipped_surfaces
             if surface.surface_id == surface_id
         )
-        flipped_normals = np.asarray(flipped.mesh.face_normals, dtype=float)
 
         np.testing.assert_allclose(
-            flipped_normals[wall_faces],
-            -original_normals[wall_faces],
+            flipped.mesh.face_normals,
+            -original.mesh.face_normals,
         )
+        for reveal in flipped_surfaces:
+            if reveal.surface_id in original_reveals:
+                np.testing.assert_allclose(
+                    reveal.mesh.face_normals,
+                    original_reveals[reveal.surface_id].mesh.face_normals,
+                )
+
+    def test_reveal_flip_preserves_case_sensitive_opening_identity(self) -> None:
+        level, wall_id = _build_room_with_doorway_level()
+        level.doorways[0] = replace(
+            level.doorways[0], doorway_id="Door A/Left:\N{LATIN SMALL LETTER E WITH ACUTE}"
+        )
+        original_surfaces = build_fixed_surfaces((level,))
+        original = next(
+            surface
+            for surface in original_surfaces
+            if surface.opening_id == level.doorways[0].doorway_id
+        )
+
+        result = flip_surface_orientation((level,), original.surface_id)
+        flipped_surfaces = {
+            surface.surface_id: surface for surface in build_fixed_surfaces((level,))
+        }
+
+        self.assertEqual(result.selected_surface_ids, (original.surface_id,))
+        self.assertEqual(level.flipped_surface_ids, {original.surface_id})
         np.testing.assert_allclose(
-            flipped_normals[reveal_faces],
-            original_normals[reveal_faces],
+            flipped_surfaces[original.surface_id].mesh.face_normals,
+            -original.mesh.face_normals,
+        )
+        wall = next(surface for surface in original_surfaces if surface.surface_id == wall_id)
+        np.testing.assert_allclose(
+            flipped_surfaces[wall_id].mesh.face_normals, wall.mesh.face_normals
         )
 
     def test_horizontal_surface_flip_reverses_every_face(self) -> None:

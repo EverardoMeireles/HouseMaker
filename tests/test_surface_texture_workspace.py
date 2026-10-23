@@ -444,6 +444,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
         data_changed = QSignalSpy(self.workspace.data_changed)
         content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        selection_changed = QSignalSpy(self.workspace.selection_changed)
 
         renamed = self.workspace.rename_assignment(
             assignment.assignment_id,
@@ -457,6 +458,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(data_changed.count(), 1)
         self.assertEqual(content_changed.count(), 1)
+        self.assertEqual(selection_changed.count(), 0)
 
     def test_external_texture_family_import_upserts_stable_assignment(
         self,
@@ -1623,6 +1625,41 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.surface_3d_page,
         )
         self.assertLessEqual(abs(splitter.sizes()[0] - splitter.sizes()[1]), 2)
+
+    def test_picker_selection_emits_only_lightweight_selection_changes(self) -> None:
+        viewer = self.workspace.surface_view
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        selection_changed = QSignalSpy(self.workspace.selection_changed)
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+
+        with patch.object(
+            SurfaceTextureData,
+            "clone",
+            side_effect=AssertionError("selection cloned all Surface data"),
+        ):
+            self.assertTrue(viewer.select_surface(first_wall))
+            viewer.set_selected_surface_ids((first_wall,))
+            self.assertEqual(selection_changed.count(), 1)
+            self.assertTrue(viewer.select_surface(second_wall, shift_pressed=True))
+            self.assertEqual(
+                self.workspace.get_selected_surface_ids(), (first_wall, second_wall)
+            )
+            viewer.clear_selection()
+
+        self.assertEqual(selection_changed.count(), 3)
+        self.assertEqual(selection_changed.at(0)[0], (first_wall,))
+        self.assertEqual(selection_changed.at(1)[0], (first_wall, second_wall))
+        self.assertEqual(selection_changed.at(2)[0], ())
+        self.assertEqual(data_changed.count(), 0)
+        self.assertEqual(content_changed.count(), 0)
+        self.assertEqual(self.workspace.get_data().selected_surface_ids, ())
+
+        viewer.select_surface(second_wall)
+        persisted = self.workspace.get_data()
+        self.assertEqual(persisted.selected_surface_ids, (second_wall,))
+        self.assertEqual(persisted.selected_surface_type, "wall")
 
     def test_same_path_texture_replacement_refreshes_fixed_surface_preview(
         self,
@@ -4089,6 +4126,65 @@ class SharedSceneSurfaceSelectionTests(unittest.TestCase):
                 available_ids
             )
         )
+
+    def test_shared_selection_changes_do_not_publish_or_clone_content(self) -> None:
+        walls = tuple(
+            surface
+            for surface in build_fixed_surfaces([_test_level()])
+            if surface.surface_type == "wall"
+        )[:2]
+        selection_changed = QSignalSpy(self.workspace.selection_changed)
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        controls_synced = QSignalSpy(self.workspace.controls_synced)
+
+        with (
+            patch.object(
+                SurfaceTextureData,
+                "clone",
+                side_effect=AssertionError("selection cloned all Surface data"),
+            ),
+            patch(
+                "housemaker.surface_texture_workspace.build_fixed_surfaces",
+                side_effect=AssertionError("selection rebuilt architectural geometry"),
+            ),
+        ):
+            self.assertTrue(self.workspace.set_scene_surface_selection((walls[0],)))
+            self.assertFalse(self.workspace.set_scene_surface_selection((walls[0],)))
+            self.assertTrue(self.workspace.set_scene_surface_selection((walls[1],)))
+            self.assertTrue(self.workspace.set_scene_surface_selection(()))
+            self.assertFalse(self.workspace.set_scene_surface_selection(()))
+
+        self.assertEqual(selection_changed.count(), 3)
+        self.assertEqual(selection_changed.at(0)[0], (walls[0].surface_id,))
+        self.assertEqual(selection_changed.at(1)[0], (walls[1].surface_id,))
+        self.assertEqual(selection_changed.at(2)[0], ())
+        self.assertEqual(data_changed.count(), 0)
+        self.assertEqual(content_changed.count(), 0)
+        self.assertEqual(controls_synced.count(), 5)
+        self.assertEqual(self.workspace.get_data().selected_surface_ids, ())
+
+    def test_shared_selection_updates_controls_and_remains_persisted(self) -> None:
+        wall = next(
+            surface
+            for surface in build_fixed_surfaces([_test_level()])
+            if surface.surface_type == "wall"
+        )
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(meshy_api_key="test-key")
+        )
+        self.workspace.set_temporary_reference(np.full((16, 16, 4), 255, np.uint8))
+        self.assertFalse(self.workspace.generate_button.isEnabled())
+
+        self.workspace.set_scene_surface_selection((wall,))
+
+        self.assertTrue(self.workspace.generate_button.isEnabled())
+        self.assertIn("1 wall surface", self.workspace.selection_label.text())
+        persisted = self.workspace.get_data()
+        self.assertEqual(persisted.selected_surface_type, "wall")
+        self.assertEqual(persisted.selected_surface_ids, (wall.surface_id,))
+        self.workspace.set_scene_surface_selection(())
+        self.assertFalse(self.workspace.generate_button.isEnabled())
 
     def test_mixed_scene_surface_types_cannot_start_one_texture_request(
         self,

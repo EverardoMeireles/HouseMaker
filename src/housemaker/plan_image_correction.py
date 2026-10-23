@@ -667,6 +667,7 @@ def openai_image_edit(
     prompt: str,
     output_size: tuple[int, int],
     cancellation_check: CancellationCheck | None,
+    additional_images: tuple[bytes, ...] = (),
 ) -> bytes:
     """Call the Images edit endpoint and return decoded PNG bytes."""
 
@@ -685,7 +686,7 @@ def openai_image_edit(
         "size": f"{output_size[0]}x{output_size[1]}",
         "output_format": "png",
     }
-    body = _build_multipart_body(boundary, fields, image_bytes)
+    body = _build_multipart_body(boundary, fields, image_bytes, additional_images)
     request = Request(
         OPENAI_IMAGE_EDIT_URL,
         data=body,
@@ -725,6 +726,7 @@ def build_openai_responses_image_edit_body(
     output_size: tuple[int, int] = (1024, 1024),
     background: str | None = None,
     action: str = "edit",
+    additional_images: tuple[bytes, ...] = (),
 ) -> dict:
     """Build the same Responses image body for standard and Batch requests."""
 
@@ -745,7 +747,6 @@ def build_openai_responses_image_edit_body(
         raise PlanImageCorrectionInferenceError(
             "The requested OpenAI image action is unsupported."
         )
-    encoded_input = base64.b64encode(bytes(image_bytes)).decode("ascii")
     image_tool = {
         "type": "image_generation",
         "model": OPENAI_IMAGE_MODEL,
@@ -763,11 +764,11 @@ def build_openai_responses_image_edit_body(
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    {
+                    *[{
                         "type": "input_image",
-                        "image_url": f"data:image/png;base64,{encoded_input}",
+                        "image_url": "data:image/png;base64," + base64.b64encode(bytes(image)).decode("ascii"),
                         "detail": "original",
-                    },
+                    } for image in (image_bytes, *additional_images)],
                 ],
             }
         ],
@@ -788,6 +789,7 @@ def openai_responses_image_edit(
     background: str | None = None,
     action: str = "edit",
     progress_callback: Callable[[str, int], None] | None = None,
+    additional_images: tuple[bytes, ...] = (),
 ) -> bytes:
     """Use a GPT-5.6 model through the chosen standard or Batch transport."""
 
@@ -804,6 +806,7 @@ def openai_responses_image_edit(
         output_size=output_size,
         background=background,
         action=action,
+        additional_images=additional_images,
     )
     if model == PLAN_CORRECTION_MODEL_GPT_5_6_LUNA_BATCH:
         try:
@@ -999,6 +1002,7 @@ def _build_multipart_body(
     boundary: str,
     fields: dict[str, str],
     image_bytes: bytes,
+    additional_images: tuple[bytes, ...] = (),
 ) -> bytes:
     chunks: list[bytes] = []
     marker = boundary.encode("ascii")
@@ -1011,15 +1015,15 @@ def _build_multipart_body(
                 b"\r\n",
             )
         )
-    chunks.extend(
-        (
+    for index, image in enumerate((image_bytes, *additional_images)):
+        filename = "plan.png" if index == 0 else f"reference-{index}.png"
+        chunks.extend((
             b"--" + marker + b"\r\n",
-            b'Content-Disposition: form-data; name="image[]"; filename="plan.png"\r\n',
+            f'Content-Disposition: form-data; name="image[]"; filename="{filename}"\r\n'.encode(),
             b"Content-Type: image/png\r\n\r\n",
-            bytes(image_bytes),
-            b"\r\n--" + marker + b"--\r\n",
-        )
-    )
+            bytes(image), b"\r\n",
+        ))
+    chunks.append(b"--" + marker + b"--\r\n")
     return b"".join(chunks)
 
 

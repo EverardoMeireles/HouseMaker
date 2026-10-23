@@ -37,6 +37,7 @@ from housemaker.surface_geometry import (
     FixedSurface,
     build_base_fixed_surfaces,
 )
+from housemaker.surface_texture_state import normalize_surface_id
 
 # ### Constants ###
 EDITABLE_SURFACE_ID_PATTERN = re.compile(
@@ -4291,7 +4292,10 @@ def _find_level(levels: Sequence[LevelData], level_index: int) -> LevelData:
 
 
 def _normalize_surface_id(value: object) -> str:
-    normalized = str(value).strip().lower()
+    normalized = str(value).strip()
+    if "/opening:" in normalized.lower():
+        return normalize_surface_id(normalized)
+    normalized = normalized.lower()
     if not normalized or len(normalized) > 512:
         raise ValueError("Surface ID is empty or too long.")
     return normalized

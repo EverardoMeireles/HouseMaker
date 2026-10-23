@@ -812,14 +812,12 @@ class WallWindowGeometryTests(unittest.TestCase):
         head[2] = floor_top + 2.25
 
         model = convert_to_glb([level])
-        reveal_name = next(
-            name
-            for name in model.scene.geometry
-            if name.endswith("_window_reveals")
-        )
-        self.assertEqual(len(model.scene.geometry[reveal_name].faces), 16)
-        self.assertAlmostEqual(target.area_square_meters, 12.5)
-        for mesh in (target.mesh, model.mesh):
+        reveal_surfaces = [surface for surface in surfaces.values() if surface.opening_id == "sealed-window"]
+        self.assertEqual(len(reveal_surfaces), 4)
+        reveal_mesh = trimesh.util.concatenate([surface.mesh for surface in reveal_surfaces])
+        self.assertEqual(len(reveal_mesh.faces), 8)
+        self.assertAlmostEqual(target.area_square_meters, 9.0)
+        for mesh in (reveal_mesh, model.mesh):
             for point, fixed_axis in (
                 (low_jamb, 0),
                 (high_jamb, 0),
@@ -832,7 +830,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                         tuple(point),
                         fixed_axis=fixed_axis,
                     ),
-                    4,
+                    2,
                 )
 
         exported = _load_glb_world_mesh(model.glb_bytes)
@@ -849,7 +847,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                     tuple(exported_point),
                     fixed_axis=fixed_axis,
                 ),
-                4,
+                2,
             )
 
     def test_window_reveal_stops_at_nearest_outward_wall(self) -> None:
@@ -931,12 +929,12 @@ class WallWindowGeometryTests(unittest.TestCase):
         reveal_y = (target_y + outer_y) / 2.0
         model = convert_to_glb([level])
 
-        reveal_name = next(
-            name
-            for name in model.scene.geometry
-            if name.endswith("_window_reveals")
-        )
-        self.assertEqual(len(model.scene.geometry[reveal_name].faces), 16)
+        reveal_meshes = [
+            mesh for mesh in model.scene.geometry.values()
+            if "/opening:window:segmented-outer-window/reveal:" in mesh.metadata.get("housemaker_surface_id", "")
+        ]
+        self.assertEqual(len(reveal_meshes), 4)
+        self.assertEqual(sum(len(mesh.faces) for mesh in reveal_meshes), 8)
         for horizontal_ratio in (0.3, 0.7):
             sill_point = _get_wall_ratio_point(
                 rebuilt_target,
@@ -1255,6 +1253,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                 target_surface.surface_id: _solid_png(),
                 near_surface.surface_id: _solid_png(),
                 far_surface.surface_id: _solid_png(),
+                **{surface.surface_id: _solid_png() for surface in surfaces.values() if surface.opening_id == "textured-deep-window"},
             },
             export_untextured_surfaces=False,
         )
@@ -1317,14 +1316,18 @@ class WallWindowGeometryTests(unittest.TestCase):
             )
         )
         assert model.preview_untextured_mesh is not None
+        textured_reveals = trimesh.util.concatenate([
+            mesh for surface_id, mesh in textured_by_id.items()
+            if "/opening:window:textured-deep-window/reveal:" in surface_id
+        ])
         for reveal_point, fixed_axis in reveal_points:
             self.assertEqual(
                 _count_mesh_triangles_covering_point_on_plane(
-                    textured_by_id[target_surface.surface_id],
+                    textured_reveals,
                     tuple(reveal_point),
                     fixed_axis=fixed_axis,
                 ),
-                4,
+                2,
             )
             self.assertEqual(
                 _count_mesh_triangles_covering_point_on_plane(
@@ -1332,7 +1335,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                     tuple(reveal_point),
                     fixed_axis=fixed_axis,
                 ),
-                4,
+                2,
             )
             self.assertEqual(
                 _count_mesh_triangles_covering_point_on_plane(
@@ -1372,7 +1375,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                     tuple(exported_point),
                     fixed_axis=exported_fixed_axis,
                 ),
-                4,
+                2,
             )
 
     def test_textured_wall_preview_and_export_preserve_window_hole(self) -> None:

@@ -526,20 +526,14 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
                 rotation_degrees=90.0,
             )
         ]
-        doorway_wall = next(
-            surface
-            for surface in build_fixed_surfaces((level,))
-            if surface.surface_id
-            == f"level:2/room:{room.center_vertex_id}/wall:1:2"
-        )
+        reveals = [
+            surface for surface in build_fixed_surfaces((level,))
+            if surface.opening_id == level.doorways[0].doorway_id
+        ]
         reveal_triangles = [
             triangle
-            for triangle, normal in zip(
-                doorway_wall.mesh.triangles,
-                doorway_wall.mesh.face_normals,
-                strict=True,
-            )
-            if abs(float(normal[1])) < 0.9
+            for surface in reveals
+            for triangle in surface.mesh.triangles
         ]
         self.assertEqual(len(reveal_triangles), 6)
 
@@ -1616,21 +1610,22 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
 
 # ### Doorway ownership tests ###
 class SharedDoorwaySurfaceTests(unittest.TestCase):
-    def test_shared_doorway_reveals_are_owned_by_only_one_room_surface(self) -> None:
+    def test_shared_doorway_reveals_are_independent_of_both_room_surfaces(self) -> None:
         level, shared_wall_key = _build_adjacent_room_level_with_doorway()
+        surfaces = build_fixed_surfaces([level])
         shared_surfaces = [
             surface
-            for surface in build_fixed_surfaces([level])
+            for surface in surfaces
             if surface.wall_key == shared_wall_key
         ]
 
         self.assertEqual(len(shared_surfaces), 2)
         self.assertEqual(
             sorted(len(surface.mesh.faces) for surface in shared_surfaces),
-            [6, 12],
+            [6, 6],
         )
         self.assertAlmostEqual(
-            sum(surface.area_square_meters for surface in shared_surfaces),
+            sum(surface.area_square_meters for surface in surfaces if surface.wall_key == shared_wall_key or surface.opening_id is not None),
             9.76,
         )
 

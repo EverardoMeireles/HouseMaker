@@ -381,7 +381,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
             ("ordinary-object",),
         )
 
-    def test_opening_and_handles_remain_selectable_through_a_nearer_wall(
+    def test_nearer_wall_blocks_opening_and_handle_selection(
         self,
     ) -> None:
         target = _build_target()
@@ -397,11 +397,13 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         ):
             viewer._handle_window_wall_pick_requested(QPointF())
 
+        self.assertIsNone(viewer.get_selected_canvas_opening_reference())
         self.assertEqual(
-            viewer.get_selected_canvas_opening_reference(),
-            target.reference,
+            viewer.get_selected_wall_surface_id(), "level:0/wall:1:2"
         )
-        self.assertIsNone(viewer.get_selected_wall_surface_id())
+
+        # A previously selected opening must not intercept the next wall click.
+        viewer.select_canvas_opening(target.reference)
 
         with (
             patch.object(viewer.view, "pixelSize", return_value=0.01),
@@ -413,17 +415,8 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         ):
             viewer._handle_placed_object_pointer_pressed(QPointF())
 
-        self.assertIsNotNone(viewer._canvas_opening_edit_drag)
-        assert viewer._canvas_opening_edit_drag is not None
-        self.assertEqual(
-            viewer._canvas_opening_edit_drag.handle,
-            _CanvasOpeningGizmoHandle(
-                CANVAS_OPENING_GIZMO_SIDE,
-                CANVAS_OPENING_SIDE_LEFT,
-            ),
-        )
-        self.assertTrue(viewer.view.is_primary_pointer_drag_reserved)
-        viewer._cancel_canvas_opening_edit_drag()
+        self.assertIsNone(viewer._canvas_opening_edit_drag)
+        viewer._cancel_canvas_rectangle_selection()
 
     def test_selected_opening_renders_handles_and_survives_model(
         self,

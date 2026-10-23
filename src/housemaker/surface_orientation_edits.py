@@ -9,6 +9,7 @@ from housemaker.architectural_surface_edits import (
 )
 from housemaker.models import LevelData
 from housemaker.surface_geometry import build_fixed_surfaces
+from housemaker.surface_texture_state import normalize_surface_id
 
 
 # ### Public orientation operations ###
@@ -143,7 +144,11 @@ def _normalize_levels(levels: Sequence[LevelData]) -> tuple[LevelData, ...]:
 
 
 def _normalize_surface_id(value: object) -> str:
-    surface_id = str(value).strip().lower()
+    surface_id = str(value).strip()
+    if "/opening:" in surface_id.lower():
+        # The opening token is opaque and must keep its original case.
+        return normalize_surface_id(surface_id)
+    surface_id = surface_id.lower()
     if not surface_id or len(surface_id) > 512:
         raise ValueError("A surface orientation edit requires a valid surface ID.")
     return surface_id

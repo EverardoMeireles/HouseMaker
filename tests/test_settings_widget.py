@@ -66,7 +66,6 @@ from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
-    DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
     DOORS_AND_WINDOWS_POINT_LIGHT_INTENSITY_SETTING_KEY,
     ENABLE_OBJECT_SYMMETRY_INFERENCE_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
@@ -99,7 +98,6 @@ from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     SYMMETRY_INFERENCE_MODEL_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
-    USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
     USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
     WALL_VERIFICATION_MODEL_SETTING_KEY,
     Fullscreen3DViewerScreenOption,
@@ -130,7 +128,6 @@ from housemaker.settings_widget import (
     read_snap_middle_equal_angle_only,
     read_symmetry_inference_model,
     read_unused_face_removal,
-    read_use_half_mesh_texture_prefix,
     read_use_uv_raycast_for_object_generation,
     read_wall_verification_model,
 )
@@ -523,7 +520,6 @@ class SettingsWidgetTests(unittest.TestCase):
                     (
                         widget.automatic_atlas_creation_checkbox,
                         widget.automatic_atlas_texture_sort_by_pbr_checkbox,
-                        widget.use_half_mesh_texture_prefix_checkbox,
                         widget.automatic_atlas_texture_resolution_combo,
                     ),
                 ),
@@ -742,6 +738,13 @@ class SettingsWidgetTests(unittest.TestCase):
                 lambda: emitted_changes.append(True)
             )
 
+            speed_form = widget.first_person_speed_control.parentWidget().layout()
+            self.assertEqual(
+                speed_form.labelForField(widget.first_person_speed_control).text(),
+                "Fps mode speed",
+            )
+            self.assertEqual(widget.first_person_speed_slider.minimum(), 1)
+            self.assertEqual(widget.first_person_speed_slider.maximum(), 200)
             self.assertEqual(
                 widget.get_settings().first_person_speed_meters_per_second,
                 DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
@@ -1543,7 +1546,7 @@ class SettingsWidgetTests(unittest.TestCase):
                         )
                     )
 
-    def test_half_mesh_texture_prefix_defaults_persists_and_restores(
+    def test_half_mesh_texture_prefix_setting_and_control_are_removed(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1552,65 +1555,41 @@ class SettingsWidgetTests(unittest.TestCase):
                 application_settings=application_settings,
                 environment={},
             )
-            checkbox = widget.use_half_mesh_texture_prefix_checkbox
-            emitted_changes: list[bool] = []
-            widget.settings_changed.connect(
-                lambda: emitted_changes.append(True)
-            )
-
-            self.assertFalse(DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX)
-            self.assertFalse(checkbox.isChecked())
             self.assertFalse(
-                widget.get_settings().use_half_mesh_texture_prefix
+                hasattr(widget, "use_half_mesh_texture_prefix_checkbox")
             )
-            self.assertIn(
+            self.assertFalse(
+                hasattr(widget.get_settings(), "use_half_mesh_texture_prefix")
+            )
+            self.assertNotIn(
                 "Use [HALF] half-mesh texture prefix",
                 [label.text() for label in widget.findChildren(QLabel)],
             )
+            widget.close()
 
-            checkbox.setChecked(True)
-
-            self.assertTrue(
-                application_settings.get(
-                    USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY
-                )
-            )
-            self.assertTrue(
-                widget.get_settings().use_half_mesh_texture_prefix
-            )
-            self.assertEqual(emitted_changes, [True])
-            restored = SettingsWidget(
-                application_settings=_build_test_settings(temporary_directory),
-                environment={},
-            )
-            self.assertTrue(
-                restored.get_settings().use_half_mesh_texture_prefix
-            )
-
-    def test_half_mesh_texture_prefix_rejects_malformed_values(self) -> None:
-        for value in (0, 1, "true", None):
-            with self.subTest(model_value=value):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "Half-mesh texture prefix",
-                ):
-                    GenerationServiceSettings(
-                        use_half_mesh_texture_prefix=(
-                            value  # type: ignore[arg-type]
-                        )
-                    )
-
+    def test_legacy_half_mesh_texture_prefix_setting_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
-            for value in (0, 1, "true", None):
+            for value in (False, True, 0, 1, "true", None):
                 with self.subTest(persisted_value=value):
                     application_settings.set(
-                        USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
+                        "atlas/use_half_mesh_texture_prefix",
                         value,
                     )
-                    self.assertFalse(
-                        read_use_half_mesh_texture_prefix(application_settings)
+                    widget = SettingsWidget(
+                        application_settings=application_settings,
+                        environment={},
                     )
+                    self.assertFalse(
+                        hasattr(
+                            widget.get_settings(), "use_half_mesh_texture_prefix"
+                        )
+                    )
+                    self.assertEqual(
+                        widget.get_settings().automatic_atlas_texture_resolution,
+                        DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
+                    )
+                    widget.close()
 
     def test_api_key_fields_and_workspace_display_selectors_are_visible(
         self,

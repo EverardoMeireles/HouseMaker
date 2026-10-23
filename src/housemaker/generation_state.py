@@ -7,6 +7,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from housemaker.geometry_generation_models import (
+    DEFAULT_GEOMETRY_MODEL,
+    DEFAULT_GEOMETRY_RESOLUTION,
+    normalize_geometry_model,
+    normalize_geometry_resolution,
+)
 from housemaker.video_source import VideoMetadata
 
 # ### Constants ###
@@ -346,8 +352,12 @@ class GenerationData:
     frame_strokes: dict[int, list[MaskStroke]] = field(default_factory=dict)
     generated_objects: list[GeneratedObjectRecord] = field(default_factory=list)
     object_instances: list[GeneratedObjectInstance] = field(default_factory=list)
+    geometry_model: str = DEFAULT_GEOMETRY_MODEL
+    geometry_resolution: str = DEFAULT_GEOMETRY_RESOLUTION
 
     def __post_init__(self) -> None:
+        self.geometry_model = normalize_geometry_model(self.geometry_model)
+        self.geometry_resolution = normalize_geometry_resolution(self.geometry_resolution)
         if int(self.current_frame_index) < 0:
             raise ValueError("Current video frame cannot be negative.")
         normalized_strokes: dict[int, list[MaskStroke]] = {}
@@ -480,6 +490,8 @@ class GenerationData:
             "object_instances": [
                 instance.to_dict() for instance in self.object_instances
             ],
+            "geometry_model": self.geometry_model,
+            "geometry_resolution": self.geometry_resolution,
         }
 
     @classmethod
@@ -488,6 +500,24 @@ class GenerationData:
             raise ValueError("Generation data must contain an object.")
         raw_video = payload.get("video_metadata", payload.get("video"))
         raw_frame_strokes = payload.get("frame_strokes", {})
+        # Removed multi-view sessions kept the ordinary blobs in a hidden bank.
+        # Recover it only when that bank was hidden; disabled-mode saves already
+        # expose the current ordinary strokes in the top-level frame_strokes.
+        legacy_reference = payload.get("single_object_reference")
+        if not isinstance(legacy_reference, dict):
+            legacy_reference = {}
+        legacy_mode_active = bool(
+            legacy_reference.get(
+                "multi_view_generation",
+                bool(legacy_reference.get("multi_inpaint", False))
+                or (
+                    bool(legacy_reference.get("multi_view", False))
+                    and legacy_reference.get("geometry_model") == "meshy-7.1"
+                ),
+            )
+        )
+        if legacy_mode_active and "ordinary_frame_strokes" in legacy_reference:
+            raw_frame_strokes = legacy_reference["ordinary_frame_strokes"]
         if not isinstance(raw_frame_strokes, dict):
             raise ValueError("Generation frame strokes must contain an object.")
         raw_generated_objects = payload.get("generated_objects", [])
@@ -499,15 +529,12 @@ class GenerationData:
         generated_objects = _load_generated_objects(raw_generated_objects)
         return cls(
             video_metadata=(
-                None
-                if raw_video is None
-                else VideoMetadata.from_dict(raw_video)
+                None if raw_video is None else VideoMetadata.from_dict(raw_video)
             ),
             current_frame_index=int(payload.get("current_frame_index", 0)),
             frame_strokes={
                 int(frame_index): [
-                    MaskStroke.from_dict(raw_stroke)
-                    for raw_stroke in raw_strokes
+                    MaskStroke.from_dict(raw_stroke) for raw_stroke in raw_strokes
                 ]
                 for frame_index, raw_strokes in raw_frame_strokes.items()
                 if isinstance(raw_strokes, list)
@@ -516,6 +543,13 @@ class GenerationData:
             object_instances=_load_generated_object_instances(
                 raw_object_instances,
                 generated_objects,
+            ),
+            geometry_model=payload.get(
+                "geometry_model", legacy_reference.get("geometry_model", DEFAULT_GEOMETRY_MODEL)
+            ),
+            geometry_resolution=payload.get(
+                "geometry_resolution",
+                legacy_reference.get("geometry_resolution", DEFAULT_GEOMETRY_RESOLUTION),
             ),
         )
 

@@ -1056,7 +1056,12 @@ def _coalesce_sloped_ceiling_surfaces(
 ) -> list[object]:
     """Reassemble prior semantic slope partitions before rebuilding them."""
 
-    surface_items = list(surfaces)
+    # Opening returns are rebuilt from their frames, not coalesced into the
+    # ceiling skin. Keeping them here would duplicate old window tunnels.
+    surface_items = [
+        surface for surface in surfaces
+        if getattr(surface, "opening_sloped_ceiling_id", None) is None
+    ]
     children_by_host_id: dict[str, list[object]] = {}
     for surface in surface_items:
         slope_id = getattr(surface, "sloped_ceiling_id", None)
@@ -2522,23 +2527,19 @@ def _rebuild_ceiling_surfaces(
         faces,
         face_parts,
     )
-    _append_sloped_window_reveals(
-        openings,
-        vertices,
-        vertex_index,
-        faces,
-        face_parts,
-    )
     rebuilt = _build_mesh(vertices, faces)
     if rebuilt is None:
         return (surface,)
-    return _partition_rebuilt_ceiling_surface(
-        surface,
-        rebuilt,
-        frames,
-        main_face_count=main_face_count,
-        face_parts=face_parts,
-        surface_alias_parts=surface_alias_parts,
+    return (
+        *_partition_rebuilt_ceiling_surface(
+            surface,
+            rebuilt,
+            frames,
+            main_face_count=main_face_count,
+            face_parts=face_parts,
+            surface_alias_parts=surface_alias_parts,
+        ),
+        *_build_sloped_window_reveal_surfaces(openings, surface),
     )
 
 
@@ -2756,47 +2757,44 @@ def _geometry_outer_shell(geometry: BaseGeometry) -> BaseGeometry:
     return shapely.union_all(shells) if shells else geometry
 
 
-def _append_sloped_window_reveals(
+def _build_sloped_window_reveal_surfaces(
     openings: Sequence[_SlopedCeilingWindowOpening],
-    vertices: list[tuple[float, float, float]],
-    vertex_index: dict[tuple[float, float, float], int],
-    faces: list[tuple[int, int, int]],
-    face_parts: dict[int, tuple[str, str]],
-) -> None:
-    """Seal every slope opening with four inward-facing tunnel sides."""
+    host_surface: object,
+) -> tuple[object, ...]:
+    """Seal each slope window with four independently selectable returns."""
 
+    from housemaker.surface_geometry import build_opening_reveal_surface
+
+    surfaces: list[object] = []
     for opening in openings:
         inner = np.asarray(opening.corners_world, dtype=float)
         normal = np.asarray(opening.host.wall_normal_world, dtype=float)
         outer = inner + normal * SLOPED_CEILING_WINDOW_REVEAL_DEPTH_METERS
         center = np.mean(inner, axis=0)
-        for index in range(4):
+        for index, part in enumerate(("sill", "right", "header", "left")):
             next_index = (index + 1) % 4
             first_inner = inner[index]
             second_inner = inner[next_index]
             first_outer = outer[index]
             second_outer = outer[next_index]
             desired_normal = center - (first_inner + second_inner) * 0.5
-            first_face_index = _append_oriented_triangle(
-                vertices,
-                vertex_index,
-                faces,
-                (first_inner, second_inner, second_outer),
-                desired_normal,
+            quad = np.asarray((first_inner, second_inner, second_outer, first_outer))
+            candidate_normal = np.cross(quad[1] - quad[0], quad[2] - quad[0])
+            if float(np.dot(candidate_normal, desired_normal)) < 0.0:
+                quad = quad[[1, 0, 3, 2]]
+            surface = build_opening_reveal_surface(
+                level_index=int(host_surface.level_index),
+                opening_kind="window",
+                opening_id=opening.window.window_id,
+                part=part,
+                owner_surface_id=opening.host.wall_surface_id,
+                world_quads=(quad,),
+                sloped_ceiling_id=opening.host.slope_id,
+                host_surface_id=str(host_surface.surface_id),
             )
-            second_face_index = _append_oriented_triangle(
-                vertices,
-                vertex_index,
-                faces,
-                (first_inner, second_outer, first_outer),
-                desired_normal,
-            )
-            for face_index in (first_face_index, second_face_index):
-                if face_index is not None:
-                    face_parts[face_index] = (
-                        opening.host.slope_id,
-                        SLOPED_CEILING_PART_WINDOW_REVEALS,
-                    )
+            if surface is not None:
+                surfaces.append(surface)
+    return tuple(surfaces)
 
 
 def _partition_ceiling_polygon(

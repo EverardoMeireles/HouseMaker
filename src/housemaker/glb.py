@@ -604,6 +604,7 @@ class WallOpening:
     penetrates_parallel_walls: bool = False
     profile_points: tuple[tuple[float, float], ...] = ()
     meters_per_pixel: float = PIXEL_TO_METER
+    source_opening_id: str | None = None
 
     @property
     def top_height_meters(self) -> float:
@@ -1028,6 +1029,10 @@ def _build_blueprint_model(
             base_fixed_surfaces,
             structural_fixed_surfaces,
         )
+        named_meshes = _apply_opening_reveal_surface_geometry(
+            named_meshes,
+            structural_fixed_surfaces,
+        )
         preview_textured_walls = _build_preview_textured_walls(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
@@ -1075,6 +1080,45 @@ def _build_blueprint_model(
     )
 
 
+# ### Independent opening reveal geometry ###
+def _apply_opening_reveal_surface_geometry(
+    named_meshes: Sequence[NamedMesh],
+    fixed_surfaces: Sequence[object],
+) -> list[NamedMesh]:
+    """Replace legacy tunnel aggregates with the same semantic pick surfaces.
+
+    This also removes their reverse-wound duplicate faces. The independently
+    textured reveal can then replace its exact base mesh without leaving an
+    untextured copy behind or changing either adjacent wall's material.
+    """
+
+    reveals = [
+        surface for surface in fixed_surfaces
+        if getattr(surface, "opening_id", None) is not None
+    ]
+    reveal_ids = {str(surface.surface_id) for surface in reveals}
+    retained = [
+        named_mesh for named_mesh in named_meshes
+        if not named_mesh.name.endswith(("_doorway_reveals", "_window_reveals"))
+        and str(named_mesh.mesh.metadata.get("housemaker_surface_id", ""))
+        not in reveal_ids
+    ]
+    for surface in reveals:
+        surface_id = str(surface.surface_id)
+        mesh = surface.mesh.copy()
+        mesh.metadata = copy.deepcopy(dict(mesh.metadata or {}))
+        mesh.metadata["housemaker_surface_id"] = surface_id
+        retained.append(
+            NamedMesh(
+                name=f"{_get_surface_object_name(surface_id)}_opening_geometry",
+                mesh=mesh,
+                export_role=NAMED_MESH_ROLE_SURFACE,
+            )
+        )
+    return retained
+
+
+# ### Untextured ceiling geometry ###
 def _build_untextured_ceiling_named_meshes(
     levels: Sequence[LevelData],
     fixed_surfaces: Sequence[object],
@@ -8260,6 +8304,9 @@ def _build_wall_openings(
                 bottom_height_meters=bottom_height_meters,
                 profile_points=profile_points,
                 meters_per_pixel=meters_per_pixel,
+                source_opening_id=(
+                    str(getattr(doorway, "doorway_id", "")).strip() or None
+                ),
             )
         )
 
@@ -8350,6 +8397,9 @@ def _build_window_openings(
                 parallel_walls_only=True,
                 penetrates_parallel_walls=True,
                 meters_per_pixel=level.meters_per_pixel,
+                source_opening_id=(
+                    str(getattr(window, "window_id", "")).strip() or None
+                ),
             )
         )
     return openings

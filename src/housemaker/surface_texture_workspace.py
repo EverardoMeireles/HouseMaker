@@ -770,6 +770,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     """Select fixed surfaces and texture them from masked video references."""
 
     data_changed = Signal(object)
+    selection_changed = Signal(object)
     generation_completed = Signal(object)
     assignments_removed = Signal(object)
     surface_content_changed = Signal()
@@ -1217,7 +1218,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         Main supplies the exact selected semantic surfaces, which preserves the
         IDs, types, and physical areas used by the rendered scene. Mixed surface
         types remain visible in the selection label but are deliberately invalid
-        for one Surface generation request.
+        for one Surface generation request. Selection-only changes publish their
+        ID tuple through ``selection_changed``, not the content ``data_changed``
+        signal; the selection is still included by ``get_data()`` when saving.
         """
 
         if self._shared_controls is None:
@@ -1262,7 +1265,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
         )
         if changed:
-            self._emit_data_changed()
+            self.selection_changed.emit(next_snapshot.surface_ids)
         return changed
 
     def get_selected_surface_ids(self) -> tuple[str, ...]:
@@ -3379,6 +3382,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._handle_video_strokes_changed
         )
         self.seekbar = QSlider(Qt.Orientation.Horizontal)
+        self.seekbar.setSingleStep(2)
         self.seekbar.setRange(0, 0)
         self.seekbar.valueChanged.connect(self._handle_seekbar_changed)
         self.load_video_button = QPushButton("Load video")
@@ -3655,12 +3659,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_surface_selection_changed(self, raw_ids: object) -> None:
         if self.surface_view is None or not isinstance(raw_ids, tuple | list):
             return
-        self._persist_surface_selection_snapshot(
-            self._get_surface_selection_snapshot()
+        previous_selection = (
+            self._data.selected_surface_type,
+            self._data.selected_surface_ids,
         )
+        selection = self._get_surface_selection_snapshot()
+        self._persist_surface_selection_snapshot(selection)
         self._sync_selection_status()
-        self._emit_data_changed()
         self._sync_controls()
+        if previous_selection != (
+            self._data.selected_surface_type,
+            self._data.selected_surface_ids,
+        ):
+            self.selection_changed.emit(selection.surface_ids)
 
     @Slot(object)
     def _handle_camera_pose_changed(self, pose: object) -> None:

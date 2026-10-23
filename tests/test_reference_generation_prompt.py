@@ -153,6 +153,11 @@ class ReferenceGenerationPromptTests(unittest.TestCase):
 
     def test_edited_preset_prompt_is_persisted_and_restored(self):
         self.workspace.reference_generation_prompt_edit.setText("My edited reference")
+        self.assertNotEqual(
+            self.settings.get(REFERENCE_GENERATION_PROMPT_SETTINGS_KEY),
+            "My edited reference",
+        )
+        self.workspace.reference_generation_prompt_edit.editingFinished.emit()
         self.assertEqual(
             self.settings.get(REFERENCE_GENERATION_PROMPT_SETTINGS_KEY),
             "My edited reference",

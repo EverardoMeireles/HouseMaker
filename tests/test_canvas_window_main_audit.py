@@ -280,8 +280,8 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         assert model is not None
         self.assertTrue(
             any(
-                name.endswith("_window_reveals")
-                for name in model.scene.geometry
+                "/opening:window:" in mesh.metadata.get("housemaker_surface_id", "")
+                for mesh in model.scene.geometry.values()
             )
         )
         self.assertFalse(
@@ -326,8 +326,8 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                name.endswith("_window_reveals")
-                for name in restored_model.scene.geometry
+                "/opening:window:" in mesh.metadata.get("housemaker_surface_id", "")
+                for mesh in restored_model.scene.geometry.values()
             )
         )
 

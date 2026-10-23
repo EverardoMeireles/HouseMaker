@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath, PureWindowsPath
+from urllib.parse import unquote
 
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import (
@@ -75,6 +76,9 @@ _SURFACE_ID_PATTERN = re.compile(
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
     r"(?:(?P<wall>wall):(?P<wall_key>[1-9]\d*:[1-9]\d*)|"
     r"(?P<plane>floor|ceiling))|"
+    r"opening:(?P<opening_kind>doorway|window):"
+    r"(?P<opening_id>(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)/"
+    r"reveal:(?P<opening_part>left|right|header|sill)|"
     r"sloped-ceiling:(?P<sloped_ceiling_id>[0-9a-f]{32}):"
     r"(?:part:(?P<sloped_ceiling_part>[a-z0-9][a-z0-9-]*):)?"
     r"(?P<sloped_ceiling_type>ceiling)|"
@@ -962,6 +966,18 @@ def _normalize_surface_id(surface_id: object) -> str:
     match = _SURFACE_ID_PATTERN.fullmatch(normalized_id)
     if match is None:
         raise ValueError(f"Invalid fixed-surface ID: {normalized_id!r}.")
+    if match.group("opening_id") is not None:
+        try:
+            opening_id = unquote(match.group("opening_id"), errors="strict")
+        except UnicodeDecodeError:
+            raise ValueError(f"Invalid fixed-surface ID: {normalized_id!r}.") from None
+        if (
+            not opening_id
+            or opening_id != opening_id.strip()
+            or len(opening_id) > 128
+            or any(ord(character) < 32 for character in opening_id)
+        ):
+            raise ValueError(f"Invalid fixed-surface ID: {normalized_id!r}.")
     stair_part = match.group("stair_part")
     if (
         stair_part is not None
@@ -981,6 +997,8 @@ def _surface_type_for_id(surface_id: str) -> str:
     match = _SURFACE_ID_PATTERN.fullmatch(surface_id)
     if match is None:
         raise ValueError(f"Invalid fixed-surface ID: {surface_id!r}.")
+    if match.group("opening_kind") is not None:
+        return SURFACE_TYPE_WALL
     edit_face_type = match.group("edit_face_type")
     if edit_face_type is not None:
         return str(edit_face_type)

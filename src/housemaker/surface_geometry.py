@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import math
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
+from urllib.parse import quote
 
 import numpy as np
 import shapely
@@ -63,6 +64,8 @@ MIN_WINDOW_SIZE_METERS = 0.05
 WINDOW_PLANE_DISTANCE_TOLERANCE_METERS = 0.01
 WINDOW_PATCH_COVERAGE_TOLERANCE_METERS = 1e-7
 SURFACE_INTERIOR_PROBE_RATIOS = (1e-7, 1e-6, 1e-5, 1e-4, 1e-3)
+OPENING_REVEAL_PARTS = frozenset(("left", "right", "header", "sill"))
+OPENING_KINDS = frozenset(("doorway", "window"))
 
 
 # ### Surface models ###
@@ -88,6 +91,12 @@ class FixedSurface:
     sloped_ceiling_host_surface_id: str | None = None
     sloped_ceiling_part: str | None = None
     surface_alias_ids: tuple[str, ...] = ()
+    opening_kind: str | None = None
+    opening_id: str | None = None
+    opening_part: str | None = None
+    opening_owner_surface_id: str | None = None
+    opening_sloped_ceiling_id: str | None = None
+    opening_host_surface_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.surface_id:
@@ -174,6 +183,35 @@ class FixedSurface:
                 "A fixed surface cannot declare its own ID as an alias."
             )
         object.__setattr__(self, "surface_alias_ids", alias_ids)
+        opening_metadata = (
+            self.opening_kind,
+            self.opening_id,
+            self.opening_part,
+            self.opening_owner_surface_id,
+        )
+        if any(value is not None for value in opening_metadata):
+            if any(value is None for value in opening_metadata):
+                raise ValueError(
+                    "An opening reveal requires complete ownership metadata."
+                )
+            if self.opening_kind not in OPENING_KINDS:
+                raise ValueError("Unknown opening reveal kind.")
+            if self.opening_part not in OPENING_REVEAL_PARTS:
+                raise ValueError("Unknown opening reveal part.")
+            if self.surface_type != SURFACE_TYPE_WALL:
+                raise ValueError("Opening reveals must support wall surface textures.")
+            if (
+                not str(self.opening_id).strip()
+                or not str(self.opening_owner_surface_id).strip()
+            ):
+                raise ValueError(
+                    "An opening reveal requires stable opening and owner IDs."
+                )
+        elif (
+            self.opening_sloped_ceiling_id is not None
+            or self.opening_host_surface_id is not None
+        ):
+            raise ValueError("Only an opening reveal can declare an opening host.")
 
 
 @dataclass(frozen=True)
@@ -798,15 +836,11 @@ def build_base_fixed_surfaces(
             level,
             additional_floor_coherency_geometry=floor_coherency_geometry,
         )
-        doorway_reveals_by_surface_id = _group_doorway_reveals_by_surface_id(
-            _build_level_doorway_reveals(
-                level,
-                include_single_wall_fallback=True,
-            )
+        doorway_reveals = _build_level_doorway_reveals(
+            level,
+            include_single_wall_fallback=True,
         )
-        window_reveals_by_surface_id = _group_window_reveals_by_surface_id(
-            _build_level_window_reveals(level, wall_orientation)
-        )
+        window_reveals = _build_level_window_reveals(level, wall_orientation)
         floor_open_spaces = (
             slab_openings_by_level.get(level.index)
             if clip_open_spaces
@@ -827,8 +861,6 @@ def build_base_fixed_surfaces(
             _build_plain_level_wall_surfaces(
                 level,
                 base_z_meters,
-                doorway_reveals_by_surface_id,
-                window_reveals_by_surface_id,
                 wall_orientation,
             )
         )
@@ -839,18 +871,20 @@ def build_base_fixed_surfaces(
                     room=room,
                     room_index=room_index,
                     base_z_meters=base_z_meters,
-                    doorway_reveals_by_surface_id=(
-                        doorway_reveals_by_surface_id
-                    ),
-                    window_reveals_by_surface_id=(
-                        window_reveals_by_surface_id
-                    ),
                     floor_open_spaces=floor_open_spaces,
                     ceiling_open_spaces=ceiling_open_spaces,
                     wall_orientation=wall_orientation,
                 )
             )
 
+        surfaces.extend(
+            _build_level_opening_reveal_surfaces(
+                level,
+                base_z_meters,
+                doorway_reveals,
+                window_reveals,
+            )
+        )
         surfaces.extend(
             _build_level_residual_horizontal_surfaces(
                 level,
@@ -1089,11 +1123,6 @@ def _build_room_surfaces(
     room: RoomData,
     room_index: int,
     base_z_meters: float,
-    doorway_reveals_by_surface_id: Mapping[
-        str,
-        Sequence[DoorwayReveal],
-    ],
-    window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
     floor_open_spaces: BaseGeometry | None,
     ceiling_open_spaces: BaseGeometry | None,
     wall_orientation: WallOrientationResolver,
@@ -1113,7 +1142,6 @@ def _build_room_surfaces(
             wall_openings=wall_openings,
             room_index=room_index,
             room_identity=room_identity,
-            doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
             interior_polygon=room_polygon,
             preferred_facing_normal_xy=(
                 wall_orientation.resolve_image_paired_wall_facing_normal(
@@ -1121,7 +1149,6 @@ def _build_room_surfaces(
                     wall.end_point,
                 )
             ),
-            window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if wall_surface is not None:
             surfaces.append(wall_surface)
@@ -1176,11 +1203,6 @@ def _build_room_surfaces(
 def _build_plain_level_wall_surfaces(
     level: LevelData,
     base_z_meters: float,
-    doorway_reveals_by_surface_id: Mapping[
-        str,
-        Sequence[DoorwayReveal],
-    ],
-    window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
     wall_orientation: WallOrientationResolver,
 ) -> list[FixedSurface]:
     room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
@@ -1222,7 +1244,6 @@ def _build_plain_level_wall_surfaces(
             wall_openings=wall_openings,
             room_index=None,
             room_identity=None,
-            doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
             interior_polygon=None,
             preferred_facing_normal_xy=(
                 wall_orientation.resolve_image_wall_facing_normal(
@@ -1230,35 +1251,10 @@ def _build_plain_level_wall_surfaces(
                     (end_vertex.x, end_vertex.y),
                 )
             ),
-            window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if surface is not None:
             surfaces.append(surface)
     return surfaces
-
-
-def _group_window_reveals_by_surface_id(
-    reveals: Sequence[WindowReveal],
-) -> dict[str, tuple[WindowReveal, ...]]:
-    grouped: dict[str, list[WindowReveal]] = {}
-    for reveal in reveals:
-        grouped.setdefault(reveal.owner_surface_id, []).append(reveal)
-    return {
-        surface_id: tuple(surface_reveals)
-        for surface_id, surface_reveals in grouped.items()
-    }
-
-
-def _group_doorway_reveals_by_surface_id(
-    reveals: Sequence[DoorwayReveal],
-) -> dict[str, tuple[DoorwayReveal, ...]]:
-    grouped: dict[str, list[DoorwayReveal]] = {}
-    for reveal in reveals:
-        grouped.setdefault(reveal.owner_surface_id, []).append(reveal)
-    return {
-        surface_id: tuple(surface_reveals)
-        for surface_id, surface_reveals in grouped.items()
-    }
 
 
 # ### Window placement helpers ###
@@ -1402,12 +1398,7 @@ def _build_wall_surface(
     wall_openings: Sequence[WallOpening],
     room_index: int | None,
     room_identity: int | None,
-    doorway_reveals_by_surface_id: Mapping[
-        str,
-        Sequence[DoorwayReveal],
-    ],
     interior_polygon: BaseGeometry | None,
-    window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
     preferred_facing_normal_xy: tuple[float, float] | None = None,
 ) -> FixedSurface | None:
     if (
@@ -1418,7 +1409,6 @@ def _build_wall_surface(
 
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
-    duplicate_face_indices: list[int] = []
     for wall_piece in _build_visible_wall_pieces(
         start_point=start_point,
         end_point=end_point,
@@ -1454,34 +1444,10 @@ def _build_wall_surface(
         )
 
     surface_id = build_wall_surface_id(level.index, wall_key, room_identity)
-    for doorway_reveal in doorway_reveals_by_surface_id.get(surface_id, ()):
-        _append_connected_doorway_reveals(
-            vertices=vertices,
-            faces=faces,
-            level=level,
-            base_z_meters=base_z_meters,
-            doorway_reveal=doorway_reveal,
-        )
-
-    for window_reveal in window_reveals_by_surface_id.get(surface_id, ()):
-        _append_connected_window_reveals(
-            vertices=vertices,
-            faces=faces,
-            duplicate_face_indices=duplicate_face_indices,
-            level=level,
-            base_z_meters=base_z_meters,
-            window_reveal=window_reveal,
-        )
-
     mesh = _build_mesh(vertices, faces)
     if mesh is None:
         return None
-    duplicate_area = float(
-        np.sum(mesh.area_faces[duplicate_face_indices])
-        if duplicate_face_indices
-        else 0.0
-    )
-    area = float(mesh.area) - duplicate_area
+    area = float(mesh.area)
     if area <= SURFACE_GEOMETRY_EPSILON:
         return None
     return FixedSurface(
@@ -1498,68 +1464,168 @@ def _build_wall_surface(
     )
 
 
-def _append_connected_window_reveals(
-    vertices: list[list[float]],
-    faces: list[list[int]],
-    duplicate_face_indices: list[int],
-    level: LevelData,
-    base_z_meters: float,
-    window_reveal: WindowReveal,
-) -> None:
-    for image_quad in _build_wall_opening_reveal_quads(
-        window_reveal.reveal_pair,
-        window_reveal.opening,
-        include_sill=True,
-    ):
-        world_quad = tuple(
-            (
-                *level_image_to_world_xy(
-                    level,
-                    local_point[0],
-                    local_point[1],
-                ),
-                base_z_meters + local_point[2],
-            )
-            for local_point in image_quad
-        )
-        _append_quad(vertices, faces, world_quad)
-        duplicate_start = len(faces)
-        _append_quad(
-            vertices,
-            faces,
-            world_quad,
-            reverse_winding=True,
-        )
-        duplicate_face_indices.extend(range(duplicate_start, len(faces)))
+# ### Independent opening reveal surfaces ###
+def build_opening_reveal_surface_id(
+    level_index: int,
+    opening_kind: str,
+    opening_id: str,
+    part: str,
+) -> str:
+    """Keep one opening face's identity independent of its wall dimensions."""
+
+    if opening_kind not in OPENING_KINDS or part not in OPENING_REVEAL_PARTS:
+        raise ValueError("Unknown opening reveal kind or part.")
+    encoded_id = quote(str(opening_id).strip(), safe="-._~")
+    if not encoded_id:
+        raise ValueError("An opening reveal requires a stable opening ID.")
+    return (
+        f"level:{int(level_index)}/opening:{opening_kind}:{encoded_id}"
+        f"/reveal:{part}"
+    )
 
 
-def _append_connected_doorway_reveals(
-    vertices: list[list[float]],
-    faces: list[list[int]],
+def build_opening_reveal_surface(
+    *,
+    level_index: int,
+    opening_kind: str,
+    opening_id: str,
+    part: str,
+    owner_surface_id: str,
+    world_quads: Sequence[Sequence[Sequence[float]]],
+    sloped_ceiling_id: str | None = None,
+    host_surface_id: str | None = None,
+) -> FixedSurface | None:
+    """Build one inward-facing reveal, with an unfolded metric UV strip.
+
+    Each physical quad occurs once. Separate vertices at the strip seams keep
+    arched headers valid without welding incompatible UV coordinates.
+    """
+
+    vertices: list[list[float]] = []
+    faces: list[list[int]] = []
+    uv: list[tuple[float, float]] = []
+    profile_distance = 0.0
+    for source_quad in world_quads:
+        quad = np.asarray(source_quad, dtype=float)
+        if quad.shape != (4, 3) or not np.all(np.isfinite(quad)):
+            continue
+        profile_length = float(np.linalg.norm(quad[1] - quad[0]))
+        first_depth = float(np.linalg.norm(quad[3] - quad[0]))
+        second_depth = float(np.linalg.norm(quad[2] - quad[1]))
+        if min(profile_length, first_depth, second_depth) <= SURFACE_GEOMETRY_EPSILON:
+            continue
+        previous_vertex_count = len(vertices)
+        _append_quad(vertices, faces, tuple(tuple(point) for point in quad))
+        if len(vertices) == previous_vertex_count:
+            continue
+        uv.extend(
+            (
+                (profile_distance, 0.0),
+                (profile_distance + profile_length, 0.0),
+                (profile_distance + profile_length, second_depth),
+                (profile_distance, first_depth),
+            )
+        )
+        profile_distance += profile_length
+    mesh = _build_mesh(vertices, faces)
+    if mesh is None or float(mesh.area) <= SURFACE_GEOMETRY_EPSILON:
+        return None
+    surface_id = build_opening_reveal_surface_id(
+        level_index, opening_kind, opening_id, part
+    )
+    mesh.visual = trimesh.visual.TextureVisuals(uv=np.asarray(uv, dtype=float))
+    mesh.metadata["housemaker_surface_id"] = surface_id
+    return FixedSurface(
+        surface_id=surface_id,
+        surface_type=SURFACE_TYPE_WALL,
+        level_index=level_index,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=float(mesh.area),
+        opening_kind=opening_kind,
+        opening_id=opening_id,
+        opening_part=part,
+        opening_owner_surface_id=owner_surface_id,
+        opening_sloped_ceiling_id=sloped_ceiling_id,
+        opening_host_surface_id=host_surface_id,
+    )
+
+
+def _build_level_opening_reveal_surfaces(
     level: LevelData,
     base_z_meters: float,
-    doorway_reveal: DoorwayReveal,
-) -> None:
-    for image_quad in _build_wall_opening_reveal_quads(
-        doorway_reveal.reveal_pair,
-        doorway_reveal.opening,
-        include_sill=(
-            doorway_reveal.opening.bottom_height_meters
-            > WALL_OPENING_EPSILON
-        ),
-    ):
-        world_quad = tuple(
-            (
-                *level_image_to_world_xy(
-                    level,
-                    local_point[0],
-                    local_point[1],
+    doorway_reveals: Sequence[DoorwayReveal],
+    window_reveals: Sequence[WindowReveal],
+) -> list[FixedSurface]:
+    """Partition tunnel geometry instead of appending it into either wall."""
+
+    surfaces: list[FixedSurface] = []
+    for kind, reveals in (("doorway", doorway_reveals), ("window", window_reveals)):
+        for reveal in reveals:
+            opening = reveal.opening
+            if opening.source_opening_id is None:
+                continue
+            quads_by_part: dict[
+                str, list[tuple[tuple[float, float, float], ...]]
+            ] = {}
+            for image_quad in _build_wall_opening_reveal_quads(
+                reveal.reveal_pair,
+                opening,
+                include_sill=(
+                    kind == "window"
+                    or opening.bottom_height_meters > WALL_OPENING_EPSILON
                 ),
-                base_z_meters + local_point[2],
-            )
-            for local_point in image_quad
-        )
-        _append_quad(vertices, faces, world_quad)
+            ):
+                part = _get_opening_reveal_part(opening, reveal, image_quad)
+                world_quad = tuple(
+                    (
+                        *level_image_to_world_xy(level, point[0], point[1]),
+                        base_z_meters + point[2],
+                    )
+                    for point in image_quad
+                )
+                quads_by_part.setdefault(part, []).append(world_quad)
+            for part, quads in sorted(quads_by_part.items()):
+                surface = build_opening_reveal_surface(
+                    level_index=level.index,
+                    opening_kind=kind,
+                    opening_id=opening.source_opening_id,
+                    part=part,
+                    owner_surface_id=reveal.owner_surface_id,
+                    world_quads=quads,
+                )
+                if surface is not None:
+                    surfaces.append(surface)
+    return surfaces
+
+
+def _get_opening_reveal_part(
+    opening: WallOpening,
+    reveal: DoorwayReveal | WindowReveal,
+    quad: Sequence[Sequence[float]],
+) -> str:
+    """Name jambs and the full curved header by opening-local coordinates."""
+
+    first_width = (
+        (quad[0][0] - opening.center_x) * opening.width_direction_x
+        + (quad[0][1] - opening.center_y) * opening.width_direction_y
+    )
+    second_width = (
+        (quad[1][0] - opening.center_x) * opening.width_direction_x
+        + (quad[1][1] - opening.center_y) * opening.width_direction_y
+    )
+    if abs(first_width - second_width) <= WALL_OPENING_EPSILON:
+        low = reveal.reveal_pair.low_width_position
+        high = reveal.reveal_pair.high_width_position
+        return "left" if abs(first_width - low) <= abs(first_width - high) else "right"
+    floor_height = max(
+        opening.bottom_height_meters,
+        reveal.reveal_pair.first_contact.opening_bottom_height_meters,
+        reveal.reveal_pair.second_contact.opening_bottom_height_meters,
+    )
+    if all(abs(point[2] - floor_height) <= WALL_OPENING_EPSILON for point in quad):
+        return "sill"
+    return "header"
 
 
 # ### Horizontal geometry helpers ###

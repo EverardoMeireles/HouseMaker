@@ -420,6 +420,7 @@ CANVAS_OPENING_ARCH_SIDES = frozenset(
     (CANVAS_OPENING_SIDE_LEFT, CANVAS_OPENING_SIDE_RIGHT)
 )
 CANVAS_OPENING_PREVIEW_COLOR = (1.0, 0.72, 0.18, 0.98)
+OPENING_PROPORTIONS_PREVIEW_FILL_COLOR = (1.0, 0.72, 0.18, 0.18)
 CANVAS_OPENING_SIDE_COLOR = (1.0, 0.46, 0.12, 1.0)
 CANVAS_OPENING_ANCHOR_COLOR = (0.20, 0.86, 0.38, 1.0)
 CANVAS_OPENING_ARCH_COLOR = (0.25, 0.72, 1.0, 1.0)
@@ -1209,6 +1210,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     items_clicked = Signal(object)
     viewport_clicked = Signal(object)
     viewport_double_clicked = Signal(object)
+    first_person_center_clicked = Signal(object)
     first_person_pointer_capture_changed = Signal(bool)
     rectangle_pointer_pressed = Signal(object)
     rectangle_pointer_moved = Signal(object)
@@ -1270,10 +1272,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._vertex_selection_release_suppressed = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_pointer_captured = False
+        self._first_person_center_click_pending = False
         self._first_person_ctrl_interaction_enabled = False
         self._first_person_ctrl_interaction_active = False
         self._control_modifier_pressed = False
         self._first_person_pointer_release_latched = False
+        self._first_person_focus_reentry_pending = False
         self._first_person_application_deactivated = False
         self._application_event_filter_installed = False
         self._first_person_camera_pose = CameraPose(
@@ -1741,6 +1745,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def release_first_person_pointer_capture(self) -> None:
         """Release mouse-look without changing the first-person camera mode."""
 
+        self._first_person_center_click_pending = False
         was_pointer_captured = self._first_person_pointer_captured
         self._pressed_movement_keys.clear()
         if not was_pointer_captured:
@@ -1794,6 +1799,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             or self._primary_pointer_drag_reserved
             or self._face_selection_gesture_active
             or self.is_first_person_pointer_captured
+            or self._first_person_focus_reentry_pending
             or self._first_person_application_deactivated
         ):
             return
@@ -2034,7 +2040,24 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self._sync_view_to_first_person_camera_pose()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.is_first_person_active
+            and self._first_person_ctrl_interaction_enabled
+            and self._first_person_focus_reentry_pending
+        ):
+            # Ctrl may have been released in another window, where this view
+            # cannot observe its key event. The returning click is authoritative.
+            control_pressed = bool(
+                getattr(event, "modifiers", QApplication.keyboardModifiers)()
+                & Qt.KeyboardModifier.ControlModifier
+            )
+            self._set_control_modifier_pressed(control_pressed)
+            self._first_person_ctrl_interaction_active = control_pressed
+            self._first_person_focus_reentry_pending = False
+            self._first_person_application_deactivated = False
         if event.button() == Qt.MouseButton.LeftButton:
+            self._first_person_center_click_pending = False
             self._face_selection_release_suppressed = False
             self._vertex_selection_release_suppressed = False
             self._primary_pointer_release_suppressed = False
@@ -2124,7 +2147,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             event.button() == Qt.MouseButton.LeftButton
             and not self.is_first_person_pointer_captured
-            and self._first_person_viewport_interaction_is_allowed()
+            and (
+                self._first_person_viewport_interaction_is_allowed()
+                or self._first_person_pointer_release_latched
+            )
         ):
             self.click_press_position = event.position()
             self.primary_pointer_pressed.emit(event.position())
@@ -2133,6 +2159,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 return
 
         if self.is_first_person_active:
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self.is_first_person_pointer_captured
+                and self._viewport_click_selection_enabled
+            ):
+                self._first_person_center_click_pending = True
             if event.button() == Qt.MouseButton.RightButton:
                 if self._first_person_ctrl_interaction_enabled:
                     self._first_person_pointer_release_latched = True
@@ -2140,8 +2172,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             elif not self.is_first_person_pointer_captured:
                 if (
                     event.button() == Qt.MouseButton.LeftButton
-                    and self._first_person_pointer_release_latched
+                    and self._first_person_ctrl_interaction_enabled
                     and not self._first_person_ctrl_interaction_active
+                    and not self._primary_pointer_tool_active
                 ):
                     self._capture_first_person_pointer()
                 else:
@@ -2174,10 +2207,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             self._viewport_click_selection_enabled
             and event.button() == Qt.MouseButton.LeftButton
-            and not self.is_first_person_pointer_captured
         ):
+            self._first_person_center_click_pending = False
             self._primary_pointer_release_suppressed = True
-            self.viewport_double_clicked.emit(event.position())
+            position = (
+                QPointF(self.rect().center())
+                if self.is_first_person_pointer_captured
+                else event.position()
+            )
+            self.viewport_double_clicked.emit(position)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -2272,6 +2310,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
 
         if self.is_first_person_active:
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self._first_person_center_click_pending
+            ):
+                self._first_person_center_click_pending = False
+                if self.is_first_person_pointer_captured:
+                    self.first_person_center_clicked.emit(QPointF(self.rect().center()))
+                event.accept()
+                return
             if (
                 not self.is_first_person_pointer_captured
                 and event.button() == Qt.MouseButton.LeftButton
@@ -2534,6 +2581,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().keyReleaseEvent(event)
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        if self.is_first_person_active:
+            self._first_person_focus_reentry_pending = True
         self.cancel_transient_pointer_interactions()
         if self._primary_pointer_drag_reserved:
             self.primary_pointer_cancel_requested.emit()
@@ -2567,6 +2616,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        self._first_person_focus_reentry_pending = False
         self._first_person_application_deactivated = False
         if self._first_person_ctrl_interaction_enabled:
             self._install_first_person_ctrl_event_filter()
@@ -2602,6 +2652,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._navigation_mode = NAVIGATION_MODE_FIRST_PERSON
         self._is_middle_navigation_active = False
         self._first_person_pointer_release_latched = False
+        self._first_person_focus_reentry_pending = False
         if self._first_person_ctrl_interaction_enabled:
             self._install_first_person_ctrl_event_filter()
         control_pressed = bool(
@@ -2626,6 +2677,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
         self.primary_pointer_left.emit()
         self._first_person_pointer_release_latched = False
+        self._first_person_focus_reentry_pending = False
         self._first_person_pointer_captured = True
         self.setFocus(Qt.FocusReason.OtherFocusReason)
         self.setCursor(Qt.CursorShape.BlankCursor)
@@ -2642,6 +2694,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.release_first_person_pointer_capture()
         self._first_person_ctrl_interaction_active = False
         self._first_person_pointer_release_latched = False
+        self._first_person_focus_reentry_pending = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._pressed_movement_keys.clear()
         self._movement_timer.stop()
@@ -4756,6 +4809,7 @@ class GlbViewerWidget(QWidget):
     landing_edit_cancelled = Signal(str)
     landing_deletion_requested = Signal(str)
     landing_generation_requested = Signal(str)
+    opening_proportions_requested = Signal(object)
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
     window_placement_requested = Signal(object)
@@ -4895,6 +4949,9 @@ class GlbViewerWidget(QWidget):
         self._selected_projection_camera_id: str | None = None
         self._doorway_preview_outline_positions: np.ndarray | None = None
         self._doorway_preview_outline_item: gl.GLLinePlotItem | None = None
+        self._opening_proportions_preview_target: CanvasOpeningTarget | None = None
+        self._opening_proportions_preview_outline_item: gl.GLLinePlotItem | None = None
+        self._opening_proportions_preview_profile_item: gl.GLMeshItem | None = None
         self._level_transform_preview_level_index: int | None = None
         self._level_transform_preview_source_positions: np.ndarray | None = None
         self._level_transform_preview_delta_matrix: np.ndarray | None = None
@@ -4982,6 +5039,10 @@ class GlbViewerWidget(QWidget):
         self._placed_object_render_groups: dict[
             str,
             _PlacedObjectRenderGroup,
+        ] = {}
+        self._pending_placed_object_previews: dict[str, PreviewPlacedObject] = {}
+        self._pending_placed_object_source_meshes: dict[
+            str, tuple[trimesh.Trimesh, ...]
         ] = {}
         self._landing_levels: tuple[LevelData, ...] = ()
         self._landing_previews: dict[str, PreviewPlacedObject] = {}
@@ -5127,6 +5188,7 @@ class GlbViewerWidget(QWidget):
         self._tour_gizmo_items: list[GLGraphicsItem] = []
         self._tour_gizmo_size = TOUR_GIZMO_MIN_SIZE_METERS
         self._canvas_opening_targets: dict[str, CanvasOpeningTarget] = {}
+        self._pending_canvas_opening_keys: frozenset[str] = frozenset()
         self._placed_door_opening_references: dict[
             str,
             CanvasOpeningReference,
@@ -5134,6 +5196,13 @@ class GlbViewerWidget(QWidget):
         self._selected_canvas_opening_key: str | None = None
         self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
         self._canvas_opening_gizmo_items: list[GLGraphicsItem] = []
+        self._opening_proportions_items: list[GLGraphicsItem] = []
+        self._opening_proportions_center: np.ndarray | None = None
+        self._opening_proportions_hit_radius = 0.0
+        self._opening_proportions_pressed_reference: CanvasOpeningReference | None = None
+        self._opening_proportions_hovered = False
+        self._opening_proportions_previous_cursor: QCursor | None = None
+        self._opening_proportions_previous_cursor_explicit = False
         self._canvas_opening_creation_items: list[GLGraphicsItem] = []
         self._canvas_opening_creation_pressed_reference: (
             CanvasOpeningReference | None
@@ -6487,6 +6556,65 @@ class GlbViewerWidget(QWidget):
         )
         self._refresh_doorway_preview_outline_item()
 
+    # ### Opening proportions live preview API ###
+    def set_opening_proportions_preview(self, target: CanvasOpeningTarget) -> None:
+        """Preview an opening profile without editing its mesh, target or camera."""
+
+        if not isinstance(target, CanvasOpeningTarget):
+            raise TypeError(
+                "An opening proportions preview requires a Canvas opening target."
+            )
+        outline, vertices, faces = _build_opening_proportions_preview_geometry(target)
+        self._opening_proportions_preview_target = target
+        profile = self._opening_proportions_preview_profile_item
+        if profile is None or profile not in self.view.items:
+            profile = gl.GLMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                color=OPENING_PROPORTIONS_PREVIEW_FILL_COLOR,
+                smooth=False,
+                computeNormals=False,
+                drawFaces=True,
+                drawEdges=False,
+            )
+            profile.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            profile.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 4.0)
+            self.view.addItem(profile)
+            self._opening_proportions_preview_profile_item = profile
+        else:
+            profile.setMeshData(vertexes=vertices, faces=faces)
+        item = self._opening_proportions_preview_outline_item
+        if item is None or item not in self.view.items:
+            item = gl.GLLinePlotItem(
+                pos=outline,
+                color=CANVAS_OPENING_PREVIEW_COLOR,
+                width=CANVAS_OPENING_OUTLINE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 5.0)
+            self.view.addItem(item)
+            self._opening_proportions_preview_outline_item = item
+        else:
+            item.setData(pos=outline)
+        self.view.update()
+
+    def clear_opening_proportions_preview(self) -> None:
+        """Discard the temporary outline and fill without applying an edit."""
+
+        self._opening_proportions_preview_target = None
+        for item in (
+            self._opening_proportions_preview_outline_item,
+            self._opening_proportions_preview_profile_item,
+        ):
+            if item is not None and hasattr(self, "view") and item in self.view.items:
+                self.view.removeItem(item)
+        self._opening_proportions_preview_outline_item = None
+        self._opening_proportions_preview_profile_item = None
+        if hasattr(self, "view"):
+            self.view.update()
+
     # ### Level transform preview API ###
     def set_level_transform_preview(
         self,
@@ -6581,6 +6709,9 @@ class GlbViewerWidget(QWidget):
         self.view = SelectableGLViewWidget()
         self.view.frame_about_to_render.connect(
             self._update_landing_generation_control_geometry
+        )
+        self.view.frame_about_to_render.connect(
+            self._update_opening_proportions_control_geometry
         )
         self.view.setBackgroundColor((24, 24, 28))
         self.view.set_item_click_selection_enabled(False)
@@ -7204,12 +7335,15 @@ class GlbViewerWidget(QWidget):
     def get_visible_placed_object_ids(self) -> tuple[str, ...]:
         """Return placed objects visible under the current focus mode."""
 
-        if not self._canvas_objects_are_visible() or self.model is None:
+        if not self._canvas_objects_are_visible():
             return ()
         return tuple(
             dict.fromkeys(
                 preview.object_id
-                for preview in self.model.preview_placed_objects
+                for preview in (
+                    *(self.model.preview_placed_objects if self.model is not None else ()),
+                    *self._pending_placed_object_previews.values(),
+                )
                 if self._canvas_placed_object_is_visible(preview.object_id)
             )
         )
@@ -7495,8 +7629,10 @@ class GlbViewerWidget(QWidget):
                     None,
                 )
             )
-        opening = self._get_selected_canvas_opening_target()
-        if opening is not None and opening.wall_surface_id not in visible_surface_ids:
+        opening = self._canvas_opening_targets.get(
+            self._selected_canvas_opening_key or ""
+        )
+        if opening is not None and not self._canvas_opening_target_is_visible(opening):
             self._set_selected_canvas_opening_key(None)
         visible_object_ids = set(self.get_visible_placed_object_ids())
         self.set_selected_placed_object_ids(
@@ -8396,6 +8532,7 @@ class GlbViewerWidget(QWidget):
             if (
                 surface.surface_type != SURFACE_TYPE_WALL
                 or _get_fixed_surface_source_id(surface) is not None
+                or getattr(surface, "opening_id", None) is not None
             ):
                 continue
             targets[surface.surface_id] = surface
@@ -9278,6 +9415,27 @@ class GlbViewerWidget(QWidget):
 
         if not isinstance(bindings, Mapping):
             raise TypeError("Placed-door opening bindings must be a mapping.")
+        if any(
+            not isinstance(reference, CanvasOpeningReference)
+            for reference in bindings.values()
+        ):
+            raise TypeError(
+                "Placed-door bindings require CanvasOpeningReference values."
+            )
+        if any(
+            reference.kind != CANVAS_OPENING_DOORWAY for reference in bindings.values()
+        ):
+            raise ValueError("Placed doors can only be bound to doorways.")
+        return self.set_placed_opening_bindings(bindings)
+
+    def set_placed_opening_bindings(
+        self,
+        bindings: Mapping[str, CanvasOpeningReference],
+    ) -> bool:
+        """Redirect installed door and window meshes to their opening frames."""
+
+        if not isinstance(bindings, Mapping):
+            raise TypeError("Placed opening bindings must be a mapping.")
 
         normalized_bindings: dict[str, CanvasOpeningReference] = {}
         for raw_object_id, reference in bindings.items():
@@ -9288,8 +9446,6 @@ class GlbViewerWidget(QWidget):
                 raise TypeError(
                     "Placed-door bindings require CanvasOpeningReference values."
                 )
-            if reference.kind != CANVAS_OPENING_DOORWAY:
-                raise ValueError("Placed doors can only be bound to doorways.")
             if object_id in normalized_bindings:
                 raise ValueError(f"Duplicate placed-door object ID: {object_id!r}.")
             normalized_bindings[object_id] = reference
@@ -9313,6 +9469,8 @@ class GlbViewerWidget(QWidget):
     def set_canvas_opening_targets(
         self,
         targets: tuple[CanvasOpeningTarget, ...],
+        *,
+        pending_keys: tuple[str, ...] = (),
     ) -> None:
         """Replace the explicit hole-plane targets available for 3D editing."""
 
@@ -9331,11 +9489,15 @@ class GlbViewerWidget(QWidget):
                 raise ValueError(f"Duplicate Canvas opening target: {target.key!r}.")
             normalized_targets[target.key] = target
 
+        self.clear_opening_proportions_preview()
         self._cancel_canvas_opening_creation_press()
         self._cancel_canvas_opening_edit_drag()
         selected_key = self._selected_canvas_opening_key
         previous_targets = self._canvas_opening_targets
         self._canvas_opening_targets = normalized_targets
+        self._pending_canvas_opening_keys = frozenset(pending_keys).intersection(
+            normalized_targets
+        )
         if self._door_placement_door_id is not None:
             retained_keys = self._door_placement_compatible_opening_keys.intersection(
                 normalized_targets
@@ -9362,6 +9524,92 @@ class GlbViewerWidget(QWidget):
             self._set_selected_canvas_opening_key(None)
             return
         self._refresh_canvas_opening_gizmo_items()
+
+    def set_pending_canvas_opening_target(
+        self, target: CanvasOpeningTarget, *, pending: bool = True,
+    ) -> None:
+        """Expose a new opening's controls while its wall cut is still pending."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(target, CanvasOpeningTarget):
+            raise TypeError("A Canvas opening target is required.")
+        self._canvas_opening_targets[target.key] = target
+        if pending:
+            self._pending_canvas_opening_keys = (
+                self._pending_canvas_opening_keys | {target.key}
+            )
+        else:
+            self._pending_canvas_opening_keys = (
+                self._pending_canvas_opening_keys - {target.key}
+            )
+        self._refresh_canvas_opening_gizmo_items()
+
+    def _canvas_opening_target_is_visible(self, target: CanvasOpeningTarget) -> bool:
+        """A pending host can be edited before it has a rendered surface ID."""
+
+        wall = self._canvas_surface_targets.get(target.wall_surface_id)
+        if wall is not None:
+            return self._canvas_surface_is_visible(wall)
+        return bool(
+            target.key in self._pending_canvas_opening_keys
+            and self._canvas_level_is_visible(target.reference.level_index)
+            and self._canvas_surface_type_is_visible(
+                SURFACE_TYPE_CEILING if target.sloped_ceiling_id else SURFACE_TYPE_WALL
+            )
+        )
+
+    def _get_canvas_opening_pick_surfaces(
+        self,
+        target: CanvasOpeningTarget | None,
+        *,
+        for_controls: bool = False,
+    ) -> tuple[FixedSurface, ...]:
+        """Keep nearer walls blocking, except an opening's own stale cut.
+
+        Selected controls can overlay their own jambs and wall skins, but
+        must never capture a click through an unrelated wall. Host planes
+        also recognize the old edge IDs before a delayed mesh rebuild.
+        """
+
+        allow_host = target is not None and (
+            for_controls or target.key in self._pending_canvas_opening_keys
+        )
+        return tuple(
+            surface
+            for surface in self._canvas_surface_targets.values()
+            if self._canvas_surface_is_visible(surface)
+            and not (
+                allow_host
+                and target is not None
+                and _canvas_opening_surface_is_host(target, surface)
+            )
+            and not (
+                for_controls
+                and target is not None
+                and surface.level_index == target.reference.level_index
+                and target.reference.stable_id is not None
+                and surface.opening_id == target.reference.stable_id
+            )
+        )
+
+    def _canvas_opening_control_is_occluded(
+        self,
+        target: CanvasOpeningTarget,
+        ray_origin: object,
+        ray_direction: object,
+        distance: float,
+    ) -> bool:
+        """Do not let a selected overlay intercept clicks behind solid walls."""
+
+        if not self._canvas_opening_target_is_visible(target):
+            return True
+        blocker = _get_nearest_fixed_surface_ray_hit(
+            self._get_canvas_opening_pick_surfaces(target, for_controls=True),
+            ray_origin,
+            ray_direction,
+        )
+        return blocker is not None and blocker[2] < distance - 1e-6
 
     def update_canvas_opening_target(self, target: CanvasOpeningTarget) -> None:
         """Refresh one opening's live shape without disturbing its selection."""
@@ -9410,7 +9658,7 @@ class GlbViewerWidget(QWidget):
         target = self._canvas_opening_targets.get(reference.key)
         if (
             target is None
-            or target.wall_surface_id not in self.get_visible_canvas_surface_ids()
+            or not self._canvas_opening_target_is_visible(target)
         ):
             return False
         return self._set_selected_canvas_opening_key(target.key)
@@ -9423,8 +9671,7 @@ class GlbViewerWidget(QWidget):
         )
         if not isinstance(target, CanvasOpeningTarget):
             return None
-        wall = self._canvas_surface_targets.get(target.wall_surface_id)
-        if wall is None or not self._canvas_surface_is_visible(wall):
+        if not self._canvas_opening_target_is_visible(target):
             return None
         return target
 
@@ -9699,7 +9946,7 @@ class GlbViewerWidget(QWidget):
             tuple(
                 target
                 for target in self._canvas_opening_targets.values()
-                if target.wall_surface_id in self.get_visible_canvas_surface_ids()
+                if self._canvas_opening_target_is_visible(target)
             ),
             *camera_ray,
         )
@@ -9849,6 +10096,121 @@ class GlbViewerWidget(QWidget):
                 mirrored_horizontally,
                 mirrored_depthwise,
             )
+        return True
+
+    # ### Pending placed-object previews ###
+    def get_pending_placed_object_ids(self) -> tuple[str, ...]:
+        """Return real scene IDs awaiting the caller's delayed mesh rebuild."""
+
+        return tuple(self._pending_placed_object_previews)
+
+    def get_pending_placed_object_previews(self) -> tuple[PreviewPlacedObject, ...]:
+        """Return immutable records with the most recently edited transforms."""
+
+        return tuple(self._pending_placed_object_previews.values())
+
+    @property
+    def is_placed_object_interaction_active(self) -> bool:
+        """Whether a transform or clone drag currently owns an object root."""
+
+        return bool(
+            self._placed_object_transform_drag is not None
+            or self._placed_object_instance_drag is not None
+        )
+
+    def clear_pending_placed_object_previews(self) -> bool:
+        """Retire temporary green models, restoring any committed counterparts."""
+
+        return self.set_pending_placed_object_previews(())
+
+    def set_pending_placed_object_previews(
+        self, previews: Sequence[PreviewPlacedObject],
+    ) -> bool:
+        """Replace editable placement overlays without rebuilding the scene.
+
+        Meshes are owned color-only copies. Real scene IDs keep ordinary pick,
+        transform and instance handles working before the final model arrives.
+        The caller retires these previews after displaying that final revision.
+        """
+
+        incoming = tuple(previews)
+        if not all(isinstance(preview, PreviewPlacedObject) for preview in incoming):
+            raise TypeError("Pending objects require PreviewPlacedObject records.")
+        if len({preview.object_id for preview in incoming}) != len(incoming):
+            raise ValueError("Pending object IDs must be unique.")
+        previous = self._pending_placed_object_previews
+        next_previews: dict[str, PreviewPlacedObject] = {}
+        next_sources: dict[str, tuple[trimesh.Trimesh, ...]] = {}
+        geometry_changed: set[str] = set()
+        for preview in incoming:
+            old = previous.get(preview.object_id)
+            source_meshes = self._pending_placed_object_source_meshes.get(
+                preview.object_id, (),
+            )
+            same_geometry = bool(
+                old is not None
+                and (
+                    _same_pending_meshes(source_meshes, preview.meshes)
+                    or _same_pending_meshes(old.meshes, preview.meshes)
+                )
+                and old.symmetric_preview_orientation
+                == preview.symmetric_preview_orientation
+                and old.symmetric_preview_plane_coordinate
+                == preview.symmetric_preview_plane_coordinate
+            )
+            meshes = (
+                old.meshes
+                if same_geometry and old is not None
+                else tuple(
+                    _build_pending_placed_object_mesh(mesh) for mesh in preview.meshes
+                )
+            )
+            next_previews[preview.object_id] = replace(preview, meshes=meshes)
+            next_sources[preview.object_id] = (
+                source_meshes if same_geometry else preview.meshes
+            )
+            if not same_geometry:
+                geometry_changed.add(preview.object_id)
+        if previous.keys() == next_previews.keys() and all(
+            _pending_placed_object_previews_match(previous[object_id], preview)
+            for object_id, preview in next_previews.items()
+        ):
+            return False
+
+        removed_ids = previous.keys() - next_previews.keys()
+        drag = self._placed_object_transform_drag
+        if drag is not None and drag.object_id in (removed_ids | geometry_changed):
+            self._cancel_placed_object_gizmo_drag()
+        instance_drag = self._placed_object_instance_drag
+        if (
+            instance_drag is not None
+            and instance_drag.source_scene_object_id in removed_ids
+        ):
+            self._cancel_placed_object_instance_drag()
+        self._pending_placed_object_previews = next_previews
+        self._pending_placed_object_source_meshes = next_sources
+        for object_id in previous.keys() | next_previews.keys():
+            group = self._placed_object_render_groups.get(object_id)
+            if group is None:
+                continue
+            preview = next_previews.get(object_id)
+            if preview is None or object_id in geometry_changed:
+                self.view.removeItem(group.root_item)
+                del self._placed_object_render_groups[object_id]
+            elif drag is None or drag.object_id != object_id:
+                group.preview = preview
+                group.current_transform = np.asarray(preview.placement_transform).copy()
+                group.root_item.setTransform(
+                    _numpy_transform_to_qt(group.current_transform)
+                )
+                self._sync_live_symmetric_preview_bindings(
+                    object_id, group.current_transform,
+                )
+        self._canvas_selection_geometry_revision += 1
+        self._invalidate_canvas_rectangle_selection_requests()
+        self._add_placed_object_items()
+        self._apply_render_display_options()
+        self._sync_placed_object_selection_rendering()
         return True
 
     # ### Placed-object transform API ###
@@ -10187,7 +10549,7 @@ class GlbViewerWidget(QWidget):
             target = self._canvas_opening_targets.get(reference.key)
             if (
                 target is not None
-                and target.wall_surface_id in self.get_visible_canvas_surface_ids()
+                and self._canvas_opening_target_is_visible(target)
             ):
                 return self.select_canvas_opening(reference)
         if normalized_ids:
@@ -13764,6 +14126,12 @@ class GlbViewerWidget(QWidget):
 
     def _connect_window_editor_input(self) -> None:
         self.view.viewport_clicked.connect(self._handle_window_wall_pick_requested)
+        self.view.first_person_center_clicked.connect(
+            self._handle_first_person_center_pick_requested
+        )
+        self.view.viewport_double_clicked.connect(
+            self._handle_opening_proportions_double_click_requested
+        )
 
     def _connect_placed_object_editor_input(self) -> None:
         """Connect pointer events used by editable placed-model previews."""
@@ -13787,6 +14155,13 @@ class GlbViewerWidget(QWidget):
         )
         self.view.primary_pointer_hovered.connect(
             self._handle_landing_generation_pointer_hovered
+        )
+        self.view.primary_pointer_hovered.connect(
+            self._handle_opening_proportions_pointer_hovered
+        )
+        self.view.primary_pointer_left.connect(self._clear_opening_proportions_hover)
+        self.view.first_person_pointer_capture_changed.connect(
+            self._clear_opening_proportions_hover
         )
         self.view.primary_pointer_left.connect(self._clear_landing_generation_hover)
         self.view.first_person_pointer_capture_changed.connect(
@@ -13845,6 +14220,11 @@ class GlbViewerWidget(QWidget):
         if self.is_window_placement_active():
             self.cancel_window_placement()
 
+    def _handle_first_person_center_pick_requested(self, position: QPointF) -> None:
+        """Use the normal CPU picker at the crosshair without seeing through walls."""
+
+        self._handle_window_wall_pick_requested(position)
+
     def _handle_window_wall_pick_requested(
         self,
         position: QPointF,
@@ -13890,7 +14270,7 @@ class GlbViewerWidget(QWidget):
             tuple(
                 target
                 for target in self._canvas_opening_targets.values()
-                if target.wall_surface_id in self.get_visible_canvas_surface_ids()
+                if self._canvas_opening_target_is_visible(target)
             ),
             ray_origin,
             ray_direction,
@@ -13908,10 +14288,8 @@ class GlbViewerWidget(QWidget):
             ray_direction,
         )
         surface_hit = _get_nearest_fixed_surface_ray_hit(
-            tuple(
-                surface
-                for surface in self._canvas_surface_targets.values()
-                if self._canvas_surface_is_visible(surface)
+            self._get_canvas_opening_pick_surfaces(
+                None if opening_hit is None else opening_hit[0]
             ),
             ray_origin,
             ray_direction,
@@ -13971,8 +14349,14 @@ class GlbViewerWidget(QWidget):
             ),
             None,
         )
-        if opening_hit is not None and (
-            winning_kind in {None, "surface"}
+        # A hole-plane hit must not steal a click from its actual jamb/sill.
+        reveal_is_nearest = bool(
+            winning_kind == "surface"
+            and surface_hit is not None
+            and getattr(surface_hit[0], "opening_id", None) is not None
+        )
+        if opening_hit is not None and not reveal_is_nearest and (
+            nearest_distance is None
             or (
                 nearest_distance is not None
                 and opening_hit[2] <= nearest_distance + 1e-9
@@ -14265,6 +14649,16 @@ class GlbViewerWidget(QWidget):
                 self.view.reserve_primary_pointer_drag()
             return
         camera_ray = self.view.build_camera_ray(position)
+        if (
+            camera_ray is not None
+            and not self.view.is_first_person_pointer_captured
+            and self._pick_opening_proportions_control(camera_ray)
+        ):
+            target = self._get_selected_canvas_opening_target()
+            if target is not None:
+                self._opening_proportions_pressed_reference = target.reference
+                self.view.reserve_primary_pointer_drag()
+                return
         if camera_ray is not None and self._pick_landing_generation_control(camera_ray):
             self._landing_generation_press_id = self._selected_landing_id
             self.view.reserve_primary_pointer_drag()
@@ -14416,6 +14810,21 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
         """Finish the one Canvas gizmo that currently owns the pointer."""
 
+        if self._opening_proportions_pressed_reference is not None:
+            reference = self._opening_proportions_pressed_reference
+            self._opening_proportions_pressed_reference = None
+            ray = self.view.build_camera_ray(position)
+            target = self._get_selected_canvas_opening_target()
+            should_emit = (
+                target is not None
+                and target.reference == reference
+                and ray is not None
+                and self._pick_opening_proportions_control(ray)
+            )
+            self.view.release_primary_pointer_drag()
+            if should_emit:
+                self.opening_proportions_requested.emit(reference)
+            return
         if self._landing_placement_active and self._landing_placement_pressed:
             self._update_landing_placement_hover(position)
             point = self._landing_placement_hover
@@ -14492,6 +14901,10 @@ class GlbViewerWidget(QWidget):
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
         """Cancel the Canvas gizmo that owns the pointer before navigation."""
 
+        if self._opening_proportions_pressed_reference is not None:
+            self._opening_proportions_pressed_reference = None
+            self.view.cancel_primary_pointer_drag()
+            return
         if self.cancel_landing_placement():
             return
         if self._landing_generation_press_id is not None:
@@ -14549,6 +14962,10 @@ class GlbViewerWidget(QWidget):
             not self._window_editing_enabled
             or self.model is None
             or self.view.is_first_person_pointer_captured
+            or (
+                self.view.is_first_person_active
+                and not self.view.is_first_person_ctrl_interaction_active
+            )
         ):
             return False
         self._invalidate_canvas_rectangle_selection_requests()
@@ -17260,6 +17677,8 @@ class GlbViewerWidget(QWidget):
                 self.begin_architectural_trim_placement(retained_trim_placement_kind)
 
     def clear_model(self) -> None:
+        self._pending_placed_object_previews = {}
+        self._pending_placed_object_source_meshes = {}
         self._invalidate_progressive_texture_updates()
         self._hover_point_light_position = None
         self.view.cancel_transient_pointer_interactions()
@@ -19670,6 +20089,10 @@ class GlbViewerWidget(QWidget):
         self._add_grid()
         if self.model is None:
             self._set_default_camera()
+            if self._placed_object_editing_enabled:
+                self._add_placed_object_items()
+                self._apply_render_display_options()
+                self._sync_placed_object_selection_rendering()
             self._refresh_face_selection_items()
             self._refresh_vertex_selection_items()
             self._refresh_canvas_surface_selection_outlines()
@@ -20092,11 +20515,14 @@ class GlbViewerWidget(QWidget):
     def _add_placed_object_items(self) -> None:
         """Render each Canvas object below one independently movable root."""
 
-        if self.model is None:
-            return
         has_symmetric_preview = False
+        object_previews = {
+            preview.object_id: preview
+            for preview in (() if self.model is None else self.model.preview_placed_objects)
+        }
+        object_previews.update(self._pending_placed_object_previews)
         previews = (
-            *(self.model.preview_placed_objects if self._canvas_objects_are_visible() else ()),
+            *(object_previews.values() if self._canvas_objects_are_visible() else ()),
             *(preview for preview in self._landing_previews.values() if self._canvas_level_is_visible(self._landing_records[preview.object_id.removeprefix("landing:")][0].index)),
         )
         for preview in previews:
@@ -20111,6 +20537,11 @@ class GlbViewerWidget(QWidget):
                 preview.meshes,
                 root_item,
             )
+            pending = preview.object_id in self._pending_placed_object_previews
+            if pending:
+                for part in retained_parts:
+                    part.mesh_item.setGLOptions("translucent")
+                    part.mesh_item.opts["edgeColor"] = OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR
             mirrored_meshes = _build_local_symmetric_preview_meshes(preview)
             symmetric_groups = [
                 group
@@ -20119,10 +20550,15 @@ class GlbViewerWidget(QWidget):
                     group := self._create_symmetric_preview_mesh_group(
                         mesh,
                         root_item,
+                        fade_enabled=not pending,
                     )
                 )
                 is not None
             ]
+            if pending:
+                for group in symmetric_groups:
+                    group.mesh_item.setGLOptions("translucent")
+                    group.mesh_item.opts["edgeColor"] = OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR
             progressive_bundle = self._progressive_object_texture_bundles.get(
                 preview.object_id
             )
@@ -20276,6 +20712,7 @@ class GlbViewerWidget(QWidget):
     def _refresh_canvas_opening_gizmo_items(self) -> None:
         """Draw the selected opening outline and its available controls."""
 
+        self._remove_opening_proportions_control()
         self._remove_canvas_opening_gizmo_items()
         self._remove_canvas_opening_creation_items()
         if self._level_transform_preview_level_index is not None:
@@ -20311,7 +20748,7 @@ class GlbViewerWidget(QWidget):
         )
         outline_color = (
             CANVAS_OPENING_PREVIEW_COLOR
-            if drag is not None
+            if drag is not None or target.key in self._pending_canvas_opening_keys
             else CANVAS_SURFACE_SELECTION_COLOR
         )
         outline_item = gl.GLLinePlotItem(
@@ -20392,6 +20829,7 @@ class GlbViewerWidget(QWidget):
             )
             self._add_canvas_opening_overlay_item(arch_handle_item)
         self._add_canvas_opening_creation_items(target)
+        self._add_opening_proportions_control()
         self.view.update()
 
     def _add_canvas_opening_overlay_item(
@@ -20413,6 +20851,248 @@ class GlbViewerWidget(QWidget):
             if item in self.view.items:
                 self.view.removeItem(item)
         self._canvas_opening_gizmo_items = []
+
+    # ### Opening proportions control and activation ###
+    def _add_opening_proportions_control(self) -> None:
+        """Draw a camera-facing asterisk beside one selected opening."""
+
+        background = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3)),
+            color=LANDING_GENERATION_CONTROL_COLOR,
+            size=LANDING_GENERATION_CONTROL_SIZE_PIXELS,
+            pxMode=True,
+        )
+        icon = gl.GLLinePlotItem(
+            pos=np.zeros((6, 3)),
+            color=LANDING_GENERATION_CONTROL_ICON_COLOR,
+            width=3.0,
+            antialias=True,
+            mode="lines",
+        )
+        for item in (background, icon):
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 30.0)
+            self.view.addItem(item)
+            self._opening_proportions_items.append(item)
+        self._update_opening_proportions_control_geometry()
+
+    def _remove_opening_proportions_control(self) -> None:
+        self._clear_opening_proportions_hover()
+        if hasattr(self, "view"):
+            for item in self._opening_proportions_items:
+                if item in self.view.items:
+                    self.view.removeItem(item)
+        self._opening_proportions_items = []
+        self._opening_proportions_center = None
+        self._opening_proportions_hit_radius = 0.0
+
+    def _update_opening_proportions_control_geometry(self) -> None:
+        """Keep the clickable icon screen-sized as the camera moves."""
+
+        if not self._opening_proportions_items:
+            return
+        target = self._get_selected_canvas_opening_target()
+        if target is None:
+            return
+        inverse_view, invertible = self.view.viewMatrix().inverted()
+        if not invertible:
+            return
+        pivot = np.asarray(target.get_world_center(), dtype=float)
+        right_vector = inverse_view.mapVector(QVector3D(1.0, 0.0, 0.0))
+        up_vector = inverse_view.mapVector(QVector3D(0.0, 1.0, 0.0))
+        right = np.asarray((right_vector.x(), right_vector.y(), right_vector.z()))
+        up = np.asarray((up_vector.x(), up_vector.y(), up_vector.z()))
+        try:
+            pixel_size = float(self.view.pixelSize(QVector3D(*pivot)))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if not math.isfinite(pixel_size) or pixel_size <= 0.0:
+            pixel_size = self._transform_gizmo_size / TRANSFORM_GIZMO_SCREEN_SIZE_PIXELS
+        # Opposite the fixture-creation plus, clear of the opening's handles.
+        center = pivot + pixel_size * (-right * 56.0 + up * 44.0)
+        radius = pixel_size * LANDING_GENERATION_CONTROL_ICON_RADIUS_PIXELS
+        icon_positions = np.asarray(
+            [
+                center
+                + sign * radius * (math.cos(angle) * right + math.sin(angle) * up)
+                for angle in (math.pi / 2.0, math.pi / 6.0, -math.pi / 6.0)
+                for sign in (-1.0, 1.0)
+            ]
+        )
+        self._opening_proportions_center = center
+        self._opening_proportions_hit_radius = (
+            pixel_size * LANDING_GENERATION_CONTROL_HIT_RADIUS_PIXELS
+        )
+        self._opening_proportions_items[0].setData(pos=center[np.newaxis, :])
+        self._opening_proportions_items[1].setData(pos=icon_positions)
+
+    def _pick_opening_proportions_control(
+        self,
+        ray: tuple[np.ndarray, np.ndarray],
+    ) -> bool:
+        if not self._opening_proportions_interaction_is_available():
+            return False
+        self._update_opening_proportions_control_geometry()
+        if self._opening_proportions_center is None:
+            return False
+        hit = _get_ray_point_distance(*ray, self._opening_proportions_center)
+        target = self._get_selected_canvas_opening_target()
+        return bool(
+            target is not None
+            and hit is not None
+            and hit[0] <= self._opening_proportions_hit_radius
+            and not self._canvas_opening_control_is_occluded(target, *ray, hit[1])
+        )
+
+    def _handle_opening_proportions_pointer_hovered(self, position: QPointF) -> None:
+        if (
+            not self._opening_proportions_items
+            or not self._opening_proportions_interaction_is_available()
+            or self.view.is_primary_pointer_drag_reserved
+            or self.view.is_first_person_pointer_captured
+        ):
+            self._clear_opening_proportions_hover()
+            return
+        ray = self.view.build_camera_ray(position)
+        self._set_opening_proportions_hovered(
+            ray is not None and self._pick_opening_proportions_control(ray)
+        )
+
+    def _clear_opening_proportions_hover(self, *_args: object) -> None:
+        self._set_opening_proportions_hovered(False)
+
+    def _set_opening_proportions_hovered(self, hovered: bool) -> None:
+        hovered = bool(hovered and self._opening_proportions_items)
+        if hovered == self._opening_proportions_hovered:
+            return
+        self._opening_proportions_hovered = hovered
+        if self._opening_proportions_items:
+            self._opening_proportions_items[0].setData(
+                color=(
+                    LANDING_GENERATION_CONTROL_HOVER_COLOR
+                    if hovered
+                    else LANDING_GENERATION_CONTROL_COLOR
+                ),
+                size=(
+                    LANDING_GENERATION_CONTROL_HOVER_SIZE_PIXELS
+                    if hovered
+                    else LANDING_GENERATION_CONTROL_SIZE_PIXELS
+                ),
+            )
+            self._opening_proportions_items[1].setData(width=4.0 if hovered else 3.0)
+        if hovered:
+            self._opening_proportions_previous_cursor = QCursor(self.view.cursor())
+            self._opening_proportions_previous_cursor_explicit = (
+                self.view.testAttribute(Qt.WidgetAttribute.WA_SetCursor)
+            )
+            self.view.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            if self.view.cursor().shape() == Qt.CursorShape.PointingHandCursor:
+                if self._opening_proportions_previous_cursor_explicit:
+                    self.view.setCursor(self._opening_proportions_previous_cursor)
+                else:
+                    self.view.unsetCursor()
+            self._opening_proportions_previous_cursor = None
+            self._opening_proportions_previous_cursor_explicit = False
+
+    def _pick_opening_proportions_target(
+        self,
+        position: QPointF,
+    ) -> CanvasOpeningTarget | None:
+        """Pick a visible opening without selecting through nearer geometry."""
+
+        if not self._window_editing_enabled:
+            return None
+        ray = self.view.build_camera_ray(position)
+        if ray is None:
+            return None
+        hit = _get_nearest_canvas_opening_ray_hit(
+            tuple(
+                target
+                for target in self._canvas_opening_targets.values()
+                if self._canvas_opening_target_is_visible(target)
+            ),
+            *ray,
+        )
+        if hit is None:
+            return None
+        target, _point, distance = hit
+        blockers = [
+            _get_nearest_fixed_surface_ray_hit(
+                self._get_canvas_opening_pick_surfaces(target),
+                *ray,
+            ),
+            _get_nearest_preview_placed_object_ray_hit(
+                tuple(
+                    replace(group.preview, placement_transform=group.current_transform)
+                    for group in self._placed_object_render_groups.values()
+                    if (
+                        self._canvas_objects_are_visible()
+                        or group.preview.object_id.startswith("landing:")
+                    )
+                    and self._placed_door_opening_references.get(
+                        group.preview.object_id
+                    )
+                    != target.reference
+                ),
+                *ray,
+            ),
+            _get_nearest_preview_stair_part_ray_hit(
+                tuple(
+                    part
+                    for part in self._canvas_stair_part_targets.values()
+                    if self._canvas_stair_part_is_visible(part)
+                    and not self._canvas_stair_part_is_preview_hidden(part)
+                ),
+                *ray,
+            ),
+            _get_nearest_architectural_trim_part_ray_hit(
+                tuple(
+                    part
+                    for part in self._architectural_trim_parts.values()
+                    if self._architectural_trim_part_is_visible(part)
+                ),
+                *ray,
+            ),
+        ]
+        if any(
+            blocker is not None and blocker[2] < distance - 1e-6 for blocker in blockers
+        ):
+            return None
+        return target
+
+    def _handle_opening_proportions_double_click_requested(
+        self,
+        position: QPointF,
+    ) -> None:
+        """Activate opening proportions, including already placed fixtures."""
+
+        if not self._opening_proportions_interaction_is_available():
+            return
+        target = self._pick_opening_proportions_target(position)
+        if target is None:
+            return
+        self._cancel_canvas_gizmo_drag()
+        self.select_canvas_opening(target.reference)
+        self.opening_proportions_requested.emit(target.reference)
+
+    def _opening_proportions_interaction_is_available(self) -> bool:
+        """Do not steal clicks belonging to an active placement or drawing tool."""
+
+        return bool(
+            self._window_editing_enabled
+            and not (
+                self._landing_placement_active
+                or self.is_window_placement_active()
+                or self.is_glass_area_placement_active
+                or self.is_opening_fixture_placement_active
+                or self.is_object_placement_active
+                or self.is_architectural_trim_placement_active
+                or self.is_directional_light_placement_active
+                or self.is_tour_point_placement_active
+                or self.is_surface_vertex_placement_active()
+            )
+        )
 
     # ### Canvas opening-fixture creation control ###
     def _add_canvas_opening_creation_items(
@@ -20515,10 +21195,15 @@ class GlbViewerWidget(QWidget):
         hit = _get_ray_point_distance(origin, direction, world_position)
         if hit is None:
             return False
-        distance, _ray_parameter = hit
-        return distance <= self._get_canvas_opening_creation_hit_radius(
-            target,
-            world_position,
+        distance, ray_parameter = hit
+        return (
+            distance <= self._get_canvas_opening_creation_hit_radius(
+                target,
+                world_position,
+            )
+            and not self._canvas_opening_control_is_occluded(
+                target, origin, direction, ray_parameter
+            )
         )
 
     def _get_canvas_opening_creation_hit_radius(
@@ -20675,7 +21360,20 @@ class GlbViewerWidget(QWidget):
                 )
         if not candidates:
             return None
-        return min(candidates, key=lambda candidate: candidate[:3])[3]
+        # One blocker query is sufficient for every handle on this ray.
+        blocker = _get_nearest_fixed_surface_ray_hit(
+            self._get_canvas_opening_pick_surfaces(target, for_controls=True),
+            origin,
+            direction,
+        )
+        visible_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if blocker is None or candidate[2] <= blocker[2] + 1e-6
+        )
+        if not self._canvas_opening_target_is_visible(target) or not visible_candidates:
+            return None
+        return min(visible_candidates, key=lambda candidate: candidate[:3])[3]
 
     def _get_canvas_opening_handle_hit_radius(
         self,
@@ -23452,6 +24150,9 @@ class GlbViewerWidget(QWidget):
         if preview.object_id.startswith("landing:"):
             self._landing_previews[preview.object_id] = preview
             return
+        if preview.object_id in self._pending_placed_object_previews:
+            self._pending_placed_object_previews[preview.object_id] = preview
+            return
         if self.model is None:
             return
         self.model.preview_placed_objects = [
@@ -23625,7 +24326,10 @@ class GlbViewerWidget(QWidget):
         if not hasattr(self, "view"):
             return
 
+        self.clear_opening_proportions_preview()
         self._clear_landing_generation_hover()
+        self._remove_opening_proportions_control()
+        self._opening_proportions_pressed_reference = None
         self._cancel_canvas_opening_creation_press()
         self._cancel_placed_object_instance_drag()
         self._symmetric_preview_timer.stop()
@@ -25873,6 +26577,43 @@ def _normalize_doorway_preview_outline_positions(
 
 
 # ### Window editor helpers ###
+def _canvas_opening_surface_is_host(
+    target: CanvasOpeningTarget,
+    surface: FixedSurface,
+) -> bool:
+    """Match actual host planes, not stale edge IDs or nearby parallel walls."""
+
+    if (
+        surface.level_index != target.reference.level_index
+        or surface.opening_id is not None
+    ):
+        return False
+    normal = np.asarray(target.wall_normal_world, dtype=float)
+    planes = target.host_wall_planes_world or (target.plane_start_world,)
+    if target.opposite_wall_plane_world is not None:
+        planes = (*planes, target.opposite_wall_plane_world)
+    if target.sloped_ceiling_id is not None:
+        if surface.sloped_ceiling_id != target.sloped_ceiling_id:
+            return False
+        points = np.asarray(surface.mesh.vertices, dtype=float)
+        if points.size == 0:
+            return False
+    else:
+        if surface.surface_type != SURFACE_TYPE_WALL:
+            return False
+        try:
+            start, tangent, _normal = _get_fixed_surface_wall_frame(surface)
+        except ValueError:
+            return False
+        if abs(float(np.dot(tangent, target.wall_tangent_world))) < 1.0 - 1e-6:
+            return False
+        points = np.asarray((start, surface.wall_end_world), dtype=float)
+    return any(
+        np.all(np.abs((points - np.asarray(plane, dtype=float)) @ normal) <= 1e-6)
+        for plane in planes
+    )
+
+
 def _world_point_tuple(point: object) -> tuple[float, float, float]:
     """Return one finite world point as a plain immutable tuple."""
 
@@ -25934,6 +26675,59 @@ def _build_canvas_opening_edit(target: CanvasOpeningTarget) -> CanvasOpeningEdit
         destination_target=(
             target if target.reference.kind == CANVAS_OPENING_WINDOW else None
         ),
+    )
+
+
+# ### Opening proportions preview geometry ###
+def _build_opening_proportions_preview_geometry(
+    target: CanvasOpeningTarget,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a filled convex opening profile and optional back-face depth cage."""
+
+    near = np.asarray(
+        [
+            target.local_to_world(*point)
+            for point in _get_canvas_opening_outline_local_positions(target)
+        ],
+        dtype=float,
+    )
+    if np.allclose(near[0], near[-1], rtol=0.0, atol=1e-10):
+        near = near[:-1]
+    layers = [near]
+    if target.opposite_wall_plane_world is not None:
+        normal = np.asarray(target.wall_normal_world, dtype=float)
+        depth = float(
+            np.dot(np.asarray(target.opposite_wall_plane_world) - near[0], normal)
+        )
+        if abs(depth) > 1e-9:
+            layers.append(near + normal * depth)
+    outlines: list[np.ndarray] = []
+    vertices: list[np.ndarray] = []
+    faces: list[tuple[int, int, int]] = []
+    vertex_offset = 0
+    for layer in layers:
+        # Doorway arches and rectangular windows are convex, so a center fan
+        # follows the same curved silhouette as the scene's existing gizmos.
+        count = len(layer)
+        outlines.append(
+            np.stack((layer, np.roll(layer, -1, axis=0)), axis=1).reshape(-1, 3)
+        )
+        vertices.append(np.vstack((layer.mean(axis=0), layer)))
+        faces.extend(
+            (
+                vertex_offset,
+                vertex_offset + index + 1,
+                vertex_offset + (index + 1) % count + 1,
+            )
+            for index in range(count)
+        )
+        vertex_offset += count + 1
+    if len(layers) == 2:
+        outlines.append(np.stack(layers, axis=1).reshape(-1, 3))
+    return (
+        np.concatenate(outlines),
+        np.concatenate(vertices),
+        np.asarray(faces, dtype=np.int32),
     )
 
 
@@ -28321,6 +29115,7 @@ def _build_rehosted_canvas_window_target(
         bounds=empty_bounds,
         sloped_ceiling_id=sloped_ceiling_id,
         opposite_wall_plane_world=None,
+        host_wall_planes_world=(plane_start,),
     )
     pointer_horizontal, pointer_vertical = destination_frame.world_to_local(
         pointer_world
@@ -29752,6 +30547,45 @@ def _build_symmetric_reflection_transform(
     return transform
 
 
+# ### Pending object preview helpers ###
+def _build_pending_placed_object_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Own only local geometry, never duplicate texture images for an overlay."""
+
+    pending_mesh = trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices, dtype=float).copy(),
+        faces=np.asarray(mesh.faces, dtype=np.int64).copy(),
+        process=False,
+    )
+    pending_mesh.visual.face_colors = np.rint(
+        np.asarray(OBJECT_PLACEMENT_PREVIEW_COLOR) * 255.0
+    ).astype(np.uint8)
+    return pending_mesh
+
+
+def _same_pending_meshes(first: Sequence[object], second: Sequence[object]) -> bool:
+    return len(first) == len(second) and all(
+        left is right for left, right in zip(first, second, strict=True)
+    )
+
+
+def _pending_placed_object_previews_match(
+    first: PreviewPlacedObject, second: PreviewPlacedObject,
+) -> bool:
+    return bool(
+        _same_pending_meshes(first.meshes, second.meshes)
+        and np.array_equal(first.placement_transform, second.placement_transform)
+        and first.world_position == second.world_position
+        and first.rotation_degrees == second.rotation_degrees
+        and first.scale == second.scale
+        and first.axis_scales == second.axis_scales
+        and first.source_object_id == second.source_object_id
+        and first.symmetric_preview_orientation == second.symmetric_preview_orientation
+        and first.symmetric_preview_plane_coordinate
+        == second.symmetric_preview_plane_coordinate
+    )
+
+
+# ### Placed-object transform helpers ###
 def _numpy_transform_to_qt(transform: object) -> Transform3D:
     matrix = np.asarray(transform, dtype=float)
     if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):

@@ -13,6 +13,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from housemaker.geometry_generation_models import (
+    DEFAULT_GEOMETRY_MODEL,
+    DEFAULT_GEOMETRY_RESOLUTION,
+    GEOMETRY_MODEL_7_1,
+    SMART_TOPOLOGY_MAX_POLYCOUNTS,
+    normalize_geometry_model,
+    normalize_geometry_resolution,
+)
+
 # ### Constants ###
 MESHY_IMAGE_TO_3D_ENDPOINT = "https://api.meshy.ai/openapi/v1/image-to-3d"
 MESHY_RETEXTURE_ENDPOINT = "https://api.meshy.ai/openapi/v1/retexture"
@@ -89,38 +98,46 @@ def build_image_to_3d_request_body(
     should_texture: bool = True,
     enable_pbr: bool = False,
     texture_prompt: str = "",
+    *,
+    ai_model: str = DEFAULT_GEOMETRY_MODEL,
+    geometry_resolution: str = DEFAULT_GEOMETRY_RESOLUTION,
 ) -> dict[str, Any]:
-    """Build a Meshy Smart Topology T2.5 Image-to-3D request."""
+    """Build a single-image geometry request for the selected Meshy model."""
 
     normalized_image = _normalize_binary_payload(
         image_png,
         empty_message="The selected object image is empty.",
     )
+    normalized_model = normalize_geometry_model(ai_model)
+    normalized_resolution = normalize_geometry_resolution(geometry_resolution)
+    if normalized_resolution != "standard" and normalized_model != GEOMETRY_MODEL_7_1:
+        raise ValueError("Ultra 2K geometry requires Meshy 7.1.")
     if not isinstance(should_texture, bool):
         raise ValueError("Meshy should_texture must be a boolean.")
     if not isinstance(enable_pbr, bool):
         raise ValueError("Meshy enable_pbr must be a boolean.")
     if enable_pbr and not should_texture:
-        raise ValueError(
-            "Meshy PBR maps require texture generation to be enabled."
-        )
-    normalized_texture_prompt = normalize_image_to_3d_texture_prompt(
-        texture_prompt
-    )
-    normalized_polycount = _normalize_smart_topology_target_polycount(
-        target_polycount
-    )
+        raise ValueError("Meshy PBR maps require texture generation to be enabled.")
+    normalized_texture_prompt = normalize_image_to_3d_texture_prompt(texture_prompt)
     body: dict[str, Any] = {
+        "ai_model": normalized_model,
         "image_url": _build_data_uri("image/png", normalized_image),
-        "model_type": "smart-topology",
-        "ai_model": SMART_TOPOLOGY_AI_MODEL,
         "should_texture": should_texture,
-        "target_polycount": normalized_polycount,
         "moderation": False,
         "target_formats": ["glb"],
         "auto_size": True,
         "origin_at": "bottom",
     }
+    if normalized_model == GEOMETRY_MODEL_7_1:
+        # The native-resolution model does not use Smart Topology's face target.
+        body["model_type"] = "standard"
+        body["geometry_resolution"] = normalized_resolution
+        body["should_remesh"] = False
+    else:
+        body["model_type"] = "smart-topology"
+        body["target_polycount"] = _normalize_smart_topology_target_polycount(
+            target_polycount, ai_model=normalized_model
+        )
     if should_texture:
         body.update(
             {
@@ -202,20 +219,19 @@ def _normalize_retexture_reference_images(
     ]
 
 
-def _normalize_smart_topology_target_polycount(target_polycount: int) -> int:
-    """Validate Meshy's Smart Topology T2.5 face-count range."""
+def _normalize_smart_topology_target_polycount(
+    target_polycount: int, *, ai_model: str = DEFAULT_GEOMETRY_MODEL
+) -> int:
+    """Validate the selected Smart Topology model's face-count range."""
 
+    maximum = SMART_TOPOLOGY_MAX_POLYCOUNTS[ai_model]
     if isinstance(target_polycount, bool) or not isinstance(target_polycount, int):
         raise ValueError("Meshy target polycount must be an integer.")
-    if not (
-        MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT
-        <= target_polycount
-        <= MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT
-    ):
+    if not (MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT <= target_polycount <= maximum):
         raise ValueError(
             "Meshy Smart Topology target polycount must be between "
             f"{MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT:,} and "
-            f"{MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT:,}."
+            f"{maximum:,}."
         )
     return target_polycount
 
@@ -244,6 +260,9 @@ def create_image_to_3d_task(
     should_texture: bool = True,
     enable_pbr: bool = False,
     texture_prompt: str = "",
+    *,
+    ai_model: str = DEFAULT_GEOMETRY_MODEL,
+    geometry_resolution: str = DEFAULT_GEOMETRY_RESOLUTION,
 ) -> str:
     normalized_key = _require_api_key(api_key)
     payload = build_image_to_3d_request_body(
@@ -252,6 +271,8 @@ def create_image_to_3d_task(
         should_texture=should_texture,
         enable_pbr=enable_pbr,
         texture_prompt=texture_prompt,
+        ai_model=ai_model,
+        geometry_resolution=geometry_resolution,
     )
     response = _request_json(
         Request(
@@ -451,7 +472,14 @@ def request_image_to_3d_model(
     should_texture: bool = True,
     enable_pbr: bool = False,
     texture_prompt: str = "",
+    *,
+    ai_model: str = DEFAULT_GEOMETRY_MODEL,
+    geometry_resolution: str = DEFAULT_GEOMETRY_RESOLUTION,
 ) -> MeshyGenerationResult:
+    if cancel_event is not None and cancel_event.is_set():
+        raise MeshyTaskError(
+            "Meshy geometry generation was canceled locally before task submission."
+        )
     task_id = create_image_to_3d_task(
         api_key=api_key,
         image_png=image_png,
@@ -460,6 +488,8 @@ def request_image_to_3d_model(
         should_texture=should_texture,
         enable_pbr=enable_pbr,
         texture_prompt=texture_prompt,
+        ai_model=ai_model,
+        geometry_resolution=geometry_resolution,
     )
     task = wait_for_image_to_3d_task(
         api_key=api_key,

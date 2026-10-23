@@ -276,6 +276,8 @@ def _host_wall(flat_surfaces: list[FixedSurface]) -> FixedSurface:
         surface
         for surface in flat_surfaces
         if surface.surface_type == "wall"
+        and surface.wall_start_world is not None
+        and surface.wall_end_world is not None
         and np.allclose(surface.wall_start_world[1], 0.0)
         and np.allclose(surface.wall_end_world[1], 0.0)
     )
@@ -3279,8 +3281,13 @@ class SlopedCeilingWindowTests(unittest.TestCase):
         )
         outer = inner + np.asarray(host.wall_normal_world) * 0.5
         expected = np.concatenate((inner, outer), axis=0)
+        reveal_surfaces = [
+            surface for surface in sloped_surfaces
+            if surface.opening_id == "slope-window"
+        ]
+        self.assertEqual({surface.opening_part for surface in reveal_surfaces}, {"left", "right", "header", "sill"})
         matching_faces = 0
-        for triangle in np.asarray(ceiling.mesh.triangles, dtype=float):
+        for triangle in np.concatenate([surface.mesh.triangles for surface in reveal_surfaces]):
             if all(
                 np.any(np.all(np.isclose(expected, point, atol=1e-8), axis=1))
                 for point in triangle

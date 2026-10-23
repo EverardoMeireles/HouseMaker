@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QGuiApplication, QScreen
 from PySide6.QtWidgets import (
     QFrame,
@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from housemaker.window_geometry import fit_normal_window_to_screen
 
 # ### Constants ###
 JOB_STATUS_RUNNING = "running"
@@ -252,6 +254,9 @@ class JobsWindow(QWidget):
         self._rows: dict[str, _JobRow] = {}
         self._is_disposed = False
         self._has_been_shown = False
+        self._normal_window_fit_timer = QTimer(self)
+        self._normal_window_fit_timer.setSingleShot(True)
+        self._normal_window_fit_timer.timeout.connect(self._fit_visible_normal_window)
         self._build_ui()
         manager.job_added.connect(self._handle_job_added)
         manager.job_updated.connect(self._handle_job_updated)
@@ -269,6 +274,7 @@ class JobsWindow(QWidget):
         if self._is_disposed:
             return
         self._is_disposed = True
+        self._normal_window_fit_timer.stop()
         self.hide()
         for signal, slot in (
             (self._manager.job_added, self._handle_job_added),
@@ -286,6 +292,15 @@ class JobsWindow(QWidget):
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self.hide()
         event.ignore()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._schedule_normal_window_fit()
+
+    def changeEvent(self, event: QEvent) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._schedule_normal_window_fit()
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -323,12 +338,16 @@ class JobsWindow(QWidget):
         if self._is_disposed or not isinstance(raw_job, GenerationJob):
             return
         self._add_or_update_row(raw_job)
-        is_first_show = not self._has_been_shown
-        self.show()
-        self._move_to_target_screen()
-        if is_first_show:
-            self.showMaximized()
-            self._has_been_shown = True
+        if not self.isVisible():
+            # Choose the display before creating a visible native window.
+            # Showing normal, retargeting, then maximizing races Windows DPI
+            # and non-client frame adjustments on mixed-density monitors.
+            self._move_to_target_screen()
+            if not self._has_been_shown:
+                self.showMaximized()
+                self._has_been_shown = True
+            else:
+                self.show()
         self.raise_()
 
     def _handle_job_updated(self, raw_job: object) -> None:
@@ -390,20 +409,51 @@ class JobsWindow(QWidget):
         """Move safely, returning false for a display removed mid-update."""
 
         try:
-            window_handle = self.windowHandle()
-            if window_handle is not None:
-                window_handle.setScreen(screen)
-            geometry = screen.availableGeometry()
-            x = geometry.right() - self.width() - _WINDOW_EDGE_OFFSET + 1
-            maximum_y = geometry.bottom() - self.height() + 1
-            y = min(
-                geometry.top() + _WINDOW_EDGE_OFFSET,
-                max(geometry.top(), maximum_y),
-            )
-            self.move(max(geometry.left(), x), y)
+            if not screen.availableGeometry().isValid():
+                return False
+            screen_changed = self.screen() is not screen
+            was_maximized = self.isMaximized()
+            if screen_changed:
+                self.setScreen(screen)
+            if was_maximized or self.isFullScreen():
+                if screen_changed and self.isVisible() and was_maximized:
+                    self.showMaximized()
+                return True
+            # The first display is maximized directly; no normal geometry is
+            # needed until the user explicitly restores that window.
+            if self._has_been_shown:
+                fit_normal_window_to_screen(
+                    self,
+                    screen,
+                    edge_offset=_WINDOW_EDGE_OFFSET,
+                    align_right=True,
+                )
+                if screen_changed:
+                    self._schedule_normal_window_fit()
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return False
         return True
+
+    def _schedule_normal_window_fit(self) -> None:
+        """Wait for target-display DPI and native frame margins to settle."""
+
+        if (
+            not self._is_disposed
+            and self.isVisible()
+            and not self.isMaximized()
+            and not self.isFullScreen()
+        ):
+            self._normal_window_fit_timer.start(0)
+
+    def _fit_visible_normal_window(self) -> None:
+        if (
+            self._is_disposed
+            or not self.isVisible()
+            or self.isMaximized()
+            or self.isFullScreen()
+        ):
+            return
+        self._move_to_target_screen()
 
 
 class _JobRow(QFrame):

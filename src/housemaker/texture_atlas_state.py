@@ -31,8 +31,18 @@ SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION = 4
 SYMMETRIC_SQUARE_PAIR_ATLAS_STATE_SCHEMA_VERSION = 5
 SURFACE_AO_ATLAS_STATE_SCHEMA_VERSION = 6
 GUARDED_TEXTURE_ATLAS_STATE_SCHEMA_VERSION = 7
-ATLAS_STATE_SCHEMA_VERSION = GUARDED_TEXTURE_ATLAS_STATE_SCHEMA_VERSION
+TYPED_ATLAS_STATE_SCHEMA_VERSION = 8
+ATLAS_STATE_SCHEMA_VERSION = TYPED_ATLAS_STATE_SCHEMA_VERSION
 ATLAS_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+ATLAS_TYPE_OBJECT = "object"
+ATLAS_TYPE_SURFACE = "surface"
+ATLAS_NAME_PREFIX_BY_TYPE = {
+    ATLAS_TYPE_OBJECT: "[OBJECT]",
+    ATLAS_TYPE_SURFACE: "[SURFACE]",
+}
+ATLAS_TYPE_NAME_PREFIX_PATTERN = re.compile(
+    r"^\[(?:OBJECT|SURFACE|HALF)\]\s*", re.IGNORECASE
+)
 ATLAS_PACKING_MODE_FULL = "full"
 # Schemas v2-v4 persist these legacy modes and must retain their old geometry.
 ATLAS_PACKING_MODE_SYMMETRIC_HALF = "symmetric_half"
@@ -94,6 +104,47 @@ MAX_SURFACE_AO_GEOMETRY_SIGNATURE_LENGTH = 256
 MIN_SURFACE_AO_INTENSITY = 0.0
 MAX_SURFACE_AO_INTENSITY = 1.0
 ATLAS_TEXTURE_GUARD_DIVISOR = 64
+
+
+# ### Atlas identity helpers ###
+def normalize_atlas_type(value: object) -> str | None:
+    """Validate explicit source categories without guessing legacy contents."""
+
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not isinstance(value, str) or normalized not in ATLAS_NAME_PREFIX_BY_TYPE:
+        raise ValueError("Texture atlas type must be 'object' or 'surface'.")
+    return normalized
+
+
+def normalize_atlas_name(name: object, atlas_type: object = None) -> str:
+    """Protect typed prefixes while leaving unclassified legacy names alone."""
+
+    normalized_name = str(name).strip()
+    _validate_atlas_name(normalized_name)
+    normalized_type = normalize_atlas_type(atlas_type)
+    if normalized_type is None:
+        return normalized_name
+    while match := ATLAS_TYPE_NAME_PREFIX_PATTERN.match(normalized_name):
+        normalized_name = normalized_name[match.end():].strip()
+    _validate_atlas_name(normalized_name)
+    normalized_name = f"{ATLAS_NAME_PREFIX_BY_TYPE[normalized_type]} {normalized_name}"
+    _validate_atlas_name(normalized_name)
+    return normalized_name
+
+
+def normalize_atlas_partial_slots(atlas: TextureAtlasRecord) -> None:
+    """Canonicalize split half/quarter members without moving logical slots."""
+
+    if not isinstance(atlas, TextureAtlasRecord):
+        raise TypeError("Partial-slot normalization requires a texture atlas.")
+    placements = _normalize_partial_slot_placements(atlas.placements)
+    _validate_placements_fit(atlas.resolution, placements)
+    if placements != atlas.placements:
+        atlas.placements = placements
+        atlas.image_path = None
+        atlas.clear_surface_ambient_occlusion()
 
 
 # ### Packing compatibility helpers ###
@@ -272,11 +323,12 @@ class TextureAtlasRecord:
     surface_ao_image_path: str | None = None
     surface_ao_geometry_signature: str | None = None
     surface_ao_intensity: float = 1.0
+    atlas_type: str | None = None
 
     def __post_init__(self) -> None:
         _validate_atlas_id(self.atlas_id)
-        self.name = str(self.name).strip()
-        _validate_atlas_name(self.name)
+        self.atlas_type = normalize_atlas_type(self.atlas_type)
+        self.name = normalize_atlas_name(self.name, self.atlas_type)
         _validate_atlas_resolution(self.resolution)
         if len(self.placements) > MAX_ATLAS_OBJECT_COUNT:
             raise ValueError("Texture atlas contains too many texture sources.")
@@ -335,6 +387,7 @@ class TextureAtlasRecord:
         return {
             "atlas_id": self.atlas_id,
             "name": self.name,
+            "atlas_type": self.atlas_type,
             "resolution": int(self.resolution),
             "image_path": self.image_path,
             "surface_ao_image_path": self.surface_ao_image_path,
@@ -378,6 +431,7 @@ class TextureAtlasRecord:
                 else str(payload["surface_ao_geometry_signature"])
             ),
             surface_ao_intensity=payload.get("surface_ao_intensity", 1.0),
+            atlas_type=payload.get("atlas_type"),
         )
 
     def clear_surface_ambient_occlusion(self) -> bool:
@@ -465,13 +519,14 @@ class TextureAtlasData:
         resolution: int,
         *,
         atlas_id: str | None = None,
+        atlas_type: str | None = None,
     ) -> TextureAtlasRecord:
         if len(self.atlases) >= MAX_ATLAS_COUNT:
             raise ValueError("Project contains too many texture atlases.")
         normalized_id = str(atlas_id or uuid.uuid4())
         if self.atlas_by_id(normalized_id) is not None:
             raise ValueError(f"Texture atlas ID already exists: {normalized_id!r}.")
-        normalized_name = str(name).strip()
+        normalized_name = normalize_atlas_name(name, atlas_type)
         if any(
             atlas.name.casefold() == normalized_name.casefold()
             for atlas in self.atlases
@@ -481,6 +536,7 @@ class TextureAtlasData:
             atlas_id=normalized_id,
             name=normalized_name,
             resolution=int(resolution),
+            atlas_type=atlas_type,
         )
         self.atlases.append(atlas)
         if self.selected_atlas_id is None:
@@ -495,14 +551,33 @@ class TextureAtlasData:
         """Rename one atlas without invalidating its pixels or AO bake."""
 
         atlas = self._require_atlas(atlas_id)
-        normalized_name = str(name).strip()
-        _validate_atlas_name(normalized_name)
+        normalized_name = normalize_atlas_name(name, atlas.atlas_type)
         if any(
             candidate.atlas_id != atlas.atlas_id
             and candidate.name.casefold() == normalized_name.casefold()
             for candidate in self.atlases
         ):
             raise ValueError(f"Texture atlas name already exists: {normalized_name!r}.")
+        atlas.name = normalized_name
+        return atlas
+
+    def set_atlas_type(
+        self,
+        atlas_id: str,
+        atlas_type: str | None,
+    ) -> TextureAtlasRecord:
+        """Classify an atlas without touching its pixels, layout, or AO bake."""
+
+        atlas = self._require_atlas(atlas_id)
+        normalized_type = normalize_atlas_type(atlas_type)
+        normalized_name = normalize_atlas_name(atlas.name, normalized_type)
+        if any(
+            candidate.atlas_id != atlas.atlas_id
+            and candidate.name.casefold() == normalized_name.casefold()
+            for candidate in self.atlases
+        ):
+            raise ValueError(f"Texture atlas name already exists: {normalized_name!r}.")
+        atlas.atlas_type = normalized_type
         atlas.name = normalized_name
         return atlas
 

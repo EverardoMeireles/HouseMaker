@@ -28,7 +28,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QWheelEvent
+from PySide6.QtGui import QColor, QKeySequence, QPalette, QScreen, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -133,6 +133,7 @@ from housemaker.canvas_openings import (
     CanvasOpeningTarget,
     CanvasWindowDimensionSnapshot,
     apply_canvas_opening_edit,
+    build_canvas_opening_preview_targets,
     build_canvas_opening_targets,
     capture_canvas_window_dimensions,
     preserve_canvas_window_dimensions,
@@ -340,6 +341,10 @@ from housemaker.models import (
 from housemaker.object_symmetry import (
     SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
 )
+from housemaker.opening_proportions_workspace import (
+    OpeningProportionsUndoState,
+    OpeningProportionsWorkspaceMixin,
+)
 from housemaker.outer_wall_marking import (
     OuterWallMark,
     find_outer_wall_vertex_ids,
@@ -402,6 +407,7 @@ from housemaker.scene_export import (
     DoorBodyReconstruction,
     write_runtime_scene_manifest,
 )
+from housemaker.scene_surface_cache import build_scene_surface_geometry_signature
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     SettingsWidget,
@@ -461,6 +467,8 @@ from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     ATLAS_SLOT_HALF_LEFT,
+    ATLAS_TYPE_OBJECT,
+    ATLAS_TYPE_SURFACE,
     OBJECT_TEXTURE_RESOLUTIONS,
     TextureAtlasData,
     TextureAtlasPlacement,
@@ -515,6 +523,7 @@ from housemaker.window_frame_bridge import (
     add_window_frame_bridge,
     normalize_wall_window_placement,
 )
+from housemaker.window_geometry import fit_normal_window_to_screen
 from housemaker.window_topology import resolve_linked_window_frame
 
 # ### Constants ###
@@ -565,6 +574,7 @@ SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS = 100
 SURFACE_AO_PREVIEW_REFRESH_DELAY_MILLISECONDS = 150
 ATLAS_DRAW_CALL_ESTIMATE_REFRESH_DELAY_MILLISECONDS = 200
 STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS = 35
+CONFIRM_MESH_UPDATES_POLL_INTERVAL_MILLISECONDS = 250
 PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
 PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
 PLAN_WALL_PREVIEW_REFRESH_DELAY_MILLISECONDS = 75
@@ -1737,6 +1747,7 @@ _CanvasUndoState = (
     | _CanvasStairsUndoState
     | CanvasLandingUndoState
     | CanvasGlobalScaleUndoState
+    | OpeningProportionsUndoState
     | _SurfaceTextureTilingUndoState
     | _SurfaceTextureColorBalanceUndoState
 )
@@ -1905,7 +1916,12 @@ class StairEditorHeightFilter(QObject):
         self._sync_height()
 
 
-class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidget):
+class BlueprintWorkspace(
+    OpeningProportionsWorkspaceMixin,
+    GlobalScaleWorkspaceMixin,
+    LandingWorkspaceMixin,
+    QWidget,
+):
     _progressive_texture_result_ready = Signal(int, object)
 
     def __init__(
@@ -1921,6 +1937,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         )
         self.current_project_path: str | None = None
         self.global_scale = GlobalScale()
+        self._init_opening_proportions()
         self.levels: list[LevelData] = create_default_levels()
         self.outer_wall_marks: tuple[OuterWallMark, ...] = ()
         self._staged_outer_wall_marks: tuple[OuterWallMark, ...] | None = None
@@ -2016,6 +2033,17 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         ] = {}
         self._reset_viewer_doorway_snapshots()
         self._mesh_edit_update_delay_seconds = DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
+        self._pending_object_placement_ids: set[str] = set()
+        self._committing_object_placement_revisions: dict[str, int] = {}
+        self._is_publishing_object_placements = False
+        self._object_placement_mesh_update_timer = QTimer(self)
+        self._object_placement_mesh_update_timer.setSingleShot(True)
+        self._object_placement_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._object_placement_mesh_update_timer.timeout.connect(
+            self._commit_pending_object_placement_mesh_update
+        )
         self._init_landing_state()
         self._pending_wall_vertex_mesh_update = False
         self._pending_wall_vertex_doorway_level_indices: set[int] = set()
@@ -2157,6 +2185,8 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             self._commit_pending_wall_vertex_update
         )
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
+        self._atlas_surface_geometry_signature: tuple[object, ...] | None = None
+        self._atlas_exported_surface_ids: frozenset[str] = frozenset()
         self._atlas_source_content_paths: (
             dict[str, tuple[tuple[object, ...], ...]] | None
         ) = None
@@ -2329,6 +2359,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._confirm_mesh_updates_timer.stop()
+        self._cancel_pending_object_placement_mesh_updates()
+        self._reset_opening_proportions()
         self._is_viewer_refresh_scheduled = False
         self._surface_ao_preview_refresh_timer.stop()
         self._atlas_draw_call_estimate_refresh_timer.stop()
@@ -2581,10 +2614,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         root_layout.addWidget(self.workspace_splitter, 1)
 
         self.workspace_tabs = QTabWidget()
-        # Hidden pages contain wide tool rows whose size hints must not push
-        # the visible Canvas panel beyond the actual window bounds.
+        # Hidden pages must not force the window beyond the screen's work area.
         workspace_tabs_policy = self.workspace_tabs.sizePolicy()
         workspace_tabs_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        workspace_tabs_policy.setVerticalPolicy(QSizePolicy.Policy.Ignored)
         self.workspace_tabs.setSizePolicy(workspace_tabs_policy)
         self.canvas = BlueprintCanvas()
         self.viewer = GlbViewerWidget(window_editing_enabled=True)
@@ -3130,6 +3163,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self.viewer.canvas_opening_selection_changed.connect(
             self._handle_canvas_opening_selection_changed
         )
+        self.viewer.opening_proportions_requested.connect(self._open_opening_proportions)
         self.viewer.canvas_opening_fixture_deletion_requested.connect(
             self._handle_canvas_opening_fixture_deletion_requested
         )
@@ -3360,12 +3394,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         right_side_layout.addWidget(
             self.merged_generation_workspace.ceiling_height_section
         )
-        # Reclaim the Generation control space after reparenting Room analysis.
-        merged_controls = self.merged_generation_workspace
-        merged_controls.controls_scroll.setMinimumHeight(
-            merged_controls.controls_row.sizeHint().height()
-            + merged_controls.controls_scroll.horizontalScrollBar().sizeHint().height()
-        )
+        # Generation sizes its draggable rows on first show, after reparenting.
 
         self.open_spaces_group = QGroupBox("Open spaces")
         open_spaces_layout = QVBoxLayout(self.open_spaces_group)
@@ -5082,9 +5111,93 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         workspace.setObjectName("scene-3d-workspace")
         workspace_layout = QVBoxLayout(workspace)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
+        controls = QHBoxLayout()
+        self.confirm_mesh_updates_button = QPushButton("Confirm mesh updates")
+        self.confirm_mesh_updates_button.setObjectName("confirm-mesh-updates-button")
+        self.confirm_mesh_updates_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.confirm_mesh_updates_button.setToolTip(
+            "Apply pending mesh edits now without changing the mesh edit update delay."
+        )
+        self.confirm_mesh_updates_button.clicked.connect(
+            self._handle_confirm_mesh_updates_clicked
+        )
+        controls.addWidget(self.confirm_mesh_updates_button)
+        controls.addStretch(1)
+        workspace_layout.addLayout(controls)
         workspace_layout.addWidget(self.viewer)
+        self._confirm_mesh_updates_blink_on = False
+        self._confirm_mesh_updates_timer = QTimer(self)
+        self._confirm_mesh_updates_timer.setInterval(
+            CONFIRM_MESH_UPDATES_POLL_INTERVAL_MILLISECONDS
+        )
+        self._confirm_mesh_updates_timer.timeout.connect(
+            self._refresh_confirm_mesh_updates_button
+        )
+        self._refresh_confirm_mesh_updates_button()
+        self._confirm_mesh_updates_timer.start()
         return workspace
 
+    # ### Immediate confirmation of delayed mesh edits ###
+    def _has_pending_mesh_updates(self) -> bool:
+        """Inspect authored edit queues, not unrelated jobs or render timers."""
+
+        return any((
+            self._pending_level_transform is not None,
+            self._pending_canvas_face_orientation_undo_state is not None,
+            bool(self._pending_canvas_face_orientation_surface_ids),
+            self._pending_canvas_surface_mesh_update,
+            self._pending_floor_thickness_level_index is not None,
+            self._pending_sloped_ceiling_undo_state is not None,
+            self._pending_architectural_trim_undo_state is not None,
+            self._pending_wall_vertex_mesh_update,
+            self._pending_open_space_corner_mesh_update,
+            self._pending_stair_point_mesh_update,
+            self._pending_landing_mesh_update,
+            bool(self._pending_object_placement_ids),
+            self._pending_doorway_mesh_level_index is not None,
+            self._pending_window_mesh_level_index is not None,
+            self._staged_canvas_opening_mesh_update,
+            self._pending_doorway_bridge_topology_change,
+        ))
+
+    def _refresh_confirm_mesh_updates_button(self) -> None:
+        """Blink yellow while a mesh edit is waiting for its quiet period."""
+
+        pending = not self._is_shutdown and self._has_pending_mesh_updates()
+        button = self.confirm_mesh_updates_button
+        button.setEnabled(pending)
+        button.setProperty("mesh_updates_pending", pending)
+        self._confirm_mesh_updates_blink_on = (
+            not self._confirm_mesh_updates_blink_on if pending else False
+        )
+        style = (
+            "QPushButton { background-color: #f2ce43; color: #171717; }"
+            if self._confirm_mesh_updates_blink_on else ""
+        )
+        if button.styleSheet() != style:
+            button.setStyleSheet(style)
+
+    def _handle_confirm_mesh_updates_clicked(self) -> None:
+        """Flush ordinary edit transactions, preserving their undo and delay."""
+
+        if self._is_shutdown or not self._has_pending_mesh_updates():
+            self._refresh_confirm_mesh_updates_button()
+            return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        self._commit_pending_canvas_face_orientation_update()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_sloped_ceiling_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_stair_point_mesh_update()
+        self._commit_landing_mesh_update()
+        self._commit_pending_object_placement_mesh_update()
+        self._commit_pending_doorway_mesh_update()
+        self._queue_viewer_preview_refresh()
+        self._refresh_confirm_mesh_updates_button()
+
+    # ### Canvas 3D navigation ###
     def _set_canvas_3d_navigation_shortcut(self, hotkey: str) -> None:
         """Apply the persisted Canvas-only navigation shortcut."""
 
@@ -5391,6 +5504,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             )
         )
         self._sync_canvas_window_undo_availability()
+        self._show_pending_canvas_opening(reference, select=True)
         self.viewer.set_window_tools_status(
             "Window frame added. The mesh will update after "
             f"{self._mesh_edit_update_delay_seconds:g} seconds."
@@ -5525,6 +5639,31 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         ]
 
     # ### Canvas opening gizmo edits ###
+    def _show_pending_canvas_opening(
+        self,
+        reference: CanvasOpeningReference,
+        *,
+        select: bool = False,
+        pending: bool = True,
+    ) -> None:
+        """Publish lightweight controls immediately, leaving the mesh delayed."""
+
+        try:
+            targets = build_canvas_opening_preview_targets(
+                self.levels, tuple(self._canvas_surface_targets_by_id.values()),
+            )
+        except (TypeError, ValueError):
+            return
+        target = next(
+            (target for target in targets if target.key == reference.key), None,
+        )
+        if target is None:
+            return
+        self._canvas_opening_targets_by_key[target.key] = target
+        self.viewer.set_pending_canvas_opening_target(target, pending=pending)
+        if select:
+            self.viewer.select_canvas_opening(reference)
+
     def _handle_blueprint_canvas_opening_selection_requested(
         self,
         raw_reference: object,
@@ -6088,7 +6227,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 # controls or door-placement targets from the live scene.
                 opening_level.include_in_export = True
                 opening_levels.append(opening_level)
-            opening_targets = build_canvas_opening_targets(
+            opening_targets = build_canvas_opening_preview_targets(
                 opening_levels,
                 surface_targets,
             )
@@ -6107,7 +6246,14 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._canvas_opening_targets_by_key = {
             target.key: target for target in opening_targets
         }
-        self.viewer.set_canvas_opening_targets(opening_targets)
+        self.viewer.set_canvas_opening_targets(
+            opening_targets,
+            pending_keys=tuple(
+                target.key for target in opening_targets
+                if target.wall_surface_id not in installed_surface_ids
+                or target.key == self._pending_canvas_opening_key
+            ),
+        )
         self._sync_canvas_opening_fixture_keys()
         stair_part_targets = self._sync_canvas_stair_semantic_targets(
             semantic_levels
@@ -7267,6 +7413,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 is not None
                 and surface.surface_type == SURFACE_TYPE_WALL
                 and surface.source_surface_id is None
+                and surface.wall_key is not None
             )
         )
 
@@ -7345,7 +7492,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
     ) -> None:
         """Stage clicked winding changes for one delayed mesh rebuild."""
 
-        normalized_surface_id = str(surface_id).strip().lower()
+        normalized_surface_id = str(surface_id).strip()
+        if "/opening:" not in normalized_surface_id:
+            normalized_surface_id = normalized_surface_id.lower()
         surface = self._canvas_surface_targets_by_id.get(normalized_surface_id)
         if surface is None and normalized_surface_id:
             try:
@@ -7509,6 +7658,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             if surface is not None
             and surface.surface_type == SURFACE_TYPE_WALL
             and surface.source_surface_id is None
+            and surface.wall_key is not None
             and current_level is not None
             and surface.level_index == current_level.index
             else None
@@ -8876,6 +9026,8 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 self._restore_canvas_outer_wall_mark_undo_state(state)
             elif isinstance(state, _CanvasOpeningEditUndoState):
                 self._restore_canvas_opening_edit_undo_state(state)
+            elif isinstance(state, OpeningProportionsUndoState):
+                self._restore_opening_proportions_undo_state(state)
             elif isinstance(state, _CanvasWindowAdditionUndoState):
                 self._restore_canvas_window_addition_undo_state(state)
             elif isinstance(state, _CanvasWindowRemovalUndoState):
@@ -9293,6 +9445,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
     ) -> int:
         """Restore one object's prior placement and eligible Atlas bindings."""
 
+        placement_was_pending = self._object_placement_preview_is_pending(state.object_id)
         instance_state_changed = False
         if state.source_object_id is not None:
             current_instance = self.generation.get_generated_object_instance(
@@ -9330,6 +9483,8 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             )
         if not restored:
             raise ValueError("The placed object in this undo step no longer exists.")
+        if state.placement is None:
+            self._drop_pending_object_placement_previews((state.object_id,))
         for instance in state.child_instances:
             if not self.generation.restore_generated_object_instance(
                 instance,
@@ -9385,6 +9540,12 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._desired_canvas_object_id = active_object_id
         self._desired_canvas_surface_ids = ()
         self._sync_canvas_placed_object_profiles()
+        if placement_was_pending and state.placement is not None:
+            self._stage_object_placement_mesh_update((state.object_id,))
+            self.viewer.set_selected_placed_object_ids(
+                selected_object_ids, active_object_id=active_object_id
+            )
+            return skipped_atlas_placements
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return skipped_atlas_placements
 
@@ -11009,6 +11170,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
     def _sync_atlas_texture_selection_from_canvas_scene(self) -> None:
         """Select textures assigned to the current semantic 3D selection."""
 
+        request_preview = self._atlas_workspace_is_active()
         object_ids = self._desired_canvas_object_ids
         if object_ids:
             textured_object_ids = tuple(
@@ -11036,6 +11198,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             self.texture_atlas_workspace.select_source_ids(
                 textured_object_ids,
                 active_source_id=active_object_id,
+                request_preview=request_preview,
             )
             self._selected_atlas_surface_source_id = None
             self._set_atlas_canvas_surface_highlights(())
@@ -11072,6 +11235,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             selected_source_ids = self.texture_atlas_workspace.select_source_ids(
                 (active_trim_record.object_id,),
                 active_source_id=active_trim_record.object_id,
+                request_preview=request_preview,
             )
             if self._is_atlas_surface_texture_source_id(
                 active_trim_record.object_id
@@ -11109,6 +11273,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         selected_source_ids = self.texture_atlas_workspace.select_source_ids(
             source_ids,
             active_source_id=active_source_id,
+            request_preview=request_preview,
         )
         self._handle_atlas_surface_textures_selected(selected_source_ids)
 
@@ -11201,6 +11366,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             self._sync_selected_canvas_wall_highlight(None)
             return
         if self._desired_canvas_surface_ids:
+            desired_surface_ids = self._desired_canvas_surface_ids
             self.viewer.set_selected_placed_object_ids(())
             self.viewer.select_canvas_opening(None)
             selected_surface = (
@@ -11213,12 +11379,13 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             if (
                 selected_surface is not None
                 and selected_surface.surface_type == SURFACE_TYPE_WALL
+                and selected_surface.wall_key is not None
             ):
                 self.viewer.select_wall_target(selected_surface.surface_id)
             else:
                 self.viewer.select_wall_target(None)
                 self.viewer.set_selected_canvas_surface_ids(
-                    self._desired_canvas_surface_ids
+                    desired_surface_ids
                 )
         self._sync_selected_canvas_wall_highlight(
             self.viewer.get_active_canvas_surface_id()
@@ -11872,6 +12039,11 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_landing_mesh_update
+            or bool(self._pending_object_placement_ids)
+            or (
+                bool(self._committing_object_placement_revisions)
+                and self.viewer.is_placed_object_interaction_active
+            )
             or self._active_landing_undo_state is not None
             or self._pending_doorway_bridge_topology_change
             or self._active_architectural_trim_undo_state is not None
@@ -11926,6 +12098,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             finally:
                 self._is_syncing_canvas_scene_selection = False
             self._canvas_viewer_preview_revision = revision
+            self._clear_committed_object_placement_previews_if_displayed()
             return
         self._ensure_viewer_preview_current(preserve_camera=True)
 
@@ -13400,7 +13573,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._sync_atlas_object_texture_sources(
             automatically_assign_scene_textures=False
         )
-        if self._show_unpacked_scene_texture_export_error():
+        if (
+            self._show_unpacked_scene_texture_export_error()
+            or self._show_mixed_scene_atlas_export_error()
+        ):
             return
 
         default_path = Path.cwd() / "housemaker_export.glb"
@@ -13420,6 +13596,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._commit_pending_doorway_mesh_update()
 
         self._commit_landing_mesh_update()
+        self._commit_pending_object_placement_mesh_update()
         export_path = Path(file_path)
         if export_path.suffix.lower() != ".glb":
             export_path = export_path.with_suffix(".glb")
@@ -13576,6 +13753,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         elif is_atlas_workspace:
             if self._atlas_sources_need_tab_sync():
                 self._sync_atlas_object_texture_sources()
+            else:
+                # Scene selection can advance while this preview is hidden,
+                # without changing any source file or invalidating its cache.
+                self._request_hosted_atlas_object_preview()
             self._schedule_atlas_draw_call_estimate()
         elif is_doors_workspace:
             self._sync_selected_door_slot_preview()
@@ -13719,6 +13900,158 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             and self.texture_atlas_workspace.selected_object_id != selected_source_id
         ):
             self._sync_canvas_selection_to_current_atlas_source()
+
+    # ### Delayed object and instance placement meshes ###
+    def _stage_object_placement_mesh_update(
+        self,
+        object_ids: Sequence[str],
+    ) -> bool:
+        """Keep live placement data editable without rebuilding the scene."""
+
+        previews = {
+            preview.object_id: preview
+            for preview in self.viewer.get_pending_placed_object_previews()
+        }
+        records = {
+            record.object_id: record
+            for record in self.generation.get_generated_object_records()
+        }
+        levels = {level.index: level for level in self.levels}
+        base_z = build_level_base_z_lookup(self.levels)
+        staged_ids: list[str] = []
+        for object_id in dict.fromkeys(object_ids):
+            placement = self.generation.get_scene_object_placement(object_id)
+            source_id = self.generation.get_scene_object_source_id(object_id)
+            record = records.get(source_id)
+            if placement is None or record is None:
+                continue
+            try:
+                placed = self._resolve_placed_generated_model(
+                    record,
+                    scene_object_id=object_id,
+                    source_object_id=source_id,
+                    placement=placement,
+                    visible_level_by_index=levels,
+                    base_z_by_level_index=base_z,
+                    preview_only=True,
+                )
+                if placed is None:
+                    continue
+                previews[object_id] = PreviewPlacedObject(
+                    object_id=object_id,
+                    source_object_id=source_id,
+                    meshes=(placed.model.mesh,),
+                    placement_transform=build_placed_generated_model_transform(placed),
+                    world_position=placed.world_position,
+                    rotation_degrees=placed.rotation_degrees,
+                    scale=placed.scale,
+                    axis_scales=placed.axis_scales,
+                    symmetric_preview_orientation=placed.symmetric_preview_orientation,
+                    symmetric_preview_plane_coordinate=(
+                        placed.symmetric_preview_plane_coordinate
+                    ),
+                )
+            except (OSError, TypeError, ValueError, OverflowError):
+                continue
+            staged_ids.append(object_id)
+        if not staged_ids:
+            return False
+        self._pending_object_placement_ids.update(staged_ids)
+        for object_id in staged_ids:
+            self._committing_object_placement_revisions.pop(object_id, None)
+        self.viewer.set_pending_placed_object_previews(tuple(previews.values()))
+        self._sync_canvas_placed_object_profiles()
+        self._object_placement_mesh_update_timer.start()
+        self._refresh_confirm_mesh_updates_button()
+        return True
+
+    def _select_pending_object_placements(self, object_ids: Sequence[str]) -> None:
+        """Expose the newly placed preview's normal transform gizmos at once."""
+
+        available = set(self.viewer.get_pending_placed_object_ids())
+        selected = tuple(object_id for object_id in object_ids if object_id in available)
+        if not selected:
+            return
+        self._remember_desired_canvas_object_selection(
+            selected, active_object_id=selected[-1]
+        )
+        self.viewer.set_selected_placed_object_ids(
+            selected, active_object_id=selected[-1]
+        )
+
+    def _object_placement_preview_is_pending(self, object_id: str) -> bool:
+        return (
+            object_id in self._pending_object_placement_ids
+            or object_id in self._committing_object_placement_revisions
+        )
+
+    def _commit_pending_object_placement_mesh_update(self) -> None:
+        """Publish the latest quiet placements once, retaining green previews."""
+
+        self._object_placement_mesh_update_timer.stop()
+        if not self._pending_object_placement_ids:
+            return
+        if self.viewer.is_placed_object_interaction_active:
+            self._object_placement_mesh_update_timer.start()
+            return
+        object_ids = tuple(self._pending_object_placement_ids)
+        self._pending_object_placement_ids.clear()
+        authored_ids = tuple(
+            object_id for object_id in object_ids
+            if self.generation.get_generated_object_instance(object_id) is None
+        )
+        self._is_publishing_object_placements = True
+        try:
+            if authored_ids:
+                self.generation.publish_placeable_object_placement_changes(authored_ids)
+            if len(authored_ids) != len(object_ids):
+                self.generation.publish_generated_object_instance_changes()
+        finally:
+            self._is_publishing_object_placements = False
+        self._sync_canvas_placed_object_profiles()
+        self._sync_viewer_scene_levels()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        for object_id in object_ids:
+            self._committing_object_placement_revisions[object_id] = (
+                self._viewer_preview_revision
+            )
+        self._refresh_confirm_mesh_updates_button()
+
+    def _clear_committed_object_placement_previews_if_displayed(self) -> None:
+        """Remove green geometry only after its replacement is on screen."""
+
+        committed = tuple(
+            object_id
+            for object_id, revision in self._committing_object_placement_revisions.items()
+            if self._canvas_viewer_preview_revision >= revision
+        )
+        self._drop_pending_object_placement_previews(committed)
+
+    def _drop_pending_object_placement_previews(
+        self, object_ids: Sequence[str],
+    ) -> None:
+        """Retire deleted/undone previews so a late timer cannot revive them."""
+
+        removed = set(object_ids)
+        if not removed:
+            return
+        self._pending_object_placement_ids.difference_update(removed)
+        for object_id in removed:
+            self._committing_object_placement_revisions.pop(object_id, None)
+        previews = self.viewer.get_pending_placed_object_previews()
+        retained = tuple(preview for preview in previews if preview.object_id not in removed)
+        if len(retained) != len(previews):
+            self.viewer.set_pending_placed_object_previews(retained)
+        if not self._pending_object_placement_ids:
+            self._object_placement_mesh_update_timer.stop()
+
+    def _cancel_pending_object_placement_mesh_updates(self) -> None:
+        """Discard only transient render work at project/shutdown boundaries."""
+
+        self._object_placement_mesh_update_timer.stop()
+        self._pending_object_placement_ids.clear()
+        self._committing_object_placement_revisions.clear()
+        self.viewer.clear_pending_placed_object_previews()
 
     # ### Generated-object placement ###
     def _handle_object_placement_requested(
@@ -13885,6 +14218,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         instance = self.generation.add_generated_object_instance(
             source_object_id,
             placement,
+            emit_change_signals=False,
         )
         if instance is None:
             self.texture_atlas_workspace.status_label.setText(
@@ -13906,6 +14240,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             (instance.instance_id,),
             active_object_id=instance.instance_id,
         )
+        if self._stage_object_placement_mesh_update((instance.instance_id,)):
+            self._select_pending_object_placements((instance.instance_id,))
+        else:
+            self.generation.publish_generated_object_instance_changes()
         self.texture_atlas_workspace.status_label.setText("Object instance placed.")
         return True
 
@@ -13924,14 +14262,16 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             if previous_state is not None
             else ()
         )
-        if not self.generation.set_active_object_placement(request_id, placement):
+        if not self.generation.set_active_object_placement(
+            request_id, placement, emit_change_signals=False
+        ):
             self.generation.cancel_object_placement_request(request_id)
             return False
-        if previous_state is None or self._is_restoring_canvas_undo:
+        if previous_state is None:
             return True
         object_id, previous_placement = previous_state
         current_placement = self.generation.get_generated_object_placement(object_id)
-        if current_placement != previous_placement:
+        if current_placement != previous_placement and not self._is_restoring_canvas_undo:
             self._record_canvas_undo_state(
                 _CanvasPlacedObjectUndoState(
                     object_id=object_id,
@@ -13940,6 +14280,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                     restore_atlas_bindings=True,
                 )
             )
+        if self._stage_object_placement_mesh_update((object_id,)):
+            self._select_pending_object_placements((object_id,))
+        else:
+            self.generation.publish_placeable_object_placement_changes((object_id,))
         return True
 
     def _commit_placeable_object_group(
@@ -14034,7 +14378,6 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 return False
             changed_ids.append(placeable_id)
 
-        self.generation.publish_placeable_object_placement_changes(changed_ids)
         undo_states: list[_CanvasPlacedObjectUndoState] = []
         for (
             placeable_id,
@@ -14060,6 +14403,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 if len(undo_states) == 1
                 else _CanvasPlacedObjectGroupUndoState(tuple(undo_states))
             )
+        if self._stage_object_placement_mesh_update(changed_ids):
+            self._select_pending_object_placements(changed_ids)
+        else:
+            self.generation.publish_placeable_object_placement_changes(changed_ids)
         changed_count = len(changed_ids)
         self.generation.status_label.setText(
             f"Placed {changed_count} generated object"
@@ -14205,7 +14552,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 )
             )
         self._sync_canvas_placed_object_profiles()
-        self._schedule_viewer_preview_refresh(preserve_camera=False)
+        if self._stage_object_placement_mesh_update((raw_record.object_id,)):
+            self._select_pending_object_placements((raw_record.object_id,))
+        else:
+            self._schedule_viewer_preview_refresh(preserve_camera=False)
 
     def _handle_generated_object_changed_for_canvas(
         self,
@@ -14235,6 +14585,15 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         """Move or remove a completed object in the Canvas preview."""
 
         if isinstance(raw_record, GeneratedObjectRecord):
+            if raw_record.placement is None:
+                self._drop_pending_object_placement_previews((raw_record.object_id,))
+            if self._is_publishing_object_placements:
+                return
+            if (
+                self._object_placement_preview_is_pending(raw_record.object_id)
+                and self._stage_object_placement_mesh_update((raw_record.object_id,))
+            ):
+                return
             self._sync_canvas_placed_object_profiles()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -14244,6 +14603,13 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
     ) -> None:
         """Refresh both scene overlays after an instance is added or removed."""
 
+        self._drop_pending_object_placement_previews(tuple(
+            object_id
+            for object_id in self.viewer.get_pending_placed_object_ids()
+            if self.generation.get_scene_object_placement(object_id) is None
+        ))
+        if self._is_publishing_object_placements:
+            return
         retained_selection = tuple(
             object_id
             for object_id in self._desired_canvas_object_ids
@@ -14503,6 +14869,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         instance = self.generation.add_generated_object_instance(
             source_object_id,
             placement,
+            emit_change_signals=False,
         )
         if instance is None:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -14522,6 +14889,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             (instance.instance_id,),
             active_object_id=instance.instance_id,
         )
+        if self._stage_object_placement_mesh_update((instance.instance_id,)):
+            self._select_pending_object_placements((instance.instance_id,))
+        else:
+            self.generation.publish_generated_object_instance_changes()
 
     def _handle_placed_object_transform_changed(
         self,
@@ -14612,6 +14983,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             )
         self._sync_canvas_placed_object_profiles()
 
+        if self._object_placement_preview_is_pending(normalized_object_id):
+            self._stage_object_placement_mesh_update((normalized_object_id,))
+            return
         revision = self._mark_viewer_preview_dirty(
             preserve_camera=True,
             affects_draw_call_estimate=False,
@@ -14722,6 +15096,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._sync_canvas_placed_object_profiles()
         # Unlike the 3D gizmo path, the retained Viewer root has not already
         # moved. Always invalidate it so the 3D scene cannot keep stale pixels.
+        if self._object_placement_preview_is_pending(normalized_object_id):
+            self._stage_object_placement_mesh_update((normalized_object_id,))
+            return
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_placed_object_scales_changed(self, raw_updates: object) -> None:
@@ -14813,6 +15190,13 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             )
         self._sync_canvas_placed_object_profiles()
 
+        pending_ids = tuple(
+            object_id for object_id, _existing, _replacement in committed_updates
+            if self._object_placement_preview_is_pending(object_id)
+        )
+        if pending_ids:
+            self._stage_object_placement_mesh_update(pending_ids)
+            return
         revision = self._mark_viewer_preview_dirty(
             preserve_camera=True,
             affects_draw_call_estimate=False,
@@ -14921,6 +15305,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             )
         self._sync_canvas_placed_object_profiles()
 
+        if self._object_placement_preview_is_pending(normalized_object_id):
+            self._stage_object_placement_mesh_update((normalized_object_id,))
+            return
         revision = self._mark_viewer_preview_dirty(
             preserve_camera=True,
             affects_draw_call_estimate=False,
@@ -14955,6 +15342,12 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         normalized_object_id = str(object_id).strip()
         self._discard_canvas_placement_undo_object_id(normalized_object_id)
         self._discard_desired_canvas_object(normalized_object_id)
+        self._drop_pending_object_placement_previews(tuple(
+            preview.object_id
+            for preview in self.viewer.get_pending_placed_object_previews()
+            if preview.object_id == normalized_object_id
+            or preview.source_object_id == normalized_object_id
+        ))
         self._sync_canvas_placed_object_profiles()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -16343,42 +16736,11 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             finally:
                 self._is_assigning_surface_texture_from_atlas = False
 
-        if self.texture_atlas_workspace.is_source_assigned_to_any_atlas(source_id):
-            assigned = commit_surface_assignment()
-        elif self.texture_atlas_workspace.can_assign_source_to_selected_atlas(
+        assigned = self.texture_atlas_workspace.ensure_source_in_typed_atlas(
             source_id,
+            commit_callback=commit_surface_assignment,
             source_ids_to_remove=source_ids_to_remove,
-        ):
-            assigned = self.texture_atlas_workspace.assign_source_to_selected_atlas(
-                source_id,
-                commit_callback=commit_surface_assignment,
-                source_ids_to_remove=source_ids_to_remove,
-            )
-        else:
-            if self.texture_atlas_workspace.selected_atlas is None:
-                self.texture_atlas_workspace.status_label.setText(
-                    "Select or create an Atlas before assigning the texture."
-                )
-                return
-            dialog_parent = (
-                self._external_atlas_host.window
-                if self._external_atlas_host.is_active
-                else self.texture_atlas_workspace
-            )
-            answer = QMessageBox.question(
-                dialog_parent,
-                "Atlas full",
-                "not space in atlas for the texture, create a new atlas?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            assigned = self.texture_atlas_workspace.create_atlas_and_assign_source(
-                source_id,
-                commit_callback=commit_surface_assignment,
-                source_ids_to_remove=source_ids_to_remove,
-            )
+        )
 
         if not assigned:
             surface_status_after = (
@@ -17196,17 +17558,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             for source_id in active_trim_source_ids
             if source_id in self._atlas_available_source_ids
         )
-        export_levels = remove_generated_architectural_trims_from_levels(
-            self.levels,
-            generated_trim_keys,
+        exported_surface_ids = set(
+            self._get_atlas_exported_surface_ids(generated_trim_keys)
         )
-        exported_surface_ids = {
-            surface.surface_id
-            for surface in build_fixed_surfaces(
-                export_levels,
-                stairs=self.stairs,
-            )
-        }
         exported_surface_ids.update(
             semantic_id
             for semantic_id, target in self._canvas_stair_part_targets_by_id.items()
@@ -17224,6 +17578,32 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             if surface_id in exported_surface_ids
         )
         return tuple(dict.fromkeys(required_ids))
+
+    def _get_atlas_exported_surface_ids(
+        self,
+        generated_trim_keys: Sequence[tuple[int, str]],
+    ) -> frozenset[str]:
+        """Reuse semantic geometry IDs until the live structural inputs change.
+
+        Keep only this expensive geometry result cached: placements and texture
+        assignments are still resolved afresh by the caller. The value snapshot
+        also detects pending edits and undo/load before a viewer mesh refresh.
+        """
+
+        signature = build_scene_surface_geometry_signature(
+            self.levels, self.stairs, generated_trim_keys=generated_trim_keys,
+        )
+        if signature != self._atlas_surface_geometry_signature:
+            export_levels = remove_generated_architectural_trims_from_levels(
+                self.levels, generated_trim_keys,
+            )
+            surface_ids = frozenset(
+                surface.surface_id
+                for surface in build_fixed_surfaces(export_levels, stairs=self.stairs)
+            )
+            self._atlas_exported_surface_ids = surface_ids
+            self._atlas_surface_geometry_signature = signature
+        return self._atlas_exported_surface_ids
 
     def _build_bound_surface_atlas_source_ids(self) -> tuple[str, ...]:
         """Return available texture sources applied to any live surface."""
@@ -17249,12 +17629,10 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         target_resolution = settings.automatic_atlas_texture_resolution
         allow_atlas_creation = settings.automatic_atlas_creation
         sort_by_pbr = settings.automatic_atlas_texture_sort_by_pbr
-        use_half_mesh_texture_prefix = settings.use_half_mesh_texture_prefix
         attempt_key = self._build_automatic_atlas_assignment_key(
             target_resolution,
             allow_atlas_creation,
             sort_by_pbr,
-            use_half_mesh_texture_prefix,
             source_ids=source_ids,
         )
         if attempt_key == self._last_automatic_atlas_assignment_key:
@@ -17272,7 +17650,6 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                         )
                     ),
                     sort_by_pbr=sort_by_pbr,
-                    use_half_mesh_texture_prefix=(use_half_mesh_texture_prefix),
                     allow_atlas_creation=allow_atlas_creation,
                     source_ids=source_ids,
                 )
@@ -17291,7 +17668,6 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                     target_resolution,
                     allow_atlas_creation,
                     sort_by_pbr,
-                    use_half_mesh_texture_prefix,
                     source_ids=source_ids,
                 )
             )
@@ -17301,7 +17677,6 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         target_resolution: int,
         allow_atlas_creation: bool,
         sort_by_pbr: bool,
-        use_half_mesh_texture_prefix: bool,
         *,
         source_ids: Sequence[str] | None = None,
     ) -> tuple[object, ...]:
@@ -17313,6 +17688,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 atlas.atlas_id,
                 atlas.name,
                 atlas.resolution,
+                atlas.atlas_type,
                 tuple(
                     (
                         placement.object_id,
@@ -17334,7 +17710,6 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             int(target_resolution),
             bool(allow_atlas_creation),
             bool(sort_by_pbr),
-            bool(use_half_mesh_texture_prefix),
             (
                 self.texture_atlas_workspace
                 .get_unpacked_scene_texture_source_ids()
@@ -17445,6 +17820,37 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             "Every texture used by the exported scene must be assigned to "
             "an Atlas before GLB export. Review these unpacked textures in "
             "the Atlas tab:\n\n" + "\n".join(detail_lines),
+        )
+        return True
+
+    def _show_mixed_scene_atlas_export_error(self) -> bool:
+        """Do not export mixed legacy batches when safe migration was blocked."""
+
+        required_ids = set(self._build_required_scene_atlas_source_ids())
+        invalid_names: list[str] = []
+        for atlas in self.texture_atlas_workspace.get_data().atlases:
+            types = {
+                ATLAS_TYPE_SURFACE
+                if self._is_atlas_surface_texture_source_id(placement.object_id)
+                else ATLAS_TYPE_OBJECT
+                for placement in atlas.placements
+                if placement.object_id in required_ids
+            }
+            if len(types) > 1 or (
+                types and atlas.atlas_type is not None and atlas.atlas_type not in types
+            ):
+                invalid_names.append(atlas.name)
+        if not invalid_names:
+            return False
+        QMessageBox.warning(
+            self,
+            "Atlas separation incomplete",
+            "These Atlases still mix object and surface textures or have the "
+            "wrong type:\n\n"
+            + "\n".join(f"- {name}" for name in invalid_names[:10])
+            + "\n\nRestore any missing source textures and reopen the Atlas tab "
+            "so the layouts can be separated before exporting. Existing "
+            "assignments have been kept unchanged.",
         )
         return True
 
@@ -18685,6 +19091,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             self._refresh_pending_level_transform_outline()
         self._clear_committed_doorway_outline_if_displayed()
         self._clear_committed_level_transform_outline_if_displayed()
+        self._clear_committed_object_placement_previews_if_displayed()
         return True
 
     def _build_viewer_preview_dependency_signature(
@@ -19140,7 +19547,23 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             )
             is not None
         }
-        self.viewer.set_placed_door_opening_bindings(placed_door_bindings)
+        window_references = {
+            (target.reference.level_index, target.reference.stable_id): target.reference
+            for target in self._canvas_opening_targets_by_key.values()
+            if target.reference.kind == CANVAS_OPENING_WINDOW
+            and target.reference.stable_id is not None
+        }
+        placed_opening_bindings = {
+            **placed_door_bindings,
+            **{
+                f"window-placement:{placement.placement_id}": reference
+                for placement in library.window_placements
+                if (reference := window_references.get(
+                    (placement.level_index, placement.window_frame_id)
+                )) is not None
+            },
+        }
+        self.viewer.set_placed_opening_bindings(placed_opening_bindings)
 
     def _set_mesh_edit_update_delay_seconds(
         self,
@@ -19165,6 +19588,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             self._stair_point_mesh_update_timer,
             self._wall_vertex_update_timer,
             self._landing_mesh_update_timer,
+            self._object_placement_mesh_update_timer,
         )
         active_timers = tuple(timer.isActive() for timer in timers)
         self._mesh_edit_update_delay_seconds = normalized_delay
@@ -20154,6 +20578,12 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
     ) -> tuple[frozenset[str], tuple[tuple[int, str], ...]]:
         """Resolve valid Atlas trim ownership without serializing fitted GLBs."""
 
+        if not any(
+            level.architectural_trims
+            for level in self.levels
+            if level.index in included_level_indices
+        ):
+            return frozenset(), ()
         generated_records = self.generation.get_generated_object_records()
         records_by_id = {record.object_id: record for record in generated_records}
         records_by_trim_key = {
@@ -21455,7 +21885,12 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
 
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         if (
-            self._active_canvas_surface_edit_target is not None
+            bool(self._pending_object_placement_ids)
+            or (
+                bool(self._committing_object_placement_revisions)
+                and self.viewer.is_placed_object_interaction_active
+            )
+            or self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or bool(self._active_sloped_ceiling_edits)
@@ -21571,6 +22006,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
                 self._refresh_pending_level_transform_outline()
             self._clear_committed_doorway_outline_if_displayed()
             self._clear_committed_level_transform_outline_if_displayed()
+            self._clear_committed_object_placement_previews_if_displayed()
 
         if tour_is_stale:
             tour_preview_viewer = self.tour_preview_viewer
@@ -21620,7 +22056,12 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         if not self._active_viewer_preview_needs_refresh():
             return
         if (
-            self._active_canvas_surface_edit_target is not None
+            bool(self._pending_object_placement_ids)
+            or (
+                bool(self._committing_object_placement_revisions)
+                and self.viewer.is_placed_object_interaction_active
+            )
+            or self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or bool(self._active_sloped_ceiling_edits)
@@ -21679,7 +22120,12 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         if not self._active_viewer_preview_needs_refresh():
             return
         if (
-            self._active_canvas_surface_edit_target is not None
+            bool(self._pending_object_placement_ids)
+            or (
+                bool(self._committing_object_placement_revisions)
+                and self.viewer.is_placed_object_interaction_active
+            )
+            or self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_face_orientation_undo_state is not None
             or self._pending_canvas_surface_mesh_update
             or bool(self._active_sloped_ceiling_edits)
@@ -21721,7 +22167,9 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._commit_pending_stair_point_mesh_update()
 
         self._commit_landing_mesh_update()
+        self._commit_pending_object_placement_mesh_update()
         try:
+            self.merged_generation_workspace.flush_reference_generation_preferences()
             save_project(
                 path=file_path,
                 current_level_index=self.current_level_index,
@@ -29830,6 +30278,15 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
             self._clear_committed_doorway_outline_if_displayed()
             if self._doorway_outline_commit_revision is None:
                 self.viewer.set_doorway_preview_outline(None)
+            selected_index = self.canvas.selected_doorway_index
+            if selected_index is not None and 0 <= selected_index < len(level.doorways):
+                self._show_pending_canvas_opening(
+                    CanvasOpeningReference(
+                        CANVAS_OPENING_DOORWAY, level.index, selected_index,
+                        level.doorways[selected_index].doorway_id,
+                    ),
+                    pending=False,
+                )
             return
 
         selected_index = self.canvas.selected_doorway_index
@@ -29859,6 +30316,15 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
 
         self._pending_doorway_mesh_level_index = level.index
         self._pending_canvas_opening_key = f"doorway:{level.index}:{selected_index}"
+        self._show_pending_canvas_opening(
+            CanvasOpeningReference(
+                CANVAS_OPENING_DOORWAY, level.index, selected_index,
+                doorway.doorway_id,
+            ),
+            select=not (
+                self._is_doorway_move_drag_active or self._is_doorway_resize_drag_active
+            ),
+        )
         if self._is_doorway_move_drag_active or self._is_doorway_resize_drag_active:
             self._doorway_mesh_update_timer.stop()
         else:
@@ -30823,6 +31289,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         # boundary. Retire result bindings and queued work before replacing the
         # old scene, so any active decode can finish without committing into the
         # incoming project.
+        self._reset_opening_proportions()
         self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_plan_wall_detections()
         self._restore_plan_wall_detection_options(plan_wall_generation)
@@ -30833,6 +31300,7 @@ class BlueprintWorkspace(GlobalScaleWorkspaceMixin, LandingWorkspaceMixin, QWidg
         self._cancel_and_join_surface_texture_tiling_preparations()
         self._pending_generation_placement_anchor = None
         self._cancel_direct_object_placement()
+        self._cancel_pending_object_placement_mesh_updates()
         self.viewer.cancel_door_placement()
         self._cancel_directional_light_placement(notify=False)
         self._tour_point_request_revision += 1
@@ -31678,24 +32146,32 @@ def _show_window_on_primary_screen(window: QMainWindow) -> None:
         window.show()
         return
 
-    available_geometry = screen.availableGeometry()
-    window_width = min(window.width(), available_geometry.width())
-    window_height = min(window.height(), available_geometry.height())
-    if window_width != window.width() or window_height != window.height():
-        window.resize(window_width, window_height)
-
-    window_x = available_geometry.x() + max(
-        0,
-        (available_geometry.width() - window.width()) // 2,
-    )
-    window_y = available_geometry.y() + max(
-        0,
-        (available_geometry.height() - window.height()) // 2,
-    )
-    window.move(window_x, window_y)
+    window.ensurePolished()
+    window.winId()
+    window_handle = window.windowHandle()
+    try:
+        if window_handle is not None:
+            window_handle.setScreen(screen)
+        fit_normal_window_to_screen(window, screen)
+    except (RuntimeError, ValueError):
+        # Windows chooses a fallback if a display disappears during startup.
+        pass
     window.show()
+    # Native decorations and per-monitor DPI can settle after the first show.
+    QTimer.singleShot(0, partial(_fit_shown_window_to_screen, window, screen))
     window.raise_()
     window.activateWindow()
+
+
+def _fit_shown_window_to_screen(window: QMainWindow, screen: QScreen) -> None:
+    """Recheck the frame once without resizing closed or maximized windows."""
+
+    try:
+        if window.isVisible():
+            fit_normal_window_to_screen(window, screen)
+    except (RuntimeError, ValueError):
+        # A monitor or window may disappear before the queued callback runs.
+        return
 
 
 # ### Entrypoint ###

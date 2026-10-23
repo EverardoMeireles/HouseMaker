@@ -27,6 +27,7 @@ from housemaker.generation_state import (
     MaskPoint,
     MaskStroke,
 )
+from housemaker.generation_views import _build_masked_frame_crop
 from housemaker.generation_workspace import (
     DOOR_COMPONENT_PIPELINE_KEY,
     GenerationWorkspace,
@@ -147,27 +148,41 @@ class GeneratedReferenceMeshyRoutingTests(unittest.TestCase):
         self.objects._selected_object_id = record.object_id
         return record
 
-    def test_full_generate_uses_one_reference_not_old_mask_blobs(self) -> None:
+    def _assert_per_blob_generation_references(self, *, geometry_only: bool) -> None:
+        reference_key = self.objects.current_inpaint_reference_key()
+        frame = self.objects.video_view.get_frame_bgr()
+        expected = {
+            self.objects._inpaint_reference_key(0, mask): _build_masked_frame_crop(
+                frame, mask, 0.08
+            )
+            for mask in self.objects._frame_inpaint_masks(0)
+        }
+        self.assertIn(reference_key, expected)
+        expected[reference_key] = self.reference
         with patch.object(
             self.objects, "_start_generation", return_value="mock-job"
         ) as start:
-            self.objects.generate()
+            if geometry_only:
+                self.objects.generate_geometry()
+            else:
+                self.objects.generate()
 
-        start.assert_called_once()
-        request = start.call_args.args[0]
-        self.assertFalse(request.geometry_only)
-        np.testing.assert_array_equal(request.selected_object_bgra, self.reference)
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(
+            {call.args[0].inpaint_key for call in start.call_args_list}, set(expected)
+        )
+        for call in start.call_args_list:
+            request = call.args[0]
+            self.assertEqual(request.geometry_only, geometry_only)
+            np.testing.assert_array_equal(
+                request.selected_object_bgra, expected[request.inpaint_key]
+            )
 
-    def test_geometry_generate_uses_the_generated_reference(self) -> None:
-        with patch.object(
-            self.objects, "_start_generation", return_value="mock-job"
-        ) as start:
-            self.objects.generate_geometry()
+    def test_full_generate_keeps_corrected_and_raw_references_private_to_each_blob(self) -> None:
+        self._assert_per_blob_generation_references(geometry_only=False)
 
-        start.assert_called_once()
-        request = start.call_args.args[0]
-        self.assertTrue(request.geometry_only)
-        np.testing.assert_array_equal(request.selected_object_bgra, self.reference)
+    def test_geometry_generate_keeps_corrected_and_raw_references_private_to_each_blob(self) -> None:
+        self._assert_per_blob_generation_references(geometry_only=True)
 
     def test_texture_generate_uses_reference_not_the_video_mask(self) -> None:
         self._add_existing_object()

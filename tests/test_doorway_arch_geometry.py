@@ -399,9 +399,10 @@ class DoorwayArchWallGeometryTests(unittest.TestCase):
             doorway.shape,
             doorway.arch_amount,
         )
+        surfaces = build_fixed_surfaces([level])
         wall = next(
             surface
-            for surface in build_fixed_surfaces([level])
+            for surface in surfaces
             if surface.surface_id == "level:2/room:5/wall:1:2"
         )
         expected_reveal_area = (
@@ -410,13 +411,15 @@ class DoorwayArchWallGeometryTests(unittest.TestCase):
 
         self.assertAlmostEqual(
             wall.area_square_meters,
-            6.0 - _profile_area(outline) + expected_reveal_area,
+            6.0 - _profile_area(outline),
             places=5,
         )
+        reveals = [surface for surface in surfaces if surface.opening_id == doorway.doorway_id]
+        self.assertAlmostEqual(sum(surface.mesh.area for surface in reveals), expected_reveal_area)
         self.assertGreater(len(wall.mesh.faces), DOORWAY_ARCH_SEGMENT_COUNT)
         np.testing.assert_allclose(
             wall.mesh.bounds[:, 1],
-            np.asarray((-0.1, 0.1)),
+            np.asarray((0.0, 0.0)),
             atol=1e-6,
         )
 

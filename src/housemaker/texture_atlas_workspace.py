@@ -58,10 +58,12 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSplitter,
     QStyle,
@@ -96,6 +98,7 @@ from housemaker.texture_atlas_state import (
     ATLAS_DOUBLE_SIZED_PACKING_MODES,
     ATLAS_HALF_SLOT_PACKING_MODES,
     ATLAS_LIMITED_RESOLUTION_PACKING_MODES,
+    ATLAS_NAME_PREFIX_BY_TYPE,
     ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
@@ -109,11 +112,15 @@ from housemaker.texture_atlas_state import (
     ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
     ATLAS_SLOT_QUADRANT_ORDER,
     ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+    ATLAS_TYPE_OBJECT,
+    ATLAS_TYPE_SURFACE,
     SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS,
     TextureAtlasData,
     TextureAtlasPlacement,
     TextureAtlasRecord,
     atlas_packing_modes_can_share_slot,
+    normalize_atlas_name,
+    normalize_atlas_partial_slots,
     write_texture_atlas_png,
 )
 from housemaker.texture_color_balance import (
@@ -177,9 +184,6 @@ ATLAS_PREVIEW_MAP_LABELS = {
 }
 NON_PBR_ATLAS_NAME_PREFIX = "[NON-PBR]"
 NON_PBR_ATLAS_BASE_NAME = f"{NON_PBR_ATLAS_NAME_PREFIX} Atlas"
-HALF_MESH_ATLAS_NAME_PREFIX = "[HALF]"
-HALF_MESH_ATLAS_BASE_NAME = f"{HALF_MESH_ATLAS_NAME_PREFIX} Atlas"
-HALF_MESH_ATLAS_RESOLUTION = 4096
 DEFAULT_ATLAS_BASE_NAME = "Atlas"
 DEFAULT_AUTOMATIC_ATLAS_RESOLUTION = min(ATLAS_RESOLUTIONS)
 DRAW_CALL_ESTIMATE_TOOLTIP = (
@@ -2754,6 +2758,11 @@ class TextureAtlasWorkspace(QWidget):
         self._last_published_source_selection: (
             tuple[str | None, tuple[str, ...], str | None] | None
         ) = None
+        self._last_scene_source_selection: (
+            tuple[str | None, tuple[str, ...], str | None] | None
+        ) = None
+        self._scene_source_preview_pending = True
+        self._atlas_type_migration_warning: str | None = None
         self._object_preview_widget: QWidget | None = None
         self._build_ui()
         self._refresh_all()
@@ -3055,19 +3064,26 @@ class TextureAtlasWorkspace(QWidget):
         self._texture_variant_resolver = variant_resolver
         self._texture_variant_selectability_resolver = selectability_resolver
         self._variant_source_cache.clear()
+        self.normalize_legacy_atlas_types()
         self._refresh_object_list(selected_object_id)
         self._refresh_preview()
+        self._sync_selected_atlas_editor()
+        if self._atlas_type_migration_warning:
+            self.status_label.setText(self._atlas_type_migration_warning)
 
     def set_scene_texture_source_ids(self, source_ids: Sequence[str]) -> None:
         """Set the ordered, ephemeral Atlas sources required by the scene."""
 
-        self._scene_texture_source_ids = tuple(
+        normalized_ids = tuple(
             dict.fromkeys(
                 source_id
                 for source_id in (str(value).strip() for value in source_ids)
                 if source_id
             )
         )
+        if normalized_ids == self._scene_texture_source_ids:
+            return
+        self._scene_texture_source_ids = normalized_ids
         self._refresh_object_list(self._selected_object_id())
 
     def set_scene_bound_source_ids(self, source_ids: Sequence[str]) -> None:
@@ -3159,38 +3175,240 @@ class TextureAtlasWorkspace(QWidget):
             for source_id in self.get_unpacked_scene_texture_source_ids()
         )
 
+    # ### Typed atlas routing and legacy migration ###
+    def _source_atlas_type(self, source_id: str) -> str:
+        return (
+            ATLAS_TYPE_SURFACE
+            if self._is_surface_texture_source_id(source_id)
+            else ATLAS_TYPE_OBJECT
+        )
+
+    def _known_source_atlas_type(self, source_id: str) -> str | None:
+        if (
+            source_id not in self._sources_by_object_id
+            and source_id not in self._surface_texture_entries_by_id
+            and source_id not in self._placeable_objects_by_id
+        ):
+            return None
+        return self._source_atlas_type(source_id)
+
+    def get_atlas_type_migration_warning(self) -> str | None:
+        """Explain legacy layouts which could not yet be migrated safely."""
+
+        return self._atlas_type_migration_warning
+
+    def _atlas_accepts_source_type(
+        self, atlas: TextureAtlasRecord, atlas_type: str,
+    ) -> bool:
+        return bool(
+            atlas.atlas_type in (None, atlas_type)
+            and all(
+                self._known_source_atlas_type(placement.object_id) == atlas_type
+                for placement in atlas.placements
+            )
+        )
+
+    @staticmethod
+    def _next_typed_atlas_name(
+        data: TextureAtlasData,
+        atlas_type: str,
+        *,
+        base_name: str = DEFAULT_ATLAS_BASE_NAME,
+        exclude_atlas_id: str | None = None,
+    ) -> str:
+        existing_names = {
+            atlas.name.casefold() for atlas in data.atlases
+            if atlas.atlas_id != exclude_atlas_id
+        }
+        try:
+            name = normalize_atlas_name(base_name, atlas_type)
+        except ValueError:
+            # Legacy names could consist only of a now-reserved prefix.
+            name = normalize_atlas_name(DEFAULT_ATLAS_BASE_NAME, atlas_type)
+        suffix = 2
+        candidate = name
+        while candidate.casefold() in existing_names:
+            candidate = f"{name} {suffix}"
+            suffix += 1
+        return candidate
+
+    def _claim_atlas_type(
+        self, data: TextureAtlasData, atlas: TextureAtlasRecord, atlas_type: str,
+    ) -> None:
+        if atlas.atlas_type == atlas_type:
+            return
+        name = self._next_typed_atlas_name(
+            data, atlas_type, base_name=atlas.name, exclude_atlas_id=atlas.atlas_id,
+        )
+        if atlas.atlas_type is not None:
+            data.set_atlas_type(atlas.atlas_id, None)
+        data.rename_atlas(atlas.atlas_id, name)
+        data.set_atlas_type(atlas.atlas_id, atlas_type)
+
+    def ensure_source_in_typed_atlas(
+        self, source_id: str,
+        commit_callback: SourceAssignmentCommitCallback | None = None,
+        *, source_ids_to_remove: Sequence[str] = (),
+    ) -> bool:
+        """Atomically find or create an appropriate Object/Surface destination."""
+
+        source = self._sources_by_object_id.get(str(source_id).strip())
+        if source is None:
+            self.status_label.setText("The texture source is unavailable.")
+            return False
+        atlas_type = self._source_atlas_type(source.object_id)
+        previous_selected = self._data.selected_atlas_id
+        candidate = self._data.clone()
+        affected_ids = list(self._remove_sources_from_candidate(
+            candidate,
+            tuple(value for value in source_ids_to_remove if value != source.object_id),
+        ))
+        already_assigned = next((
+            atlas for atlas in candidate.atlases
+            if atlas.placement_for_object(source.object_id) is not None
+            and self._atlas_accepts_source_type(atlas, atlas_type)
+        ), None)
+        if already_assigned is not None:
+            self._claim_atlas_type(candidate, already_assigned, atlas_type)
+            destination_id = already_assigned.atlas_id
+            placement = already_assigned.placement_for_object(source.object_id)
+        else:
+            destination_id = self._assign_automatic_scene_source(
+                candidate, source, selected_atlas_id=candidate.selected_atlas_id,
+                sort_by_pbr=False, allow_atlas_creation=True, source_overrides={},
+            )
+            if destination_id is None:
+                self.status_label.setText("The texture could not fit in a typed Atlas.")
+                return False
+            affected_ids.append(destination_id)
+            destination = candidate.atlas_by_id(destination_id)
+            assert destination is not None
+            placement = destination.placement_for_object(source.object_id)
+        assert placement is not None
+        candidate.select_atlas(destination_id)
+        if affected_ids:
+            if not self._commit_source_assignment_candidate(
+                candidate, affected_ids, commit_callback,
+            ):
+                return False
+        else:
+            if commit_callback is not None:
+                try:
+                    accepted = bool(commit_callback())
+                except Exception:
+                    accepted = False
+                if not accepted:
+                    self.status_label.setText("Atlas assignment was rejected; no data changed.")
+                    return False
+            self._data = candidate
+        self._refresh_all()
+        self._emit_data_changed()
+        if previous_selected != destination_id:
+            self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
+        self.status_label.setText(
+            f"{source.object_name} is assigned to {self.selected_atlas.name}."
+        )
+        return True
+
+    def normalize_legacy_atlas_types(self) -> int:
+        """Classify legacy layouts, splitting mixed pixels only with all exact sources.
+
+        Source catalogs must already be installed. A split keeps every placement
+        coordinate and packing slot; missing pixels leave the original untouched.
+        No source assets or original AO images are deleted.
+        """
+
+        changed = 0
+        blocked: list[str] = []
+        self._atlas_type_migration_warning = None
+        for original in tuple(self._data.atlases):
+            kinds = {
+                self._known_source_atlas_type(item.object_id)
+                for item in original.placements
+            }
+            if None in kinds:
+                blocked.append(original.name)
+                continue
+            atlas_type = next(iter(kinds)) if len(kinds) == 1 else (
+                original.atlas_type or ATLAS_TYPE_SURFACE
+            )
+            if not kinds:
+                atlas_type = original.atlas_type or ATLAS_TYPE_OBJECT
+            if len(kinds) <= 1 and original.atlas_type == atlas_type:
+                continue
+            snapshots: dict[Path, bytes | None] = {}
+            try:
+                candidate = self._data.clone()
+                atlas = candidate.atlas_by_id(original.atlas_id)
+                assert atlas is not None
+                self._claim_atlas_type(candidate, atlas, atlas_type)
+                if len(kinds) > 1:
+                    if any(
+                        self._resolve_placement_source(item) is None
+                        for item in original.placements
+                    ):
+                        blocked.append(original.name)
+                        continue
+                    other_type = (
+                        ATLAS_TYPE_OBJECT
+                        if atlas_type == ATLAS_TYPE_SURFACE
+                        else ATLAS_TYPE_SURFACE
+                    )
+                    other = candidate.create_atlas(
+                        self._next_typed_atlas_name(
+                            candidate, other_type, base_name=original.name,
+                        ),
+                        original.resolution, atlas_type=other_type,
+                    )
+                    other.placements = [
+                        item for item in atlas.placements
+                        if self._source_atlas_type(item.object_id) == other_type
+                    ]
+                    atlas.placements = [
+                        item for item in atlas.placements
+                        if self._source_atlas_type(item.object_id) == atlas_type
+                    ]
+                    normalize_atlas_partial_slots(atlas)
+                    normalize_atlas_partial_slots(other)
+                    atlas.clear_surface_ambient_occlusion()
+                    snapshots = self._snapshot_atlas_pngs((atlas.atlas_id, other.atlas_id))
+                    self._materialize_atlas(atlas)
+                    self._materialize_atlas(other)
+            except (OSError, TypeError, ValueError):
+                _restore_atlas_png_snapshots(snapshots)
+                blocked.append(original.name)
+                continue
+            self._data = candidate
+            changed += 1
+        if changed:
+            self._refresh_atlas_list(self._data.selected_atlas_id)
+            self._emit_data_changed()
+        if blocked:
+            self._atlas_type_migration_warning = (
+                "Legacy Atlas contents were retained and kept unchanged because their "
+                "sources are unavailable or could not be safely separated: " + ", ".join(blocked)
+            )
+        return changed
+
+    # ### Automatic typed atlas assignment ###
     def auto_assign_scene_texture_sources(
         self,
         resolution: int,
         commit_callback: SceneTextureAssignmentCommitCallback | None = None,
         *,
         sort_by_pbr: bool = False,
-        use_half_mesh_texture_prefix: bool = False,
         allow_atlas_creation: bool = False,
         source_ids: Sequence[str] | None = None,
     ) -> tuple[str, ...]:
         """Pack every currently-unpacked source into an appropriate Atlas.
 
-        By default this preserves selected-Atlas behavior. Half-mesh routing
-        takes precedence over PBR sorting and sends sources with mirrored
-        geometry previews to a ``[HALF]`` Atlas. Texture-only half-packed
-        sources remain in ordinary Atlases. PBR sorting sends other
-        base-color-only sources to an Atlas whose exact sources own no PBR
-        maps. Missing auxiliary Atlases are created as needed. When generic
-        Atlas creation is enabled, a full selected Atlas overflows into
-        uniquely named Atlases of the same size. The successful subset is
-        published as one Atlas/PNG transaction.
+        Objects and surfaces always use separate typed Atlases. Surface sources
+        create or overflow their own Atlases automatically. Object overflow
+        follows the creation preference; optional PBR sorting stays within each
+        category. The successful subset is published as one PNG transaction.
         """
 
         selected_atlas = self.selected_atlas
-        if (
-            selected_atlas is None
-            and not bool(sort_by_pbr)
-            and not bool(use_half_mesh_texture_prefix)
-            and not bool(allow_atlas_creation)
-        ):
-            self._refresh_object_list(self._selected_object_id())
-            return ()
         try:
             target_resolution = int(resolution)
         except (TypeError, ValueError, OverflowError):
@@ -3245,7 +3463,6 @@ class TextureAtlasWorkspace(QWidget):
                     None if selected_atlas is None else selected_atlas.atlas_id
                 ),
                 sort_by_pbr=bool(sort_by_pbr),
-                use_half_mesh_texture_prefix=bool(use_half_mesh_texture_prefix),
                 allow_atlas_creation=bool(allow_atlas_creation),
                 source_overrides=source_overrides,
             )
@@ -3333,30 +3550,19 @@ class TextureAtlasWorkspace(QWidget):
         *,
         selected_atlas_id: str | None,
         sort_by_pbr: bool,
-        use_half_mesh_texture_prefix: bool,
         allow_atlas_creation: bool,
         source_overrides: dict[tuple[str, int], AtlasObjectTextureSource],
     ) -> str | None:
         """Assign one prepared source and return its destination Atlas ID."""
 
-        if (
-            use_half_mesh_texture_prefix
-            and source.packing_mode != ATLAS_PACKING_MODE_FULL
-            and source.symmetric_preview_orientation is not None
-        ):
-            return self._assign_half_mesh_source(
-                data,
-                source,
-                selected_atlas_id=selected_atlas_id,
-            )
-
+        atlas_type = self._source_atlas_type(source.object_id)
         if not sort_by_pbr or self._source_has_pbr_maps(source):
             candidate_ids = tuple(
                 dict.fromkeys(
                     atlas_id
                     for atlas_id in (
-                        data.selected_atlas_id if allow_atlas_creation else None,
                         selected_atlas_id,
+                        *(atlas.atlas_id for atlas in data.atlases),
                     )
                     if atlas_id is not None
                 )
@@ -3372,7 +3578,11 @@ class TextureAtlasWorkspace(QWidget):
             )
 
         for atlas_id in candidate_ids:
+            atlas = data.atlas_by_id(atlas_id)
+            if atlas is None or not self._atlas_accepts_source_type(atlas, atlas_type):
+                continue
             try:
+                self._claim_atlas_type(data, atlas, atlas_type)
                 data.assign_object(
                     atlas_id,
                     source.object_id,
@@ -3386,7 +3596,7 @@ class TextureAtlasWorkspace(QWidget):
             return atlas_id
 
         if not sort_by_pbr or self._source_has_pbr_maps(source):
-            if not allow_atlas_creation:
+            if not allow_atlas_creation and atlas_type != ATLAS_TYPE_SURFACE:
                 return None
             return self._create_generic_atlas_for_source(
                 data,
@@ -3420,8 +3630,9 @@ class TextureAtlasWorkspace(QWidget):
         created_atlas_id: str | None = None
         try:
             atlas = data.create_atlas(
-                self._next_generic_atlas_name(data),
+                self._next_typed_atlas_name(data, self._source_atlas_type(source.object_id)),
                 atlas_resolution,
+                atlas_type=self._source_atlas_type(source.object_id),
             )
             created_atlas_id = atlas.atlas_id
             data.select_atlas(atlas.atlas_id)
@@ -3439,88 +3650,6 @@ class TextureAtlasWorkspace(QWidget):
                 data.select_atlas(previous_selected_atlas_id)
             return None
         return atlas.atlas_id
-
-    def _assign_half_mesh_source(
-        self,
-        data: TextureAtlasData,
-        source: AtlasObjectTextureSource,
-        *,
-        selected_atlas_id: str | None,
-    ) -> str | None:
-        """Put one symmetric source in a prefixed Atlas, creating one if full."""
-
-        candidate_atlases = sorted(
-            (
-                atlas
-                for atlas in data.atlases
-                if atlas.name.casefold().startswith(
-                    HALF_MESH_ATLAS_NAME_PREFIX.casefold()
-                )
-            ),
-            key=lambda atlas: (
-                0 if atlas.atlas_id == selected_atlas_id else 1,
-                data.atlases.index(atlas),
-            ),
-        )
-        for atlas in candidate_atlases:
-            try:
-                data.assign_object(
-                    atlas.atlas_id,
-                    source.object_id,
-                    source.texture_path,
-                    source.texture_resolution,
-                    source.packing_mode,
-                    allow_pairing=True,
-                )
-            except (OSError, TypeError, ValueError):
-                continue
-            return atlas.atlas_id
-
-        return self._create_half_mesh_atlas_for_source(data, source)
-
-    def _create_half_mesh_atlas_for_source(
-        self,
-        data: TextureAtlasData,
-        source: AtlasObjectTextureSource,
-    ) -> str | None:
-        """Create one uniquely named 4096 half-mesh Atlas and place a source."""
-
-        previous_selected_atlas_id = data.selected_atlas_id
-        created_atlas_id: str | None = None
-        try:
-            atlas = data.create_atlas(
-                self._next_half_mesh_atlas_name(data),
-                HALF_MESH_ATLAS_RESOLUTION,
-            )
-            created_atlas_id = atlas.atlas_id
-            data.assign_object(
-                atlas.atlas_id,
-                source.object_id,
-                source.texture_path,
-                source.texture_resolution,
-                source.packing_mode,
-                allow_pairing=True,
-            )
-        except (OSError, TypeError, ValueError):
-            if created_atlas_id is not None:
-                data.remove_atlas(created_atlas_id)
-                data.select_atlas(previous_selected_atlas_id)
-            return None
-        return atlas.atlas_id
-
-    @staticmethod
-    def _next_half_mesh_atlas_name(data: TextureAtlasData) -> str:
-        """Return a unique, deterministic name with the required prefix."""
-
-        existing_names = {atlas.name.casefold() for atlas in data.atlases}
-        if HALF_MESH_ATLAS_BASE_NAME.casefold() not in existing_names:
-            return HALF_MESH_ATLAS_BASE_NAME
-        suffix = 2
-        while True:
-            candidate = f"{HALF_MESH_ATLAS_BASE_NAME} {suffix}"
-            if candidate.casefold() not in existing_names:
-                return candidate
-            suffix += 1
 
     def _ordered_non_pbr_atlases(
         self,
@@ -3543,9 +3672,7 @@ class TextureAtlasWorkspace(QWidget):
                     0 if atlas.atlas_id == selected_atlas_id else 1,
                     (
                         0
-                        if atlas.name.casefold().startswith(
-                            NON_PBR_ATLAS_NAME_PREFIX.casefold()
-                        )
+                        if NON_PBR_ATLAS_NAME_PREFIX.casefold() in atlas.name.casefold()
                         else 1
                     ),
                     data.atlases.index(atlas),
@@ -3601,8 +3728,12 @@ class TextureAtlasWorkspace(QWidget):
         created_atlas_id: str | None = None
         try:
             atlas = data.create_atlas(
-                self._next_non_pbr_atlas_name(data),
+                self._next_typed_atlas_name(
+                    data, self._source_atlas_type(source.object_id),
+                    base_name=NON_PBR_ATLAS_BASE_NAME,
+                ),
                 atlas_resolution,
+                atlas_type=self._source_atlas_type(source.object_id),
             )
             created_atlas_id = atlas.atlas_id
             data.assign_object(
@@ -3619,20 +3750,6 @@ class TextureAtlasWorkspace(QWidget):
                 data.select_atlas(previous_selected_atlas_id)
             return None
         return atlas.atlas_id
-
-    @staticmethod
-    def _next_non_pbr_atlas_name(data: TextureAtlasData) -> str:
-        """Return a unique, deterministic name with the required prefix."""
-
-        existing_names = {atlas.name.casefold() for atlas in data.atlases}
-        if NON_PBR_ATLAS_BASE_NAME.casefold() not in existing_names:
-            return NON_PBR_ATLAS_BASE_NAME
-        suffix = 2
-        while True:
-            candidate = f"{NON_PBR_ATLAS_BASE_NAME} {suffix}"
-            if candidate.casefold() not in existing_names:
-                return candidate
-            suffix += 1
 
     def materialize_missing_atlases(self) -> int:
         """Materialize the selected non-empty atlas PNG when it is missing."""
@@ -4252,8 +4369,15 @@ class TextureAtlasWorkspace(QWidget):
         source_ids: Sequence[str],
         *,
         active_source_id: str | None = None,
+        request_preview: bool = True,
     ) -> tuple[str, ...]:
-        """Select scene-owned texture rows without emitting selection signals."""
+        """Select scene-owned rows silently, optionally without a 3D preview.
+
+        Repeated selections leave the lists and preview alone. Source/Atlas
+        content refreshes invalidate that shortcut, including missing sources
+        which have become available since the preceding selection. A deferred
+        3D preview is requested once when ``request_preview`` next becomes true.
+        """
 
         raw_source_ids = (source_ids,) if isinstance(source_ids, str) else source_ids
         normalized_ids = tuple(
@@ -4300,6 +4424,42 @@ class TextureAtlasWorkspace(QWidget):
         if active_match not in selected_ids:
             active_match = selected_ids[-1] if selected_ids else None
 
+        actual_selected_ids = self._selected_source_ids(source_kind)
+        selection_signature = (source_kind, actual_selected_ids, active_match)
+        selection_matches = (
+            self._active_source_kind == source_kind
+            and set(actual_selected_ids) == set(selected_ids)
+            and all(
+                source_list.currentRow()
+                == (
+                    locations[active_match][2]
+                    if active_match is not None and source_kind == kind
+                    else -1
+                )
+                and (
+                    kind == source_kind
+                    or not self._selected_source_ids(kind)
+                )
+                for kind, source_list in (
+                    ("object", self.object_list),
+                    ("surface", self.surface_list),
+                )
+            )
+            and all(
+                preview._selected_object_id == active_match
+                for preview in self.map_previews.values()
+            )
+        )
+        if (
+            self._last_scene_source_selection == selection_signature
+            and selection_matches
+        ):
+            self._last_published_source_selection = selection_signature
+            if request_preview and self._scene_source_preview_pending:
+                self.request_selected_object_preview()
+            return actual_selected_ids
+
+        preview_pending = self._scene_source_preview_pending or not selection_matches
         was_syncing = self._is_syncing
         self._is_syncing = True
         try:
@@ -4325,13 +4485,16 @@ class TextureAtlasWorkspace(QWidget):
         for preview in self.map_previews.values():
             preview.set_selected_object_id(active_match)
         self._sync_controls()
-        self.request_selected_object_preview()
+        self._scene_source_preview_pending = preview_pending
+        if request_preview and self._scene_source_preview_pending:
+            self.request_selected_object_preview()
         actual_selected_ids = self._selected_source_ids(source_kind)
         self._last_published_source_selection = (
             source_kind,
             actual_selected_ids,
             active_match,
         )
+        self._last_scene_source_selection = self._last_published_source_selection
         return actual_selected_ids
 
     @property
@@ -4802,6 +4965,7 @@ class TextureAtlasWorkspace(QWidget):
 
         if self.is_ambient_occlusion_preview_active:
             return False
+        self._scene_source_preview_pending = False
         object_id = self._selected_object_id()
         source = (
             None
@@ -4871,6 +5035,11 @@ class TextureAtlasWorkspace(QWidget):
         self.atlas_name_edit.setObjectName("texture_atlas_name_edit")
         self.atlas_name_edit.setPlaceholderText("Atlas name")
         creation_layout.addRow("Name", self.atlas_name_edit)
+        self.atlas_type_combo = QComboBox()
+        self.atlas_type_combo.setObjectName("texture_atlas_type_combo")
+        self.atlas_type_combo.addItem(ATLAS_NAME_PREFIX_BY_TYPE[ATLAS_TYPE_OBJECT], ATLAS_TYPE_OBJECT)
+        self.atlas_type_combo.addItem(ATLAS_NAME_PREFIX_BY_TYPE[ATLAS_TYPE_SURFACE], ATLAS_TYPE_SURFACE)
+        creation_layout.addRow("Type", self.atlas_type_combo)
         self.atlas_resolution_combo = QComboBox()
         self.atlas_resolution_combo.setObjectName("texture_atlas_resolution_combo")
         for resolution in sorted(ATLAS_RESOLUTIONS):
@@ -5031,7 +5200,10 @@ class TextureAtlasWorkspace(QWidget):
 
         texture_column = QWidget()
         texture_column.setObjectName("texture_atlas_texture_menu_column")
-        texture_column_layout = QVBoxLayout(texture_column)
+        texture_controls = QWidget()
+        texture_controls.setObjectName("texture_atlas_texture_controls")
+        texture_column_layout = QVBoxLayout(texture_controls)
+        texture_column_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         texture_column_layout.setContentsMargins(0, 0, 0, 0)
         texture_column_layout.setSpacing(6)
 
@@ -5318,7 +5490,19 @@ class TextureAtlasWorkspace(QWidget):
         color_balance_layout.addRow("", color_balance_action_row)
         texture_column_layout.addWidget(self.color_balance_group)
 
-        texture_column_layout.addWidget(QLabel("3D preview"))
+        # Keep the texture tools scrollable without scrolling either preview.
+        outer_texture_layout = QVBoxLayout(texture_column)
+        outer_texture_layout.setContentsMargins(0, 0, 0, 0)
+        outer_texture_layout.setSpacing(6)
+        self.texture_controls_scroll = QScrollArea()
+        self.texture_controls_scroll.setObjectName("texture_atlas_texture_controls_scroll")
+        self.texture_controls_scroll.setWidgetResizable(True)
+        self.texture_controls_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.texture_controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.texture_controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.texture_controls_scroll.setWidget(texture_controls)
+        outer_texture_layout.addWidget(self.texture_controls_scroll, 1)
+        outer_texture_layout.addWidget(QLabel("3D preview"))
         self.object_preview_container = QWidget()
         self.object_preview_container.setObjectName("texture_atlas_embedded_3d_preview")
         self.object_preview_container.setMinimumHeight(180)
@@ -5330,7 +5514,7 @@ class TextureAtlasWorkspace(QWidget):
         self.object_preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.object_preview_placeholder.setWordWrap(True)
         self.object_preview_layout.addWidget(self.object_preview_placeholder, 1)
-        texture_column_layout.addWidget(self.object_preview_container, 1)
+        outer_texture_layout.addWidget(self.object_preview_container, 1)
 
         content_splitter.addWidget(texture_column)
         preview_container = QWidget()
@@ -5721,7 +5905,9 @@ class TextureAtlasWorkspace(QWidget):
         resolution = int(self.atlas_resolution_combo.currentData())
         previous_data = self._data.clone()
         try:
-            atlas = self._data.create_atlas(name, resolution)
+            atlas = self._data.create_atlas(
+                name, resolution, atlas_type=self.atlas_type_combo.currentData(),
+            )
             self._data.select_atlas(atlas.atlas_id)
         except (OSError, TypeError, ValueError) as error:
             self._data = previous_data
@@ -5875,6 +6061,7 @@ class TextureAtlasWorkspace(QWidget):
             atlas_id=current_atlas.atlas_id,
             name=normalized_name,
             resolution=normalized_resolution,
+            atlas_type=current_atlas.atlas_type,
         )
         was_repacked = False
         preserves_surface_ao = normalized_resolution == current_atlas.resolution
@@ -5896,6 +6083,7 @@ class TextureAtlasWorkspace(QWidget):
                     else None
                 ),
                 surface_ao_intensity=current_atlas.surface_ao_intensity,
+                atlas_type=current_atlas.atlas_type,
             )
         except ValueError:
             if normalized_resolution >= current_atlas.resolution:
@@ -5929,6 +6117,7 @@ class TextureAtlasWorkspace(QWidget):
             name=name,
             resolution=resolution,
             surface_ao_intensity=atlas.surface_ao_intensity,
+            atlas_type=atlas.atlas_type,
         )
         packing_data = TextureAtlasData(
             atlases=[replacement],
@@ -6016,8 +6205,15 @@ class TextureAtlasWorkspace(QWidget):
         atlas = self.selected_atlas
         normalized_source_id = str(source_id).strip()
         source = self._sources_by_object_id.get(normalized_source_id)
-        if atlas is None or source is None:
+        if source is None:
             return False
+        atlas_type = self._source_atlas_type(source.object_id)
+        if (
+            atlas is None
+            or atlas_type == ATLAS_TYPE_SURFACE
+            or not self._atlas_accepts_source_type(atlas, atlas_type)
+        ):
+            return True
         try:
             self._build_selected_source_assignment_candidate(
                 source,
@@ -6039,8 +6235,17 @@ class TextureAtlasWorkspace(QWidget):
         atlas = self.selected_atlas
         normalized_source_id = str(source_id).strip()
         source = self._sources_by_object_id.get(normalized_source_id)
-        if atlas is None or source is None:
+        if source is None:
             return False
+        atlas_type = self._source_atlas_type(source.object_id)
+        if (
+            atlas is None
+            or atlas_type == ATLAS_TYPE_SURFACE
+            or not self._atlas_accepts_source_type(atlas, atlas_type)
+        ):
+            return self.ensure_source_in_typed_atlas(
+                source_id, commit_callback, source_ids_to_remove=source_ids_to_remove,
+            )
         try:
             candidate_data, placement, affected_atlas_ids = (
                 self._build_selected_source_assignment_candidate(
@@ -6108,8 +6313,9 @@ class TextureAtlasWorkspace(QWidget):
                 )
             )
             atlas = candidate_data.create_atlas(
-                self._next_generic_atlas_name(candidate_data),
+                self._next_typed_atlas_name(candidate_data, self._source_atlas_type(source.object_id)),
                 target_resolution,
+                atlas_type=self._source_atlas_type(source.object_id),
             )
             candidate_data.select_atlas(atlas.atlas_id)
             placement = candidate_data.assign_object(
@@ -6140,20 +6346,6 @@ class TextureAtlasWorkspace(QWidget):
         )
         return True
 
-    @staticmethod
-    def _next_generic_atlas_name(data: TextureAtlasData) -> str:
-        """Return the next deterministic default Atlas name."""
-
-        existing_names = {atlas.name.casefold() for atlas in data.atlases}
-        if DEFAULT_ATLAS_BASE_NAME.casefold() not in existing_names:
-            return DEFAULT_ATLAS_BASE_NAME
-        suffix = 2
-        while True:
-            candidate = f"{DEFAULT_ATLAS_BASE_NAME} {suffix}"
-            if candidate.casefold() not in existing_names:
-                return candidate
-            suffix += 1
-
     def _build_selected_source_assignment_candidate(
         self,
         source: AtlasObjectTextureSource,
@@ -6177,6 +6369,12 @@ class TextureAtlasWorkspace(QWidget):
             )
         )
 
+        candidate_atlas = candidate_data.atlas_by_id(selected_atlas.atlas_id)
+        assert candidate_atlas is not None
+        atlas_type = self._source_atlas_type(source.object_id)
+        if not self._atlas_accepts_source_type(candidate_atlas, atlas_type):
+            raise ValueError("Object and Surface textures must use separate Atlases.")
+        self._claim_atlas_type(candidate_data, candidate_atlas, atlas_type)
         placement = candidate_data.assign_object(
             selected_atlas.atlas_id,
             source.object_id,
@@ -6692,8 +6890,13 @@ class TextureAtlasWorkspace(QWidget):
                 "Texture placement blocked: the atlas or source is unavailable."
             )
             return
+        atlas_type = self._source_atlas_type(source.object_id)
+        if not self._atlas_accepts_source_type(atlas, atlas_type):
+            self.ensure_source_in_typed_atlas(source.object_id)
+            return
         previous_data = self._data.clone()
         try:
+            self._claim_atlas_type(self._data, atlas, atlas_type)
             placement = self._data.place_object_at(
                 atlas.atlas_id,
                 source.object_id,
@@ -7241,6 +7444,8 @@ class TextureAtlasWorkspace(QWidget):
         self._apply_fix_tiling_button_attention()
 
     def _refresh_preview(self) -> None:
+        self._last_scene_source_selection = None
+        self._scene_source_preview_pending = True
         self._refresh_atlas_storage_sizes()
         atlas = self.selected_atlas
         atlas_id = None if atlas is None else atlas.atlas_id

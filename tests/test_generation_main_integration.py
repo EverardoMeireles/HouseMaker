@@ -41,6 +41,7 @@ from housemaker.first_person_navigation import (
 )
 from housemaker.generation_state import GenerationData, MaskPoint, MaskStroke
 from housemaker.generation_workspace import GenerationRequest
+from housemaker.geometry_generation_models import GEOMETRY_MODEL_7_1
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.object_texture_variants import (
@@ -324,6 +325,73 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                     tabs_geometry.right(),
                     self.workspace.side_panel.geometry().left(),
                 )
+
+    # ### Hidden tall tabs must not force a larger top-level window ###
+    def test_hidden_workspace_pages_do_not_force_window_height_on_short_screens(self) -> None:
+        for requested_height in (900, 700):
+            for index in range(self.workspace.workspace_tabs.count()):
+                with self.subTest(
+                    height=requested_height,
+                    tab=self.workspace.workspace_tabs.tabText(index),
+                ):
+                    self.workspace.workspace_tabs.setCurrentIndex(index)
+                    self.workspace.resize(1_400, requested_height)
+                    _qt_application.processEvents()
+                    _qt_application.processEvents()
+                    self.assertLessEqual(self.workspace.height(), requested_height)
+                    self.assertLessEqual(self.workspace.minimumSizeHint().height(), requested_height)
+                    tabs = self.workspace.workspace_tabs
+                    self.assertGreater(tabs.height(), 0)
+                    self.assertGreaterEqual(tabs.geometry().top(), 0)
+                    self.assertLessEqual(tabs.geometry().bottom(), self.workspace.rect().bottom())
+                    for column in (self.workspace.left_panel, self.workspace.side_panel):
+                        if column.isVisible():
+                            self.assertGreaterEqual(column.geometry().top(), 0)
+                            self.assertLessEqual(column.geometry().bottom(), self.workspace.rect().bottom())
+
+    def test_short_window_keeps_atlas_and_tour_tools_readable_and_scrollable(self) -> None:
+        atlas = self.workspace.texture_atlas_workspace
+        tour = self.workspace.tour_workspace
+        tour.start_new_tour()
+        self.assertTrue(tour.accept_world_point((4.0, 5.0, 1.0)))
+        self.assertTrue(tour.accept_world_point((0.0, 0.0, 1.5)))
+        self.assertTrue(tour.accept_world_point((5.0, 0.0, 1.5)))
+        self.assertTrue(tour.finish_curve())
+        tour.add_floating_tooltip_button.click()
+        cases = (
+            (
+                atlas, atlas.texture_controls_scroll, atlas.color_balance_apply_button,
+                atlas.object_preview_container,
+                (atlas.color_balance_reset_button, atlas.color_balance_apply_button),
+            ),
+            (
+                tour, tour.steps_controls_scroll, tour.tooltip_style_edit,
+                tour.preview_container,
+                (tour.add_text_button, tour.add_floating_tooltip_button, tour.add_wait_button,
+                 tour.add_idle_camera_button, tour.add_speed_override_button),
+            ),
+        )
+        for page, scroll, last_control, preview, buttons in cases:
+            with self.subTest(page=type(page).__name__):
+                self.workspace.workspace_tabs.setCurrentWidget(page)
+                self.workspace.resize(1_400, 700)
+                _qt_application.processEvents()
+                _qt_application.processEvents()
+                self.assertLessEqual(self.workspace.height(), 700)
+                self.assertFalse(scroll.isAncestorOf(preview))
+                self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+                for button in buttons:
+                    self.assertGreaterEqual(button.height(), button.minimumSizeHint().height())
+                preview_geometry = preview.geometry()
+                scroll.ensureWidgetVisible(last_control)
+                _qt_application.processEvents()
+                target_center = last_control.mapTo(scroll.viewport(), last_control.rect().center())
+                self.assertTrue(
+                    scroll.viewport().rect().contains(target_center),
+                    (target_center, scroll.viewport().rect(), last_control.isVisibleTo(page),
+                     scroll.verticalScrollBar().value(), scroll.verticalScrollBar().maximum()),
+                )
+                self.assertEqual(preview.geometry(), preview_geometry)
 
     def test_generation_uses_only_the_compact_generated_object_view(self) -> None:
         merged = self.workspace.merged_generation_workspace
@@ -638,6 +706,36 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 button_texts
             )
         )
+
+    def test_main_window_keeps_generation_controls_shrinkable_after_room_analysis_move(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        self.workspace.workspace_tabs.setCurrentWidget(merged)
+        _qt_application.processEvents()
+        self.assertFalse(merged.isAncestorOf(merged.ceiling_height_section))
+        self.assertEqual(merged.controls_scroll.minimumHeight(), 96)
+        self.assertLess(
+            merged.controls_scroll.minimumHeight(), merged.controls_row.sizeHint().height(),
+        )
+        self.assertIs(merged.rows_splitter.widget(0), merged.preview_row)
+        self.assertIs(merged.rows_splitter.widget(1), merged.controls_scroll)
+        merged.rows_splitter.setSizes([merged.rows_splitter.height() - 120, 120])
+        _qt_application.processEvents()
+        self.assertLessEqual(merged.rows_splitter.sizes()[1], 140)
+        self.assertGreater(merged.controls_scroll.verticalScrollBar().maximum(), 0)
+
+    def test_generation_row_splitter_keeps_user_size_after_tab_round_trip(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        self.workspace.workspace_tabs.setCurrentWidget(merged)
+        _qt_application.processEvents()
+        merged.rows_splitter.setSizes([merged.rows_splitter.height() - 140, 140])
+        _qt_application.processEvents()
+        before = merged.rows_splitter.sizes()[1]
+        self.workspace.workspace_tabs.setCurrentWidget(self.workspace.canvas_viewer_workspace)
+        _qt_application.processEvents()
+        self.workspace.workspace_tabs.setCurrentWidget(merged)
+        _qt_application.processEvents()
+        self.assertLessEqual(abs(merged.rows_splitter.sizes()[1] - before), 5)
+        self.assertGreater(merged.controls_scroll.verticalScrollBar().maximum(), 0)
 
     def test_canvas_and_3d_scene_are_dedicated_top_level_tabs(self) -> None:
         canvas_tab_index = self.workspace.workspace_tabs.indexOf(
@@ -1132,6 +1230,96 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                 )
                 self.assertTrue(merged.opening_profile_options_section.isHidden())
                 self.assertFalse(merged.division_options_section.isHidden())
+
+    # ### Restored selections must not capture ordinary pasted references ###
+    def test_restored_opening_does_not_capture_pasted_object_geometry(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        generation = self.workspace.generation
+        image = QImage(48, 32, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF804020)
+        for asset_kind in ("door", "window"):
+            with self.subTest(asset_kind=asset_kind):
+                asset_id = f"passive-{asset_kind}"
+                common = {
+                    "name": f"Restored {asset_kind}",
+                    "width_meters": 0.9,
+                    "height_meters": 2.1,
+                    "slots": (
+                        DoorSlotData(DOOR_SLOT_BODY, f"{asset_id}-body", joined=True),
+                        DoorSlotData(DOOR_SLOT_KNOB, f"{asset_id}-handle"),
+                    ),
+                }
+                if asset_kind == "door":
+                    library = DoorLibraryData(doors=[DoorDefinition(
+                        door_id=asset_id, source_doorway_id="source", **common,
+                    )])
+                else:
+                    library = DoorLibraryData(windows=[WindowDefinition(
+                        window_id=asset_id, source_window_frame_id="source", **common,
+                    )])
+                self.workspace._apply_project_state(
+                    levels=create_default_levels(),
+                    current_level_index=GROUND_LEVEL_INDEX,
+                    doors=library,
+                )
+                self.workspace.workspace_tabs.setCurrentWidget(merged)
+                generation.set_runtime_settings(
+                    GenerationServiceSettings(meshy_api_key="mock-api-key")
+                )
+                target = generation._door_slot_editing_target
+                self.assertIsNotNone(target)
+                self.assertFalse(target.generation_ready)
+                with patch(
+                    "housemaker.merged_generation_workspace._read_clipboard_image",
+                    return_value=image,
+                ):
+                    merged._handle_paste_inpaint_clicked()
+                reference = generation.get_temporary_object_reference()
+                self.assertIsNotNone(reference)
+                self.assertTrue(generation.generate_geometry_button.isEnabled())
+
+                with (
+                    patch.object(generation, "_start_generation", return_value="ordinary") as start,
+                    patch.object(generation, "_start_door_slot_model_generation") as slot_start,
+                ):
+                    generation.generate_geometry_button.click()
+
+                slot_start.assert_not_called()
+                start.assert_called_once()
+                request = start.call_args.args[0]
+                self.assertTrue(request.geometry_only)
+                self.assertIsNone(request.door_body_fit_dimensions)
+                self.assertIsNone(start.call_args.kwargs.get("door_slot_target"))
+                np.testing.assert_array_equal(request.selected_object_bgra, reference)
+                self.assertFalse(generation._door_slot_editing_target.generation_ready)
+                self.assertTrue(merged.opening_profile_options_section.isHidden())
+                self.assertTrue(merged.door_slot_generation_indicator.isHidden())
+
+    # ### Independent geometry provider controls ###
+    def test_meshy71_remains_available_without_multi_view_generation(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        self.workspace.workspace_tabs.setCurrentWidget(merged)
+        provider = merged.geometry_provider_combo
+        self.assertGreaterEqual(provider.findData(GEOMETRY_MODEL_7_1), 0)
+
+        provider.setCurrentIndex(provider.findData(GEOMETRY_MODEL_7_1))
+        _qt_application.processEvents()
+
+        self.assertTrue(provider.isEnabled())
+        self.assertEqual(
+            self.workspace.generation.geometry_generation_options(),
+            (GEOMETRY_MODEL_7_1, "standard"),
+        )
+        self.assertFalse(merged.geometry_resolution_control.isHidden())
+        self.assertEqual(
+            [
+                merged.geometry_resolution_combo.itemData(index)
+                for index in range(merged.geometry_resolution_combo.count())
+            ],
+            ["standard", "2k"],
+        )
+        self.assertFalse(hasattr(merged, "multi_view_generation_checkbox"))
+        self.assertFalse(hasattr(merged, "multi_view_slots_control"))
 
     def test_load_during_generation_is_rejected_without_partial_state(self) -> None:
         current_generation = _generation_data()

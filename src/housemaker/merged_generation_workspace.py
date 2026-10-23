@@ -23,10 +23,10 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QImage, QImageReader, QKeySequence, QShortcut
+from PySide6.QtGui import QImage, QImageReader, QKeySequence, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
-    QCheckBox,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -82,6 +82,12 @@ from housemaker.generation_state import (
 from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
+from housemaker.geometry_generation_models import (
+    GEOMETRY_MODEL_7_1,
+    GEOMETRY_MODEL_OPTIONS,
+    GEOMETRY_RESOLUTION_OPTIONS,
+    maximum_geometry_target_polycount,
+)
 from housemaker.models import LevelData
 from housemaker.openai_batch import LUNA_BATCH_MODEL
 from housemaker.plan_correction_models import PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1
@@ -94,10 +100,10 @@ from housemaker.reference_generation import (
     REMOVE_OBJECTS_FROM_FURNITURE_PROMPT,
 )
 from housemaker.reference_generation_batch import (
-    LocalReferenceBatchItem,
+    APIReferenceBatchThread as _APIReferenceBatchThread,
 )
 from housemaker.reference_generation_batch import (
-    APIReferenceBatchThread as _APIReferenceBatchThread,
+    LocalReferenceBatchItem,
 )
 from housemaker.reference_generation_batch import (
     LocalReferenceBatchThread as _LocalReferenceBatchThread,
@@ -138,6 +144,8 @@ from housemaker.video_source import (
 # ### Constants ###
 WORKFLOW_SECTION_SPACING = 10
 GENERATION_CONTROLS_PADDING = 10
+GENERATION_CONTROLS_MINIMUM_HEIGHT = 96
+GENERATION_ROWS_HANDLE_WIDTH = 8
 CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS = 100
 CEILING_HEIGHT_NOT_ESTIMATED_TEXT = "Ceiling height: Not estimated"
 MAX_CONSECUTIVE_CEILING_HEIGHT_FRAME_FAILURES = 3
@@ -772,6 +780,9 @@ class MergedGenerationWorkspace(QWidget):
             ) is True
         )
         self._displayed_reference_view_scope = None
+        self._reference_preferences_dirty = False
+        self._reference_generate_can_start = False
+        self._reference_generate_all_can_start = False
 
         self.surface_workspace.setParent(self)
         self.object_workspace.setParent(self)
@@ -801,6 +812,12 @@ class MergedGenerationWorkspace(QWidget):
 
         if self._is_shutdown:
             return
+        if self._reference_preferences_dirty:
+            try:
+                self.flush_reference_generation_preferences()
+            except OSError:
+                # A preference-store failure must not prevent worker cleanup.
+                pass
         self._is_shutdown = True
         self._invalidate_reference_generation_input()
         self._cancel_all_reference_generations()
@@ -963,6 +980,16 @@ class MergedGenerationWorkspace(QWidget):
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
 
+        self.rows_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.rows_splitter.setObjectName("merged_generation_rows_splitter")
+        self.rows_splitter.setChildrenCollapsible(False)
+        self.rows_splitter.setHandleWidth(GENERATION_ROWS_HANDLE_WIDTH)
+        self.preview_row = QWidget()
+        self.preview_row.setObjectName("merged_generation_preview_row")
+        preview_layout = QVBoxLayout(self.preview_row)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(8)
+
         self.views_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.views_splitter.setObjectName("merged_generation_views_splitter")
         self.views_splitter.setChildrenCollapsible(False)
@@ -976,8 +1003,9 @@ class MergedGenerationWorkspace(QWidget):
         self.views_splitter.setStretchFactor(0, 1)
         self.views_splitter.setStretchFactor(1, 1)
         self.views_splitter.setSizes([1_000, 1_000])
-        root_layout.addWidget(self.views_splitter, 1)
-        root_layout.addWidget(self.seekbar)
+        preview_layout.addWidget(self.views_splitter, 1)
+        preview_layout.addWidget(self.seekbar)
+        self.rows_splitter.addWidget(self.preview_row)
 
         self.shared_controls = self._build_shared_controls()
         self.object_controls = self._build_object_controls()
@@ -1000,20 +1028,54 @@ class MergedGenerationWorkspace(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self.controls_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self.controls_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self.controls_scroll.setWidget(self.controls_row)
         self.controls_scroll.setSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Expanding,
         )
         self.controls_scroll.setMinimumHeight(
+            GENERATION_CONTROLS_MINIMUM_HEIGHT
+        )
+        self.rows_splitter.addWidget(self.controls_scroll)
+        self.rows_splitter.setStretchFactor(0, 1)
+        self.rows_splitter.setStretchFactor(1, 0)
+        handle = self.rows_splitter.handle(1)
+        handle.setCursor(Qt.CursorShape.SizeVerCursor)
+        handle.setToolTip("Drag to resize the previews and generation controls.")
+        root_layout.addWidget(self.rows_splitter, 1)
+        self._initial_rows_sizing_applied = False
+
+    # ### Resizable preview and control rows ###
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if not self._initial_rows_sizing_applied:
+            QTimer.singleShot(0, self._initialize_row_sizes)
+
+    def _initialize_row_sizes(self) -> None:
+        """Fit the controls once; later resizes keep the user's chosen divider."""
+
+        if self._initial_rows_sizing_applied or not self.isVisible():
+            return
+        available = self.rows_splitter.height() - self.rows_splitter.handleWidth()
+        preview_minimum = self.preview_row.minimumSizeHint().height()
+        controls_height = (
             self.controls_row.sizeHint().height()
             + self.controls_scroll.horizontalScrollBar().sizeHint().height()
         )
-        root_layout.addWidget(self.controls_scroll)
+        controls_height = max(
+            GENERATION_CONTROLS_MINIMUM_HEIGHT,
+            min(controls_height, available - preview_minimum),
+        )
+        self.rows_splitter.setSizes([
+            max(preview_minimum, available - controls_height),
+            controls_height,
+        ])
+        self._initial_rows_sizing_applied = True
 
+    # ### Shared generation controls ###
     def _build_shared_controls(self) -> QWidget:
         section, layout = _build_controls_section("shared")
 
@@ -1417,6 +1479,42 @@ class MergedGenerationWorkspace(QWidget):
             )
 
     # ### Reference generation preferences and state ###
+    def _handle_geometry_options_changed(self, _index: int = 0) -> None:
+        model = str(self.geometry_provider_combo.currentData())
+        resolution = str(self.geometry_resolution_combo.currentData())
+        self.object_workspace.set_geometry_generation_options(
+            model, resolution,
+        )
+        self._sync_geometry_generation_controls()
+        self.sync_shared_controls()
+
+    def _sync_geometry_generation_controls(self) -> None:
+        """Restore provider choices and show their supported sizing controls."""
+
+        objects = self.object_workspace
+        if not hasattr(self, "geometry_provider_combo"):
+            return
+        model, resolution = objects.geometry_generation_options()
+        for control, value in (
+            (self.geometry_provider_combo, model),
+            (self.geometry_resolution_combo, resolution),
+        ):
+            with QSignalBlocker(control):
+                control.setCurrentIndex(max(0, control.findData(value)))
+        is_7_1 = model == GEOMETRY_MODEL_7_1
+        if not is_7_1:
+            tris = objects.meshy_target_polycount_spinbox
+            tris.setMaximum(maximum_geometry_target_polycount(model))
+            tris.setToolTip(
+                f"Target triangle count for {self.geometry_provider_combo.currentText()} "
+                f"({tris.minimum():,}-{tris.maximum():,}). Lower values make lighter geometry."
+            )
+        self.geometry_resolution_control.setVisible(is_7_1)
+        objects.meshy_target_polycount_control.setVisible(not is_7_1)
+        self.generate_all_references_button.setVisible(
+            objects.get_landing_editing_target() is None
+        )
+
     def _read_initial_reference_preferences(self, default_view: str) -> tuple[str, str]:
         """Migrate the former custom/extra fields into one authoritative prompt."""
 
@@ -1503,14 +1601,59 @@ class MergedGenerationWorkspace(QWidget):
         }
 
     @Slot()
+    def _handle_reference_generation_text_changed(self, *_arguments: object) -> None:
+        """Keep each keystroke local; committing text must not rebuild the scene."""
+
+        if self._is_shutdown:
+            return
+        self._store_current_reference_preferences()
+        self._reference_preferences_dirty = True
+        self._sync_reference_prompt_action_availability()
+
+    def flush_reference_generation_preferences(self) -> None:
+        """Commit the latest visible draft without scene/Atlas notifications."""
+
+        if self._is_shutdown:
+            return
+        self._store_current_reference_preferences()
+        self._persist_reference_generation_preferences()
+        self._reference_preferences_dirty = False
+
+    def _sync_reference_prompt_action_availability(self) -> None:
+        """Refresh prompt-dependent buttons using already-known input readiness."""
+
+        has_prompt = bool(self._selected_reference_generation_prompt())
+        landing_mode = self.object_workspace.get_landing_editing_target() is not None
+        running = (
+            self.object_workspace.is_landing_generating if landing_mode
+            else self._reference_generation_runtime is not None
+        )
+        batch_running = bool(self._batch_reference_generation_runtimes) or self._local_reference_batch_thread is not None
+        self.generate_reference_button.setEnabled(
+            not self._is_shutdown and not batch_running
+            and (running or (self._reference_generate_can_start and has_prompt))
+        )
+        self.generate_all_references_button.setEnabled(
+            not self._is_shutdown
+            and (batch_running or (self._reference_generate_all_can_start and has_prompt))
+        )
+
+    @Slot()
     def _handle_reference_generation_preferences_changed(
         self, *_arguments: object
     ) -> None:
         """Remember reference-only settings without changing Meshy's prompt."""
 
+        if self._is_shutdown:
+            return
         self._update_reference_generation_view_tooltip()
         self._make_default_reference_negative_prompt_view_compatible()
-        self._store_current_reference_preferences()
+        self.flush_reference_generation_preferences()
+        self._sync_reference_generation_controls()
+
+    def _persist_reference_generation_preferences(self) -> None:
+        """Write changed application defaults only at an explicit commit boundary."""
+
         if self._application_settings is not None:
             preferences = [
                 (
@@ -1540,8 +1683,8 @@ class MergedGenerationWorkspace(QWidget):
                     )
                 )
             for key, value in preferences:
-                self._application_settings.set(key, value)
-        self._sync_reference_generation_controls()
+                if self._application_settings.get(key) != value:
+                    self._application_settings.set(key, value)
 
     def _sync_reference_generation_controls(self) -> None:
         """Keep local-only options and the cancellable action coherent."""
@@ -1551,14 +1694,9 @@ class MergedGenerationWorkspace(QWidget):
             self.generate_reference_button.setText(
                 "Cancel" if running else "Generate reference"
             )
-            self.generate_reference_button.setEnabled(
-                not self._is_shutdown
-                and (
-                    running
-                    or bool(self._selected_reference_generation_prompt())
-                    and self.object_workspace._has_current_object_generation_reference()
-                )
-            )
+            self._reference_generate_can_start = self.object_workspace._has_current_object_generation_reference()
+            self._reference_generate_all_can_start = False
+            self._sync_reference_prompt_action_availability()
             self.generate_all_references_button.setVisible(False)
             self.reference_generation_view_combo.setEnabled(not running)
             self.reference_generation_prompt_edit.setEnabled(not running)
@@ -1577,7 +1715,7 @@ class MergedGenerationWorkspace(QWidget):
                 == REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION
             )
             return
-        self.generate_all_references_button.setVisible(True)
+        self._sync_geometry_generation_controls()
         self._sync_inpaint_reference_preferences()
         self._make_default_reference_negative_prompt_view_compatible()
         self._cancel_batch_references_if_source_changed()
@@ -1587,33 +1725,24 @@ class MergedGenerationWorkspace(QWidget):
         self.generate_reference_button.setText(
             "Cancel" if running else "Generate reference"
         )
-        self.generate_reference_button.setEnabled(
+        self._reference_generate_can_start = (
             not self._is_shutdown
             and not batch_running
             and (
-                running
-                or (
-                    bool(self._selected_reference_generation_prompt())
-                    and (
-                        self.object_workspace.has_temporary_object_reference()
-                        or self.video_view.has_selection()
-                    )
-                )
+                self.object_workspace.has_temporary_object_reference()
+                or self.video_view.has_selection()
             )
         )
         self.generate_all_references_button.setText(
             "Cancel all" if batch_running else "Generate reference for all"
         )
-        self.generate_all_references_button.setEnabled(
+        self._reference_generate_all_can_start = (
             not self._is_shutdown
-            and (batch_running or (
-                not running
-                and self.object_workspace._door_slot_editing_target is None
-                and self.object_workspace._architectural_trim_editing_target is None
-                and bool(self._selected_reference_generation_prompt())
-                and bool(self.object_workspace.inpaint_queue())
-            ))
+            and not running
+            and not self.object_workspace.component_generation_active
+            and bool(self.object_workspace.inpaint_queue())
         )
+        self._sync_reference_prompt_action_availability()
         settings_available = not running and not batch_running and not self._is_shutdown
         self.reference_generation_view_combo.setEnabled(settings_available)
         self.remove_objects_from_furniture_checkbox.setEnabled(settings_available)
@@ -1647,6 +1776,10 @@ class MergedGenerationWorkspace(QWidget):
             )
         door_target = objects._door_slot_editing_target
         trim_target = objects._architectural_trim_editing_target
+        if door_target is not None and not door_target.generation_ready:
+            door_target = None
+        if trim_target is not None and not trim_target.generation_ready:
+            trim_target = None
         return (
             self._reference_generation_input_revision,
             id(objects._data),
@@ -1695,6 +1828,7 @@ class MergedGenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_generate_reference_clicked(self) -> None:
+        self.flush_reference_generation_preferences()
         if self.object_workspace.get_landing_editing_target() is not None:
             if self.object_workspace.is_landing_generating:
                 self.object_workspace.cancel_landing_generation()
@@ -1788,7 +1922,9 @@ class MergedGenerationWorkspace(QWidget):
                 self._handle_reference_generation_finished, job.job_id, thread
             )
         )
-        self.reference_generation_status_label.setText("Generating reference...")
+        self.reference_generation_status_label.setText(
+            "Generating reference..."
+        )
         self._sync_reference_generation_controls()
         thread.start()
 
@@ -2076,9 +2212,9 @@ class MergedGenerationWorkspace(QWidget):
             return
         objects = self.object_workspace
         if (self._is_shutdown or self._reference_generation_runtime is not None
-                or objects._door_slot_editing_target is not None
-                or objects._architectural_trim_editing_target is not None):
+                or objects.component_generation_active):
             return
+        self.flush_reference_generation_preferences()
         prompt = self._selected_reference_generation_prompt()
         if not prompt:
             self.reference_generation_status_label.setText("Choose a reference view or write a prompt first.")
@@ -2607,8 +2743,26 @@ class MergedGenerationWorkspace(QWidget):
         creation_layout.addWidget(generation_settings)
         creation_layout.addWidget(objects.meshy_target_polycount_control)
 
+        self.geometry_resolution_combo = QComboBox()
+        self.geometry_resolution_combo.setObjectName("geometry_resolution_combo")
+        for label, value in GEOMETRY_RESOLUTION_OPTIONS:
+            self.geometry_resolution_combo.addItem(label, value)
+        self.geometry_resolution_control = _build_labeled_inline_control(
+            "Resolution", self.geometry_resolution_combo,
+        )
+        self.geometry_resolution_control.hide()
+        creation_layout.addWidget(self.geometry_resolution_control)
+        self.geometry_provider_combo = QComboBox()
+        self.geometry_provider_combo.setObjectName("geometry_provider_combo")
+        for label, value in GEOMETRY_MODEL_OPTIONS:
+            self.geometry_provider_combo.addItem(label, value)
+        self.geometry_provider_control = _build_labeled_inline_control(
+            "Geometry provider", self.geometry_provider_combo,
+        )
+        creation_layout.addWidget(self.geometry_provider_control)
+
         self.texture_provider_control = _build_labeled_inline_control(
-            "Texture provider",
+            "Surface texture provider",
             self.surface_workspace.surface_texture_provider_combo,
         )
         self.texture_provider_control.setObjectName(
@@ -2704,6 +2858,8 @@ class MergedGenerationWorkspace(QWidget):
         )
         self.generate_reference_button.clicked.connect(self._handle_generate_reference_clicked)
         self.generate_all_references_button.clicked.connect(self._handle_generate_all_references_clicked)
+        self.geometry_provider_combo.currentIndexChanged.connect(self._handle_geometry_options_changed)
+        self.geometry_resolution_combo.currentIndexChanged.connect(self._handle_geometry_options_changed)
         self.previous_inpaint_button.clicked.connect(
             partial(self._navigate_inpaints, -1)
         )
@@ -2717,12 +2873,18 @@ class MergedGenerationWorkspace(QWidget):
             self._handle_reference_generation_preferences_changed
         )
         self.reference_generation_prompt_edit.textChanged.connect(
+            self._handle_reference_generation_text_changed
+        )
+        self.reference_generation_prompt_edit.editingFinished.connect(
             self._handle_reference_generation_preferences_changed
         )
         self.reference_generation_strength_spinbox.valueChanged.connect(
             self._handle_reference_generation_preferences_changed
         )
         self.reference_generation_negative_prompt_edit.textChanged.connect(
+            self._handle_reference_generation_text_changed
+        )
+        self.reference_generation_negative_prompt_edit.editingFinished.connect(
             self._handle_reference_generation_preferences_changed
         )
         QApplication.clipboard().dataChanged.connect(
@@ -2748,10 +2910,14 @@ class MergedGenerationWorkspace(QWidget):
         surface.data_changed.connect(
             self._handle_surface_generation_context_changed
         )
+        surface.selection_changed.connect(
+            self._handle_surface_generation_context_changed
+        )
         objects.door_slot_generation_status_changed.connect(
             self._handle_door_slot_generation_status_changed
         )
         objects.controls_synced.connect(self._sync_generation_action_buttons)
+        objects.controls_synced.connect(self._sync_geometry_generation_controls)
         surface.controls_synced.connect(self._sync_generation_action_buttons)
         try:
             self.seekbar.valueChanged.disconnect()
@@ -2935,15 +3101,12 @@ class MergedGenerationWorkspace(QWidget):
     def _sync_generation_texture_context(self) -> None:
         """Show the texture action belonging to the active semantic target."""
 
-        trim_is_selected = bool(
-            self.object_workspace._architectural_trim_editing_target is not None
-        )
         surface_is_selected = bool(
             self.surface_workspace.get_selected_surface_ids()
         )
         use_surface_texture_pipeline = bool(
-            surface_is_selected and not trim_is_selected
-            and self.object_workspace.get_landing_editing_target() is None
+            surface_is_selected
+            and not self.object_workspace.component_generation_active
         )
         self.object_workspace.set_external_surface_generation_target_selected(
             use_surface_texture_pipeline
@@ -3758,9 +3921,7 @@ class MergedGenerationWorkspace(QWidget):
     def _handle_copy_inpaint_clicked(self) -> None:
         """Copy the exact current Object reference with its alpha mask."""
 
-        reference = (
-            self.object_workspace.get_current_object_generation_reference()
-        )
+        reference = self.object_workspace.get_current_object_generation_reference()
         if reference is None:
             QMessageBox.information(
                 self,
@@ -3835,9 +3996,8 @@ class MergedGenerationWorkspace(QWidget):
         if not generated:
             self._invalidate_reference_generation_input()
         try:
-            self.object_workspace.set_temporary_object_reference(
-                reference_bgra
-            )
+            objects = self.object_workspace
+            objects.set_temporary_object_reference(reference_bgra)
             self.surface_workspace.set_temporary_reference(reference_bgra)
         except ValueError as error:
             self.object_workspace.clear_temporary_object_reference()
@@ -3962,7 +4122,9 @@ class MergedGenerationWorkspace(QWidget):
         self.clear_mask_button.setEnabled(
             video_editor_is_available and self.video_view.has_selection()
         )
-        self.clear_mask_button.setToolTip("Remove only the currently selected red inpaint object.")
+        self.clear_mask_button.setToolTip(
+            "Remove only the currently selected red inpaint object."
+        )
         inpaint_index, inpaint_count = objects.current_inpaint_position()
         opening_target = objects._door_slot_editing_target
         trim_target = objects._architectural_trim_editing_target

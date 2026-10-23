@@ -10,10 +10,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMainWindow
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.generation_state import GenerationData
@@ -21,10 +21,10 @@ from housemaker.main import (
     LAST_PROJECT_PATH_SETTING_KEY,
     BlueprintWorkspace,
     MainWindow,
+    _show_window_on_primary_screen,
 )
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.project_io import ProjectData
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -77,6 +77,57 @@ class StartupRestorationTests(unittest.TestCase):
         self.assertFalse(hasattr(window, "home_page"))
         self.assertFalse(hasattr(window, "stack"))
         load_project_mock.assert_not_called()
+
+    # ### Startup frame fitting is repeated after native decorations settle ###
+    def test_startup_fits_primary_screen_before_show_and_after_native_layout(self) -> None:
+        window = Mock(spec=QMainWindow)
+        window.isVisible.return_value = True
+        screen = Mock()
+        screen.devicePixelRatio.return_value = 1.5
+        events = []
+        scheduled = []
+        window.show.side_effect = lambda: events.append("show")
+        with (
+            patch("housemaker.main.QApplication.primaryScreen", return_value=screen),
+            patch("housemaker.main.fit_normal_window_to_screen", create=True,
+                  side_effect=lambda *_args, **_kwargs: events.append("fit")) as fit,
+            patch("housemaker.main.QTimer.singleShot",
+                  side_effect=lambda _delay, callback: scheduled.append(callback)),
+        ):
+            _show_window_on_primary_screen(window)
+            self.assertEqual(events[:2], ["fit", "show"])
+            self.assertEqual(fit.call_count, 1)
+            self.assertIs(fit.call_args.args[0], window)
+            self.assertIs(fit.call_args.args[1], screen)
+            self.assertEqual(len(scheduled), 1)
+            scheduled[0]()
+            self.assertEqual(fit.call_count, 2)
+            self.assertIs(fit.call_args.args[1], screen)
+
+    def test_deferred_startup_fit_does_not_resize_a_closed_window(self) -> None:
+        window = Mock(spec=QMainWindow)
+        screen = Mock()
+        scheduled = []
+        with (
+            patch("housemaker.main.QApplication.primaryScreen", return_value=screen),
+            patch("housemaker.main.fit_normal_window_to_screen", create=True) as fit,
+            patch("housemaker.main.QTimer.singleShot",
+                  side_effect=lambda _delay, callback: scheduled.append(callback)),
+        ):
+            _show_window_on_primary_screen(window)
+            window.isVisible.return_value = False
+            scheduled[0]()
+            self.assertEqual(fit.call_count, 1)
+
+    def test_startup_without_a_screen_still_shows_the_window(self) -> None:
+        window = Mock(spec=QMainWindow)
+        with (
+            patch("housemaker.main.QApplication.primaryScreen", return_value=None),
+            patch("housemaker.main.fit_normal_window_to_screen", create=True) as fit,
+        ):
+            _show_window_on_primary_screen(window)
+        window.show.assert_called_once()
+        fit.assert_not_called()
 
     def test_main_window_restores_last_successful_project(self) -> None:
         project_path = Path(self._temporary_directory.name) / "restored.json"

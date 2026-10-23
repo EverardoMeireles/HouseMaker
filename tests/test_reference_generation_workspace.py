@@ -365,6 +365,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         combo = self.workspace.reference_generation_view_combo
         combo.setCurrentIndex(combo.findData(preset.preset_id))
         self.workspace.reference_generation_prompt_edit.setText("Retained custom prompt")
+        self.workspace.reference_generation_prompt_edit.editingFinished.emit()
         with self._reopened_workspace() as reopened:
             self.assertEqual(
                 reopened.reference_generation_view_combo.currentData(), preset.preset_id
@@ -568,6 +569,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
         view_combo.setCurrentIndex(view_combo.findData(""))
         self.workspace.reference_generation_strength_spinbox.setValue(0.65)
         self.workspace.reference_generation_negative_prompt_edit.setText("blur, clutter")
+        self.workspace.reference_generation_negative_prompt_edit.editingFinished.emit()
         self.assertEqual(
             self.settings.get(REFERENCE_GENERATION_MODEL_SETTINGS_KEY),
             REFERENCE_GENERATION_MODEL_STABLE_DIFFUSION,
@@ -639,6 +641,7 @@ class ReferenceGenerationWorkspaceTests(unittest.TestCase):
 
     def test_explicit_empty_negative_prompt_is_persisted_and_restored(self):
         self.workspace.reference_generation_negative_prompt_edit.clear()
+        self.workspace.reference_generation_negative_prompt_edit.editingFinished.emit()
         self.assertEqual(
             self.settings.get(REFERENCE_GENERATION_NEGATIVE_PROMPT_SETTINGS_KEY), ""
         )

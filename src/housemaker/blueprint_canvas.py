@@ -181,6 +181,7 @@ DRAG_THRESHOLD_SCREEN = 4.0
 WINDOW_STRIP_HALF_WIDTH_SCREEN = 5.0
 WINDOW_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 12.0
+WINDOW_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
 # Keep the fixed outward wall edges nonzero at a linked opening's limits.
 WINDOW_LINKED_BOUNDARY_CLEARANCE_PIXELS = 1e-4
 LANDING_FILL_COLOR = QColor(140, 225, 155, 90)
@@ -6052,23 +6053,48 @@ class BlueprintCanvas(QWidget):
         )
 
     def _find_window_hit(self, widget_point: QPointF) -> WindowHit | None:
-        """Prefer selected endpoint handles, then test visible window bodies."""
+        """Prefer selected jamb-side controls, then test visible window bodies."""
 
         if not self.windows:
             return None
         selected_index = self._find_window_index_by_id(self.selected_window_id)
         if selected_index is not None:
             selected_window = self.windows[selected_index]
-            segment = self._get_window_widget_segment(selected_window)
-            if segment is not None:
-                for side_sign, handle_center in (
-                    (-1.0, segment[0]),
-                    (1.0, segment[1]),
-                ):
-                    if self._point_distance(
+            handles = self._get_window_width_handle_widget_centers(selected_window)
+            if handles is not None:
+                for side_sign, handle_center in zip((-1.0, 1.0), handles):
+                    if (
+                        self._point_distance(
+                            (widget_point.x(), widget_point.y()),
+                            (handle_center.x(), handle_center.y()),
+                        )
+                        <= WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN
+                    ):
+                        return WindowHit(selected_index, side_sign)
+            sides = self._get_window_widget_width_sides(selected_window)
+            if sides is not None:
+                centers = tuple((start + end) * 0.5 for start, end in sides)
+                side_tolerance = min(
+                    EDGE_HIT_TOLERANCE_SCREEN,
+                    math.hypot(
+                        centers[1].x() - centers[0].x(), centers[1].y() - centers[0].y()
+                    )
+                    * 0.25,
+                )
+                for side_sign, (start, end) in zip((-1.0, 1.0), sides):
+                    projected = _project_point_onto_segment(
                         (widget_point.x(), widget_point.y()),
-                        (handle_center.x(), handle_center.y()),
-                    ) <= WINDOW_WIDTH_HANDLE_HIT_RADIUS_SCREEN:
+                        (start.x(), start.y()),
+                        (end.x(), end.y()),
+                    )
+                    if (
+                        projected is not None
+                        and self._point_distance(
+                            (widget_point.x(), widget_point.y()),
+                            projected,
+                        )
+                        <= side_tolerance
+                    ):
                         return WindowHit(selected_index, side_sign)
 
         point = (widget_point.x(), widget_point.y())
@@ -6242,7 +6268,7 @@ class BlueprintCanvas(QWidget):
         )
 
     def _resize_dragged_window(self, image_point: QPointF) -> None:
-        """Move one plan-view endpoint while anchoring the opposite endpoint."""
+        """Move one jamb pair, preserving the grab offset and opposite jamb."""
 
         initial_window = self.window_drag_initial_window
         initial_bounds = self.window_drag_initial_bounds
@@ -6265,6 +6291,28 @@ class BlueprintCanvas(QWidget):
         )
         if requested_ratio is None:
             return
+        minimum_visual_span = self._screen_distance_to_image(
+            2.0 * WINDOW_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN
+        )
+        initial_width_pixels = initial_bounds.horizontal_span * math.dist(
+            frame.start_point, frame.end_point
+        )
+        if (
+            self.window_drag_press_image_point is not None
+            and initial_width_pixels < minimum_visual_span
+        ):
+            pressed_ratio = self._project_image_point_to_window_ratio(
+                QPointF(*self.window_drag_press_image_point),
+                frame,
+            )
+            if pressed_ratio is None:
+                return
+            initial_side_ratio = (
+                initial_bounds.start_ratio
+                if side_sign < 0.0
+                else initial_bounds.end_ratio
+            )
+            requested_ratio += initial_side_ratio - pressed_ratio
         minimum_ratio, maximum_ratio = self._get_window_drag_ratio_limits(frame)
         if side_sign < 0.0:
             resized = replace(
@@ -6475,6 +6523,39 @@ class BlueprintCanvas(QWidget):
                 start - perpendicular,
             )
         )
+
+    def _get_window_widget_width_sides(
+        self,
+        window: WindowData,
+        wall_frame: WindowWallFrame | None = None,
+    ) -> tuple[tuple[QPointF, QPointF], tuple[QPointF, QPointF]] | None:
+        """Return the left and right jamb edges across the full wall depth."""
+
+        strip = self._get_window_widget_strip(window, wall_frame)
+        if strip is None:
+            return None
+        return (strip[0], strip[3]), (strip[1], strip[2])
+
+    def _get_window_width_handle_widget_centers(
+        self,
+        window: WindowData,
+        wall_frame: WindowWallFrame | None = None,
+    ) -> tuple[QPointF, QPointF] | None:
+        """Keep equally sized controls on the lateral sides, not wall vertices."""
+
+        sides = self._get_window_widget_width_sides(window, wall_frame)
+        if sides is None:
+            return None
+        first, second = tuple((start + end) * 0.5 for start, end in sides)
+        direction = second - first
+        length = math.hypot(direction.x(), direction.y())
+        if length <= 1e-6:
+            return None
+        center = (first + second) * 0.5
+        offset = direction * (
+            max(length * 0.5, WINDOW_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN) / length
+        )
+        return center - offset, center + offset
 
     def _get_linked_window_corner_points(
         self,
@@ -9463,7 +9544,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Window painting ###
     def _paint_windows(self, painter: QPainter) -> None:
-        """Draw purple windows and endpoint handles for the selected one."""
+        """Draw purple windows and lateral controls for the selected one."""
 
         if not self.windows:
             return
@@ -9497,17 +9578,23 @@ class BlueprintCanvas(QWidget):
         window: WindowData,
         wall_frame: WindowWallFrame | None,
     ) -> None:
-        """Paint fixed-screen endpoint handles for horizontal expansion."""
+        """Draw equal side handles without enlarging either wall-vertex pair."""
 
-        segment = self._get_window_widget_segment(window, wall_frame)
-        if segment is None:
+        sides = self._get_window_widget_width_sides(window, wall_frame)
+        handles = self._get_window_width_handle_widget_centers(window, wall_frame)
+        if sides is None or handles is None:
             return
         painter.save()
         handle_pen = QPen(VERTEX_OUTLINE_COLOR, 2.0)
         handle_pen.setCosmetic(True)
-        painter.setPen(handle_pen)
+        connector_pen = QPen(SELECTED_WINDOW_EDGE_COLOR, 1.5)
+        connector_pen.setCosmetic(True)
+        connector_pen.setStyle(Qt.PenStyle.DotLine)
         painter.setBrush(SELECTED_WINDOW_EDGE_COLOR)
-        for handle_center in segment:
+        for (start, end), handle_center in zip(sides, handles):
+            painter.setPen(connector_pen)
+            painter.drawLine((start + end) * 0.5, handle_center)
+            painter.setPen(handle_pen)
             painter.drawEllipse(
                 handle_center,
                 WINDOW_WIDTH_HANDLE_RADIUS_SCREEN,

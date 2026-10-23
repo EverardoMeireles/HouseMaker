@@ -11,6 +11,7 @@ import numpy as np
 
 from housemaker.doorway_topology import move_doorway_corner_vertices
 from housemaker.level_coordinates import (
+    build_level_base_z_lookup,
     level_image_to_world_xy,
     level_world_to_image_xy,
 )
@@ -135,6 +136,7 @@ class CanvasOpeningTarget:
     vertical_axis_world: tuple[float, float, float] = (0.0, 0.0, 1.0)
     sloped_ceiling_id: str | None = None
     opposite_wall_plane_world: tuple[float, float, float] | None = None
+    host_wall_planes_world: tuple[tuple[float, float, float], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasOpeningReference):
@@ -213,6 +215,14 @@ class CanvasOpeningTarget:
                     self.opposite_wall_plane_world, "opening opposite wall plane"
                 ),
             )
+        object.__setattr__(
+            self,
+            "host_wall_planes_world",
+            tuple(
+                _normalize_world_vector(point, "opening host wall plane")
+                for point in self.host_wall_planes_world
+            ),
+        )
 
     @property
     def key(self) -> str:
@@ -398,7 +408,118 @@ class CanvasWindowDimensionSnapshot:
         object.__setattr__(self, "height_meters", height)
 
 
+# ### Preview-only wall frames ###
+@dataclass(frozen=True)
+class _OpeningWallFrame:
+    """Structural wall metadata without generating any triangles or meshes."""
+
+    surface_id: str
+    level_index: int
+    wall_start_world: tuple[float, float, float]
+    wall_end_world: tuple[float, float, float]
+    wall_height_meters: float
+    surface_type: str = SURFACE_TYPE_WALL
+
+
+def _build_live_opening_wall_frames(
+    level: LevelData,
+    base_z_meters: float,
+) -> tuple[_OpeningWallFrame, ...]:
+    """Include virtual lintel spans before their delayed meshes exist."""
+
+    from housemaker.glb import _build_level_wall_sources
+
+    sources = _build_level_wall_sources(
+        level,
+        [set(room.vertex_ids) for room in level.rooms],
+    )
+    return tuple(
+        _OpeningWallFrame(
+            surface_id=source.surface_id,
+            level_index=level.index,
+            wall_start_world=(
+                *level_image_to_world_xy(level, *source.start_point),
+                base_z_meters,
+            ),
+            wall_end_world=(
+                *level_image_to_world_xy(level, *source.end_point),
+                base_z_meters,
+            ),
+            wall_height_meters=source.height_meters,
+        )
+        for source in sources
+        if source.surface_id is not None
+    )
+
+
 # ### Target builders ###
+def build_canvas_opening_preview_targets(
+    levels: Sequence[LevelData],
+    surfaces: Sequence[FixedSurface],
+) -> tuple[CanvasOpeningTarget, ...]:
+    """Include live opening hosts without rebuilding any wall meshes.
+
+    A four-corner placement changes the host edge ID immediately, while the
+    rendered wall intentionally keeps its old ID until the mesh-edit delay.
+    Doorway virtual spans must also bridge pre-existing gaps in that old mesh.
+    Resolve those frames from the live graph, not a new model.
+    """
+
+    from housemaker.glb import _build_window_wall_target_lookup
+
+    level_sequence = tuple(levels)
+    surface_sequence = tuple(surfaces)
+    targets = list(build_canvas_opening_targets(level_sequence, surface_sequence))
+    existing_keys = {target.key for target in targets}
+    base_z_by_level = build_level_base_z_lookup(level_sequence)
+    for level in level_sequence:
+        preview_doorways = tuple(
+            (index, doorway)
+            for index, doorway in enumerate(level.doorways)
+            if doorway.corner_vertex_ids is not None
+            or f"doorway:{level.index}:{index}" not in existing_keys
+        )
+        if preview_doorways:
+            frames = _build_live_opening_wall_frames(
+                level, base_z_by_level[level.index]
+            )
+            for index, doorway in preview_doorways:
+                target = _build_doorway_target(level, doorway, index, frames)
+                if target is not None:
+                    targets = [item for item in targets if item.key != target.key]
+                    targets.append(target)
+                    existing_keys.add(target.key)
+        missing_windows = tuple(
+            (index, window)
+            for index, window in enumerate(level.windows)
+            if window.sloped_ceiling_id is None
+            and f"window:{window.window_id}" not in existing_keys
+        )
+        if not missing_windows:
+            continue
+        hosts = _build_window_wall_target_lookup(level)
+        for index, window in missing_windows:
+            host = hosts.get(window.wall_surface_id)
+            if host is None:
+                continue
+            start_xy = level_image_to_world_xy(level, *host.start_point)
+            end_xy = level_image_to_world_xy(level, *host.end_point)
+            base_z = base_z_by_level[level.index]
+            start = np.asarray((*start_xy, base_z), dtype=float)
+            end = np.asarray((*end_xy, base_z), dtype=float)
+            width = float(np.linalg.norm(end - start))
+            if width <= OPENING_FRAME_EPSILON:
+                continue
+            tangent = (end - start) / width
+            target = _build_window_target_from_frame(
+                level, window, index, window.wall_surface_id,
+                (start, tangent, np.cross(tangent, (0.0, 0.0, 1.0)),
+                 width, host.height_meters),
+            )
+            targets.append(target)
+    return tuple(sorted(targets, key=lambda target: target.key))
+
+
 def build_canvas_opening_targets(
     levels: Sequence[LevelData],
     surfaces: Sequence[FixedSurface],
@@ -644,6 +765,20 @@ def _build_window_target(
     frame = _get_surface_frame(surface)
     if frame is None:
         return None
+    return _build_window_target_from_frame(
+        level, window, window_index, surface.surface_id, frame,
+    )
+
+
+def _build_window_target_from_frame(
+    level: LevelData,
+    window: WindowData,
+    window_index: int,
+    surface_id: str,
+    frame: tuple[np.ndarray, np.ndarray, np.ndarray, float, float],
+) -> CanvasOpeningTarget:
+    """Use the same linked frame for committed and not-yet-rendered windows."""
+
     wall_start, tangent, normal, wall_width, wall_height = frame
     start_ratio, end_ratio = window.start_ratio, window.end_ratio
     opposite_wall_plane = None
@@ -663,11 +798,11 @@ def _build_window_target(
     return CanvasOpeningTarget(
         reference=CanvasOpeningReference(
             kind=CANVAS_OPENING_WINDOW,
-            level_index=surface.level_index,
+            level_index=level.index,
             item_index=window_index,
             stable_id=window.window_id,
         ),
-        wall_surface_id=surface.surface_id,
+        wall_surface_id=surface_id,
         plane_start_world=tuple(float(value) for value in wall_start),
         wall_tangent_world=tuple(float(value) for value in tangent),
         wall_normal_world=tuple(float(value) for value in normal),
@@ -683,6 +818,14 @@ def _build_window_target(
         ),
         sloped_ceiling_id=None,
         opposite_wall_plane_world=opposite_wall_plane,
+        host_wall_planes_world=(
+            (tuple(float(value) for value in wall_start),)
+            if opposite_wall_plane is None
+            else (
+                tuple(float(value) for value in wall_start),
+                opposite_wall_plane,
+            )
+        ),
     )
 
 
@@ -690,7 +833,7 @@ def _build_doorway_target(
     level: LevelData,
     doorway: DoorwayData,
     doorway_index: int,
-    surfaces: Sequence[FixedSurface],
+    surfaces: Sequence[FixedSurface | _OpeningWallFrame],
 ) -> CanvasOpeningTarget | None:
     selected = _select_doorway_surface(level, doorway, surfaces)
     if selected is None:
@@ -735,13 +878,73 @@ def _build_doorway_target(
             else None
         ),
         sloped_ceiling_id=None,
+        host_wall_planes_world=_build_doorway_host_wall_planes(
+            level, doorway, wall_start, normal, normal_offset,
+        ),
     )
 
 
+def _build_doorway_host_wall_planes(
+    level: LevelData,
+    doorway: DoorwayData,
+    wall_start: np.ndarray,
+    normal: np.ndarray,
+    center_offset: float,
+) -> tuple[tuple[float, float, float], ...]:
+    """Record known host planes, without guessing a wall-thickness tolerance.
+
+    Four linked corners locate both real wall faces even when their split IDs
+    do not exist in the rendered snapshot. A legacy unlinked doorway always
+    keeps its selected real face; its opposite is known only when the center
+    offset matches exactly half the configured physical depth.
+    """
+
+    tolerance = OPENING_FRAME_EPSILON * 100.0
+    corner_ids = doorway.corner_vertex_ids
+    if corner_ids is not None and len(corner_ids) == 4:
+        corners = tuple(
+            level.vertex_data.get_vertex(vertex_id) for vertex_id in corner_ids
+        )
+        if all(vertex is not None for vertex in corners):
+            world = tuple(
+                np.asarray(
+                    (
+                        *level_image_to_world_xy(level, vertex.x, vertex.y),
+                        wall_start[2],
+                    ),
+                    dtype=float,
+                )
+                for vertex in corners
+            )
+            if (
+                abs(float(np.dot(world[1] - world[0], normal))) <= tolerance
+                and abs(float(np.dot(world[3] - world[2], normal))) <= tolerance
+                and abs(float(np.dot(world[2] - world[0], normal))) > tolerance
+            ):
+                return tuple(
+                    tuple(float(value) for value in point)
+                    for point in (world[0], world[2])
+                )
+
+    planes = [tuple(float(value) for value in wall_start)]
+    try:
+        physical_depth = float(doorway.depth_meters) * float(level.scale)
+    except (TypeError, ValueError, OverflowError):
+        return tuple(planes)
+    if (
+        math.isfinite(physical_depth)
+        and physical_depth > tolerance
+        and abs(abs(center_offset) * 2.0 - physical_depth) <= tolerance
+    ):
+        opposite = wall_start + normal * (2.0 * center_offset)
+        planes.append(tuple(float(value) for value in opposite))
+    return tuple(planes)
+
+
 def _extend_linked_doorway_frame(
-    selected_surface: FixedSurface,
+    selected_surface: FixedSurface | _OpeningWallFrame,
     frame: tuple[np.ndarray, np.ndarray, np.ndarray, float, float],
-    surfaces: Sequence[FixedSurface],
+    surfaces: Sequence[FixedSurface | _OpeningWallFrame],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
     """Join touching coplanar wall spans around a four-corner opening.
 
@@ -801,9 +1004,9 @@ def _extend_linked_doorway_frame(
 def _select_doorway_surface(
     level: LevelData,
     doorway: DoorwayData,
-    surfaces: Sequence[FixedSurface],
+    surfaces: Sequence[FixedSurface | _OpeningWallFrame],
 ) -> tuple[
-    FixedSurface,
+    FixedSurface | _OpeningWallFrame,
     tuple[np.ndarray, np.ndarray, np.ndarray, float, float],
     np.ndarray,
 ] | None:
@@ -835,7 +1038,7 @@ def _select_doorway_surface(
     candidates: list[
         tuple[
             tuple[float, float, str],
-            FixedSurface,
+            FixedSurface | _OpeningWallFrame,
             tuple[np.ndarray, np.ndarray, np.ndarray, float, float],
         ]
     ] = []
@@ -871,7 +1074,7 @@ def _select_doorway_surface(
 
 
 def _get_surface_frame(
-    surface: FixedSurface,
+    surface: FixedSurface | _OpeningWallFrame,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float] | None:
     if (
         surface.wall_start_world is None

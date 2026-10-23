@@ -69,6 +69,7 @@ from housemaker.texture_atlas_state import (
 SURFACE_ID_METADATA_KEY = "housemaker_surface_id"
 OBJECT_ID_METADATA_KEY = "housemaker_object_id"
 ATLAS_ID_METADATA_KEY = "housemaker_atlas_id"
+ATLAS_TYPE_METADATA_KEY = "housemaker_atlas_type"
 UV_TOLERANCE = 1e-6
 GEOMETRY_EPSILON = 1e-12
 MAX_TILED_SURFACE_TRIANGLES = 2_000_000
@@ -1035,6 +1036,11 @@ def _apply_texture_atlases_to_export(
         combined.metadata["housemaker_atlas_source_ids"] = sorted(
             atlas_source_ids[atlas_id]
         )
+        atlas_metadata: dict[str, object] = {}
+        if atlas_item.atlas.atlas_type is not None:
+            atlas_metadata[ATLAS_ID_METADATA_KEY] = atlas_id
+            atlas_metadata[ATLAS_TYPE_METADATA_KEY] = atlas_item.atlas.atlas_type
+            combined.metadata[ATLAS_TYPE_METADATA_KEY] = atlas_item.atlas.atlas_type
         name = _reserve_name(
             f"housemaker_atlas_{atlas_id}",
             occupied_names,
@@ -1043,6 +1049,7 @@ def _apply_texture_atlases_to_export(
             combined,
             geom_name=name,
             node_name=name,
+            metadata=atlas_metadata or None,
         )
         batched_count += 1
 
@@ -1233,14 +1240,23 @@ def _append_instance_source_models_to_scene(
                 "the exported scene. Rename the object before exporting."
             )
         occupied_names.add(root_name)
+        root_metadata = {
+            INSTANCE_SOURCE_ID_METADATA_KEY: source_id,
+            INSTANCE_SOURCE_NAME_METADATA_KEY: root_name,
+        }
+        atlas_types = {
+            materialized_by_id[part.atlas_id].atlas.atlas_type
+            for part in parts
+            if part.atlas_id is not None
+            and materialized_by_id[part.atlas_id].atlas.atlas_type is not None
+        }
+        if len(atlas_types) == 1:
+            root_metadata[ATLAS_TYPE_METADATA_KEY] = next(iter(atlas_types))
         output_scene.graph.update(
             frame_to=root_name,
             frame_from=output_scene.graph.base_frame,
             matrix=np.eye(4, dtype=float),
-            metadata={
-                INSTANCE_SOURCE_ID_METADATA_KEY: source_id,
-                INSTANCE_SOURCE_NAME_METADATA_KEY: root_name,
-            },
+            metadata=root_metadata,
         )
 
         for part_index, part in enumerate(parts, start=1):
@@ -1257,6 +1273,11 @@ def _append_instance_source_models_to_scene(
                     material=material,
                 )
             child_metadata = copy.deepcopy(part.node_metadata)
+            if part.atlas_id is not None:
+                atlas_type = materialized_by_id[part.atlas_id].atlas.atlas_type
+                if atlas_type is not None:
+                    child_metadata[ATLAS_TYPE_METADATA_KEY] = atlas_type
+                    fragment.metadata[ATLAS_TYPE_METADATA_KEY] = atlas_type
             child_metadata.pop(INSTANCE_SOURCE_ID_METADATA_KEY, None)
             child_metadata.pop(INSTANCE_SOURCE_NAME_METADATA_KEY, None)
             is_half = isinstance(
@@ -1374,6 +1395,11 @@ def _append_half_model_meshes_to_scene(
         child_metadata = copy.deepcopy(part.metadata)
         child_metadata.pop(HALF_MESH_EXTRAS_KEY, None)
         child_metadata.update(copy.deepcopy(context.metadata))
+        if part.atlas_id is not None:
+            atlas_type = materialized_by_id[part.atlas_id].atlas.atlas_type
+            if atlas_type is not None:
+                child_metadata[ATLAS_TYPE_METADATA_KEY] = atlas_type
+                part.fragment.metadata[ATLAS_TYPE_METADATA_KEY] = atlas_type
         preferred_name = (
             context.export_mesh_name
             if part_index == 1
