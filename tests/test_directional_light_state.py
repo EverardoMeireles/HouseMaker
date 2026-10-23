@@ -8,6 +8,7 @@ from pathlib import Path
 
 from housemaker.directional_light_state import (
     DirectionalLightData,
+    create_default_sun_light,
     create_directional_light,
     directional_lights_from_payload,
     directional_lights_to_runtime_dicts,
@@ -48,6 +49,23 @@ class DirectionalLightValidationTests(unittest.TestCase):
         self.assertEqual(light.intensity, 2.5)
         self.assertIs(light.cast_shadow, True)
         self.assertIsNone(light.level_index)
+
+    def test_missing_shadow_flag_defaults_to_true_but_explicit_false_is_preserved(
+        self,
+    ) -> None:
+        payload = _directional_light().to_dict()
+        payload.pop("cast_shadow")
+
+        self.assertIs(DirectionalLightData.from_dict(payload).cast_shadow, True)
+
+        payload["cast_shadow"] = False
+        disabled = DirectionalLightData.from_dict(payload)
+        self.assertIs(disabled.cast_shadow, False)
+        self.assertIs(disabled.to_dict()["cast_shadow"], False)
+        self.assertIs(
+            directional_lights_to_runtime_dicts((disabled,))[0]["castShadow"],
+            False,
+        )
 
     def test_record_rejects_an_invalid_direction_or_appearance(self) -> None:
         invalid_overrides = (
@@ -158,12 +176,22 @@ class DirectionalLightFactoryTests(unittest.TestCase):
         )
 
         self.assertEqual(created.light_id, "directional-light-2")
-        self.assertEqual(created.name, "Directional light 2")
+        self.assertEqual(created.name, "Sun light 2")
         self.assertEqual(created.position, (10.0, 20.0, 30.0))
         self.assertEqual(created.target, (10.0, 21.0, 30.0))
         self.assertEqual(created.color, "#ffffff")
         self.assertEqual(created.intensity, 1.0)
-        self.assertIs(created.cast_shadow, False)
+        self.assertIs(created.cast_shadow, True)
+
+    def test_default_sun_casts_shadows_in_project_and_runtime_payloads(self) -> None:
+        sun = create_default_sun_light()
+
+        self.assertIs(sun.cast_shadow, True)
+        self.assertIs(sun.to_dict()["cast_shadow"], True)
+        self.assertIs(
+            directional_lights_to_runtime_dicts((sun,))[0]["castShadow"],
+            True,
+        )
 
     def test_factory_defaults_to_a_straight_down_target(self) -> None:
         created = create_directional_light(

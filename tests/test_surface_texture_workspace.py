@@ -1045,7 +1045,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
                 (surface_id,),
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             self.workspace.assignment_targets_are_valid(
                 assignment.assignment_id,
                 ("level:2/room:5/floor",),
@@ -1082,7 +1082,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.surface_view.get_surface_texture_rgba(surface_id)
         )
 
-    def test_generation_rejects_target_deleted_while_view_is_stale(self) -> None:
+    def test_generation_keeps_library_texture_if_target_deleted_while_view_is_stale(self) -> None:
         surface_id = "level:2/room:5/wall:1:2"
         request = SurfaceTextureRequest(
             provider="meshy",
@@ -1105,12 +1105,14 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(committed)
-        self.assertEqual(self.workspace.get_assignments(), ())
+        self.assertTrue(committed)
+        assignments = self.workspace.get_assignments()
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].surface_ids, ())
         self.assertIn("target surfaces changed", self.workspace.status_label.text())
         self.assertEqual(
-            tuple((self._temporary_path / "surface_assets").glob("*.png")),
-            (),
+            len(tuple((self._temporary_path / "surface_assets").glob("*.png"))),
+            3,
         )
 
     def test_deleted_only_assigned_wall_retains_empty_texture_family(
@@ -3513,7 +3515,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertTrue(
             all(image.startswith(b"\x89PNG") for image in request.reference_pngs)
         )
-        self.assertEqual(request.surface_type, "floor")
+        self.assertEqual(request.surface_type, "surface")
         self.assertEqual(request.surface_ids, ("level:2/room:5/floor",))
         self.assertAlmostEqual(request.combined_area_m2, 4.0)
         self.assertIn("pale oak", request.prompt)
@@ -4174,7 +4176,7 @@ class SharedSceneSurfaceSelectionTests(unittest.TestCase):
             GenerationServiceSettings(meshy_api_key="test-key")
         )
         self.workspace.set_temporary_reference(np.full((16, 16, 4), 255, np.uint8))
-        self.assertFalse(self.workspace.generate_button.isEnabled())
+        self.assertTrue(self.workspace.generate_button.isEnabled())
 
         self.workspace.set_scene_surface_selection((wall,))
 
@@ -4184,9 +4186,9 @@ class SharedSceneSurfaceSelectionTests(unittest.TestCase):
         self.assertEqual(persisted.selected_surface_type, "wall")
         self.assertEqual(persisted.selected_surface_ids, (wall.surface_id,))
         self.workspace.set_scene_surface_selection(())
-        self.assertFalse(self.workspace.generate_button.isEnabled())
+        self.assertTrue(self.workspace.generate_button.isEnabled())
 
-    def test_mixed_scene_surface_types_cannot_start_one_texture_request(
+    def test_mixed_scene_surface_types_can_share_one_generic_texture_request(
         self,
     ) -> None:
         surfaces = tuple(build_fixed_surfaces([_test_level()]))
@@ -4198,22 +4200,27 @@ class SharedSceneSurfaceSelectionTests(unittest.TestCase):
         )
 
         self.workspace.set_scene_surface_selection((wall, floor))
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(meshy_api_key="test-key")
+        )
+        self.workspace.set_temporary_reference(np.full((16, 16, 4), 255, np.uint8))
 
         self.assertEqual(
             self.workspace.get_selected_surface_ids(),
             (wall.surface_id, floor.surface_id),
         )
-        self.assertIsNone(self.workspace.get_selected_surface_type())
+        self.assertEqual(self.workspace.get_selected_surface_type(), "surface")
         self.assertAlmostEqual(
             self.workspace.get_combined_selected_surface_area(),
             wall.area_square_meters + floor.area_square_meters,
         )
-        self.assertFalse(self.workspace.generate_button.isEnabled())
-        self.assertIn("choose one type", self.workspace.selection_label.text())
-        self.assertIsNone(
-            self.workspace._build_request(defer_reference_preparation=True)
-        )
-        self.assertIn("only one type", self.workspace.status_label.text())
+        self.assertTrue(self.workspace.generate_button.isEnabled())
+        self.assertIn("2 surfaces selected", self.workspace.selection_label.text())
+        request = self.workspace._build_request(defer_reference_preparation=True)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.surface_type, "surface")
+        self.assertEqual(request.surface_ids, (wall.surface_id, floor.surface_id))
         persisted = self.workspace.get_data()
         self.assertIsNone(persisted.selected_surface_type)
         self.assertEqual(persisted.selected_surface_ids, ())

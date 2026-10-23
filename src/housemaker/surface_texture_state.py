@@ -23,11 +23,12 @@ from housemaker.pbr_maps import (
 from housemaker.video_source import VideoMetadata
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 12
+SURFACE_TEXTURE_SCHEMA_VERSION = 13
 SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
 SURFACE_TYPE_CEILING = "ceiling"
+SURFACE_TYPE_GENERIC = "surface"
 SURFACE_TILING_MODE_NONE = "none"
 SURFACE_TILING_MODE_WHOLE_REPEATS = "whole_repeats"
 SURFACE_TILING_MODE_EDGE_VARIANTS = "edge_variants"
@@ -45,6 +46,7 @@ SURFACE_TYPES = frozenset(
         SURFACE_TYPE_CEILING,
     }
 )
+SURFACE_TEXTURE_TYPES = SURFACE_TYPES | {SURFACE_TYPE_GENERIC}
 STAIR_PART_SURFACE_TYPES = {
     "treads": SURFACE_TYPE_FLOOR,
     "support": SURFACE_TYPE_WALL,
@@ -114,25 +116,19 @@ def surface_id_accepts_texture_type(
     surface_id: object,
     texture_surface_type: object,
 ) -> bool:
-    """Return whether one semantic surface accepts a texture family type.
+    """Ordinary material textures are reusable across structural surface types.
 
-    Sloped-ceiling faces retain their ceiling identity and projection, but are
-    intentional transition surfaces between a wall and a ceiling.  They may
-    therefore use either texture family without making ordinary ceilings
-    compatible with wall textures.
+    Historical wall/floor/ceiling labels describe a texture's origin, not an
+    assignment restriction. Trim-only IDs retain their authored wall-UV path;
+    a generic material must not silently replace that specialized workflow.
     """
 
     normalized_id = _normalize_surface_id(surface_id)
-    normalized_type = _normalize_surface_type(texture_surface_type)
-    encoded_type = _surface_type_for_id(normalized_id)
-    if encoded_type == normalized_type:
-        return True
+    normalized_type = _normalize_texture_surface_type(texture_surface_type)
     match = _SURFACE_ID_PATTERN.fullmatch(normalized_id)
-    return bool(
-        match is not None
-        and match.group("sloped_ceiling_id") is not None
-        and normalized_type in {SURFACE_TYPE_WALL, SURFACE_TYPE_CEILING}
-    )
+    if match is not None and match.group("trim_id") is not None:
+        return normalized_type == SURFACE_TYPE_WALL
+    return True
 
 
 # ### Generated-texture models ###
@@ -191,7 +187,7 @@ class SurfaceTextureVariant:
 
 @dataclass(frozen=True)
 class SurfaceTextureAssignment:
-    """One generated texture assigned to a compatible group of surfaces."""
+    """One reusable generated texture with optional authored surface targets."""
 
     assignment_id: str
     surface_type: str
@@ -228,13 +224,13 @@ class SurfaceTextureAssignment:
             "Surface texture provider",
             MAX_PROVIDER_NAME_LENGTH,
         )
-        surface_type = _normalize_surface_type(self.surface_type)
+        surface_type = _normalize_texture_surface_type(self.surface_type)
         surface_ids = _normalize_surface_ids(
             self.surface_ids,
             expected_type=surface_type,
             allow_empty=True,
             maximum_count=MAX_SELECTED_SURFACES,
-            allow_sloped_ceiling_compatibility=True,
+            allow_texture_compatibility=True,
         )
         asset_path = _normalize_safe_relative_asset_path(self.asset_path)
         provider_task_id = _normalize_optional_text(
@@ -922,13 +918,20 @@ def _normalize_surface_type(surface_type: object) -> str:
     return normalized_type
 
 
+def _normalize_texture_surface_type(surface_type: object) -> str:
+    normalized_type = str(surface_type).strip().lower()
+    if normalized_type not in SURFACE_TEXTURE_TYPES:
+        raise ValueError(f"Unknown surface texture type: {surface_type!r}.")
+    return normalized_type
+
+
 def _normalize_surface_ids(
     raw_surface_ids: object,
     *,
     expected_type: str,
     allow_empty: bool,
     maximum_count: int,
-    allow_sloped_ceiling_compatibility: bool = False,
+    allow_texture_compatibility: bool = False,
 ) -> tuple[str, ...]:
     try:
         surface_ids = tuple(raw_surface_ids)  # type: ignore[arg-type]
@@ -945,7 +948,7 @@ def _normalize_surface_ids(
         surface_id = _normalize_surface_id(raw_surface_id)
         types_are_compatible = (
             surface_id_accepts_texture_type(surface_id, expected_type)
-            if allow_sloped_ceiling_compatibility
+            if allow_texture_compatibility
             else _surface_type_for_id(surface_id) == expected_type
         )
         if not types_are_compatible:

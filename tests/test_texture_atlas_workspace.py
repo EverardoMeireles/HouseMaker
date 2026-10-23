@@ -1642,7 +1642,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             (surface_sources[0].object_id, surface_sources[2].object_id)
         )
 
-    def test_multi_selection_survives_source_refresh_and_actions_use_active_row(
+    def test_multi_selection_survives_refresh_and_place_uses_group_remove_uses_active_row(
         self,
     ) -> None:
         sources = tuple(
@@ -1665,7 +1665,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         place_requests = Mock()
         remove_requests = Mock()
-        self.workspace.object_place_requested.connect(place_requests)
+        self.workspace.objects_place_requested.connect(place_requests)
         self.workspace.source_remove_requested.connect(remove_requests)
 
         self.workspace.set_object_texture_sources(sources)
@@ -1674,7 +1674,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.workspace.selected_object_texture_id, "lamp")
         self.workspace.place_assign_button.click()
         self.workspace.remove_source_button.click()
-        place_requests.assert_called_once_with("lamp")
+        place_requests.assert_called_once_with(("chair", "lamp"))
         remove_requests.assert_called_once_with("object", "lamp")
 
         self.workspace.set_object_texture_sources(sources[:2])

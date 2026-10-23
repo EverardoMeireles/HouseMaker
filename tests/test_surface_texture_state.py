@@ -464,7 +464,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 12)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 13)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,

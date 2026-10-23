@@ -618,6 +618,13 @@ class _LandingCanvasDrag:
     active: bool = False
 
 
+@dataclass
+class _DirectionalLightCanvasDrag:
+    initial_profile: CanvasDirectionalLightProfile
+    press_widget_point: QPointF
+    active: bool = False
+
+
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
     landing_placement_requested = Signal(float, float)
@@ -675,6 +682,9 @@ class BlueprintCanvas(QWidget):
     directional_light_placement_cancelled = Signal()
     directional_light_selection_requested = Signal(object)
     directional_light_deletion_requested = Signal(str)
+    directional_light_move_started = Signal(str)
+    directional_light_move_preview_changed = Signal(str, float, float)
+    directional_light_move_finished = Signal(str, bool)
     window_placement_requested = Signal(object)
     window_placement_changed = Signal(bool)
     placed_object_selection_requested = Signal(object, object)
@@ -802,6 +812,7 @@ class BlueprintCanvas(QWidget):
         self._selected_directional_light_id: str | None = None
         self._directional_light_placement_active = False
         self._directional_light_hover_image_point: QPointF | None = None
+        self._directional_light_drag: _DirectionalLightCanvasDrag | None = None
         self._selected_wall_surface_id: str | None = None
         self._placed_object_profiles: tuple[CanvasPlacedObjectProfile, ...] = ()
         self._selected_placed_object_ids: tuple[str, ...] = ()
@@ -1738,6 +1749,7 @@ class BlueprintCanvas(QWidget):
     def start_directional_light_placement(self) -> bool:
         """Arm a one-shot directional-light point placement on the plan."""
 
+        self._cancel_directional_light_drag()
         if self.blueprint_image is None:
             return False
         self.cancel_landing_placement()
@@ -1760,10 +1772,10 @@ class BlueprintCanvas(QWidget):
         return True
 
     def cancel_directional_light_placement(self) -> bool:
-        """Cancel the pending point without creating a light."""
+        """Cancel the pending point or restore an active marker movement."""
 
         if not self._directional_light_placement_active:
-            return False
+            return self._cancel_directional_light_drag()
         self._finish_directional_light_placement()
         self.directional_light_placement_cancelled.emit()
         return True
@@ -1772,6 +1784,11 @@ class BlueprintCanvas(QWidget):
         """Return whether the next valid plan click places a light."""
 
         return self._directional_light_placement_active
+
+    def cancel_directional_light_move(self) -> bool:
+        """Restore a marker drag and notify its owner before replacing state."""
+
+        return self._cancel_directional_light_drag()
 
     def set_directional_light_profiles(
         self,
@@ -1793,6 +1810,11 @@ class BlueprintCanvas(QWidget):
         if normalized_profiles == self._directional_light_profiles:
             return False
         self._directional_light_profiles = normalized_profiles
+        if (
+            self._directional_light_drag is not None
+            and self._directional_light_drag.initial_profile.light_id not in profile_ids
+        ):
+            self._cancel_directional_light_drag()
         if self._selected_directional_light_id not in profile_ids:
             self._selected_directional_light_id = None
         self.update()
@@ -1857,6 +1879,69 @@ class BlueprintCanvas(QWidget):
         if was_active:
             self.directional_light_placement_changed.emit(False)
         self.update()
+
+    # ### Directional-light marker movement ###
+    def _update_directional_light_drag(self, widget_point: QPointF) -> None:
+        drag = self._directional_light_drag
+        if drag is None or self.blueprint_image is None:
+            return
+        if not drag.active:
+            if (
+                _qpoint_distance(widget_point, drag.press_widget_point)
+                < DRAG_THRESHOLD_SCREEN
+            ):
+                return
+            drag.active = True
+            self.directional_light_move_started.emit(drag.initial_profile.light_id)
+        rect = self._image_display_rect()
+        delta = widget_point - drag.press_widget_point
+        profile = replace(
+            drag.initial_profile,
+            image_x=(
+                drag.initial_profile.image_x
+                + delta.x() * self.blueprint_image.width() / rect.width()
+            ),
+            image_y=(
+                drag.initial_profile.image_y
+                + delta.y() * self.blueprint_image.height() / rect.height()
+            ),
+        )
+        self._directional_light_profiles = tuple(
+            profile if item.light_id == profile.light_id else item
+            for item in self._directional_light_profiles
+        )
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.update()
+        self.directional_light_move_preview_changed.emit(
+            profile.light_id, profile.image_x, profile.image_y
+        )
+
+    def _finish_directional_light_drag(self, widget_point: QPointF) -> bool:
+        drag = self._directional_light_drag
+        if drag is None:
+            return False
+        self._update_directional_light_drag(widget_point)
+        self._directional_light_drag = None
+        self.unsetCursor()
+        if drag.active:
+            self.directional_light_move_finished.emit(drag.initial_profile.light_id, False)
+        self.update()
+        return True
+
+    def _cancel_directional_light_drag(self) -> bool:
+        drag = self._directional_light_drag
+        if drag is None:
+            return False
+        self._directional_light_drag = None
+        self._directional_light_profiles = tuple(
+            drag.initial_profile if item.light_id == drag.initial_profile.light_id else item
+            for item in self._directional_light_profiles
+        )
+        self.unsetCursor()
+        if drag.active:
+            self.directional_light_move_finished.emit(drag.initial_profile.light_id, True)
+        self.update()
+        return True
 
     # ### Placed-object profiles ###
     def set_placed_object_profiles(
@@ -3091,6 +3176,7 @@ class BlueprintCanvas(QWidget):
         """Prevent a held comparison from sticking after focus changes."""
 
         self.clear_level_comparison_keys()
+        self._cancel_directional_light_drag()
         self._refresh_pending_window_modifier_preview(
             Qt.KeyboardModifier.NoModifier
         )
@@ -3107,6 +3193,7 @@ class BlueprintCanvas(QWidget):
         if (
             self._plan_image_erase_selection_start is not None
             or self._vertex_selection_start_image is not None
+            or self._directional_light_drag is not None
         ):
             event.accept()
             return
@@ -3354,6 +3441,9 @@ class BlueprintCanvas(QWidget):
             self.directional_light_selection_requested.emit(
                 light_profile.light_id
             )
+            self._directional_light_drag = _DirectionalLightCanvasDrag(
+                light_profile, QPointF(event.position())
+            )
             event.accept()
             return
 
@@ -3533,6 +3623,10 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._directional_light_drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._update_directional_light_drag(event.position())
+            event.accept()
+            return
         if self._landing_drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self._update_landing_pointer_drag(event.position())
             event.accept()
@@ -3758,6 +3852,9 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton and self._finish_directional_light_drag(event.position()):
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._finish_landing_drag(event.position()):
             event.accept()
             return
@@ -4047,6 +4144,7 @@ class BlueprintCanvas(QWidget):
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._non_right_angle_highlight_timer.stop()
+        self._cancel_directional_light_drag()
         super().hideEvent(event)
 
     # ### Canvas painting ###

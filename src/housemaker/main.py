@@ -161,6 +161,7 @@ from housemaker.canvas_surface_edits import (
 from housemaker.ceiling_height_estimation import CeilingHeightAnalysisResult
 from housemaker.directional_light_state import (
     DirectionalLightData,
+    SunOrbitData,
     create_directional_light,
 )
 from housemaker.door_geometry import (
@@ -233,6 +234,7 @@ from housemaker.generation_workspace import (
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
     STAIR_PART_TREADS,
+    SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
     GeneratedModel,
     NoUsableBlueprintGeometryError,
     PlacedGeneratedModel,
@@ -338,6 +340,11 @@ from housemaker.models import (
     create_default_levels,
     create_fallback_doorway_preset,
 )
+from housemaker.object_identifiers import (
+    allocate_object_export_ids,
+    normalize_object_export_ids,
+    object_export_node_name,
+)
 from housemaker.object_symmetry import (
     SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
 )
@@ -407,7 +414,12 @@ from housemaker.scene_export import (
     DoorBodyReconstruction,
     write_runtime_scene_manifest,
 )
+from housemaker.scene_object_placement import build_object_placement_grid_offsets
 from housemaker.scene_surface_cache import build_scene_surface_geometry_signature
+from housemaker.pvs_state import PvsBakeData
+from housemaker.pvs_workspace import PvsWorkspaceMixin
+from housemaker.sunlight_workspace import SunlightWorkspaceMixin
+from housemaker.pvs_runtime import write_pvs_runtime_module
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     SettingsWidget,
@@ -1917,6 +1929,8 @@ class StairEditorHeightFilter(QObject):
 
 
 class BlueprintWorkspace(
+    SunlightWorkspaceMixin,
+    PvsWorkspaceMixin,
     OpeningProportionsWorkspaceMixin,
     GlobalScaleWorkspaceMixin,
     LandingWorkspaceMixin,
@@ -1937,6 +1951,8 @@ class BlueprintWorkspace(
         )
         self.current_project_path: str | None = None
         self.global_scale = GlobalScale()
+        self.object_export_ids: dict[str, str] = {}
+        self._init_pvs_state()
         self._init_opening_proportions()
         self.levels: list[LevelData] = create_default_levels()
         self.outer_wall_marks: tuple[OuterWallMark, ...] = ()
@@ -1945,7 +1961,10 @@ class BlueprintWorkspace(
         self.image_library_paths: list[str] = []
         self.doorway_presets: list[DoorwayPreset] = create_default_doorway_presets()
         self.stairs: list[StairData] = []
-        self.directional_lights: tuple[DirectionalLightData, ...] = ()
+        self._init_sunlight_state()
+        self._canvas_directional_light_move_initial: (
+            tuple[DirectionalLightData, LevelData] | None
+        ) = None
         self._selected_directional_light_id: str | None = None
         self._is_syncing_stair_controls = False
         self._new_stair_parameters = _StairEditorParameters()
@@ -2033,6 +2052,17 @@ class BlueprintWorkspace(
         ] = {}
         self._reset_viewer_doorway_snapshots()
         self._mesh_edit_update_delay_seconds = DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
+        self._surface_texture_binding_snapshot: dict[str, tuple[object, ...]] = {}
+        self._pending_surface_texture_ids: set[str] = set()
+        self._committing_surface_texture_revisions: dict[str, int] = {}
+        self._surface_texture_mesh_update_timer = QTimer(self)
+        self._surface_texture_mesh_update_timer.setSingleShot(True)
+        self._surface_texture_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._surface_texture_mesh_update_timer.timeout.connect(
+            self._commit_pending_surface_texture_mesh_update
+        )
         self._pending_object_placement_ids: set[str] = set()
         self._committing_object_placement_revisions: dict[str, int] = {}
         self._is_publishing_object_placements = False
@@ -2344,6 +2374,8 @@ class BlueprintWorkspace(
         self._surface_ao_canvas_preview_key: tuple[object, ...] | None = None
         self._is_shutdown = False
         self._build_ui()
+        self._position_sunlight_above_levels()
+        self._sync_directional_light_views()
 
     @property
     def vertex_data(self):
@@ -2359,8 +2391,10 @@ class BlueprintWorkspace(
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._cancel_and_join_pvs_bake()
         self._confirm_mesh_updates_timer.stop()
         self._cancel_pending_object_placement_mesh_updates()
+        self._cancel_pending_surface_texture_mesh_updates()
         self._reset_opening_proportions()
         self._is_viewer_refresh_scheduled = False
         self._surface_ao_preview_refresh_timer.stop()
@@ -2727,6 +2761,9 @@ class BlueprintWorkspace(
         self.texture_atlas_workspace.object_place_requested.connect(
             self._handle_atlas_object_place_requested
         )
+        self.texture_atlas_workspace.objects_place_requested.connect(
+            self._handle_atlas_objects_place_requested
+        )
         self.texture_atlas_workspace.object_instance_place_requested.connect(
             self._handle_atlas_object_instance_place_requested
         )
@@ -2962,6 +2999,9 @@ class BlueprintWorkspace(
         self.viewer.set_first_person_speed(
             generation_settings.first_person_speed_meters_per_second
         )
+        self.viewer.set_first_person_eye_height(
+            generation_settings.first_person_eye_height_meters
+        )
         self.viewer.set_ignore_top_down_ceiling(
             generation_settings.ignore_top_down_ceiling
         )
@@ -3094,6 +3134,9 @@ class BlueprintWorkspace(
         self.viewer.directional_light_selection_changed.connect(
             self._handle_directional_light_selection_changed
         )
+        self.viewer.directional_light_preview_requested.connect(
+            self._handle_sunlight_preview_requested
+        )
         self.viewer.directional_light_deletion_requested.connect(
             self._handle_directional_light_deletion_requested
         )
@@ -3210,10 +3253,19 @@ class BlueprintWorkspace(
             self._handle_directional_light_placement_cancelled
         )
         self.canvas.directional_light_selection_requested.connect(
-            self._handle_directional_light_selection_changed
+            self._handle_sunlight_preview_requested
         )
         self.canvas.directional_light_deletion_requested.connect(
             self._handle_directional_light_deletion_requested
+        )
+        self.canvas.directional_light_move_started.connect(
+            self._handle_canvas_directional_light_move_started
+        )
+        self.canvas.directional_light_move_preview_changed.connect(
+            self._handle_canvas_directional_light_move_preview_changed
+        )
+        self.canvas.directional_light_move_finished.connect(
+            self._handle_canvas_directional_light_move_finished
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
@@ -4484,17 +4536,7 @@ class BlueprintWorkspace(
         doors_layout.addWidget(self.place_selected_door_button)
         left_side_layout.addWidget(self.doors_group)
 
-        self.add_directional_light_button = QPushButton("Add directional light")
-        self.add_directional_light_button.setObjectName(
-            "add_directional_light_button"
-        )
-        self.add_directional_light_button.setCheckable(True)
-        self.add_directional_light_button.setMinimumHeight(40)
-        self.add_directional_light_button.toggled.connect(
-            self._handle_add_directional_light_clicked
-        )
-        self._refresh_directional_light_button_tooltip()
-        left_side_layout.addWidget(self.add_directional_light_button)
+        self._add_sunlight_controls(left_side_layout)
 
         self.outer_wall_marking_group = QGroupBox("Outer wall marking")
         outer_wall_marking_layout = QHBoxLayout(self.outer_wall_marking_group)
@@ -4595,6 +4637,7 @@ class BlueprintWorkspace(
         )
         plan_image_buttons_layout.addWidget(self.image_correction_button)
         levels_layout.addLayout(plan_image_buttons_layout)
+        self._add_pvs_controls(levels_layout)
 
         default_wall_options = PlanWallDetectionOptions()
         self.plan_wall_controls_group = QGroupBox("Automatic wall placement")
@@ -5122,6 +5165,17 @@ class BlueprintWorkspace(
             self._handle_confirm_mesh_updates_clicked
         )
         controls.addWidget(self.confirm_mesh_updates_button)
+        self.activate_gravity_checkbox = QCheckBox("Activate gravity")
+        self.activate_gravity_checkbox.setObjectName("activate-gravity-checkbox")
+        self.activate_gravity_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.activate_gravity_checkbox.setToolTip(
+            "Keep the FPS camera above floors and stairs at the configured eye "
+            "height. R/F vertical flight is disabled while gravity is active."
+        )
+        self.activate_gravity_checkbox.toggled.connect(
+            self.viewer.set_first_person_gravity_enabled
+        )
+        controls.addWidget(self.activate_gravity_checkbox)
         controls.addStretch(1)
         workspace_layout.addLayout(controls)
         workspace_layout.addWidget(self.viewer)
@@ -5154,6 +5208,7 @@ class BlueprintWorkspace(
             self._pending_stair_point_mesh_update,
             self._pending_landing_mesh_update,
             bool(self._pending_object_placement_ids),
+            bool(self._pending_surface_texture_ids),
             self._pending_doorway_mesh_level_index is not None,
             self._pending_window_mesh_level_index is not None,
             self._staged_canvas_opening_mesh_update,
@@ -5193,6 +5248,7 @@ class BlueprintWorkspace(
         self._commit_pending_stair_point_mesh_update()
         self._commit_landing_mesh_update()
         self._commit_pending_object_placement_mesh_update()
+        self._commit_pending_surface_texture_mesh_update()
         self._commit_pending_doorway_mesh_update()
         self._queue_viewer_preview_refresh()
         self._refresh_confirm_mesh_updates_button()
@@ -6079,6 +6135,11 @@ class BlueprintWorkspace(
     ) -> bool:
         """Commit one validated window model to the active Canvas consumer."""
 
+        if self._pending_surface_texture_ids:
+            # Opening undo/rollback must not publish freshly assigned materials
+            # before the texture-assignment quiet period expires.
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return False
         wall_targets = tuple(
             build_fixed_surfaces(
                 self._build_viewer_preview_levels(),
@@ -12040,6 +12101,7 @@ class BlueprintWorkspace(
             or self._pending_wall_vertex_mesh_update
             or self._pending_landing_mesh_update
             or bool(self._pending_object_placement_ids)
+            or bool(self._pending_surface_texture_ids)
             or (
                 bool(self._committing_object_placement_revisions)
                 and self.viewer.is_placed_object_interaction_active
@@ -12099,6 +12161,7 @@ class BlueprintWorkspace(
                 self._is_syncing_canvas_scene_selection = False
             self._canvas_viewer_preview_revision = revision
             self._clear_committed_object_placement_previews_if_displayed()
+            self._clear_committed_surface_texture_previews_if_displayed()
             return
         self._ensure_viewer_preview_current(preserve_camera=True)
 
@@ -13597,6 +13660,7 @@ class BlueprintWorkspace(
 
         self._commit_landing_mesh_update()
         self._commit_pending_object_placement_mesh_update()
+        self._commit_pending_surface_texture_mesh_update()
         export_path = Path(file_path)
         if export_path.suffix.lower() != ".glb":
             export_path = export_path.with_suffix(".glb")
@@ -13625,6 +13689,9 @@ class BlueprintWorkspace(
                     source_placements
                 )
             )
+            generated_model, pvs_visibility = self._prepare_pvs_export_model(
+                generated_model, source_placements, instance_placements,
+            )
             exported_path = export_glb_file(generated_model, export_path)
             manifest_path = write_runtime_scene_manifest(
                 exported_path,
@@ -13633,8 +13700,16 @@ class BlueprintWorkspace(
                 tours=self.tour_workspace.tours(),
                 door_body_reconstructions=door_body_reconstructions,
                 directional_lights=self.directional_lights,
+                sun_orbit=self.sun_orbit,
                 global_scale=self.global_scale,
+                first_person_eye_height_meters=(
+                    self._generation_settings.first_person_eye_height_meters
+                ),
+                **({"visibility": pvs_visibility} if pvs_visibility is not None else {}),
             )
+            if pvs_visibility is not None:
+                pvs_runtime_path = write_pvs_runtime_module(exported_path)
+                self._pvs_export_note += f"\nSaved PVS runtime helper to:\n{pvs_runtime_path}"
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
@@ -13648,7 +13723,8 @@ class BlueprintWorkspace(
         QMessageBox.information(
             self,
             "Export complete",
-            f"Saved GLB to:\n{exported_path}\n\nSaved scene data to:\n{manifest_path}",
+            f"Saved GLB to:\n{exported_path}\n\nSaved scene data to:\n{manifest_path}"
+            + (f"\n\n{self._pvs_export_note}" if self._pvs_export_note else ""),
         )
 
     def _refresh_blueprint_file_dependencies(
@@ -14108,6 +14184,8 @@ class BlueprintWorkspace(
         *,
         preview_model: GeneratedModel | None = None,
         preview_count: int = 1,
+        preview_meshes: Sequence[trimesh.Trimesh] | None = None,
+        preview_offsets: Sequence[Sequence[float]] | None = None,
     ) -> None:
         """Activate the existing local or detached scene and arm its floor picker."""
 
@@ -14123,12 +14201,12 @@ class BlueprintWorkspace(
             if scene_index >= 0:
                 self.workspace_tabs.setCurrentIndex(scene_index)
         self._ensure_viewer_preview_current(preserve_camera=True)
-        preview_meshes = None if preview_model is None else (preview_model.mesh,)
-        if self.viewer.begin_object_placement(
-            session.request_id,
-            preview_meshes=preview_meshes,
-            preview_count=preview_count,
-        ):
+        if preview_meshes is None and preview_model is not None:
+            preview_meshes = (preview_model.mesh,)
+        preview_options = {"preview_meshes": preview_meshes, "preview_count": preview_count}
+        if preview_offsets is not None:
+            preview_options["preview_offsets"] = preview_offsets
+        if self.viewer.begin_object_placement(session.request_id, **preview_options):
             self.viewer.focus_navigation()
             return
         self._direct_object_placement_session = None
@@ -14152,6 +14230,14 @@ class BlueprintWorkspace(
         ):
             return
         self._direct_object_placement_session = None
+        if (
+            session.request_id.startswith("atlas-grid-placement-")
+            and self._atlas_grid_placement_records(session.placeable_ids) is None
+        ):
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected object group changed; nothing was placed."
+            )
+            return
         if session.instance_source_object_id is not None:
             self._commit_generated_object_instance_placement(
                 session.instance_source_object_id,
@@ -14328,6 +14414,9 @@ class BlueprintWorkspace(
             previous_state = self.generation.get_placeable_object_placement_state(
                 placeable_id
             )
+            instance = self.generation.get_generated_object_instance(placeable_id)
+            if instance is not None:
+                previous_state = (placeable_id, instance.placement)
             previous_placement = None if previous_state is None else previous_state[1]
             placement = raw_placement
             if previous_placement is not None:
@@ -14356,7 +14445,7 @@ class BlueprintWorkspace(
             next_placements,
             strict=True,
         ):
-            if not self.generation.restore_placeable_object_placement(
+            if not self._restore_group_member_placement(
                 placeable_id,
                 placement,
                 emit_change_signals=False,
@@ -14366,7 +14455,7 @@ class BlueprintWorkspace(
                     changed_previous_placement,
                     _changed_atlas,
                 ) in reversed(previous_states[: len(changed_ids)]):
-                    self.generation.restore_placeable_object_placement(
+                    self._restore_group_member_placement(
                         changed_id,
                         changed_previous_placement,
                         emit_change_signals=False,
@@ -14392,6 +14481,7 @@ class BlueprintWorkspace(
                 undo_states.append(
                     _CanvasPlacedObjectUndoState(
                         object_id=placeable_id,
+                        source_object_id=self._get_instance_source_for_undo(placeable_id),
                         placement=previous_placement,
                         atlas_placements=previous_atlas_placements,
                         restore_atlas_bindings=True,
@@ -14407,12 +14497,34 @@ class BlueprintWorkspace(
             self._select_pending_object_placements(changed_ids)
         else:
             self.generation.publish_placeable_object_placement_changes(changed_ids)
+            if any(self.generation.get_generated_object_instance(value) is not None
+                   for value in changed_ids):
+                self.generation.publish_generated_object_instance_changes()
         changed_count = len(changed_ids)
         self.generation.status_label.setText(
             f"Placed {changed_count} generated object"
             + ("s." if changed_count != 1 else ".")
         )
         return True
+
+    def _restore_group_member_placement(
+        self,
+        object_id: str,
+        placement: GeneratedObjectPlacement | None,
+        *,
+        emit_change_signals: bool,
+    ) -> bool:
+        """Apply a group transaction to a source, running job, or existing instance."""
+
+        if self.generation.get_generated_object_instance(object_id) is not None:
+            if placement is None:
+                return False
+            return self.generation.update_generated_object_instance(
+                object_id, placement, emit_change_signals=emit_change_signals
+            )
+        return self.generation.restore_placeable_object_placement(
+            object_id, placement, emit_change_signals=emit_change_signals
+        )
 
     def _build_generated_object_placement_from_world(
         self,
@@ -14603,6 +14715,8 @@ class BlueprintWorkspace(
     ) -> None:
         """Refresh both scene overlays after an instance is added or removed."""
 
+        if not self._is_applying_project_state:
+            self._ensure_numbered_object_ids()
         self._drop_pending_object_placement_previews(tuple(
             object_id
             for object_id in self.viewer.get_pending_placed_object_ids()
@@ -15920,6 +16034,127 @@ class BlueprintWorkspace(
             "The selected object is not currently available for placement."
         )
 
+    # ### Atlas object-group placement ###
+    def _atlas_grid_placement_records(
+        self,
+        object_ids: Sequence[str],
+    ) -> tuple[tuple[str, GeneratedObjectRecord], ...] | None:
+        """Validate the entire selection before loading geometry or moving anything."""
+
+        records = {
+            record.object_id: record
+            for record in self.generation.get_generated_object_records()
+        }
+        result = []
+        for object_id in object_ids:
+            source_id = self.generation.get_scene_object_source_id(object_id)
+            record = records.get(source_id)
+            if (
+                record is None
+                or is_door_component_record(record)
+                or is_architectural_trim_component_record(record)
+                or self.generation._object_has_active_mutation_job(record.object_id)
+            ):
+                return None
+            result.append((object_id, record))
+        return tuple(result)
+
+    def _build_atlas_grid_placement_preview(
+        self,
+        records: Sequence[tuple[str, GeneratedObjectRecord]],
+    ) -> tuple[tuple[trimesh.Trimesh, ...], tuple[tuple[float, float, float], ...]]:
+        """Use existing proxy/model caches and full transformed object footprints."""
+
+        factors = np.asarray(self.global_scale.factors, dtype=float)
+        bounds = []
+        previews = []
+        models = {}
+        for object_id, record in records:
+            symmetry = self.generation.resolve_symmetric_division_for_record(record)
+            if record.object_id not in models:
+                models[record.object_id] = self._get_scene_generated_object_model(
+                    record.object_id, symmetry=symmetry, preview_only=True
+                )
+            model = models[record.object_id]
+            if model is None:
+                raise ValueError(f"{record.object_name} has no available geometry.")
+            previous = self.generation.get_scene_object_placement(object_id)
+            placed = PlacedGeneratedModel(
+                object_id=object_id,
+                model=model,
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(
+                    (0.0, 0.0, 0.0) if previous is None else previous.rotation_degrees
+                ),
+                scale=1.0 if previous is None else previous.scale,
+                axis_scales=(
+                    (1.0, 1.0, 1.0) if previous is None else previous.axis_scales
+                ),
+                symmetric_preview_orientation=(
+                    None if symmetry is None else symmetry.orientation
+                ),
+                symmetric_preview_plane_coordinate=(
+                    None if symmetry is None else symmetry.plane_coordinate
+                ),
+            )
+            footprint = np.asarray(
+                build_placed_generated_model_top_down_footprint(placed)
+            )
+            minimum_xy, maximum_xy = footprint.min(axis=0), footprint.max(axis=0)
+            physical_minimum = minimum_xy * factors[:2]
+            physical_maximum = maximum_xy * factors[:2]
+            bounds.append((*physical_minimum, *physical_maximum))
+            corners = trimesh.bounds.corners(model.mesh.bounds)
+            if symmetry is not None:
+                mirrored = corners.copy()
+                axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[symmetry.orientation]
+                mirrored[:, axis] = symmetry.plane_coordinate * 2.0 - mirrored[:, axis]
+                corners = np.concatenate((corners, mirrored))
+            transformed = trimesh.transform_points(
+                corners, build_placed_generated_model_transform(placed)
+            )
+            minimum = np.asarray((*minimum_xy, transformed[:, 2].min()))
+            maximum = np.asarray((*maximum_xy, transformed[:, 2].max()))
+            preview = trimesh.creation.box(extents=np.maximum(maximum - minimum, 1e-5))
+            preview.apply_translation((minimum + maximum) / 2.0)
+            previews.append(preview)
+        physical_offsets = build_object_placement_grid_offsets(bounds)
+        offsets = tuple(
+            tuple(float(value) for value in np.asarray(offset) / factors)
+            for offset in physical_offsets
+        )
+        return tuple(previews), offsets
+
+    def _handle_atlas_objects_place_requested(self, raw_object_ids: object) -> None:
+        """Arm one footprint-aware matrix picker for all selected Atlas objects."""
+
+        if not isinstance(raw_object_ids, (tuple, list)):
+            return
+        object_ids = tuple(dict.fromkeys(str(value).strip() for value in raw_object_ids))
+        records = self._atlas_grid_placement_records(object_ids)
+        if len(object_ids) < 2 or any(not value for value in object_ids) or records is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected object group is not available for placement."
+            )
+            return
+        try:
+            meshes, offsets = self._build_atlas_grid_placement_preview(records)
+        except (OSError, RuntimeError, TypeError, ValueError, OverflowError) as error:
+            self.texture_atlas_workspace.status_label.setText(
+                f"Object group not placed: {error}"
+            )
+            return
+        self._begin_direct_object_placement(
+            _DirectObjectPlacementSession(
+                request_id=f"atlas-grid-placement-{uuid.uuid4().hex}",
+                placeable_ids=object_ids,
+            ),
+            preview_meshes=meshes,
+            preview_offsets=offsets,
+            preview_count=len(object_ids),
+        )
+
+    # ### Atlas object-instance placement ###
     def _handle_atlas_object_instance_place_requested(self, object_id: str) -> None:
         """Arm the shared scene picker for an instance of an available object."""
 
@@ -16171,6 +16406,8 @@ class BlueprintWorkspace(
             )
         finally:
             self._is_assigning_surface_texture_from_atlas = False
+            if self._pending_surface_texture_ids:
+                QTimer.singleShot(0, self._start_pending_surface_texture_mesh_update_timer)
         if not removed_from_canvas:
             self.texture_atlas_workspace.status_label.setText(
                 "The selected surface texture could not be removed."
@@ -16683,6 +16920,8 @@ class BlueprintWorkspace(
     def _handle_atlas_surface_assign_requested(self, source_id: str) -> None:
         """Apply and pack one surface texture as a single user transaction."""
 
+        if self._is_assigning_surface_texture_from_atlas:
+            return
         assignment_id = self._atlas_surface_assignment_id_for_source(source_id)
         if assignment_id is None:
             return
@@ -16710,9 +16949,9 @@ class BlueprintWorkspace(
             target_surface_ids,
         ):
             self.texture_atlas_workspace.status_label.setText(
-                "The selected texture can only be assigned to compatible "
-                f"{assignment.surface_type} surfaces. Sloped-ceiling faces "
-                "accept wall or ceiling textures."
+                "The selected texture could not be assigned to these surfaces. "
+                "Generated trim textures require complete components of the "
+                "same trim type."
             )
             return
         source_ids_to_remove = self._atlas_surface_sources_displaced_by(
@@ -16727,43 +16966,45 @@ class BlueprintWorkspace(
         )
 
         def commit_surface_assignment() -> bool:
-            self._is_assigning_surface_texture_from_atlas = True
-            try:
-                return self.surface_texture_generation.apply_assignment_texture(
-                    assignment.assignment_id,
-                    target_surface_ids,
+            return self.surface_texture_generation.apply_assignment_texture(
+                assignment.assignment_id,
+                target_surface_ids,
+            )
+
+        self._is_assigning_surface_texture_from_atlas = True
+        try:
+            assigned = self.texture_atlas_workspace.ensure_source_in_typed_atlas(
+                source_id,
+                commit_callback=commit_surface_assignment,
+                source_ids_to_remove=source_ids_to_remove,
+            )
+
+            if not assigned:
+                surface_status_after = (
+                    self.surface_texture_generation.status_label.text().strip()
                 )
-            finally:
-                self._is_assigning_surface_texture_from_atlas = False
-
-        assigned = self.texture_atlas_workspace.ensure_source_in_typed_atlas(
-            source_id,
-            commit_callback=commit_surface_assignment,
-            source_ids_to_remove=source_ids_to_remove,
-        )
-
-        if not assigned:
-            surface_status_after = (
-                self.surface_texture_generation.status_label.text().strip()
-            )
-            atlas_status_after = (
-                self.texture_atlas_workspace.status_label.text().strip()
-            )
-            if (
-                surface_status_after
-                and surface_status_after != surface_status_before
-            ):
-                self.texture_atlas_workspace.status_label.setText(
+                atlas_status_after = (
+                    self.texture_atlas_workspace.status_label.text().strip()
+                )
+                if (
                     surface_status_after
-                )
-            elif not atlas_status_after or atlas_status_after == atlas_status_before:
-                self.texture_atlas_workspace.status_label.setText(
-                    "The texture could not be assigned to the selected surfaces."
-                )
-            return
-        self._atlas_surface_assignment_target_ids = ()
-        self._atlas_generation_signature = None
-        self._sync_atlas_object_texture_sources()
+                    and surface_status_after != surface_status_before
+                ):
+                    self.texture_atlas_workspace.status_label.setText(
+                        surface_status_after
+                    )
+                elif not atlas_status_after or atlas_status_after == atlas_status_before:
+                    self.texture_atlas_workspace.status_label.setText(
+                        "The texture could not be assigned to the selected surfaces."
+                    )
+                return
+            self._atlas_surface_assignment_target_ids = ()
+            self._atlas_generation_signature = None
+            self._sync_atlas_object_texture_sources()
+        finally:
+            self._is_assigning_surface_texture_from_atlas = False
+            if self._pending_surface_texture_ids:
+                QTimer.singleShot(0, self._start_pending_surface_texture_mesh_update_timer)
 
     def _atlas_surface_sources_displaced_by(
         self,
@@ -16887,7 +17128,7 @@ class BlueprintWorkspace(
         assignment: SurfaceTextureAssignment,
         target_surface_ids: Sequence[str],
     ) -> bool:
-        """Reject stale or mixed-type targets before changing Atlas PNGs."""
+        """Validate live targets and specialized trims before changing PNGs."""
 
         return self.surface_texture_generation.assignment_targets_are_valid(
             assignment.assignment_id,
@@ -16901,6 +17142,8 @@ class BlueprintWorkspace(
     ) -> None:
         """Move pinned Atlas placements to the object's latest exact PNGs."""
 
+        if not self._is_applying_project_state:
+            self._ensure_numbered_object_ids()
         if is_door_component_record(raw_record):
             return
         object_id = getattr(raw_record, "object_id", None)
@@ -17096,6 +17339,8 @@ class BlueprintWorkspace(
     ) -> None:
         """Pulse one newly generated object or texture until it is clicked."""
 
+        if not self._is_applying_project_state:
+            self._ensure_numbered_object_ids()
         if is_door_component_record(raw_record):
             return
         object_id = getattr(raw_record, "object_id", None)
@@ -19092,6 +19337,7 @@ class BlueprintWorkspace(
         self._clear_committed_doorway_outline_if_displayed()
         self._clear_committed_level_transform_outline_if_displayed()
         self._clear_committed_object_placement_previews_if_displayed()
+        self._clear_committed_surface_texture_previews_if_displayed()
         return True
 
     def _build_viewer_preview_dependency_signature(
@@ -19454,6 +19700,8 @@ class BlueprintWorkspace(
     ) -> None:
         """Publish independently visible scene levels and object ownership."""
 
+        if self._position_sunlight_above_levels():
+            self._sync_directional_light_views()
         level_items = tuple(
             (level.index, level.display_name)
             for level in sorted(
@@ -19589,6 +19837,7 @@ class BlueprintWorkspace(
             self._wall_vertex_update_timer,
             self._landing_mesh_update_timer,
             self._object_placement_mesh_update_timer,
+            self._surface_texture_mesh_update_timer,
         )
         active_timers = tuple(timer.isActive() for timer in timers)
         self._mesh_edit_update_delay_seconds = normalized_delay
@@ -19800,6 +20049,21 @@ class BlueprintWorkspace(
             include_instances=True,
             window_opening_targets_by_key=opening_targets_by_key,
         )
+        labels = self._ensure_numbered_object_ids(
+            identity
+            for placement in all_placed_models
+            for identity in (placement.object_id, str(placement.source_object_id))
+        )
+        all_placed_models = tuple(
+            replace(
+                placement,
+                export_node_name=object_export_node_name(labels[placement.object_id]),
+                export_source_node_name=object_export_node_name(
+                    labels[str(placement.source_object_id)]
+                ),
+            )
+            for placement in all_placed_models
+        )
         placed_models = tuple(
             placement
             for placement in all_placed_models
@@ -19814,6 +20078,18 @@ class BlueprintWorkspace(
             placed_models,
             tuple(instance_models),
         )
+
+    # ### Stable, display-name-independent exported object identities ###
+    def _ensure_numbered_object_ids(self, extra_object_ids=()) -> dict[str, str]:
+        """Reserve labels for every asset and copy, including unplaced objects."""
+
+        identities = (
+            *(record.object_id for record in self.generation.get_generated_object_records()),
+            *(instance.instance_id for instance in self.generation.get_generated_object_instances()),
+            *extra_object_ids,
+        )
+        self.object_export_ids = allocate_object_export_ids(self.object_export_ids, identities)
+        return self.object_export_ids
 
     def _build_export_door_body_reconstructions(
         self,
@@ -21844,12 +22120,111 @@ class BlueprintWorkspace(
             )
         if source_id is not None:
             self.texture_atlas_workspace.mark_sources_new((source_id,))
-        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        # A library-only result has no scene geometry to redraw. Auto-applied
+        # results publish surface_content_changed and use the shared debounce.
 
     def _handle_surface_texture_content_changed(self) -> None:
         if self._is_applying_project_state:
             return
-        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        previous = self._surface_texture_binding_snapshot
+        current = self._build_surface_texture_binding_snapshot()
+        self._surface_texture_binding_snapshot = current
+        changed_ids = {
+            surface_id for surface_id in previous.keys() | current.keys()
+            if previous.get(surface_id) != current.get(surface_id)
+        }
+        if changed_ids:
+            self._pending_surface_texture_ids.update(changed_ids)
+            for surface_id in changed_ids:
+                self._committing_surface_texture_revisions.pop(surface_id, None)
+            self._sync_pending_surface_texture_previews()
+            # Invalidate old progressive/AO results immediately, but do not
+            # build a new scene until this assignment's quiet period finishes.
+            self._cancel_progressive_texture_loads()
+            self._mark_viewer_preview_dirty()
+            # Atlas writes and thumbnail/catalog synchronization may continue
+            # synchronously after this signal. Give the yellow faces a full
+            # quiet period AFTER Qt can display them, not during that work.
+            self._surface_texture_mesh_update_timer.stop()
+            QTimer.singleShot(0, self._start_pending_surface_texture_mesh_update_timer)
+            self._refresh_confirm_mesh_updates_button()
+        elif current:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    # ### Delayed surface-texture scene updates ###
+    def _start_pending_surface_texture_mesh_update_timer(self) -> None:
+        """Begin the quiet period only after the assignment yields to Qt."""
+
+        if (
+            self._is_shutdown
+            or self._is_assigning_surface_texture_from_atlas
+            or not self._pending_surface_texture_ids
+        ):
+            return
+        self._surface_texture_mesh_update_timer.start()
+
+    def _build_surface_texture_binding_snapshot(self) -> dict[str, tuple[object, ...]]:
+        """Compare material bindings without treating names/usage as edits."""
+
+        bindings: dict[str, tuple[object, ...]] = {}
+        for assignment in self.surface_texture_generation.get_assignments():
+            signature = (
+                assignment.assignment_id, assignment.asset_path,
+                assignment.texture_variants, assignment.selected_texture_resolution,
+                assignment.enabled_pbr_maps, assignment.pbr_alignment_version,
+                assignment.tiling_mode, assignment.tiling_seed,
+                assignment.texture_repeat_size_m, assignment.source_object_id,
+            )
+            bindings.update((surface_id, signature) for surface_id in assignment.surface_ids)
+        return bindings
+
+    def _sync_pending_surface_texture_previews(self) -> None:
+        """Retain the yellow faces until their replacement model is visible."""
+
+        self.viewer.set_pending_surface_texture_preview_ids(tuple(sorted(
+            self._pending_surface_texture_ids
+            | self._committing_surface_texture_revisions.keys()
+        )))
+
+    def _commit_pending_surface_texture_mesh_update(self) -> None:
+        """Apply the latest authored assignments with one scene rebuild."""
+
+        self._surface_texture_mesh_update_timer.stop()
+        if not self._pending_surface_texture_ids:
+            return
+        surface_ids = tuple(self._pending_surface_texture_ids)
+        self._pending_surface_texture_ids.clear()
+        # Register before queueing: even an immediate refresh must know which
+        # revision needs to reach the screen before retiring the yellow faces.
+        revision = self._mark_viewer_preview_dirty()
+        self._committing_surface_texture_revisions.update(
+            (surface_id, revision) for surface_id in surface_ids
+        )
+        self._scheduled_viewer_refresh_preserve_camera = True
+        self._queue_viewer_preview_refresh()
+        self._refresh_confirm_mesh_updates_button()
+
+    def _clear_committed_surface_texture_previews_if_displayed(self) -> None:
+        """Do not remove the yellow overlay merely because its timer expired."""
+
+        displayed_ids = tuple(
+            surface_id
+            for surface_id, revision in self._committing_surface_texture_revisions.items()
+            if self._canvas_viewer_preview_revision >= revision
+        )
+        for surface_id in displayed_ids:
+            self._committing_surface_texture_revisions.pop(surface_id, None)
+        if displayed_ids:
+            self._sync_pending_surface_texture_previews()
+
+    def _cancel_pending_surface_texture_mesh_updates(self) -> None:
+        """Drop transient previews, never authored texture assignments."""
+
+        self._surface_texture_mesh_update_timer.stop()
+        self._pending_surface_texture_ids.clear()
+        self._committing_surface_texture_revisions.clear()
+        self._surface_texture_binding_snapshot.clear()
+        self.viewer.clear_pending_surface_texture_previews()
 
     def _handle_generation_scene_pbr_maps_changed(self, _checked: bool) -> None:
         """Apply shared Generation map toggles to every related preview."""
@@ -21886,6 +22261,7 @@ class BlueprintWorkspace(
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         if (
             bool(self._pending_object_placement_ids)
+            or bool(self._pending_surface_texture_ids)
             or (
                 bool(self._committing_object_placement_revisions)
                 and self.viewer.is_placed_object_interaction_active
@@ -22007,6 +22383,7 @@ class BlueprintWorkspace(
             self._clear_committed_doorway_outline_if_displayed()
             self._clear_committed_level_transform_outline_if_displayed()
             self._clear_committed_object_placement_previews_if_displayed()
+            self._clear_committed_surface_texture_previews_if_displayed()
 
         if tour_is_stale:
             tour_preview_viewer = self.tour_preview_viewer
@@ -22037,6 +22414,8 @@ class BlueprintWorkspace(
     ) -> int:
         """Invalidate shared preview data and retain future camera intent."""
 
+        if self._pvs_visibility is not None and not self._is_shutdown:
+            self._pvs_status_timer.start()
         self._pending_viewer_preview_dependency_signature = None
         self._pending_viewer_preview_dependency_signature_revision = -1
         self._viewer_preview_revision += 1
@@ -22057,6 +22436,7 @@ class BlueprintWorkspace(
             return
         if (
             bool(self._pending_object_placement_ids)
+            or bool(self._pending_surface_texture_ids)
             or (
                 bool(self._committing_object_placement_revisions)
                 and self.viewer.is_placed_object_interaction_active
@@ -22121,6 +22501,7 @@ class BlueprintWorkspace(
             return
         if (
             bool(self._pending_object_placement_ids)
+            or bool(self._pending_surface_texture_ids)
             or (
                 bool(self._committing_object_placement_revisions)
                 and self.viewer.is_placed_object_interaction_active
@@ -22168,6 +22549,7 @@ class BlueprintWorkspace(
 
         self._commit_landing_mesh_update()
         self._commit_pending_object_placement_mesh_update()
+        self._commit_pending_surface_texture_mesh_update()
         try:
             self.merged_generation_workspace.flush_reference_generation_preferences()
             save_project(
@@ -22184,8 +22566,11 @@ class BlueprintWorkspace(
                 tours=self.tour_workspace.tours(),
                 doors=self.doors_workspace.data(),
                 directional_lights=self.directional_lights,
+                sun_orbit=self.sun_orbit,
                 plan_wall_generation=self._build_plan_wall_detection_options(),
                 global_scale=self.global_scale,
+                visibility=self._pvs_visibility,
+                object_export_ids=self._ensure_numbered_object_ids(),
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -29420,29 +29805,10 @@ class BlueprintWorkspace(
 
     # ### Directional lights ###
     def _handle_add_directional_light_clicked(self, checked: bool) -> None:
-        """Arm or cancel point placement in both scene authoring views."""
+        """Edit the primary sun rather than placing additional light objects."""
 
-        if not checked:
-            self._cancel_directional_light_placement(notify=False)
-            return
-
-        self.canvas.start_directional_light_placement()
-        base_z = build_level_base_z_lookup(self.levels).get(
-            self.current_level.index,
-            0.0,
-        )
-        viewer_started = self.viewer.begin_directional_light_placement(
-            fallback_plane_z=float(base_z),
-        )
-        if not viewer_started and not self.canvas.is_directional_light_placement_active():
-            self._set_add_directional_light_button_checked(False)
-            QMessageBox.information(
-                self,
-                "Add directional light",
-                "Load a plan image or build scene geometry before placing a light.",
-            )
-            return
-        self._refresh_directional_light_button_tooltip()
+        self._cancel_directional_light_placement(notify=False)
+        self._set_sunlight_direction_editing(checked)
 
     def _handle_canvas_directional_light_placement_requested(
         self,
@@ -29492,7 +29858,7 @@ class BlueprintWorkspace(
         *,
         level_index: int,
     ) -> DirectionalLightData:
-        """Create, select, and publish one straight-down directional light."""
+        """Create, select, and publish one straight-down sun light."""
 
         light = create_directional_light(
             self.directional_lights,
@@ -29513,6 +29879,11 @@ class BlueprintWorkspace(
     def _cancel_directional_light_placement(self, *, notify: bool) -> None:
         """Disarm both placement surfaces without recursive cancellation."""
 
+        # Movement cancellation restores canonical scene state. Do not suppress
+        # that notification with the one-shot placement tool's signal blocker.
+        self.canvas.cancel_directional_light_move()
+        self._is_editing_sunlight_direction = False
+        self.viewer.set_sun_direction_editing(False)
         if notify:
             self.canvas.cancel_directional_light_placement()
         else:
@@ -29546,6 +29917,56 @@ class BlueprintWorkspace(
         self.viewer.set_selected_directional_light_id(normalized_id)
         self._refresh_directional_light_button_tooltip()
 
+    # ### Canvas sun-marker movement ###
+    def _handle_canvas_directional_light_move_started(self, light_id: str) -> None:
+        light = next(
+            (item for item in self.directional_lights if item.light_id == light_id),
+            None,
+        )
+        self._canvas_directional_light_move_initial = (
+            None if light is None else (light, self.current_level)
+        )
+
+    def _handle_canvas_directional_light_move_preview_changed(
+        self,
+        light_id: str,
+        image_x: float,
+        image_y: float,
+    ) -> None:
+        """Translate the authoring point in plan XY without rotating sun rays."""
+
+        initial = self._canvas_directional_light_move_initial
+        if initial is None or initial[0].light_id != light_id:
+            return
+        light, level = initial
+        try:
+            world_x, world_y = level_image_to_world_xy(level, image_x, image_y)
+            moved = light.with_position((world_x, world_y, light.position[2]))
+        except (TypeError, ValueError, OverflowError):
+            return
+        self.directional_lights = tuple(
+            moved if item.light_id == light_id else item
+            for item in self.directional_lights
+        )
+        self._sync_directional_light_views()
+
+    def _handle_canvas_directional_light_move_finished(
+        self,
+        light_id: str,
+        cancelled: bool,
+    ) -> None:
+        """Retain a released translation or restore its exact original state."""
+
+        initial = self._canvas_directional_light_move_initial
+        self._canvas_directional_light_move_initial = None
+        if initial is not None and initial[0].light_id == light_id and cancelled:
+            self.directional_lights = tuple(
+                initial[0] if item.light_id == light_id else item
+                for item in self.directional_lights
+            )
+        self._sync_directional_light_views()
+
+    # ### Sun deletion and 3D transforms ###
     def _handle_directional_light_deletion_requested(
         self,
         light_id: object,
@@ -29670,6 +30091,7 @@ class BlueprintWorkspace(
         """Publish canonical light state and selection to both scene editors."""
 
         self.viewer.set_directional_lights(self.directional_lights)
+        self._sync_sunlight_viewer_configuration()
         self.viewer.set_selected_directional_light_id(
             self._selected_directional_light_id
         )
@@ -29708,35 +30130,9 @@ class BlueprintWorkspace(
         )
 
     def _refresh_directional_light_button_tooltip(self) -> None:
-        """Describe point placement, wheel editing, and the selected intensity."""
+        """Explain initial direction editing and position-independent sunlight."""
 
-        selected = next(
-            (
-                light
-                for light in self.directional_lights
-                if light.light_id == self._selected_directional_light_id
-            ),
-            None,
-        )
-        selection_text = (
-            ""
-            if selected is None
-            else f" Selected intensity: {selected.intensity:.1f}."
-        )
-        placement_text = (
-            " Click a point on the 2D Canvas or 3D scene; right-click or Escape "
-            "cancels."
-            if self.add_directional_light_button.isChecked()
-            else ""
-        )
-        self.add_directional_light_button.setToolTip(
-            "Drop a white directional-light point. It initially shines straight "
-            "down; select it to move it with RGB arrows, aim it with RGB rings, "
-            "and use the wheel to change intensity by 0.1 in native Three/R3F "
-            "units. The selected light projects a hit grid onto scene geometry."
-            f"{placement_text} Current lights: {len(self.directional_lights)}."
-            f"{selection_text}"
-        )
+        self._refresh_sunlight_control_tooltips()
 
     # ### Outer wall marking controls ###
     def _handle_outer_wall_mark_clicked(self) -> None:
@@ -30809,6 +31205,7 @@ class BlueprintWorkspace(
         self.viewer.set_first_person_speed(
             settings.first_person_speed_meters_per_second
         )
+        self.viewer.set_first_person_eye_height(settings.first_person_eye_height_meters)
         self.viewer.set_ignore_top_down_ceiling(settings.ignore_top_down_ceiling)
         self.viewer.set_hide_stair_mesh_when_previewing(
             settings.hide_stair_mesh_when_previewing
@@ -31168,9 +31565,14 @@ class BlueprintWorkspace(
             tours=project_data.tours,
             doors=project_data.doors,
             directional_lights=project_data.directional_lights,
+            sun_orbit=project_data.sun_orbit,
+            object_export_ids=project_data.object_export_ids,
             plan_wall_generation=project_data.plan_wall_generation,
             global_scale=project_data.global_scale,
+            visibility=project_data.visibility,
         )
+        if project_data.visibility_warning:
+            self.pvs_status_label.setText(project_data.visibility_warning)
 
     def _apply_project_state(
         self,
@@ -31188,11 +31590,16 @@ class BlueprintWorkspace(
         directional_lights: Sequence[DirectionalLightData] | None = None,
         plan_wall_generation: PlanWallDetectionOptions | None = None,
         global_scale: GlobalScale | None = None,
+        visibility: PvsBakeData | None = None,
+        sun_orbit: SunOrbitData | None = None,
+        object_export_ids: dict[str, str] | None = None,
     ) -> None:
         """Install one project while coalescing expensive dependent refreshes."""
 
         if self._is_applying_project_state:
             raise RuntimeError("A project is already being applied.")
+        self._cancel_and_join_pvs_bake()
+        self._pvs_visibility = None
         self.merged_generation_workspace.reset_ceiling_height_analysis()
         self._is_applying_project_state = True
         self._project_apply_base_surfaces = None
@@ -31213,9 +31620,12 @@ class BlueprintWorkspace(
                 tours=tours,
                 doors=doors,
                 directional_lights=directional_lights,
+                sun_orbit=sun_orbit,
+                object_export_ids=object_export_ids,
                 plan_wall_generation=plan_wall_generation,
                 global_scale=global_scale,
             )
+            self._pvs_visibility = visibility
             apply_completed = True
         finally:
             self._project_apply_base_surfaces = None
@@ -31244,7 +31654,12 @@ class BlueprintWorkspace(
     def _finalize_project_state_apply(self) -> None:
         """Replay expensive project consumers once after signal coalescing."""
 
+        self._ensure_numbered_object_ids()
+        self._surface_texture_binding_snapshot = (
+            self._build_surface_texture_binding_snapshot()
+        )
         self._schedule_viewer_preview_refresh()
+        self._refresh_pvs_status()
         self._sync_atlas_object_texture_sources()
         # Atlas thumbnails are sufficient for the first interactive frame.
         # Exact full-size map families remain lazy until export, AO baking, or
@@ -31275,6 +31690,8 @@ class BlueprintWorkspace(
         directional_lights: Sequence[DirectionalLightData] | None = None,
         plan_wall_generation: PlanWallDetectionOptions | None = None,
         global_scale: GlobalScale | None = None,
+        sun_orbit: SunOrbitData | None = None,
+        object_export_ids: dict[str, str] | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -31301,6 +31718,7 @@ class BlueprintWorkspace(
         self._pending_generation_placement_anchor = None
         self._cancel_direct_object_placement()
         self._cancel_pending_object_placement_mesh_updates()
+        self._cancel_pending_surface_texture_mesh_updates()
         self.viewer.cancel_door_placement()
         self._cancel_directional_light_placement(notify=False)
         self._tour_point_request_revision += 1
@@ -31359,6 +31777,7 @@ class BlueprintWorkspace(
         self.viewer.cancel_landing_placement()
         self.generation.clear_landing_editing_target()
         self.levels = levels
+        self.object_export_ids = normalize_object_export_ids(object_export_ids)
         self.global_scale = global_scale if global_scale is not None else GlobalScale()
         self.outer_wall_marks = reconcile_outer_wall_marks(
             self.levels,
@@ -31368,8 +31787,14 @@ class BlueprintWorkspace(
         self._outer_wall_marking_mode = None
         self.canvas.set_outer_wall_marking_active(False)
         self.directional_lights = tuple(directional_lights or ())
+        self._ensure_default_sunlight()
+        self._position_sunlight_above_levels()
+        self.sun_orbit = sun_orbit if sun_orbit is not None else SunOrbitData()
+        self._sync_sunlight_controls()
         self._selected_directional_light_id = None
         self.viewer.set_directional_lights(self.directional_lights)
+        self._sync_sunlight_viewer_configuration()
+        self.viewer.reset_sun_orbit()
         self.viewer.set_selected_directional_light_id(None)
         self._refresh_directional_light_button_tooltip()
         self.tour_workspace.set_tours(tuple(tours or ()))

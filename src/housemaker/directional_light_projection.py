@@ -13,10 +13,59 @@ DIRECTIONAL_LIGHT_PROJECTION_DEPTH_BIAS_METERS = 0.003
 DIRECTIONAL_LIGHT_PROJECTION_UPSTREAM_BIAS_RATIO = 1e-5
 DIRECTIONAL_LIGHT_PROJECTION_MINIMUM_UPSTREAM_BIAS_METERS = 1e-5
 DIRECTIONAL_LIGHT_PROJECTION_MAXIMUM_NEIGHBOR_STRETCH = 3.0
+SUN_RAY_MINIMUM_LENGTH_METERS = 0.75
+SUN_RAY_UPSTREAM_LENGTH_RATIO = 0.35
+SUN_RAY_FALLBACK_LATTICE_STRIDE = 2
+SUN_RAY_FALLBACK_CACHE_KEY = "housemaker_sun_ray_fallback"
 _GEOMETRY_EPSILON = 1e-10
 
 
 # ### Public projection helpers ###
+def build_directional_light_projection_rays(
+    collision_mesh: trimesh.Trimesh,
+    direction: Sequence[float] | np.ndarray,
+    *,
+    depth_bias_meters: float = DIRECTIONAL_LIGHT_PROJECTION_DEPTH_BIAS_METERS,
+) -> np.ndarray:
+    """Draw independent parallel incoming rays, stopping at their first hit.
+
+    These are depth-tested authoring guides, not volumetric light or shadows.
+    Unlike the legacy hit grid, no neighboring rays are connected together.
+    """
+
+    vertices, faces = _validate_collision_mesh(collision_mesh)
+    normalized_direction = _normalize_direction(direction)
+    bias = _normalize_depth_bias(depth_bias_meters)
+    origins, _horizontal_step, _vertical_step = _build_ray_lattice(
+        vertices, normalized_direction
+    )
+    upstream_length = max(
+        float(np.linalg.norm(np.ptp(vertices, axis=0))) * SUN_RAY_UPSTREAM_LENGTH_RATIO,
+        SUN_RAY_MINIMUM_LENGTH_METERS,
+    )
+    origins -= normalized_direction * upstream_length
+    directions = np.broadcast_to(normalized_direction, origins.shape).copy()
+    hits = _cast_first_hits_with_embree(collision_mesh, origins, directions)
+    collision_mesh._cache[SUN_RAY_FALLBACK_CACHE_KEY] = hits is None
+    if hits is None:
+        # Without Embree keep a readable 5-by-5 guide instead of blocking the
+        # UI with 81 full-mesh scans. Sun shading itself never uses these rays.
+        origins = origins.reshape((DIRECTIONAL_LIGHT_PROJECTION_GRID_SIZE,
+                                   DIRECTIONAL_LIGHT_PROJECTION_GRID_SIZE, 3))[
+            ::SUN_RAY_FALLBACK_LATTICE_STRIDE, ::SUN_RAY_FALLBACK_LATTICE_STRIDE
+        ].reshape((-1, 3))
+        hits = _cast_first_hits_moller_trumbore(
+            vertices, faces, origins, normalized_direction
+        )
+    mask = np.all(np.isfinite(hits), axis=1)
+    if not np.any(mask):
+        return np.empty((0, 3), dtype=np.float32)
+    endpoints = hits[mask] - normalized_direction * bias
+    return np.ascontiguousarray(
+        np.stack((origins[mask], endpoints), axis=1).reshape((-1, 3)), dtype=np.float32
+    )
+
+
 def build_directional_light_projection_grid(
     collision_mesh: trimesh.Trimesh,
     direction: Sequence[float] | np.ndarray,
@@ -224,7 +273,12 @@ def _cast_first_hits_with_embree(
     try:
         from trimesh.ray.ray_pyembree import RayMeshIntersector
 
-        intersector = RayMeshIntersector(collision_mesh)
+        # The viewer retains the collision mesh until geometry changes. Reuse
+        # its acceleration tree while only the sun's direction is animated.
+        intersector = collision_mesh._cache["housemaker_sun_intersector"]
+        if intersector is None:
+            intersector = RayMeshIntersector(collision_mesh)
+            collision_mesh._cache["housemaker_sun_intersector"] = intersector
         locations, ray_indices, _triangle_indices = intersector.intersects_location(
             ray_origins,
             ray_directions,

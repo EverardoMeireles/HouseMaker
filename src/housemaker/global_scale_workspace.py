@@ -133,6 +133,8 @@ class GlobalScaleWorkspaceMixin:
             self.global_scale,
             floor_z=build_level_base_z_lookup(self.levels)[self.current_level.index],
         )
+        if self._position_sunlight_above_levels():
+            self._sync_directional_light_views()
         if self.tour_preview_viewer is not None:
             self.tour_preview_viewer.set_global_scale(self.global_scale)
         stair_index = self._editing_stair_index

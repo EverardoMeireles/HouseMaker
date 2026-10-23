@@ -52,6 +52,7 @@ def _mesh_timers(workspace: BlueprintWorkspace):
             "_wall_vertex_update_timer",
             "_landing_mesh_update_timer",
             "_object_placement_mesh_update_timer",
+            "_surface_texture_mesh_update_timer",
         )
     )
 
@@ -89,6 +90,7 @@ def test_idle_button_is_disabled_without_blinking(workspace) -> None:
         ("_pending_stair_point_mesh_update", True),
         ("_pending_landing_mesh_update", True),
         ("_pending_object_placement_ids", {"object-a"}),
+        ("_pending_surface_texture_ids", {"level:2/wall:1:2"}),
         ("_pending_doorway_mesh_level_index", 2),
         ("_pending_window_mesh_level_index", 2),
         ("_staged_canvas_opening_mesh_update", True),
@@ -141,6 +143,7 @@ def test_confirm_flushes_every_edit_path_without_changing_delay(workspace) -> No
         "_commit_pending_stair_point_mesh_update",
         "_commit_landing_mesh_update",
         "_commit_pending_object_placement_mesh_update",
+        "_commit_pending_surface_texture_mesh_update",
         "_commit_pending_doorway_mesh_update",
         "_queue_viewer_preview_refresh",
     )

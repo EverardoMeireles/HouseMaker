@@ -2918,6 +2918,7 @@ class MergedGenerationWorkspace(QWidget):
         )
         objects.controls_synced.connect(self._sync_generation_action_buttons)
         objects.controls_synced.connect(self._sync_geometry_generation_controls)
+        objects.controls_synced.connect(self._sync_generation_texture_context)
         surface.controls_synced.connect(self._sync_generation_action_buttons)
         try:
             self.seekbar.valueChanged.disconnect()
@@ -3101,15 +3102,21 @@ class MergedGenerationWorkspace(QWidget):
     def _sync_generation_texture_context(self) -> None:
         """Show the texture action belonging to the active semantic target."""
 
+        objects = self.object_workspace
+        component_is_active = objects.component_generation_active
         surface_is_selected = bool(
             self.surface_workspace.get_selected_surface_ids()
         )
-        use_surface_texture_pipeline = bool(
-            surface_is_selected
-            and not self.object_workspace.component_generation_active
+        surface_target_is_active = surface_is_selected and not component_is_active
+        object_is_selected = (
+            objects._selected_object_id in objects.get_placeable_object_names_by_id()
         )
-        self.object_workspace.set_external_surface_generation_target_selected(
-            use_surface_texture_pipeline
+        use_surface_texture_pipeline = surface_target_is_active or (
+            not component_is_active and not object_is_selected
+        )
+        # Library-only Surface generation must not disable new Object meshes.
+        objects.set_external_surface_generation_target_selected(
+            surface_target_is_active
         )
         target_button = (
             self.surface_workspace.generate_button

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from housemaker.directional_light_state import (
     DirectionalLightData,
+    SunOrbitData,
     directional_lights_from_payload,
     directional_lights_to_dicts,
 )
@@ -78,6 +79,7 @@ from housemaker.models import (
     normalize_doorway_arch_amount,
     normalize_doorway_shape,
 )
+from housemaker.object_identifiers import normalize_object_export_ids
 from housemaker.outer_wall_marking import (
     OuterWallMark,
     normalize_outer_wall_marks,
@@ -90,6 +92,7 @@ from housemaker.outer_wall_marking import (
 from housemaker.plan_correction_exchange import ExternalPlanCorrection
 from housemaker.plan_metric_state import PlanMetricCalibration
 from housemaker.plan_wall_options import PlanWallDetectionOptions
+from housemaker.pvs_state import PvsBakeData
 from housemaker.surface_texture_state import SurfaceTextureData, normalize_surface_id
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.tour_state import TourData, tours_from_payload, tours_to_dicts
@@ -124,8 +127,17 @@ class ProjectData:
         default_factory=PlanWallDetectionOptions
     )
     global_scale: GlobalScale = field(default_factory=GlobalScale)
+    visibility: PvsBakeData | None = None
+    visibility_warning: str | None = None
+    sun_orbit: SunOrbitData = field(default_factory=SunOrbitData)
+    object_export_ids: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.object_export_ids = normalize_object_export_ids(self.object_export_ids)
+        if not isinstance(self.sun_orbit, SunOrbitData):
+            raise TypeError("Project sun orbit must contain validated settings.")
+        if self.visibility is not None and not isinstance(self.visibility, PvsBakeData):
+            raise TypeError("Project visibility must be validated PVS bake data.")
         if not self.doorway_presets:
             self.doorway_presets = [create_fallback_doorway_preset()]
         self.tours = tuple(self.tours)
@@ -155,7 +167,15 @@ def save_project(
     directional_lights: Iterable[DirectionalLightData] | None = None,
     plan_wall_generation: PlanWallDetectionOptions | None = None,
     global_scale: GlobalScale | None = None,
+    visibility: PvsBakeData | None = None,
+    sun_orbit: SunOrbitData | None = None,
+    object_export_ids: dict[str, str] | None = None,
 ) -> Path:
+    normalized_object_export_ids = normalize_object_export_ids(object_export_ids)
+    if sun_orbit is not None and not isinstance(sun_orbit, SunOrbitData):
+        raise TypeError("Project sun orbit must contain validated settings.")
+    if visibility is not None and not isinstance(visibility, PvsBakeData):
+        raise TypeError("Project visibility must be validated PVS bake data.")
     export_path = Path(path)
     resolved_outer_wall_marks = reconcile_outer_wall_marks(
         levels,
@@ -166,6 +186,9 @@ def save_project(
         "blueprint_path": None,
         "current_level_index": int(current_level_index),
         "global_scale": (global_scale or GlobalScale()).to_dict(),
+        "visibility": None if visibility is None else visibility.to_dict(),
+        "sun_orbit": (sun_orbit or SunOrbitData()).to_dict(),
+        "object_export_ids": normalized_object_export_ids,
         "plan_wall_generation": (
             plan_wall_generation or PlanWallDetectionOptions()
         ).to_dict(),
@@ -419,6 +442,24 @@ def load_project(path: str | Path) -> ProjectData:
     directional_lights = directional_lights_from_payload(
         payload.get("directional_lights")
     )
+    try:
+        sun_orbit = SunOrbitData.from_dict(payload.get("sun_orbit"))
+    except (TypeError, ValueError, OverflowError):
+        # Optional invalid animation settings must never start unsafe motion.
+        sun_orbit = SunOrbitData(enabled=False)
+    try:
+        object_export_ids = normalize_object_export_ids(payload.get("object_export_ids"))
+    except (TypeError, ValueError):
+        # UUID ownership remains authoritative if optional labels are corrupt.
+        object_export_ids = {}
+    visibility = None
+    visibility_warning = None
+    if payload.get("visibility") is not None:
+        try:
+            visibility = PvsBakeData.from_dict(payload["visibility"])
+        except (TypeError, ValueError, OverflowError):
+            # A bad optional bake must not make the editable project unusable.
+            visibility_warning = "Saved PVS data was invalid and disabled; bake PVS again."
     if "outer_wall_marks" in payload:
         outer_wall_marks = outer_wall_marks_from_payload(
             payload.get("outer_wall_marks"),
@@ -457,10 +498,14 @@ def load_project(path: str | Path) -> ProjectData:
         tours=tours,
         doors=doors,
         directional_lights=directional_lights,
+        sun_orbit=sun_orbit,
+        object_export_ids=object_export_ids,
         plan_wall_generation=PlanWallDetectionOptions.from_dict(
             payload.get("plan_wall_generation")
         ),
         global_scale=GlobalScale.from_dict(payload.get("global_scale")),
+        visibility=visibility,
+        visibility_warning=visibility_warning,
     )
 
 

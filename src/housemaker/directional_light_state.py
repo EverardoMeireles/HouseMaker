@@ -9,9 +9,15 @@ from dataclasses import dataclass, replace
 # ### Constants ###
 DEFAULT_DIRECTIONAL_LIGHT_COLOR = "#ffffff"
 DEFAULT_DIRECTIONAL_LIGHT_INTENSITY = 1.0
-DEFAULT_DIRECTIONAL_LIGHT_CAST_SHADOW = False
+DEFAULT_DIRECTIONAL_LIGHT_CAST_SHADOW = True
 DEFAULT_DIRECTIONAL_LIGHT_TARGET_OFFSET = (0.0, 0.0, -1.0)
 DIRECTIONAL_LIGHT_INTENSITY_WHEEL_STEP = 0.1
+DEFAULT_SUN_ORBIT_ENABLED = True
+DEFAULT_SUN_ORBIT_SPEED_DEGREES_PER_SECOND = 0.5
+DEFAULT_SUN_LIGHT_POSITION = (0.0, 0.0, 3.0)
+DEFAULT_SUN_LIGHT_TARGET_OFFSET = (1.0, 0.0, -1.0)
+MIN_SUN_ORBIT_SPEED_DEGREES_PER_SECOND = 0.0
+MAX_SUN_ORBIT_SPEED_DEGREES_PER_SECOND = 360.0
 MAX_DIRECTIONAL_LIGHT_ID_LENGTH = 256
 MAX_DIRECTIONAL_LIGHT_NAME_LENGTH = 256
 _COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -20,7 +26,7 @@ _COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
 # ### Data models ###
 @dataclass(frozen=True, slots=True)
 class DirectionalLightData:
-    """One scene-global directional light authored in HouseMaker Z-up space."""
+    """One sun light: parallel global illumination in HouseMaker Z-up space."""
 
     light_id: str
     name: str
@@ -51,9 +57,7 @@ class DirectionalLightData:
             "Directional-light target",
         )
         if math.dist(position, target) <= 1e-9:
-            raise ValueError(
-                "Directional-light position and target must be different."
-            )
+            raise ValueError("Directional-light position and target must be different.")
         color = str(self.color).strip().lower()
         if _COLOR_PATTERN.fullmatch(color) is None:
             raise ValueError("Directional-light color must use #RRGGBB format.")
@@ -108,9 +112,7 @@ class DirectionalLightData:
                 payload["target"],
                 "Directional-light target",
             ),
-            color=str(
-                payload.get("color", DEFAULT_DIRECTIONAL_LIGHT_COLOR)
-            ),
+            color=str(payload.get("color", DEFAULT_DIRECTIONAL_LIGHT_COLOR)),
             intensity=payload.get(
                 "intensity",
                 DEFAULT_DIRECTIONAL_LIGHT_INTENSITY,
@@ -170,10 +172,111 @@ class DirectionalLightData:
             raise ValueError("Directional-light wheel steps must be finite.")
         adjusted = max(
             0.0,
-            self.intensity
-            + normalized_steps * DIRECTIONAL_LIGHT_INTENSITY_WHEEL_STEP,
+            self.intensity + normalized_steps * DIRECTIONAL_LIGHT_INTENSITY_WHEEL_STEP,
         )
         return self.with_intensity(round(adjusted, 10))
+
+
+# ### Sun orbit configuration and immutable direction changes ###
+@dataclass(frozen=True, slots=True)
+class SunOrbitData:
+    """Animation settings; authored light vectors remain its initial state."""
+
+    enabled: bool = DEFAULT_SUN_ORBIT_ENABLED
+    speed_degrees_per_second: float = DEFAULT_SUN_ORBIT_SPEED_DEGREES_PER_SECOND
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("Sun orbit enabled must be a boolean.")
+        speed = self.speed_degrees_per_second
+        if isinstance(speed, bool) or not isinstance(speed, int | float):
+            raise TypeError("Sun orbit speed must be numeric.")
+        try:
+            speed = float(speed)
+        except OverflowError as error:
+            raise ValueError("Sun orbit speed must be finite.") from error
+        if not math.isfinite(speed) or not (
+            MIN_SUN_ORBIT_SPEED_DEGREES_PER_SECOND
+            <= speed
+            <= MAX_SUN_ORBIT_SPEED_DEGREES_PER_SECOND
+        ):
+            raise ValueError(
+                "Sun orbit speed must be between 0 and 360 degrees per second."
+            )
+        object.__setattr__(self, "speed_degrees_per_second", speed)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "speed_degrees_per_second": self.speed_degrees_per_second,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> SunOrbitData:
+        if payload is None:
+            return cls()
+        if not isinstance(payload, dict):
+            raise TypeError("Sun orbit settings must be an object.")
+        return cls(
+            enabled=payload.get("enabled", DEFAULT_SUN_ORBIT_ENABLED),
+            speed_degrees_per_second=payload.get(
+                "speed_degrees_per_second", DEFAULT_SUN_ORBIT_SPEED_DEGREES_PER_SECOND
+            ),
+        )
+
+    def to_runtime_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "speedDegreesPerSecond": self.speed_degrees_per_second,
+        }
+
+
+def create_default_sun_light(
+    *, position: Sequence[float] = DEFAULT_SUN_LIGHT_POSITION
+) -> DirectionalLightData:
+    """Return a global sun tilted -45 degrees about the authoring Y axis."""
+
+    normalized_position = _normalize_world_point(position, "Sunlight position")
+    return DirectionalLightData(
+        light_id="directional-light-1",
+        name="Sunlight",
+        position=normalized_position,
+        target=tuple(
+            value + DEFAULT_SUN_LIGHT_TARGET_OFFSET[index]
+            for index, value in enumerate(normalized_position)
+        ),
+    )
+
+
+def rotate_sun_light_about_z(
+    light: DirectionalLightData, degrees: float
+) -> DirectionalLightData:
+    """Rotate only the initial ray direction around a fixed authoring point."""
+
+    if not isinstance(light, DirectionalLightData):
+        raise TypeError("Sun rotation requires a directional light.")
+    if isinstance(degrees, bool) or not isinstance(degrees, int | float):
+        raise TypeError("Sun rotation angle must be numeric.")
+    try:
+        angle_degrees = float(degrees)
+    except OverflowError as error:
+        raise ValueError("Sun rotation angle must be finite.") from error
+    if not math.isfinite(angle_degrees):
+        raise ValueError("Sun rotation angle must be finite.")
+    angle = math.radians(angle_degrees % 360.0)
+    dx, dy, dz = (
+        target - point
+        for point, target in zip(light.position, light.target, strict=True)
+    )
+    cosine, sine = math.cos(angle), math.sin(angle)
+    return replace(
+        light,
+        target=(
+            light.position[0] + dx * cosine - dy * sine,
+            light.position[1] + dx * sine + dy * cosine,
+            light.position[2] + dz,
+        ),
+    )
 
 
 # ### Collection helpers ###
@@ -200,14 +303,12 @@ def create_directional_light(
         if target is not None
         else tuple(
             normalized_position[index] + offset
-            for index, offset in enumerate(
-                DEFAULT_DIRECTIONAL_LIGHT_TARGET_OFFSET
-            )
+            for index, offset in enumerate(DEFAULT_DIRECTIONAL_LIGHT_TARGET_OFFSET)
         )
     )
     return DirectionalLightData(
         light_id=f"directional-light-{light_number}",
-        name=f"Directional light {light_number}",
+        name=f"Sun light {light_number}",
         position=normalized_position,
         target=normalized_target,
         level_index=level_index,

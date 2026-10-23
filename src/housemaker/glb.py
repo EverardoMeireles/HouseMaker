@@ -81,6 +81,7 @@ from housemaker.models import (
     Vertex,
     VertexData,
 )
+from housemaker.object_identifiers import object_export_label_from_node_name
 from housemaker.object_texture_variants import ObjectTextureVariants
 from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
@@ -150,6 +151,8 @@ HALF_NODE_NAME_PREFIX = "[HALF] "
 HALF_MESH_EXTRAS_KEY = "halfMesh"
 HALF_MESH_UV_MODE = "reuse"
 OBJECT_ID_METADATA_KEY = "housemaker_object_id"
+OBJECT_NAME_METADATA_KEY = "housemaker_object_name"
+OBJECT_EXPORT_ID_METADATA_KEY = "housemaker_export_object_id"
 DOOR_BODY_MARKER_METADATA_KEY = "housemaker_door_body"
 DOOR_BODY_MARKER_EXTRAS_KEY = "housemakerDoorBody"
 DOOR_COMPONENT_MARKER_METADATA_KEY = "housemaker_door_component"
@@ -390,6 +393,8 @@ class PlacedGeneratedModel:
     axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
     source_object_id: str | None = None
     atlas_source_object_id: str | None = None
+    export_node_name: str | None = None
+    export_source_node_name: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -434,6 +439,13 @@ class PlacedGeneratedModel:
             "atlas_source_object_id",
             normalized_atlas_source_object_id,
         )
+        for field_name in ("export_node_name", "export_source_node_name"):
+            value = getattr(self, field_name)
+            if value is not None:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError("Exported object node names must be nonempty strings.")
+                object_export_label_from_node_name(value.strip())
+                object.__setattr__(self, field_name, value.strip())
         object.__setattr__(self, "world_position", normalized_position)
         object.__setattr__(self, "rotation_degrees", normalized_rotation)
         object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
@@ -1505,7 +1517,8 @@ def compose_generated_model_instance_sources(
         for placement in normalized_sources
     )
     source_ids = tuple(placement.object_id for placement in canonical_sources)
-    source_names = tuple(str(placement.object_name) for placement in canonical_sources)
+    source_names = tuple(get_placed_generated_model_export_source_node_name(placement)
+                         for placement in canonical_sources)
     if len(source_ids) != len(set(source_ids)):
         raise ValueError("Instance source IDs must be unique.")
     if len(source_names) != len(set(source_names)):
@@ -2014,6 +2027,20 @@ def build_placed_generated_model_transform(
     return move_to_world @ rotation @ object_scale @ move_pivot_to_origin
 
 
+# ### Stable export identifiers ###
+def get_placed_generated_model_export_source_node_name(placement: PlacedGeneratedModel) -> str:
+    """Resolve the shared prototype name without using editable display text."""
+
+    return str(placement.export_source_node_name or placement.export_node_name or placement.object_name)
+
+
+def _add_placed_export_metadata(metadata: dict[str, object], placement: PlacedGeneratedModel) -> None:
+    if placement.export_node_name is None:
+        return
+    metadata[OBJECT_NAME_METADATA_KEY] = str(placement.object_name)
+    metadata[OBJECT_EXPORT_ID_METADATA_KEY] = object_export_label_from_node_name(placement.export_node_name)
+
+
 def _build_half_mesh_node_metadata(
     placement: PlacedGeneratedModel,
     placement_transform: np.ndarray,
@@ -2172,6 +2199,8 @@ def _clean_export_vector(values: np.ndarray) -> list[float]:
 def _get_half_model_node_name(placement: PlacedGeneratedModel) -> str:
     """Return the user-facing name written directly on a half mesh node."""
 
+    if placement.export_node_name is not None:
+        return placement.export_node_name
     assert placement.object_name is not None
     return (
         placement.object_name
@@ -2231,6 +2260,7 @@ def _build_canonical_instance_source_placement(
         rotation_degrees=(0.0, 0.0, 0.0),
         scale=1.0,
         axis_scales=(1.0, 1.0, 1.0),
+        export_node_name=placement.export_source_node_name or placement.export_node_name,
     )
 
 
@@ -2251,7 +2281,7 @@ def _append_instance_source_model_scene(
         raise ValueError("Instance sources must contain scene geometry.")
 
     source_id = placement.object_id
-    root_name = str(placement.object_name)
+    root_name = get_placed_generated_model_export_source_node_name(placement)
     if root_name in occupied_node_names:
         raise ValueError(
             f"The instance source node name {root_name!r} is already used in "
@@ -2295,6 +2325,7 @@ def _append_instance_source_model_scene(
     root_metadata[OBJECT_ID_METADATA_KEY] = source_id
     root_metadata[INSTANCE_SOURCE_ID_METADATA_KEY] = source_id
     root_metadata[INSTANCE_SOURCE_NAME_METADATA_KEY] = root_name
+    _add_placed_export_metadata(root_metadata, placement)
     half_metadata = _build_half_mesh_node_metadata(
         placement,
         np.eye(4, dtype=float),
@@ -2421,6 +2452,7 @@ def _append_placed_half_model_meshes(
         node_metadata.update(_get_scene_node_metadata(source_scene, source_node_name))
         node_metadata.pop(OBJECT_ID_METADATA_KEY, None)
         node_metadata[OBJECT_ID_METADATA_KEY] = placement.object_id
+        _add_placed_export_metadata(node_metadata, placement)
         _retarget_door_body_marker(node_metadata, placement.object_id)
         _retarget_door_component_marker(node_metadata, placement.object_id)
         node_metadata.update(half_metadata)
@@ -2462,7 +2494,7 @@ def _append_placed_model_scene(
 
     prefix = f"placed_{placement_index}_{_slugify_name(placement.object_id)}"
     root_name = _reserve_unique_scene_name(
-        f"{prefix}_root",
+        placement.export_node_name or f"{prefix}_root",
         occupied_node_names,
     )
     geometry_names = {
@@ -2507,6 +2539,7 @@ def _append_placed_model_scene(
     root_metadata = copy.deepcopy(source_base_data.get("metadata") or {})
     root_metadata.pop(OBJECT_ID_METADATA_KEY, None)
     root_metadata[OBJECT_ID_METADATA_KEY] = placement.object_id
+    _add_placed_export_metadata(root_metadata, placement)
     _prepare_nested_housemaker_metadata(
         root_metadata,
         placement.object_id,

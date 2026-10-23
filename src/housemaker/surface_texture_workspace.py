@@ -76,6 +76,7 @@ from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TILING_MODE_EDGE_VARIANTS,
     SURFACE_TILING_MODE_NONE,
+    SURFACE_TYPE_GENERIC,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
@@ -1216,11 +1217,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         """Use the application's shared 3D scene as the Surface target source.
 
         Main supplies the exact selected semantic surfaces, which preserves the
-        IDs, types, and physical areas used by the rendered scene. Mixed surface
-        types remain visible in the selection label but are deliberately invalid
-        for one Surface generation request. Selection-only changes publish their
-        ID tuple through ``selection_changed``, not the content ``data_changed``
-        signal; the selection is still included by ``get_data()`` when saving.
+        IDs, types, and physical areas used by the rendered scene. Ordinary
+        material textures can target mixed structural surface types. Selection
+        changes publish their ID tuple through ``selection_changed``, not the
+        content ``data_changed`` signal; homogeneous selections remain included
+        by ``get_data()`` when saving.
         """
 
         if self._shared_controls is None:
@@ -2881,13 +2882,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._restored_assignment_texture_signature = None
 
         texture_width, texture_height = texture_size
+        category = (
+            "" if selected_assignment.surface_type == SURFACE_TYPE_GENERIC
+            else f"{selected_assignment.surface_type} "
+        )
         self.status_label.setText(
             f"Applied the {texture_width} x {texture_height} texture "
             f"to {len(selected_assignment.surface_ids)} "
-            f"{selected_assignment.surface_type} surface(s)."
+            f"{category}surface(s)."
         )
-        self._emit_data_changed()
+        # Stage the shared scene's delayed preview before generic listeners
+        # synchronize potentially expensive Atlas assets and thumbnails.
         self.surface_content_changed.emit()
+        self._emit_data_changed()
         self._sync_controls()
         return True
 
@@ -3533,14 +3540,14 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._store_displayed_frame_strokes()
         selection = self._get_surface_selection_snapshot()
         selected_ids = selection.surface_ids
-        surface_type = selection.surface_type
-        if selection.has_mixed_types:
+        surface_type = SURFACE_TYPE_GENERIC
+        if any(
+            not surface_id_accepts_texture_type(surface_id, surface_type)
+            for surface_id in selected_ids
+        ):
             self.status_label.setText(
-                "Select surfaces of only one type before generating a texture."
+                "Generate architectural trim through its object-generation controls."
             )
-            return None
-        if not selection.is_valid or surface_type is None:
-            self.status_label.setText("Select at least one fixed surface first.")
             return None
         temporary_reference = self.get_temporary_reference()
         frame_indices = tuple(sorted(self._data.frame_strokes))
@@ -3708,17 +3715,15 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         applied_surface_ids: frozenset[str] | None = None,
     ) -> bool:
         surface_by_id = self._all_existing_surfaces_by_id()
-        if any(
+        targets_changed = any(
             (surface := surface_by_id.get(surface_id)) is None
-            or surface.surface_type != request.surface_type
+            or not _live_surface_accepts_texture_type(surface, request.surface_type)
             for surface_id in request.surface_ids
-        ):
-            self._discard_saved_outputs(tuple(saved_outputs or ()))
-            self._handle_generation_failed(
-                "The target surfaces changed before the generated texture "
-                "could be applied."
-            )
-            return False
+        )
+        if targets_changed:
+            # The source image remains useful even if its captured targets no
+            # longer exist. Never substitute the user's current selection.
+            applied_surface_ids = frozenset()
         surface_areas = {
             surface_id: float(surface.area_square_meters)
             for surface_id, surface in surface_by_id.items()
@@ -3767,7 +3772,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 target_ids = tuple(
                     surface_id
                     for surface_id in saved_output.surface_ids
-                    if (
+                    if surface_id in request.surface_ids
+                    and (
                         applied_surface_ids is None
                         or surface_id in applied_surface_ids
                     )
@@ -3794,10 +3800,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                         provider_pbr_task_id=result.pbr_task_id,
                         asset_path=active_variant.asset_path,
                         combined_area_m2=area_m2,
-                        area_description=(
-                            f"{len(target_ids)} "
-                            f"{request.surface_type} "
-                            f"surface(s), {area_m2:.2f} m²"
+                        area_description=_build_surface_area_description(
+                            request.surface_type, target_ids, area_m2,
                         ),
                         reference_frame_indices=request.reference_frame_indices,
                         texture_width=selected_resolution,
@@ -3865,25 +3869,35 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             }
         )
         if not applied_count:
-            status = (
-                "Generated texture saved as an unassigned source because a "
-                "newer job already textured its surfaces."
-            )
+            if targets_changed:
+                status = (
+                    "Generated texture saved to the library because its "
+                    "original target surfaces changed."
+                )
+            elif request.surface_ids:
+                status = (
+                    "Generated texture saved to the library because a newer "
+                    "job already textured its surfaces."
+                )
+            else:
+                status = "Generated texture saved to the library without assigning it."
         else:
+            category = "" if request.surface_type == SURFACE_TYPE_GENERIC else f"{request.surface_type} "
             status = (
                 f"Applied {request.display_name!r} to {applied_count} "
-                f"{request.surface_type} surface(s)."
+                f"{category}surface(s)."
                 if request.display_name
                 else (
                     f"Applied generated texture to {applied_count} "
-                    f"{request.surface_type} surface(s)."
+                    f"{category}surface(s)."
                 )
             )
         self.status_label.setText(status)
         self._emit_data_changed()
         for assignment in assignments:
             self.generation_completed.emit(assignment)
-        self.surface_content_changed.emit()
+        if applied_count:
+            self.surface_content_changed.emit()
         self._sync_controls()
         return True
 
@@ -4075,23 +4089,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 worker.discard_unclaimed_outputs()
             return
         current_surfaces = self._all_existing_surfaces_by_id()
-        invalid_targets = tuple(
-            surface_id
-            for surface_id in raw_request.surface_ids
-            if (
+        targets_changed = any(
+            (
                 (surface := current_surfaces.get(surface_id)) is None
-                or surface.surface_type != raw_request.surface_type
+                or not _live_surface_accepts_texture_type(surface, raw_request.surface_type)
             )
+            for surface_id in raw_request.surface_ids
         )
-        if invalid_targets:
-            message = (
-                "The target surfaces changed before the generated texture "
-                "could be applied."
-            )
-            self._handle_generation_failed(message)
-            self._job_manager.fail_job(job_id, message)
-            worker.discard_unclaimed_outputs()
-            return
         self._job_manager.update_job(
             job_id,
             stage="Applying texture (99%)",
@@ -4101,7 +4105,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         applicable_surface_ids = frozenset(
             surface_id
             for surface_id in raw_request.surface_ids
-            if self._latest_applied_generation_order.get(surface_id, 0)
+            if not targets_changed
+            and self._latest_applied_generation_order.get(surface_id, 0)
             <= submission_order
         )
         worker.claim_saved_outputs()
@@ -4315,7 +4320,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         surface_type = (
             next(iter(selected_types))
             if len(selected_types) == 1
-            else None
+            else SURFACE_TYPE_GENERIC if selected_types else None
         )
         return _SurfaceSelectionSnapshot(
             surface_ids=surface_ids,
@@ -4335,7 +4340,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> None:
         """Store only schema-valid homogeneous selections in project data."""
 
-        if selection.is_valid and selection.surface_type is not None:
+        if (
+            selection.is_valid
+            and selection.surface_type is not None
+            and not selection.has_mixed_types
+        ):
             self._data.set_selection(
                 selection.surface_type,
                 selection.surface_ids,
@@ -4512,7 +4521,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         selection = self._get_surface_selection_snapshot()
         if selection.has_mixed_types:
             self.selection_label.setText(
-                f"{len(selection.surface_ids)} surfaces selected; choose one type"
+                f"{len(selection.surface_ids)} surfaces selected, "
+                f"{selection.combined_area_m2:.2f} m²"
             )
             return
         if not selection.is_valid or selection.surface_type is None:
@@ -4549,7 +4559,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             has_video and has_mask
         )
         selection = self._get_surface_selection_snapshot()
-        has_surface = selection.is_valid
         has_key = bool(self._settings.surface_texture_api_key)
         if self._shared_controls is None:
             self.load_video_button.setEnabled(True)
@@ -4568,8 +4577,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_texture_provider_combo.setEnabled(True)
         self.generate_button.setEnabled(
             has_reference
-            and has_surface
             and has_key
+            and all(
+                surface_id_accepts_texture_type(surface_id, SURFACE_TYPE_GENERIC)
+                for surface_id in selection.surface_ids
+            )
         )
         self.controls_synced.emit()
 
@@ -5384,8 +5396,9 @@ def _build_surface_area_description(
 ) -> str:
     """Format consistent assignment count and area metadata."""
 
+    category = "" if surface_type == SURFACE_TYPE_GENERIC else f"{surface_type} "
     return (
-        f"{len(surface_ids)} {surface_type} surface(s), "
+        f"{len(surface_ids)} {category}surface(s), "
         f"{float(area_m2):.2f} m²"
     )
 
@@ -5397,9 +5410,9 @@ def _build_material_prompt(
 ) -> str:
     normalized_ai_prompt = str(ai_prompt).strip()
     prompt = (
-        f"Create one square, seamless, tileable base-color material texture for "
-        f"a {surface_type}. The selected surfaces cover {area_m2:.2f} square "
-        "meters. Match the material, colors, pattern, and physical scale visible "
+        "Create one square, seamless, tileable base-color material texture "
+        "reusable on architectural surfaces. Match the material, colors, "
+        "pattern, and physical scale visible "
         "inside every supplied masked reference. Return a flat orthographic "
         "material swatch with even lighting: no perspective, room geometry, "
         "object silhouette, borders, text, shadows, or highlights. Make opposite "

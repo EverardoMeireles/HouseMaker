@@ -19,6 +19,10 @@ DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 2.5
 MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 0.1
 MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 20.0
 FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND = 0.1
+DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS = 1.70
+MIN_FIRST_PERSON_EYE_HEIGHT_METERS = 0.10
+MAX_FIRST_PERSON_EYE_HEIGHT_METERS = 10.0
+FIRST_PERSON_EYE_HEIGHT_STEP_METERS = 0.01
 
 
 # ### Normalization ###
@@ -55,6 +59,28 @@ def normalize_first_person_speed_meters_per_second(value: object) -> float:
             "second."
         )
     return round(normalized, 1)
+
+
+def normalize_first_person_eye_height_meters(value: object) -> float:
+    """Return a finite, positive floor-relative FPS camera height."""
+
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError("First-person eye height must be a number.")
+    try:
+        normalized = float(value)
+    except OverflowError as error:
+        raise ValueError("First-person eye height must be finite.") from error
+    if not math.isfinite(normalized) or not (
+        MIN_FIRST_PERSON_EYE_HEIGHT_METERS
+        <= normalized
+        <= MAX_FIRST_PERSON_EYE_HEIGHT_METERS
+    ):
+        raise ValueError(
+            "First-person eye height must be between "
+            f"{MIN_FIRST_PERSON_EYE_HEIGHT_METERS} and "
+            f"{MAX_FIRST_PERSON_EYE_HEIGHT_METERS} meters."
+        )
+    return round(normalized, 2)
 
 
 # ### Movement vectors ###

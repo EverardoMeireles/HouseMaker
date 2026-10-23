@@ -328,7 +328,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             ["table"],
         )
         self.assertEqual(len(scene.model.scene.geometry), 2)
-        self.assertIn("Object table", scene.model.scene.graph.nodes)
+        self.assertIn("Object_1", scene.model.scene.graph.nodes)
 
     def test_export_uses_instance_when_source_level_is_excluded(self) -> None:
         self.workspace.levels = [
@@ -415,7 +415,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             ["table"],
         )
         self.assertEqual(len(scene.model.scene.geometry), 1)
-        self.assertIn("Object table", scene.model.scene.graph.nodes)
+        self.assertIn("Object_1", scene.model.scene.graph.nodes)
 
     def test_ao_snapshot_uses_one_representative_json_instance(
         self,

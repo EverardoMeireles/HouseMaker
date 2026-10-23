@@ -5,6 +5,7 @@ import copy
 import hashlib
 import math
 import threading
+import time
 import weakref
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -90,14 +91,21 @@ from housemaker.canvas_surface_edits import (
     CanvasSurfaceEditHandleTarget,
 )
 from housemaker.directional_light_projection import (
-    build_directional_light_projection_grid,
+    SUN_RAY_FALLBACK_CACHE_KEY,
 )
-from housemaker.directional_light_state import DirectionalLightData
+from housemaker.directional_light_projection import (
+    build_directional_light_projection_rays as build_directional_light_projection_grid,
+)
+from housemaker.directional_light_state import DirectionalLightData, SunOrbitData
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
+from housemaker.first_person_gravity import FirstPersonGroundIndex
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
     DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
     build_first_person_forward_vector,
+    normalize_first_person_eye_height_meters,
     normalize_first_person_navigation_mode,
     normalize_first_person_speed_meters_per_second,
 )
@@ -229,7 +237,11 @@ NAVIGATION_MODE_FIRST_PERSON = "first_person"
 VIEWER_NAVIGATION_MODES = frozenset(
     (NAVIGATION_MODE_ORBIT, NAVIGATION_MODE_FIRST_PERSON)
 )
-DEFAULT_FIRST_PERSON_HEIGHT_METERS = 1.65
+DEFAULT_FIRST_PERSON_HEIGHT_METERS = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS
+FIRST_PERSON_GRAVITY_METERS_PER_SECOND_SQUARED = 9.81
+FIRST_PERSON_MAX_FALL_SPEED_METERS_PER_SECOND = 55.0
+FIRST_PERSON_MAX_STEP_HEIGHT_METERS = 0.35
+FIRST_PERSON_GRAVITY_SUBSTEP_SECONDS = 1.0 / 60.0
 DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
@@ -400,6 +412,8 @@ DIRECTIONAL_LIGHT_PLACEMENT_HOVER_COLOR = (1.0, 0.82, 0.18, 0.82)
 DIRECTIONAL_LIGHT_PLACEMENT_HOVER_SIZE_PIXELS = 20.0
 DIRECTIONAL_LIGHT_PROJECTION_GRID_COLOR = (1.0, 0.82, 0.18, 0.72)
 DIRECTIONAL_LIGHT_PROJECTION_GRID_WIDTH_PIXELS = 2.0
+SUN_ORBIT_UPDATE_INTERVAL_MILLISECONDS = 33
+SUN_ORBIT_RAY_REFRESH_INTERVAL_SECONDS = 0.2
 DIRECTIONAL_LIGHT_PROJECTION_DIRECTION_DECIMALS = 6
 CANVAS_OPENING_GIZMO_SIDE = "side"
 CANVAS_OPENING_GIZMO_ANCHOR = "anchor"
@@ -452,6 +466,8 @@ CANVAS_OPENING_OVERLAY_GL_OPTIONS = {
         GL.GL_ONE_MINUS_SRC_ALPHA,
     ),
 }
+PENDING_SURFACE_TEXTURE_PREVIEW_COLOR = (1.0, 0.80, 0.10, 0.35)
+PENDING_SURFACE_TEXTURE_PREVIEW_DEPTH_VALUE = 9_995.0
 ARCHITECTURAL_TRIM_PREVIEW_COLOR = (0.20, 0.86, 0.48, 0.38)
 ARCHITECTURAL_TRIM_PREVIEW_EDGE_COLOR = (0.30, 1.0, 0.58, 0.96)
 ARCHITECTURAL_TRIM_EDIT_PREVIEW_COLOR = (0.16, 0.72, 0.34, 1.0)
@@ -554,6 +570,54 @@ FACE_SELECTION_UPDATE_MODES = frozenset(
     (FACE_SELECTION_REPLACE, FACE_SELECTION_TOGGLE, FACE_SELECTION_ADD)
 )
 # ### Shader source ###
+MAX_PREVIEW_SUN_LIGHTS = 4
+SUN_LIGHT_FRAGMENT_SHADER_UNIFORMS = """
+    uniform float u_sun_count;
+    uniform float u_sun_direction_x[4];
+    uniform float u_sun_direction_y[4];
+    uniform float u_sun_direction_z[4];
+    uniform float u_sun_color_r[4];
+    uniform float u_sun_color_g[4];
+    uniform float u_sun_color_b[4];
+    vec3 sun_direction(int index) {
+        return vec3(u_sun_direction_x[index], u_sun_direction_y[index],
+                    u_sun_direction_z[index]);
+    }
+    vec3 sun_color(int index) {
+        return vec3(u_sun_color_r[index], u_sun_color_g[index],
+                    u_sun_color_b[index]);
+    }
+    vec3 sun_diffuse(vec3 normal) {
+        if (u_sun_count < 0.5) {
+            return vec3(max(dot(normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0));
+        }
+        vec3 result = vec3(0.0);
+        for (int index = 0; index < 4; index++) {
+            if (float(index) < u_sun_count) {
+                result += sun_color(index)
+                    * max(dot(normal, sun_direction(index)), 0.0);
+            }
+        }
+        return result;
+    }
+    vec3 sun_specular(vec3 normal, vec3 view_direction, float shininess) {
+        if (u_sun_count < 0.5) {
+            vec3 halfway = normalize(normalize(vec3(1.0, -1.0, -1.0))
+                                     + view_direction);
+            return vec3(pow(max(dot(normal, halfway), 0.0), shininess));
+        }
+        vec3 result = vec3(0.0);
+        for (int index = 0; index < 4; index++) {
+            if (float(index) < u_sun_count) {
+                vec3 halfway = sun_direction(index) + view_direction;
+                halfway /= max(length(halfway), 0.0001);
+                result += sun_color(index)
+                    * pow(max(dot(normal, halfway), 0.0), shininess);
+            }
+        }
+        return result;
+    }
+"""
 AMBIENT_LIT_VERTEX_SHADER = """
     uniform mat4 u_mvp;
     uniform mat3 u_normal;
@@ -572,13 +636,14 @@ AMBIENT_LIT_FRAGMENT_SHADER = """
     #ifdef GL_ES
     precision mediump float;
     #endif
+""" + SUN_LIGHT_FRAGMENT_SHADER_UNIFORMS + """
     uniform float u_ambient_light;
     uniform float u_opacity;
     varying vec4 v_color;
     varying vec3 v_normal;
     void main() {
-        float diffuse = max(dot(v_normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0);
-        float illumination = min(1.0, u_ambient_light + diffuse * 0.65);
+        vec3 illumination = min(vec3(1.0), vec3(u_ambient_light)
+                                + sun_diffuse(normalize(v_normal)) * 0.65);
         gl_FragColor = vec4(
             v_color.rgb * illumination,
             v_color.a * u_opacity
@@ -612,6 +677,7 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     #ifdef GL_ES
     precision mediump float;
     #endif
+""" + SUN_LIGHT_FRAGMENT_SHADER_UNIFORMS + """
     uniform sampler2D u_texture;
     uniform sampler2D u_edit_mask;
     uniform sampler2D u_normal_texture;
@@ -731,29 +797,28 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
         if (!gl_FrontFacing) {
             surface_normal = -surface_normal;
         }
-        vec3 light_direction = normalize(vec3(1.0, -1.0, -1.0));
         vec3 point_light_delta = u_point_light_position_view - v_view_position;
         vec3 point_light_direction = point_light_delta
             / max(length(point_light_delta), 0.0001);
-        float diffuse = max(dot(surface_normal, light_direction), 0.0);
+        vec3 sunlight = sun_diffuse(surface_normal);
+        float diffuse = max(max(sunlight.r, sunlight.g), sunlight.b);
         float point_diffuse = max(
             dot(surface_normal, point_light_direction),
             0.0
         ) * u_point_light_enabled * u_point_light_intensity;
-        float illumination = min(
-            1.0,
-            u_ambient_light + diffuse * 0.65 + point_diffuse * 0.45
+        vec3 illumination = min(
+            vec3(1.0),
+            vec3(u_ambient_light + point_diffuse * 0.45) + sunlight * 0.65
         );
         float normal_detail_illumination = mix(
             0.72,
             1.0,
             max(diffuse, point_diffuse)
         );
-        illumination = mix(
-            illumination,
-            normal_detail_illumination,
-            u_normal_map_enabled
-        );
+        if (u_sun_count < 0.5) {
+            illumination = mix(illumination, vec3(normal_detail_illumination),
+                               u_normal_map_enabled);
+        }
         float roughness = 1.0;
         if (u_roughness_map_enabled > 0.5) {
             roughness = texture2D(
@@ -775,12 +840,10 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
             u_roughness_map_enabled > 0.5
             || u_metallic_map_enabled > 0.5
         ) {
-            vec3 half_direction = normalize(light_direction + view_direction);
             float shininess = mix(96.0, 4.0, roughness);
-            float specular_amount = pow(
-                max(dot(surface_normal, half_direction), 0.0),
-                shininess
-            ) * (1.0 - roughness * 0.72);
+            vec3 specular_amount = sun_specular(surface_normal, view_direction,
+                                               shininess)
+                * (1.0 - roughness * 0.72);
             vec3 reflection_color = mix(
                 vec3(0.04),
                 base_color.rgb,
@@ -1284,6 +1347,14 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             z=DEFAULT_FIRST_PERSON_HEIGHT_METERS
         )
         self._first_person_movement_mode = DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+        self._first_person_gravity_enabled = False
+        self._first_person_eye_height_meters = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS
+        self._first_person_ground_height_provider: (
+            Callable[[float, float, float], float | None] | None
+        ) = None
+        self._first_person_vertical_velocity = 0.0
+        self._first_person_grounded = False
+        self._first_person_gravity_needs_initialization = True
         self._has_custom_first_person_camera_pose = False
         self._orbit_camera_state = self._capture_camera_state()
         self._pressed_movement_keys: set[int] = set()
@@ -1311,6 +1382,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if scale == self._global_scale:
             return
         self._global_scale = scale
+        self.reset_first_person_gravity()
         self.apply_navigation_camera()
         self.update()
 
@@ -1948,9 +2020,114 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             speed_meters_per_second
         )
 
+    # ### First-person gravity and physical eye height ###
+    def is_first_person_gravity_enabled(self) -> bool:
+        return self._first_person_gravity_enabled
+
+    def set_first_person_gravity_enabled(self, enabled: bool) -> None:
+        """Enable grounded walking without changing the saved flight mode."""
+
+        if bool(enabled) == self._first_person_gravity_enabled:
+            return
+        self._first_person_gravity_enabled = bool(enabled)
+        self.reset_first_person_gravity()
+        self._update_navigation_tooltip()
+
+    def get_first_person_eye_height(self) -> float:
+        return self._first_person_eye_height_meters
+
+    def set_first_person_eye_height(self, height_meters: float) -> None:
+        """Change eye height in physical meters, retaining the grounded feet."""
+
+        height = normalize_first_person_eye_height_meters(height_meters)
+        difference = height - self._first_person_eye_height_meters
+        self._first_person_eye_height_meters = height
+        if difference and (
+            (self._first_person_gravity_enabled and self._first_person_grounded)
+            or not self._has_custom_first_person_camera_pose
+        ):
+            self._set_first_person_camera_pose(
+                replace(
+                    self._first_person_camera_pose,
+                    z=self._first_person_camera_pose.z + difference / self._global_scale.z,
+                ),
+                is_custom=self._has_custom_first_person_camera_pose,
+            )
+
+    def set_first_person_ground_height_provider(
+        self, provider: Callable[[float, float, float], float | None] | None,
+    ) -> None:
+        """Provide cached canonical support geometry independently of rendering."""
+
+        self._first_person_ground_height_provider = provider
+        self.reset_first_person_gravity()
+
+    def reset_first_person_gravity(self) -> None:
+        """Discard stale falling velocity after a teleport or scene replacement."""
+
+        self._first_person_vertical_velocity = 0.0
+        self._first_person_grounded = False
+        self._first_person_gravity_needs_initialization = True
+
+    def _step_first_person_gravity(
+        self, pose: CameraPose, dx: float, dy: float, elapsed: float,
+    ) -> CameraPose:
+        """Sweep feet downward and step onto nearby treads without tunneling."""
+
+        provider = self._first_person_ground_height_provider
+        if provider is None:
+            return replace(pose, x=pose.x + dx, y=pose.y + dy)
+        scale_z = self._global_scale.z
+        eye_height = self._first_person_eye_height_meters / scale_z
+        step_height = FIRST_PERSON_MAX_STEP_HEIGHT_METERS / scale_z
+        epsilon = 1e-5 / scale_z
+        x, y, feet_z = pose.x, pose.y, pose.z - eye_height
+        if self._first_person_gravity_needs_initialization:
+            support = provider(x, y, feet_z + step_height)
+            if support is not None and abs(support - feet_z) <= step_height + epsilon:
+                feet_z = support
+                self._first_person_grounded = True
+            self._first_person_gravity_needs_initialization = False
+        # Bound work after a suspended GUI, and keep small horizontal steps so
+        # ordinary stair treads cannot be skipped at high movement speeds.
+        count = min(240, max(
+            1, math.ceil(elapsed / FIRST_PERSON_GRAVITY_SUBSTEP_SECONDS),
+            math.ceil(math.hypot(dx * self._global_scale.x,
+                                 dy * self._global_scale.y) / 0.1),
+        ))
+        delta = elapsed / count
+        for _ in range(count):
+            x += dx / count
+            y += dy / count
+            support = provider(
+                x, y, feet_z + (step_height if self._first_person_grounded else epsilon),
+            )
+            if (
+                self._first_person_grounded and support is not None
+                and abs(support - feet_z) <= step_height + epsilon
+            ):
+                feet_z = support
+                self._first_person_vertical_velocity = 0.0
+                continue
+            self._first_person_grounded = False
+            self._first_person_vertical_velocity = max(
+                -FIRST_PERSON_MAX_FALL_SPEED_METERS_PER_SECOND,
+                self._first_person_vertical_velocity
+                - FIRST_PERSON_GRAVITY_METERS_PER_SECOND_SQUARED * delta,
+            )
+            next_feet_z = feet_z + self._first_person_vertical_velocity * delta / scale_z
+            if support is not None and next_feet_z <= support <= feet_z + epsilon:
+                next_feet_z = support
+                self._first_person_vertical_velocity = 0.0
+                self._first_person_grounded = True
+            feet_z = next_feet_z
+        return replace(pose, x=x, y=y, z=feet_z + eye_height)
+
+    # ### First-person camera positioning and movement ###
     def set_first_person_camera_pose(self, pose: CameraPose) -> None:
         """Set a persistent first-person pose, for example from the Canvas camera."""
 
+        self.reset_first_person_gravity()
         self._set_first_person_camera_pose(pose, is_custom=True)
 
     def set_default_first_person_camera_pose(self, pose: CameraPose) -> None:
@@ -1959,6 +2136,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if self._has_custom_first_person_camera_pose:
             return
         self._set_first_person_camera_pose(pose, is_custom=False)
+        self.reset_first_person_gravity()
 
     def step_first_person_movement(self, elapsed_seconds: float) -> None:
         """Advance held Z/Q/S/D/R/F movement for deterministic callers/tests."""
@@ -1967,7 +2145,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             not self.is_first_person_active
             or elapsed <= 0.0
-            or not self._pressed_movement_keys
+            or not math.isfinite(elapsed)
+            or (not self._pressed_movement_keys and not self._first_person_gravity_enabled)
         ):
             return
         forward_amount = float(
@@ -1982,9 +2161,16 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             (Qt.Key.Key_F in self._pressed_movement_keys)
             - (Qt.Key.Key_R in self._pressed_movement_keys)
         )
-        if forward_amount == 0.0 and right_amount == 0.0 and vertical_amount == 0.0:
+        if self._first_person_gravity_enabled:
+            vertical_amount = 0.0
+        if (
+            forward_amount == 0.0 and right_amount == 0.0 and vertical_amount == 0.0
+            and not self._first_person_gravity_enabled
+        ):
             return
-        magnitude = math.sqrt(forward_amount**2 + right_amount**2 + vertical_amount**2)
+        magnitude = max(1.0, math.sqrt(
+            forward_amount**2 + right_amount**2 + vertical_amount**2
+        ))
         forward_amount /= magnitude
         right_amount /= magnitude
         vertical_amount /= magnitude
@@ -1993,7 +2179,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         forward_x, forward_y, forward_z = build_first_person_forward_vector(
             pose.yaw_degrees,
             pose.pitch_degrees,
-            self._first_person_movement_mode,
+            FIRST_PERSON_NAVIGATION_MODE_GRAVITY
+            if self._first_person_gravity_enabled else self._first_person_movement_mode,
         )
         # In this Z-up coordinate system, camera-right is forward cross up.
         # This makes French-layout Q move left and D move right.
@@ -2001,25 +2188,24 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         right_y = -math.cos(yaw_radians)
         distance = self._move_speed * elapsed
         scale_x, scale_y, scale_z = self._global_scale.factors
-        self._set_first_person_camera_pose(
-            CameraPose(
-                x=pose.x
-                + (forward_x * forward_amount + right_x * right_amount)
-                * distance
-                / scale_x,
-                y=pose.y
-                + (forward_y * forward_amount + right_y * right_amount)
-                * distance
-                / scale_y,
-                z=pose.z
-                + (forward_z * forward_amount + vertical_amount) * distance / scale_z,
-                yaw_degrees=pose.yaw_degrees,
-                pitch_degrees=pose.pitch_degrees,
-                roll_degrees=pose.roll_degrees,
-                fov_degrees=pose.fov_degrees,
-            ),
-            is_custom=True,
+        next_pose = CameraPose(
+            x=pose.x
+            + (forward_x * forward_amount + right_x * right_amount) * distance / scale_x,
+            y=pose.y
+            + (forward_y * forward_amount + right_y * right_amount) * distance / scale_y,
+            z=pose.z
+            + (forward_z * forward_amount + vertical_amount) * distance / scale_z,
+            yaw_degrees=pose.yaw_degrees,
+            pitch_degrees=pose.pitch_degrees,
+            roll_degrees=pose.roll_degrees,
+            fov_degrees=pose.fov_degrees,
         )
+        if self._first_person_gravity_enabled:
+            next_pose = self._step_first_person_gravity(
+                pose, next_pose.x - pose.x, next_pose.y - pose.y, elapsed,
+            )
+        if next_pose != pose:
+            self._set_first_person_camera_pose(next_pose, is_custom=True)
 
     def step_movement(self, elapsed_seconds: float) -> None:
         """Compatibility shorthand for first-person movement stepping."""
@@ -2793,17 +2979,22 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         QCursor.setPos(self.mapToGlobal(self.rect().center()))
 
     def _update_navigation_tooltip(self) -> None:
+        movement_help = (
+            "Z/Q/S/D to walk with gravity (R/F flight disabled)"
+            if self._first_person_gravity_enabled
+            else "Z/Q/S/D to move, R/F to move down/up"
+        )
         if self.is_first_person_pointer_captured:
             if self._first_person_ctrl_interaction_enabled:
                 self.setToolTip(
-                    "First-person controls: Z/Q/S/D to move, R/F to move "
-                    "down/up, A to overlay the Generation frame, move the "
+                    f"First-person controls: {movement_help}, "
+                    "A to overlay the Generation frame, move the "
                     "mouse to look, hold Ctrl temporarily or right-click to "
                     "keep the Canvas cursor free."
                 )
                 return
             self.setToolTip(
-                "First-person controls: Z/Q/S/D to move, R/F to move down/up, "
+                f"First-person controls: {movement_help}, "
                 "A to overlay the Generation frame, move the mouse to look, "
                 "right-click to release the pointer for selection."
             )
@@ -3442,6 +3633,7 @@ class TexturedMeshItem(GLGraphicsItem):
             self._ambient_light_intensity,
             self._uniform_locations,
         )
+        self._upload_sun_light_uniforms()
         point_light_position_view = self._get_point_light_position_in_view()
         _set_float_uniform(
             self._shader_program,
@@ -3679,6 +3871,27 @@ class TexturedMeshItem(GLGraphicsItem):
             return position
         mapped = owning_view.viewMatrix().map(QVector3D(*position))
         return (float(mapped.x()), float(mapped.y()), float(mapped.z()))
+
+    # ### Global sun lighting ###
+    def _get_sun_light_uniforms(self) -> dict[str, list[float]]:
+        """Resolve lighting from this item's own view, never a shared program."""
+
+        owning_view = self.view()
+        provider = getattr(owning_view, "_housemaker_sun_lights_provider", None)
+        lights = () if provider is None else provider()
+        view_matrix = None if owning_view is None else owning_view.viewMatrix()
+        return _build_sun_light_uniforms(lights, view_matrix)
+
+    def _upload_sun_light_uniforms(self) -> None:
+        """Replace every sun uniform on every draw, including empty light sets."""
+
+        for name, values in self._get_sun_light_uniforms().items():
+            location = self._uniform_locations.get(name)
+            if location is None:
+                location = GL.glGetUniformLocation(self._shader_program, name)
+                self._uniform_locations[name] = location
+            if location >= 0:
+                GL.glUniform1fv(location, len(values), np.asarray(values, np.float32))
 
     def _get_visible_draw_ranges(self) -> tuple[_TextureDrawRange, ...]:
         """Return only ranges whose conservative bounds intersect the view."""
@@ -4002,6 +4215,31 @@ class _DepthTestedOverlayScatterItem(gl.GLScatterPlotItem):
 
     def paint(self) -> None:
         _paint_with_coplanar_depth(super().paint)
+
+
+class _PendingSurfaceTextureOverlayMeshItem(gl.GLMeshItem):
+    """Tint pending faces without z-fighting or obscuring nearer geometry."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setGLOptions(
+            {
+                GL.GL_DEPTH_TEST: True,
+                GL.GL_BLEND: True,
+                GL.GL_CULL_FACE: False,
+                GL.GL_POLYGON_OFFSET_FILL: True,
+                "glPolygonOffset": (-1.0, -1.0),
+                "glBlendFunc": (GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA),
+                "glDepthMask": (False,),
+            }
+        )
+
+    def paint(self) -> None:
+        try:
+            _paint_with_coplanar_depth(super().paint)
+        finally:
+            GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+            GL.glDepthMask(True)
 
 
 class _FaceOrientationOverlayMeshItem(gl.GLMeshItem):
@@ -4865,6 +5103,7 @@ class GlbViewerWidget(QWidget):
     directional_light_placed = Signal(object)
     directional_light_placement_cancelled = Signal()
     directional_light_selection_changed = Signal(object)
+    directional_light_preview_requested = Signal(str)
     directional_light_deletion_requested = Signal(str)
     directional_light_transform_preview_changed = Signal(str, object, object)
     directional_light_transform_changed = Signal(str, object, object)
@@ -4924,6 +5163,7 @@ class GlbViewerWidget(QWidget):
     ) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
+        self._first_person_ground_index: FirstPersonGroundIndex | None = None
         self.grid_item: gl.GLGridItem | None = None
         self.mesh_item: gl.GLMeshItem | None = None
         self.textured_mesh_item: TexturedMeshItem | None = None
@@ -5144,6 +5384,12 @@ class GlbViewerWidget(QWidget):
         self._tour_rendered_text_step_index: int | None = None
         self._tour_point_hover_items: list[GLGraphicsItem] = []
         self._directional_lights: tuple[DirectionalLightData, ...] = ()
+        self._sun_orbit = SunOrbitData()
+        self._sun_orbit_phase_degrees = 0.0
+        self._sun_direction_editing = False
+        self._sun_orbit_last_tick_time: float | None = None
+        self._sun_orbit_last_ray_refresh_time: float | None = None
+        self._sun_orbit_ray_refresh_interval_seconds = SUN_ORBIT_RAY_REFRESH_INTERVAL_SECONDS
         self._directional_light_overlay_items: list[GLGraphicsItem] = []
         self._selected_directional_light_id: str | None = None
         self._directional_light_gizmo_items: list[GLGraphicsItem] = []
@@ -5291,6 +5537,10 @@ class GlbViewerWidget(QWidget):
         self._applying_canvas_rectangle_selection_result = False
         self._highlighted_canvas_surface_ids: tuple[str, ...] = ()
         self._atlas_surface_highlight_items: list[gl.GLLinePlotItem] = []
+        self._pending_surface_texture_preview_ids: tuple[str, ...] = ()
+        self._pending_surface_texture_preview_items: dict[
+            str, _PendingSurfaceTextureOverlayMeshItem
+        ] = {}
         self._canvas_stair_part_targets: dict[str, PreviewStairPart] = {}
         self._selected_canvas_stair_part_ids: tuple[str, ...] = ()
         self._canvas_stair_part_selection_items: list[gl.GLLinePlotItem] = []
@@ -5396,7 +5646,16 @@ class GlbViewerWidget(QWidget):
             self._tick_orbiting_point_light_animation
         )
         self._continuous_preview_animation_closed = False
-        self._ambient_shader = _build_ambient_shader(self._ambient_light_intensity)
+        self._sun_orbit_timer = QTimer(self)
+        self._sun_orbit_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._sun_orbit_timer.setInterval(SUN_ORBIT_UPDATE_INTERVAL_MILLISECONDS)
+        self._sun_orbit_timer.timeout.connect(self._tick_sun_orbit_animation)
+        self._ambient_shader = _build_ambient_shader(
+            self._ambient_light_intensity,
+            sun_uniforms_provider=lambda: _build_sun_light_uniforms(
+                self._get_sun_light_snapshot(), self.view.viewMatrix()
+            ),
+        )
         application = QApplication.instance()
         if application is not None:
             application.focusChanged.connect(self._handle_application_focus_changed)
@@ -5485,6 +5744,7 @@ class GlbViewerWidget(QWidget):
         self.view.update()
 
     def _refresh_landing_previews(self) -> None:
+        self._first_person_ground_index = None
         previews = {}
         for landing_id, (level, landing) in self._landing_records.items():
             physical = landing_world_transform(level, landing, self._landing_levels)
@@ -5818,13 +6078,100 @@ class GlbViewerWidget(QWidget):
             self._cancel_directional_light_drag()
             self._selected_directional_light_id = None
             self._invalidate_directional_light_projection_collision_cache()
+        previous_primary = next(iter(self._directional_lights), None)
         self._directional_lights = normalized
+        if previous_primary != next(iter(normalized), None):
+            self._sun_orbit_phase_degrees = 0.0
+            self._sun_orbit_last_tick_time = None
+            self._sun_orbit_last_ray_refresh_time = None
+        self._sync_sun_orbit_timer()
         self._refresh_directional_light_overlay_items()
         self._refresh_directional_light_gizmo_items()
         self._sync_directional_light_wheel_input_state()
         self._sync_primary_pointer_input_state()
         if selection_removed:
             self.directional_light_selection_changed.emit(None)
+
+    # ### Sun orbit and initial-direction authoring ###
+    def set_sun_orbit(self, config: SunOrbitData) -> None:
+        """Animate the first sun without changing authored scene records."""
+
+        if not isinstance(config, SunOrbitData):
+            raise TypeError("Sun orbit requires SunOrbitData.")
+        if config == self._sun_orbit:
+            return
+        self._sun_orbit = config
+        self.reset_sun_orbit()
+
+    def get_sun_orbit_phase_degrees(self) -> float:
+        """Return the current preview-only physical-world azimuth offset."""
+
+        return self._sun_orbit_phase_degrees
+
+    def reset_sun_orbit(self) -> None:
+        """Restart at the authored initial direction, never from a prior orbit."""
+
+        self._sun_orbit_phase_degrees = 0.0
+        self._sun_orbit_last_tick_time = None
+        self._sun_orbit_last_ray_refresh_time = None
+        self._sync_sun_orbit_timer()
+        self._refresh_directional_light_overlay_items()
+        self._refresh_directional_light_gizmo_items()
+
+    def set_sun_direction_editing(self, editing: bool) -> None:
+        """Pause and expose rotation-only controls for the initial sun angle."""
+
+        normalized = bool(editing)
+        if normalized == self._sun_direction_editing:
+            return
+        self._cancel_directional_light_drag()
+        self._sun_direction_editing = normalized
+        self.reset_sun_orbit()
+
+    def _sync_sun_orbit_timer(self) -> None:
+        """Run only in an active visible viewer, with a rotating authored sun."""
+
+        if not hasattr(self, "_sun_orbit_timer"):
+            return
+        allowed = bool(
+            self._sun_orbit.enabled
+            and self._sun_orbit.speed_degrees_per_second > 0.0
+            and self._directional_lights
+            and not self._sun_direction_editing
+            and self._directional_light_drag is None
+            and self._continuous_preview_animation_allowed()
+        )
+        if not allowed:
+            self._sun_orbit_timer.stop()
+            self._sun_orbit_last_tick_time = None
+        elif not self._sun_orbit_timer.isActive():
+            self._sun_orbit_last_tick_time = time.monotonic()
+            self._sun_orbit_timer.start()
+
+    def _tick_sun_orbit_animation(self) -> None:
+        """Advance cheap light uniforms at 30 Hz and ray intersections at 5 Hz."""
+
+        self._sync_sun_orbit_timer()
+        if not self._sun_orbit_timer.isActive():
+            return
+        now = time.monotonic()
+        previous = self._sun_orbit_last_tick_time
+        self._sun_orbit_last_tick_time = now
+        if previous is None:
+            return
+        elapsed = max(now - previous, 0.0)
+        self._sun_orbit_phase_degrees = (
+            self._sun_orbit_phase_degrees
+            + elapsed * self._sun_orbit.speed_degrees_per_second
+        ) % 360.0
+        self._refresh_directional_light_overlay_items(refresh_projection=False)
+        last_rays = self._sun_orbit_last_ray_refresh_time
+        if (
+            last_rays is None
+            or now - last_rays >= self._sun_orbit_ray_refresh_interval_seconds
+        ):
+            self._sun_orbit_last_ray_refresh_time = now
+            self._refresh_directional_light_projection_grid_item()
 
     @property
     def is_directional_light_placement_active(self) -> bool:
@@ -6707,6 +7054,10 @@ class GlbViewerWidget(QWidget):
         layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
 
         self.view = SelectableGLViewWidget()
+        self.view._housemaker_sun_lights_provider = self._get_sun_light_snapshot
+        self.view.set_first_person_ground_height_provider(
+            self._get_first_person_ground_height
+        )
         self.view.frame_about_to_render.connect(
             self._update_landing_generation_control_geometry
         )
@@ -6822,6 +7173,8 @@ class GlbViewerWidget(QWidget):
             self._symmetric_preview_timer.stop()
             self._canvas_stair_preview_timer.stop()
             self._orbiting_point_light_timer.stop()
+            self._sun_orbit_timer.stop()
+            self._sun_orbit_last_tick_time = None
             return
         if (
             self._symmetric_preview_fade_enabled
@@ -6831,6 +7184,7 @@ class GlbViewerWidget(QWidget):
         if self._canvas_stair_preview_groups:
             self._canvas_stair_preview_timer.start()
         self._sync_orbiting_point_light()
+        self._sync_sun_orbit_timer()
 
     def _tick_symmetric_preview_animation(self) -> None:
         """Advance symmetric fading only while its viewer is active."""
@@ -6870,17 +7224,22 @@ class GlbViewerWidget(QWidget):
         self._symmetric_preview_timer.stop()
         self._canvas_stair_preview_timer.stop()
         self._orbiting_point_light_timer.stop()
+        self._sun_orbit_timer.stop()
+        self._sun_orbit_last_tick_time = None
         super().hideEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """Invalidate daemon work before this viewer closes or is destroyed."""
 
+        self.clear_pending_surface_texture_previews()
         self._continuous_preview_animation_closed = True
         self._invalidate_face_rectangle_selection_requests()
         self._cancel_canvas_rectangle_selection()
         self._symmetric_preview_timer.stop()
         self._canvas_stair_preview_timer.stop()
         self._orbiting_point_light_timer.stop()
+        self._sun_orbit_timer.stop()
+        self._sun_orbit_last_tick_time = None
         super().closeEvent(event)
 
     def _build_canvas_tools_panel(self) -> QWidget:
@@ -7671,6 +8030,7 @@ class GlbViewerWidget(QWidget):
     def _refresh_preview_hidden_stair_render_items(self) -> None:
         """Update stair visibility without reloading unrelated scene textures."""
 
+        self._first_person_ground_index = None
         if self.model is None:
             return
         if self.textured_mesh_item is not None or self.model_material_items:
@@ -7699,6 +8059,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_stair_part_selection_outlines()
         self._refresh_canvas_stair_face_selection_overlay()
         self._refresh_atlas_stair_part_highlight_outlines()
+        self._refresh_pending_surface_texture_previews()
         self.view.update()
 
     # ### Canvas stair-part API ###
@@ -7775,6 +8136,7 @@ class GlbViewerWidget(QWidget):
         )
         self._refresh_canvas_stair_part_selection_outlines()
         self._refresh_atlas_stair_part_highlight_outlines()
+        self._refresh_pending_surface_texture_previews()
         self._refresh_canvas_stair_preview_items()
         currently_has_hidden_parts = any(
             not self._canvas_stair_part_is_visible(part)
@@ -8055,6 +8417,7 @@ class GlbViewerWidget(QWidget):
         )
         self._refresh_architectural_trim_selection_outlines()
         self._refresh_atlas_architectural_trim_part_highlight_outlines()
+        self._refresh_pending_surface_texture_previews()
         self._refresh_architectural_trim_gizmo_items()
         return True
 
@@ -8474,6 +8837,7 @@ class GlbViewerWidget(QWidget):
     def clear_canvas_stair_preview(self) -> bool:
         """Remove staged stair geometry without changing the original model."""
 
+        self._first_person_ground_index = None
         had_preview = bool(
             self._canvas_stair_preview_stair_index is not None
             or self._canvas_stair_preview_parts
@@ -8581,6 +8945,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
+        self._refresh_pending_surface_texture_previews()
         self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
         self._refresh_sloped_ceiling_gizmo_items()
@@ -8710,6 +9075,43 @@ class GlbViewerWidget(QWidget):
 
         return self._highlighted_canvas_surface_ids
 
+    # ### Pending surface texture preview API ###
+    def get_pending_surface_texture_preview_ids(self) -> tuple[str, ...]:
+        """Return requested semantic IDs, including temporarily absent targets."""
+
+        return self._pending_surface_texture_preview_ids
+
+    def set_pending_surface_texture_preview_ids(
+        self, surface_ids: Sequence[str],
+    ) -> bool:
+        """Overlay existing faces without changing their materials or selection.
+
+        IDs remain pending across scene rebuilds until the controller clears
+        them. Missing targets render nothing; aliases and authored-source IDs
+        also cover their current fixed-surface descendants.
+        """
+
+        if isinstance(surface_ids, (str, bytes, bytearray)):
+            raise TypeError("Pending surface IDs must be supplied as a collection.")
+        normalized_ids = tuple(
+            dict.fromkeys(
+                normalized_id
+                for value in surface_ids
+                if (normalized_id := str(value).strip())
+            )
+        )
+        if normalized_ids == self._pending_surface_texture_preview_ids:
+            return False
+        self._pending_surface_texture_preview_ids = normalized_ids
+        self._refresh_pending_surface_texture_previews()
+        return True
+
+    def clear_pending_surface_texture_previews(self) -> bool:
+        """Retire only the independent pending-texture face tint."""
+
+        return self.set_pending_surface_texture_preview_ids(())
+
+    # ### Atlas surface highlights ###
     def set_highlighted_canvas_surface_ids(self, surface_ids: object) -> bool:
         """Show green outlines without changing or emitting Canvas selection."""
 
@@ -10612,6 +11014,7 @@ class GlbViewerWidget(QWidget):
         *,
         preview_meshes: Sequence[trimesh.Trimesh] | None = None,
         preview_count: int = 1,
+        preview_offsets: Sequence[Sequence[float]] | None = None,
     ) -> bool:
         """Arm floor-hover placement with actual meshes or cube placeholders."""
 
@@ -10623,6 +11026,7 @@ class GlbViewerWidget(QWidget):
             meshes, offsets = _build_object_placement_preview_geometry(
                 preview_meshes,
                 preview_count,
+                preview_offsets=preview_offsets,
             )
         except (TypeError, ValueError):
             return False
@@ -10735,10 +11139,12 @@ class GlbViewerWidget(QWidget):
 
         surface, hit_point, _distance = hit
         anchor = np.asarray(hit_point, dtype=float)
-        self._object_placement_candidate = build_scene_object_placement_group_candidate(
-            surface.level_index,
-            anchor,
-            len(self._object_placement_preview_offsets),
+        self._object_placement_candidate = SceneObjectPlacementCandidate(
+            level_index=surface.level_index,
+            world_positions=tuple(
+                tuple(float(value) for value in anchor + offset)
+                for offset in self._object_placement_preview_offsets
+            ),
         )
         root = self._object_placement_preview_root
         if root is None:
@@ -11627,8 +12033,10 @@ class GlbViewerWidget(QWidget):
         return True
 
     # ### Directional-light overlay rendering ###
-    def _refresh_directional_light_overlay_items(self) -> None:
-        """Rebuild visible markers and arrows without affecting scene lighting."""
+    def _refresh_directional_light_overlay_items(
+        self, *, refresh_projection: bool = True
+    ) -> None:
+        """Refresh sun handles; live endpoints also drive global illumination."""
 
         self._remove_tour_item_group(self._directional_light_overlay_items)
         self._directional_light_overlay_items = []
@@ -11678,12 +12086,13 @@ class GlbViewerWidget(QWidget):
             arrow._housemaker_directional_light_id = light.light_id
             self.view.addItem(arrow)
             self._directional_light_overlay_items.append(arrow)
-        self._refresh_directional_light_projection_grid_item()
+        if refresh_projection:
+            self._refresh_directional_light_projection_grid_item()
         self.view.update()
 
     # ### Directional-light projection grid ###
     def _refresh_directional_light_projection_grid_item(self) -> None:
-        """Project a depth-tested first-hit lattice for the selected light."""
+        """Draw parallel incoming ray paths stopping at first opaque hits."""
 
         light = self._get_selected_directional_light()
         if light is None or not hasattr(self, "view"):
@@ -11717,6 +12126,7 @@ class GlbViewerWidget(QWidget):
         collision_mesh = self._get_directional_light_projection_collision_mesh()
         if collision_mesh is None:
             return
+        started = time.perf_counter()
         try:
             positions = build_directional_light_projection_grid(
                 collision_mesh,
@@ -11724,6 +12134,11 @@ class GlbViewerWidget(QWidget):
             )
         except (TypeError, ValueError, RuntimeError):
             return
+        self._sun_orbit_ray_refresh_interval_seconds = max(
+            1.0 if collision_mesh._cache[SUN_RAY_FALLBACK_CACHE_KEY]
+            else SUN_ORBIT_RAY_REFRESH_INTERVAL_SECONDS,
+            (time.perf_counter() - started) * 10.0,
+        )
         if not len(positions):
             return
         item = _DepthTestedOverlayLineItem(
@@ -11749,7 +12164,7 @@ class GlbViewerWidget(QWidget):
             return self._directional_light_projection_collision_mesh
 
         collision_meshes: list[trimesh.Trimesh] = []
-        display_mesh = self._get_display_mesh()
+        display_mesh = _get_opaque_sun_collision_mesh(self._get_display_mesh())
         if _mesh_has_projectable_triangles(display_mesh):
             assert isinstance(display_mesh, trimesh.Trimesh)
             collision_meshes.append(display_mesh)
@@ -11782,12 +12197,14 @@ class GlbViewerWidget(QWidget):
                     and textured_surface.surface_type == "generated_object"
                 ):
                     continue
-                if _mesh_has_projectable_triangles(textured_surface.mesh):
-                    collision_meshes.append(textured_surface.mesh)
+                opaque_mesh = _get_opaque_sun_collision_mesh(textured_surface.mesh)
+                if _mesh_has_projectable_triangles(opaque_mesh):
+                    collision_meshes.append(opaque_mesh)
         for object_id, group in self._placed_object_render_groups.items():
             if not self._canvas_placed_object_is_visible(object_id):
                 continue
             for source_mesh in group.pick_meshes:
+                source_mesh = _get_opaque_sun_collision_mesh(source_mesh)
                 if not _mesh_has_projectable_triangles(source_mesh):
                     continue
                 world_mesh = source_mesh.copy()
@@ -11841,6 +12258,25 @@ class GlbViewerWidget(QWidget):
             self.view.removeItem(item)
 
     # ### Directional-light endpoint helpers ###
+    def _get_sun_light_snapshot(
+        self,
+    ) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float], float], ...]:
+        """Return parallel world-space sunlight, independent of handle location."""
+
+        result = []
+        for light in self._directional_lights[:MAX_PREVIEW_SUN_LIGHTS]:
+            position, target = self._get_directional_light_display_endpoints(light)
+            toward_sun = _normalize_vector(
+                np.asarray(position, dtype=float) - np.asarray(target, dtype=float)
+            )
+            if toward_sun is None:
+                continue
+            color = tuple(int(light.color[index:index + 2], 16) / 255.0
+                          for index in (1, 3, 5))
+            result.append((tuple(float(value) for value in toward_sun), color,
+                           light.intensity))
+        return tuple(result)
+
     def _get_directional_light_display_endpoints(
         self,
         light: DirectionalLightData,
@@ -11850,6 +12286,26 @@ class GlbViewerWidget(QWidget):
         drag = self._directional_light_drag
         if drag is not None and drag.light_id == light.light_id:
             return drag.preview_position, drag.preview_target
+        if (
+            self._sun_orbit.enabled
+            and not self._sun_direction_editing
+            and self._directional_lights
+            and light.light_id == self._directional_lights[0].light_id
+            and self._sun_orbit_phase_degrees != 0.0
+        ):
+            # Rotate in physical space: anisotropic building scale must not
+            # distort orbit speed/pitch or disagree with the exported runtime.
+            factors = np.asarray(self.view.get_global_scale().factors, dtype=float)
+            offset = (np.asarray(light.target) - np.asarray(light.position)) * factors
+            angle = math.radians(self._sun_orbit_phase_degrees)
+            cosine, sine = math.cos(angle), math.sin(angle)
+            rotated = np.asarray((
+                offset[0] * cosine - offset[1] * sine,
+                offset[0] * sine + offset[1] * cosine,
+                offset[2],
+            ))
+            target = np.asarray(light.position) + rotated / factors
+            return light.position, tuple(float(value) for value in target)
         return light.position, light.target
 
     def _refresh_directional_light_placement_hover_item(self) -> None:
@@ -11971,7 +12427,11 @@ class GlbViewerWidget(QWidget):
                 size=10.0,
                 pxMode=True,
             )
-            for item in (axis_item, endpoint_item):
+            translation_items = (
+                () if self._is_initial_sun_direction_edit(light)
+                else (axis_item, endpoint_item)
+            )
+            for item in translation_items:
                 item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
                 item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 12.0)
                 self.view.addItem(item)
@@ -12004,6 +12464,11 @@ class GlbViewerWidget(QWidget):
         """Describe the selected light and its raw Three/R3F intensity."""
 
         if self.object_transform_status_label is None:
+            return
+        if self._is_initial_sun_direction_edit(light):
+            self.object_transform_status_label.setText(
+                "Drag an RGB ring to set the initial sun direction. Orbit is paused."
+            )
             return
         self.object_transform_status_label.setText(
             f"{light.name}: intensity {light.intensity:g}. Drag an RGB arrow "
@@ -12043,7 +12508,10 @@ class GlbViewerWidget(QWidget):
                 pivot,
                 endpoint,
             )
-            if segment_distance is not None and segment_distance <= tolerance:
+            if (
+                not self._is_initial_sun_direction_edit(light)
+                and segment_distance is not None and segment_distance <= tolerance
+            ):
                 candidates.append(
                     (
                         segment_distance / max(tolerance, 1e-12),
@@ -12054,7 +12522,10 @@ class GlbViewerWidget(QWidget):
                     )
                 )
             point_hit = _get_ray_point_distance(origin, direction, endpoint)
-            if point_hit is not None and point_hit[0] <= tolerance * 1.5:
+            if (
+                not self._is_initial_sun_direction_edit(light)
+                and point_hit is not None and point_hit[0] <= tolerance * 1.5
+            ):
                 candidates.append(
                     (
                         point_hit[0] / max(tolerance * 1.5, 1e-12),
@@ -12102,6 +12573,14 @@ class GlbViewerWidget(QWidget):
             ),
         )[1]
 
+    def _is_initial_sun_direction_edit(self, light: DirectionalLightData) -> bool:
+        """Only the primary sun's angle is edited by the dedicated control."""
+
+        return bool(
+            self._sun_direction_editing and self._directional_lights
+            and light.light_id == self._directional_lights[0].light_id
+        )
+
     def _begin_directional_light_gizmo_drag(
         self,
         handle: _TransformGizmoHandle,
@@ -12115,6 +12594,10 @@ class GlbViewerWidget(QWidget):
             light is None
             or handle.kind not in {TRANSFORM_GIZMO_TRANSLATE, TRANSFORM_GIZMO_ROTATE}
             or camera_ray is None
+            or (
+                handle.kind == TRANSFORM_GIZMO_TRANSLATE
+                and self._is_initial_sun_direction_edit(light)
+            )
         ):
             return False
         axis = np.eye(3, dtype=float)[handle.axis_index]
@@ -12143,6 +12626,7 @@ class GlbViewerWidget(QWidget):
                 preview_target=light.target,
             )
             self._sync_directional_light_wheel_input_state()
+            self._sync_sun_orbit_timer()
             self.view.reserve_primary_pointer_drag()
             return True
 
@@ -12166,6 +12650,7 @@ class GlbViewerWidget(QWidget):
             preview_target=light.target,
         )
         self._sync_directional_light_wheel_input_state()
+        self._sync_sun_orbit_timer()
         self.view.reserve_primary_pointer_drag()
         return True
 
@@ -12266,6 +12751,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         self._directional_light_drag = None
+        self._sync_sun_orbit_timer()
         self.view.release_primary_pointer_drag()
         self._sync_directional_light_wheel_input_state()
         self._refresh_directional_light_overlay_items()
@@ -12289,6 +12775,7 @@ class GlbViewerWidget(QWidget):
         if drag is None:
             return False
         self._directional_light_drag = None
+        self._sync_sun_orbit_timer()
         if hasattr(self, "view"):
             self.view.cancel_primary_pointer_drag()
         self._sync_directional_light_wheel_input_state()
@@ -14239,6 +14726,9 @@ class GlbViewerWidget(QWidget):
         directional_light_id = self._pick_directional_light_id(position)
         if directional_light_id is not None:
             self.set_selected_directional_light_id(directional_light_id)
+            # A real marker click requests preview even when already selected.
+            # Programmatic selection by the initial-direction editor must not.
+            self.directional_light_preview_requested.emit(directional_light_id)
             return
         if self._canvas_face_orientation_visible:
             self._handle_canvas_face_orientation_pick_requested(position)
@@ -14693,20 +15183,23 @@ class GlbViewerWidget(QWidget):
         ):
             return
         self._invalidate_canvas_rectangle_selection_requests()
+        camera_ray = self.view.build_camera_ray(position)
+        # Sun handles edit lighting, not surface orientation. Let their visible
+        # controls retain priority over the diagnostic face-selection gesture.
+        if camera_ray is not None:
+            directional_light_handle = self._pick_directional_light_gizmo_handle(
+                *camera_ray
+            )
+            if directional_light_handle is not None:
+                self._begin_directional_light_gizmo_drag(
+                    directional_light_handle,
+                    position,
+                )
+                return
         if self._canvas_face_orientation_visible:
             self._begin_canvas_rectangle_selection(position)
             return
-        camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
-            return
-        directional_light_handle = self._pick_directional_light_gizmo_handle(
-            *camera_ray
-        )
-        if directional_light_handle is not None:
-            self._begin_directional_light_gizmo_drag(
-                directional_light_handle,
-                position,
-            )
             return
         if not self._placed_object_editing_enabled:
             return
@@ -15007,7 +15500,9 @@ class GlbViewerWidget(QWidget):
         end = QPointF(position)
         if self._canvas_face_orientation_visible:
             if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
-                self._handle_canvas_face_orientation_pick_requested(end)
+                # Preserve marker activation priority before diagnostic face
+                # picking, just as for an ordinary short viewport click.
+                self._handle_window_wall_pick_requested(end, additive=additive)
             return True
         if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
             self._handle_window_wall_pick_requested(
@@ -16937,6 +17432,7 @@ class GlbViewerWidget(QWidget):
     def _refresh_canvas_stair_preview_items(self) -> None:
         """Rebuild the separate pulsing overlay for one staged stair edit."""
 
+        self._first_person_ground_index = None
         self._remove_canvas_stair_preview_items()
         if self.model is None:
             return
@@ -17296,6 +17792,102 @@ class GlbViewerWidget(QWidget):
                 self.view.removeItem(item)
         self._atlas_surface_highlight_items = []
 
+    # ### Pending surface texture preview rendering ###
+    def _pending_surface_texture_legacy_wall_offsets(self) -> dict[tuple, np.ndarray]:
+        """Follow old image planes so they cannot hide the pending face tint."""
+
+        if (
+            self.model is None or not self._textures_enabled or self._wireframe_only
+            or (self._window_editing_enabled and self._canvas_surface_focus_type is not None)
+        ):
+            return {}
+        assigned_wall_keys = {
+            (surface.level_index, surface.room_index, surface.wall_key)
+            for surface in self.model.preview_textured_surfaces
+            if surface.surface_type == "wall" and surface.level_index is not None
+            and surface.room_index is not None and surface.wall_key is not None
+        }
+        offsets = {}
+        for wall in self.model.preview_textured_walls:
+            key = (wall.level_index, wall.room_index, wall.wall_key)
+            if key in assigned_wall_keys:
+                continue
+            vector = np.asarray(wall.end_point) - np.asarray(wall.start_point)
+            length = float(np.linalg.norm(vector[:2]))
+            if length > 1e-6 and np.isfinite(vector).all():
+                # Match _add_textured_wall_items' negative (room-interior) offset.
+                offsets[key] = np.asarray((vector[1], -vector[0], 0.0)) * (
+                    TEXTURE_PREVIEW_OFFSET_METERS / length
+                )
+        return offsets
+
+    def _refresh_pending_surface_texture_previews(self) -> None:
+        """Snapshot only positions and faces, never UVs or source images."""
+
+        self._remove_pending_surface_texture_preview_items()
+        requested_ids = set(self._pending_surface_texture_preview_ids)
+        if not requested_ids:
+            return
+        meshes: dict[str, trimesh.Trimesh] = {}
+        offsets: dict[str, np.ndarray] = {}
+        legacy_wall_offsets = self._pending_surface_texture_legacy_wall_offsets()
+        for surface in self._canvas_surface_targets.values():
+            semantic_ids = {
+                surface.surface_id,
+                _get_fixed_surface_source_id(surface),
+                *surface.surface_alias_ids,
+            }
+            if not requested_ids.intersection(semantic_ids):
+                continue
+            if not self._canvas_surface_is_visible(surface):
+                continue
+            meshes[surface.surface_id] = surface.mesh
+            key = (surface.level_index, surface.room_index, surface.wall_key)
+            if surface.surface_type == "wall" and key in legacy_wall_offsets:
+                offsets[surface.surface_id] = legacy_wall_offsets[key]
+        for semantic_id in requested_ids:
+            stair_part = self._canvas_stair_part_targets.get(semantic_id)
+            if (
+                stair_part is not None
+                and self._canvas_stair_part_is_visible(stair_part)
+                and not self._canvas_stair_part_is_preview_hidden(stair_part)
+            ):
+                meshes[semantic_id] = stair_part.mesh
+            trim_part = self._architectural_trim_parts.get(semantic_id)
+            if trim_part is not None and self._architectural_trim_part_is_visible(trim_part):
+                meshes[semantic_id] = trim_part.mesh
+        for semantic_id, mesh in meshes.items():
+            vertices = np.asarray(mesh.vertices, dtype=np.float32).copy()
+            if semantic_id in offsets:
+                vertices += offsets[semantic_id]
+            faces = np.asarray(mesh.faces, dtype=np.int32).copy()
+            if (
+                vertices.ndim != 2 or vertices.shape[1] != 3
+                or faces.ndim != 2 or faces.shape[1] != 3 or not len(faces)
+                or not np.isfinite(vertices).all()
+                or np.any(faces < 0) or np.any(faces >= len(vertices))
+            ):
+                continue
+            item = _PendingSurfaceTextureOverlayMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                color=PENDING_SURFACE_TEXTURE_PREVIEW_COLOR,
+                smooth=False,
+                computeNormals=False,
+                drawFaces=True,
+                drawEdges=False,
+            )
+            item.setDepthValue(PENDING_SURFACE_TEXTURE_PREVIEW_DEPTH_VALUE)
+            self.view.addItem(item)
+            self._pending_surface_texture_preview_items[semantic_id] = item
+        self.view.update()
+
+    def _remove_pending_surface_texture_preview_items(self) -> None:
+        for item in self._pending_surface_texture_preview_items.values():
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._pending_surface_texture_preview_items = {}
+
     # ### Canvas window preview rendering ###
     def _set_window_preview_item(
         self,
@@ -17624,6 +18216,73 @@ class GlbViewerWidget(QWidget):
 
         self.view.set_first_person_speed(speed_meters_per_second)
 
+    # ### First-person gravity and eye-height API ###
+    def get_first_person_gravity_enabled(self) -> bool:
+        return self.view.is_first_person_gravity_enabled()
+
+    def set_first_person_gravity_enabled(self, enabled: bool) -> None:
+        self.view.set_first_person_gravity_enabled(enabled)
+
+    def get_first_person_eye_height(self) -> float:
+        return self.view.get_first_person_eye_height()
+
+    def set_first_person_eye_height(self, height_meters: float) -> None:
+        self.view.set_first_person_eye_height(height_meters)
+        if self.model is not None and not self.view.has_custom_first_person_camera_pose:
+            self._set_default_first_person_camera_pose_from_bounding_box(
+                self.model.mesh.bounding_box
+            )
+
+    def _get_first_person_ground_height(
+        self, x: float, y: float, max_height: float,
+    ) -> float | None:
+        """Lazily index only currently rendered static support geometry."""
+
+        if self._first_person_ground_index is None:
+            meshes = []
+            display_mesh = self._get_display_mesh()
+            if display_mesh is not None:
+                meshes.append(display_mesh)
+            if self.model is not None:
+                for surface in self.model.preview_textured_surfaces:
+                    if surface.surface_type == "generated_object":
+                        continue
+                    stair = self._canvas_stair_part_targets.get(surface.surface_id)
+                    if self._window_editing_enabled and (
+                        (stair is not None and (
+                            not self._canvas_stair_part_is_visible(stair)
+                            or self._canvas_stair_part_is_preview_hidden(stair)
+                        ))
+                        or (stair is None and (
+                            not self._canvas_level_is_visible(surface.level_index)
+                            or not self._canvas_surface_type_is_visible(surface.surface_type)
+                        ))
+                    ):
+                        continue
+                    meshes.append(surface.mesh)
+            # Positions alone are needed: never clone texture images/materials
+            # merely to provide walkable floors, stair treads and landings.
+            triangles = [np.asarray(mesh.triangles, dtype=float) for mesh in meshes]
+            triangles.extend(
+                np.asarray(part.mesh.triangles, dtype=float)
+                for part in self._canvas_stair_preview_parts
+                if self._canvas_stair_part_is_visible(part)
+            )
+            for object_id, preview in self._landing_previews.items():
+                record = self._landing_records.get(object_id.removeprefix("landing:"))
+                if record is not None and not self._canvas_level_is_visible(record[0].index):
+                    continue
+                for mesh in preview.meshes:
+                    positions = trimesh.transform_points(
+                        np.asarray(mesh.vertices), preview.placement_transform,
+                    )
+                    triangles.append(positions[np.asarray(mesh.faces)])
+            self._first_person_ground_index = FirstPersonGroundIndex(
+                np.concatenate(triangles) if triangles else np.empty((0, 3, 3))
+            )
+        return self._first_person_ground_index.ground_height(x, y, max_height)
+
+    # ### Scene model installation ###
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self._invalidate_progressive_texture_updates()
         self._hover_point_light_position = None
@@ -17677,6 +18336,7 @@ class GlbViewerWidget(QWidget):
                 self.begin_architectural_trim_placement(retained_trim_placement_kind)
 
     def clear_model(self) -> None:
+        self._pending_surface_texture_preview_ids = ()
         self._pending_placed_object_previews = {}
         self._pending_placed_object_source_meshes = {}
         self._invalidate_progressive_texture_updates()
@@ -19072,6 +19732,8 @@ class GlbViewerWidget(QWidget):
 
         self._textures_enabled = bool(enabled)
         self._apply_render_display_options()
+        if self._pending_surface_texture_preview_ids:
+            self._refresh_pending_surface_texture_previews()
 
     def get_textures_enabled(self) -> bool:
         return self._textures_enabled
@@ -19821,6 +20483,8 @@ class GlbViewerWidget(QWidget):
 
         self._wireframe_only = bool(enabled)
         self._apply_render_display_options()
+        if self._pending_surface_texture_preview_ids:
+            self._refresh_pending_surface_texture_previews()
 
     def get_wireframe_only(self) -> bool:
         return self._wireframe_only
@@ -20083,6 +20747,9 @@ class GlbViewerWidget(QWidget):
         )
 
     def _populate_scene(self) -> None:
+        # Rebuild only on the first gravity query after geometry/visibility
+        # changes. Ordinary orbit and noclip viewers pay no indexing cost.
+        self._first_person_ground_index = None
         self._canvas_selection_geometry_revision += 1
         self._invalidate_canvas_rectangle_selection_requests()
         self._clear_scene()
@@ -20102,6 +20769,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_canvas_face_orientation_item()
             self._refresh_canvas_extrudable_face_outlines()
             self._refresh_atlas_surface_highlight_outlines()
+            self._refresh_pending_surface_texture_previews()
             self._refresh_atlas_stair_part_highlight_outlines()
             self._refresh_atlas_architectural_trim_part_highlight_outlines()
             self._refresh_canvas_opening_gizmo_items()
@@ -20262,6 +20930,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
+        self._refresh_pending_surface_texture_previews()
         self._refresh_atlas_stair_part_highlight_outlines()
         self._refresh_atlas_architectural_trim_part_highlight_outlines()
         self._refresh_canvas_opening_gizmo_items()
@@ -24149,6 +24818,7 @@ class GlbViewerWidget(QWidget):
         ).copy()
         if preview.object_id.startswith("landing:"):
             self._landing_previews[preview.object_id] = preview
+            self._first_person_ground_index = None
             return
         if preview.object_id in self._pending_placed_object_previews:
             self._pending_placed_object_previews[preview.object_id] = preview
@@ -24307,10 +24977,10 @@ class GlbViewerWidget(QWidget):
         scale_z = self.view.get_global_scale().z
         height = max(0.0, float(maximum[2] - minimum[2]) * scale_z)
         eye_height = (
-            DEFAULT_FIRST_PERSON_HEIGHT_METERS
+            self.view.get_first_person_eye_height()
             if height <= 0.0
             else min(
-                DEFAULT_FIRST_PERSON_HEIGHT_METERS,
+                self.view.get_first_person_eye_height(),
                 max(0.5, height * 0.65),
             )
         )
@@ -24385,6 +25055,7 @@ class GlbViewerWidget(QWidget):
         self._canvas_face_orientation_items = []
         self._canvas_extrudable_face_outline_items = []
         self._atlas_surface_highlight_items = []
+        self._pending_surface_texture_preview_items = {}
         self._atlas_stair_part_highlight_items = []
         self._canvas_stair_preview_groups = []
         self._window_preview_item = None
@@ -31184,6 +31855,8 @@ def _build_textured_wall_transform(
 def _build_object_placement_preview_geometry(
     preview_meshes: Sequence[trimesh.Trimesh] | None,
     preview_count: int,
+    *,
+    preview_offsets: Sequence[Sequence[float]] | None = None,
 ) -> tuple[tuple[trimesh.Trimesh, ...], tuple[np.ndarray, ...]]:
     """Return independent local preview meshes and their ordered XY offsets."""
 
@@ -31215,7 +31888,13 @@ def _build_object_placement_preview_geometry(
         ):
             raise TypeError("Placement preview meshes must be Trimesh values.")
 
-    offsets = _build_object_placement_group_offsets(len(source_meshes))
+    if preview_offsets is None:
+        offsets = _build_object_placement_group_offsets(len(source_meshes))
+    else:
+        raw_offsets = np.asarray(preview_offsets, dtype=float)
+        if raw_offsets.shape != (len(source_meshes), 3) or not np.all(np.isfinite(raw_offsets)):
+            raise ValueError("Placement offsets must match the preview meshes as finite XYZ values.")
+        offsets = tuple(np.asarray(offset, dtype=float) for offset in raw_offsets)
     meshes: list[trimesh.Trimesh] = []
     for source_mesh, offset in zip(source_meshes, offsets, strict=True):
         mesh = source_mesh.copy()
@@ -31240,7 +31919,9 @@ def _build_object_placement_preview_geometry(
             ),
             dtype=float,
         )
-        mesh.apply_translation(offset - bottom_center)
+        # Custom Atlas grids already carry their true anchor-relative bounds,
+        # including off-center mirrored halves. Keep those origins unchanged.
+        mesh.apply_translation(offset if preview_offsets is not None else offset - bottom_center)
         meshes.append(mesh)
     return tuple(meshes), offsets
 
@@ -32537,22 +33218,114 @@ def _build_orthogonal_tangents(normals: np.ndarray) -> np.ndarray:
 
 
 # ### Lighting helpers ###
-def _build_ambient_shader(ambient_light_intensity: float):
+def _get_opaque_sun_collision_mesh(mesh):
+    """Do not stop ray guides at transparent glass or alpha-cutout materials."""
+
+    if not isinstance(mesh, trimesh.Trimesh):
+        return None
+    material = getattr(mesh.visual, "material", None)
+    materials = getattr(material, "materials", None)
+    if materials is not None:
+        face_materials = np.asarray(getattr(mesh.visual, "face_materials", ()))
+        if face_materials.shape != (len(mesh.faces),):
+            return None
+        opaque_ids = [index for index, entry in enumerate(materials)
+                      if _is_opaque_sun_collision_material(entry)]
+        faces = np.flatnonzero(np.isin(face_materials, opaque_ids))
+        if not len(faces):
+            return None
+        return mesh if len(faces) == len(mesh.faces) else mesh.submesh(
+            (faces,), append=True, repair=False
+        )
+    return mesh if _is_opaque_sun_collision_material(material) else None
+
+
+def _is_opaque_sun_collision_material(material) -> bool:
+    """Keep unknown untextured solids, but fail open for authored transparency."""
+
+    if is_housemaker_glass_material(material):
+        return False
+    if str(getattr(material, "alphaMode", "OPAQUE") or "OPAQUE").upper() != "OPAQUE":
+        return False
+    extensions = getattr(material, "extensions", None)
+    transmission = getattr(material, "transmissionFactor", 0.0) or 0.0
+    if isinstance(extensions, dict):
+        payload = extensions.get("KHR_materials_transmission", {})
+        if isinstance(payload, dict):
+            transmission = payload.get("transmissionFactor", transmission)
+    try:
+        return float(transmission) <= 0.0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _build_sun_light_uniforms(
+    lights: Sequence[
+        tuple[Sequence[float], Sequence[float], float]
+    ],
+    view_matrix=None,
+) -> dict[str, list[float]]:
+    """Map bounded global sun directions into view space using scalar arrays."""
+
+    lights = tuple(lights[:MAX_PREVIEW_SUN_LIGHTS])
+    uniforms = {"u_sun_count": [float(len(lights))]}
+    for name in ("direction_x", "direction_y", "direction_z", "color_r", "color_g",
+                 "color_b"):
+        uniforms[f"u_sun_{name}"] = [0.0] * MAX_PREVIEW_SUN_LIGHTS
+    for index, (direction, color, intensity) in enumerate(lights):
+        mapped = QVector3D(*direction)
+        if view_matrix is not None:
+            mapped = view_matrix.mapVector(mapped)
+        mapped.normalize()
+        for component, value in zip("xyz", (mapped.x(), mapped.y(), mapped.z())):
+            uniforms[f"u_sun_direction_{component}"][index] = float(value)
+        for component, value in zip("rgb", color):
+            uniforms[f"u_sun_color_{component}"][index] = min(
+                float(value) * intensity, 10000.0
+            )
+    return uniforms
+
+
+class _SunLightShaderProgram(gl_shaders.ShaderProgram):
+    """Refresh view-local scalar uniforms immediately before each GL draw."""
+
+    def __init__(self, *args, sun_uniforms_provider=None, **kwargs):
+        self._sun_uniforms_provider = sun_uniforms_provider
+        super().__init__(*args, **kwargs)
+
+    def _refresh_sun_uniforms(self) -> None:
+        provider = self._sun_uniforms_provider
+        uniforms = _build_sun_light_uniforms(()) if provider is None else provider()
+        for name, values in uniforms.items():
+            self.setUniformData(name, values)
+
+    def __enter__(self):
+        self._refresh_sun_uniforms()
+        return super().__enter__()
+
+
+def _build_ambient_shader(
+    ambient_light_intensity: float,
+    *,
+    sun_uniforms_provider: Callable[[], dict[str, list[float]]] | None = None,
+):
     """Create an isolated shader so settings do not leak between viewers."""
 
     shader_name = AMBIENT_LIT_SHADER_NAME
-    shader = gl_shaders.ShaderProgram(
+    shader = _SunLightShaderProgram(
         shader_name,
         [
             gl_shaders.VertexShader(AMBIENT_LIT_VERTEX_SHADER),
             gl_shaders.FragmentShader(AMBIENT_LIT_FRAGMENT_SHADER),
         ],
         uniforms={
+            **_build_sun_light_uniforms(()),
             "u_ambient_light": [
                 _normalize_ambient_light_intensity(ambient_light_intensity)
             ],
             "u_opacity": [1.0],
         },
+        sun_uniforms_provider=sun_uniforms_provider,
     )
     gl_shaders.ShaderProgram.names.pop(shader_name, None)
     return shader

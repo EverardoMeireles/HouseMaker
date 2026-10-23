@@ -15,11 +15,16 @@ import trimesh
 
 from housemaker.directional_light_state import (
     DirectionalLightData,
+    SunOrbitData,
     directional_lights_to_runtime_dicts,
 )
 from housemaker.door_state import (
     DOOR_SIDE_DUPLICATION_SIDES,
     DOOR_SIDE_DUPLICATION_UV_MODE,
+)
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
+    normalize_first_person_eye_height_meters,
 )
 from housemaker.glb import (
     HALF_MESH_EXTRAS_KEY,
@@ -27,8 +32,11 @@ from housemaker.glb import (
     INSTANCE_SOURCE_NAME_METADATA_KEY,
     PlacedGeneratedModel,
     build_placed_generated_model_gltf_transform,
+    get_placed_generated_model_export_source_node_name,
 )
 from housemaker.global_scale import GlobalScale
+from housemaker.object_identifiers import object_export_label_from_node_name
+from housemaker.pvs_state import PvsBakeData
 from housemaker.tour_state import TourData, tours_to_runtime_dicts
 
 # ### Constants ###
@@ -118,9 +126,17 @@ def write_runtime_scene_manifest(
     door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
     directional_lights: Sequence[DirectionalLightData] = (),
     global_scale: GlobalScale | None = None,
+    first_person_eye_height_meters: float = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
+    visibility: PvsBakeData | None = None,
+    sun_orbit: SunOrbitData | None = None,
 ) -> Path:
     """Write the R3F runtime companion JSON next to an exported GLB."""
 
+    eye_height_meters = normalize_first_person_eye_height_meters(
+        first_person_eye_height_meters
+    )
+    _validate_visibility(visibility, eye_height_meters)
+    _validate_sun_orbit(sun_orbit)
     normalized_glb_path = Path(glb_path)
     try:
         original_glb_bytes = normalized_glb_path.read_bytes()
@@ -151,6 +167,9 @@ def write_runtime_scene_manifest(
         door_body_reconstructions=door_body_reconstructions,
         directional_lights=directional_lights,
         global_scale=global_scale,
+        first_person_eye_height_meters=eye_height_meters,
+        visibility=visibility,
+        sun_orbit=sun_orbit,
     )
     if glb_bytes != original_glb_bytes:
         _write_bytes_atomically(normalized_glb_path, glb_bytes)
@@ -169,11 +188,19 @@ def build_runtime_scene_manifest(
     door_body_reconstructions: Sequence[DoorBodyReconstruction] = (),
     directional_lights: Sequence[DirectionalLightData] = (),
     global_scale: GlobalScale | None = None,
+    first_person_eye_height_meters: float = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
+    visibility: PvsBakeData | None = None,
+    sun_orbit: SunOrbitData | None = None,
 ) -> dict[str, object]:
     """Build a versioned runtime manifest for scene runtime-only features."""
 
     if not isinstance(glb_bytes, bytes) or not glb_bytes:
         raise ValueError("A runtime scene manifest requires exported GLB bytes.")
+    eye_height_meters = normalize_first_person_eye_height_meters(
+        first_person_eye_height_meters
+    )
+    _validate_visibility(visibility, eye_height_meters)
+    _validate_sun_orbit(sun_orbit)
     normalized_sources = _normalize_source_placements(source_placements)
     normalized_instances = _normalize_instance_placements(
         instance_placements,
@@ -187,18 +214,23 @@ def build_runtime_scene_manifest(
     for _source_id, source_model_placement, group_placements in (
         _build_instance_source_groups(normalized_sources, normalized_instances)
     ):
-        group_instances = [
-            {
+        group_instances = []
+        for placement in sorted(group_placements, key=lambda value: value.object_id):
+            serialized = {
                 "id": placement.object_id,
                 "worldMatrix": _matrix_to_column_major(
                     build_placed_generated_model_gltf_transform(placement)
                 ),
             }
-            for placement in sorted(
-                group_placements,
-                key=lambda value: value.object_id,
-            )
-        ]
+            if placement.export_node_name is not None:
+                serialized.update(
+                    objectId=object_export_label_from_node_name(placement.export_node_name),
+                    sourceObjectId=object_export_label_from_node_name(
+                        _get_instance_source_node_name(placement)
+                    ),
+                    name=str(placement.object_name),
+                )
+            group_instances.append(serialized)
         group: dict[str, object] = {
             "sourceNodeName": _get_instance_source_node_name(source_model_placement),
             "instances": group_instances,
@@ -212,6 +244,9 @@ def build_runtime_scene_manifest(
         "version": RUNTIME_SCENE_VERSION,
         "coordinateSystem": "gltf-y-up",
         "matrixLayout": "column-major",
+        # Navigation height is above the finished floor in physical meters,
+        # independent of the exported house's authored global multipliers.
+        "firstPersonCamera": {"eyeHeightMeters": eye_height_meters},
         "asset": {
             "glb": str(glb_name),
             "sha256": hashlib.sha256(glb_bytes).hexdigest(),
@@ -225,7 +260,46 @@ def build_runtime_scene_manifest(
         "directionalLights": directional_lights_to_runtime_dicts(directional_lights),
     }
     _apply_global_scale_to_manifest(manifest, global_scale)
+    first_light = next(iter(manifest["directionalLights"]), None)
+    direction = None
+    if first_light is not None:
+        endpoints = np.asarray((first_light["position"], first_light["target"]), dtype=float)
+        # Normalize before subtracting so distant, finite authoring points do
+        # not overflow merely while deriving their unit ray direction.
+        if np.isfinite(endpoints).all():
+            endpoints /= max(float(np.abs(endpoints).max()), 1.0)
+            offset = endpoints[1] - endpoints[0]
+            length = float(np.linalg.norm(offset))
+            if length > 0:
+                direction = (offset / length).tolist()
+    manifest["sunlightOrbit"] = {
+        **(sun_orbit or SunOrbitData()).to_runtime_dict(),
+        "axis": [0.0, 1.0, 0.0],
+        "lightId": None if first_light is None else first_light["id"],
+        "initialDirection": direction,
+    }
+    if visibility is not None:
+        # The bake is already in final physical coordinates, unlike authored
+        # runtime transforms above. Never apply the global multipliers twice.
+        manifest["visibility"] = visibility.to_runtime_dict(
+            glb_sha256=manifest["asset"]["sha256"]
+        )
     return manifest
+
+
+# ### Optional runtime state validation ###
+def _validate_sun_orbit(sun_orbit: SunOrbitData | None) -> None:
+    if sun_orbit is not None and not isinstance(sun_orbit, SunOrbitData):
+        raise TypeError("Runtime sun orbit must contain validated settings.")
+
+
+def _validate_visibility(visibility: PvsBakeData | None, eye_height: float) -> None:
+    if visibility is None:
+        return
+    if not isinstance(visibility, PvsBakeData):
+        raise TypeError("Runtime visibility must be validated PVS bake data.")
+    if visibility.eye_height_meters != eye_height:
+        raise ValueError("PVS eye height changed; bake PVS again before exporting it.")
 
 
 # ### Global scene scaling ###
@@ -599,8 +673,7 @@ def _get_instance_source_node_name(
 ) -> str:
     """Return the single detached glTF root used by one instance group."""
 
-    assert placement.object_name is not None
-    return placement.object_name
+    return get_placed_generated_model_export_source_node_name(placement)
 
 
 def _get_instance_source_symmetry(

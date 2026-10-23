@@ -48,12 +48,17 @@ from housemaker.ceiling_height_estimation import (
     CEILING_HEIGHT_MODEL_OPTIONS,
 )
 from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
     DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_EYE_HEIGHT_STEP_METERS,
     FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND,
     FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
+    MAX_FIRST_PERSON_EYE_HEIGHT_METERS,
     MAX_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+    MIN_FIRST_PERSON_EYE_HEIGHT_METERS,
     MIN_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND,
+    normalize_first_person_eye_height_meters,
     normalize_first_person_navigation_mode,
     normalize_first_person_speed_meters_per_second,
 )
@@ -127,6 +132,7 @@ FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
 FIRST_PERSON_SPEED_SETTING_KEY = "navigation/first_person_speed"
+FIRST_PERSON_EYE_HEIGHT_SETTING_KEY = "navigation/first_person_eye_height_meters"
 IGNORE_TOP_DOWN_CEILING_SETTING_KEY = "navigation/ignore_top_down_ceiling"
 MAKE_FLOORS_DOUBLE_SIDED_SETTING_KEY = "canvas/make_floors_double_sided"
 MAKE_CEILINGS_DOUBLE_SIDED_SETTING_KEY = (
@@ -323,6 +329,7 @@ class GenerationServiceSettings:
         DEFAULT_ENABLE_OBJECT_SYMMETRY_INFERENCE
     )
     symmetry_inference_model: str = DEFAULT_SYMMETRY_INFERENCE_MODEL
+    first_person_eye_height_meters: float = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS
 
     def __post_init__(self) -> None:
         try:
@@ -355,6 +362,15 @@ class GenerationServiceSettings:
             "first_person_speed_meters_per_second",
             normalized_first_person_speed,
         )
+        try:
+            eye_height = normalize_first_person_eye_height_meters(
+                self.first_person_eye_height_meters
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "First-person eye height must be within the supported range."
+            ) from error
+        object.__setattr__(self, "first_person_eye_height_meters", eye_height)
         if not isinstance(self.snap_middle_equal_angle_only, bool):
             raise ValueError(
                 "Snap-to-middle equal-angle filtering must be enabled or "
@@ -727,6 +743,7 @@ class SettingsWidget(QWidget):
             first_person_speed_meters_per_second=(
                 self._first_person_speed_from_slider()
             ),
+            first_person_eye_height_meters=self.first_person_eye_height_spinbox.value(),
             ignore_top_down_ceiling=(
                 self.ignore_top_down_ceiling_checkbox.isChecked()
             ),
@@ -1217,6 +1234,31 @@ class SettingsWidget(QWidget):
         canvas_form.addRow(
             "Fps mode speed",
             self.first_person_speed_control,
+        )
+
+        self.first_person_eye_height_spinbox = QDoubleSpinBox()
+        self.first_person_eye_height_spinbox.setObjectName(
+            "first_person_eye_height_spinbox"
+        )
+        self.first_person_eye_height_spinbox.setRange(
+            MIN_FIRST_PERSON_EYE_HEIGHT_METERS,
+            MAX_FIRST_PERSON_EYE_HEIGHT_METERS,
+        )
+        self.first_person_eye_height_spinbox.setDecimals(2)
+        self.first_person_eye_height_spinbox.setSingleStep(
+            FIRST_PERSON_EYE_HEIGHT_STEP_METERS
+        )
+        self.first_person_eye_height_spinbox.setSuffix(" m")
+        self.first_person_eye_height_spinbox.setKeyboardTracking(False)
+        self.first_person_eye_height_spinbox.setToolTip(
+            "Set the FPS camera's eye height above the floor, in meters."
+        )
+        self.first_person_eye_height_spinbox.valueChanged.connect(
+            self._handle_first_person_eye_height_changed
+        )
+        canvas_form.addRow(
+            "Fps camera eye height",
+            self.first_person_eye_height_spinbox,
         )
 
         self.ignore_top_down_ceiling_checkbox = QCheckBox()
@@ -1981,6 +2023,9 @@ class SettingsWidget(QWidget):
                 / FIRST_PERSON_MOVE_SPEED_STEP_METERS_PER_SECOND
             )
         )
+        self.first_person_eye_height_spinbox.setValue(
+            read_first_person_eye_height(self._application_settings)
+        )
         self.ignore_top_down_ceiling_checkbox.setChecked(
             read_ignore_top_down_ceiling(self._application_settings)
         )
@@ -2611,6 +2656,17 @@ class SettingsWidget(QWidget):
             1,
         )
 
+    def _handle_first_person_eye_height_changed(self, value: float) -> None:
+        """Persist the physical floor-relative FPS camera height."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            FIRST_PERSON_EYE_HEIGHT_SETTING_KEY,
+            normalize_first_person_eye_height_meters(value),
+        )
+        self.settings_changed.emit()
+
     def _handle_ignore_top_down_ceiling_changed(self, enabled: bool) -> None:
         """Persist whether orbit navigation suppresses Canvas ceilings."""
 
@@ -3149,6 +3205,21 @@ def read_first_person_speed(
         return normalize_first_person_speed_meters_per_second(value)
     except (TypeError, ValueError):
         return DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND
+
+
+def read_first_person_eye_height(
+    application_settings: ApplicationSettingsStore,
+) -> float:
+    """Read the FPS eye height, falling back safely for older preferences."""
+
+    value = application_settings.get(
+        FIRST_PERSON_EYE_HEIGHT_SETTING_KEY,
+        DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
+    )
+    try:
+        return normalize_first_person_eye_height_meters(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS
 
 
 def read_ignore_top_down_ceiling(

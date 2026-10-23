@@ -1605,7 +1605,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.workspace.sync_shared_controls()
         self.assertIs(
             self.workspace.generate_texture_stack.currentWidget(),
-            self.objects.generate_texture_button,
+            self.surfaces.generate_button,
         )
         self.assertTrue(self.objects.generate_button.isEnabled())
         self.assertTrue(self.objects.generate_geometry_button.isEnabled())
@@ -1633,7 +1633,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
 
         self.assertIs(
             self.workspace.generate_texture_stack.currentWidget(),
-            self.objects.generate_texture_button,
+            self.surfaces.generate_button,
         )
         self.assertTrue(self.objects.generate_button.isEnabled())
         self.assertTrue(self.objects.generate_geometry_button.isEnabled())
@@ -1901,7 +1901,7 @@ class GenerationActionCancellationUiTests(unittest.TestCase):
         self.assertEqual(self.objects.generate_geometry_button.text(), "Cancel")
         buttons = (
             self.objects.generate_geometry_button,
-            self.objects.generate_texture_button,
+            self.workspace.generate_texture_stack.currentWidget(),
             self.objects.generate_button,
             self.objects.place_button,
         )

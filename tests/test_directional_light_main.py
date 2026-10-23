@@ -74,7 +74,7 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
         _process_events()
         self._temporary_directory.cleanup()
 
-    def test_add_directional_light_button_is_immediately_below_doors(
+    def test_edit_sunlight_button_is_immediately_below_doors(
         self,
     ) -> None:
         side_layout = self.workspace.doors_group.parentWidget().layout()
@@ -87,21 +87,18 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             self.workspace.add_directional_light_button.text(),
-            "Add directional light",
+            "Edit sunlight initial direction",
         )
 
-    def test_button_arms_point_placement_without_creating_a_light(self) -> None:
+    def test_button_edits_existing_sun_without_arming_point_placement(self) -> None:
+        initial_lights = self.workspace.directional_lights
+        self.assertEqual(len(initial_lights), 1)
         with (
             patch.object(
                 self.workspace.canvas,
                 "start_directional_light_placement",
                 return_value=True,
             ) as start_canvas_placement,
-            patch.object(
-                self.workspace.canvas,
-                "is_directional_light_placement_active",
-                return_value=True,
-            ),
             patch.object(
                 self.workspace.viewer,
                 "begin_directional_light_placement",
@@ -111,11 +108,18 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
             self.workspace.add_directional_light_button.click()
 
         self.assertTrue(self.workspace.add_directional_light_button.isChecked())
-        self.assertEqual(self.workspace.directional_lights, ())
-        start_canvas_placement.assert_called_once_with()
-        start_viewer_placement.assert_called_once()
+        self.assertEqual(self.workspace.directional_lights, initial_lights)
+        self.assertEqual(
+            self.workspace.viewer.get_selected_directional_light_id(),
+            initial_lights[0].light_id,
+        )
+        start_canvas_placement.assert_not_called()
+        start_viewer_placement.assert_not_called()
 
     def test_scene_drops_create_incremental_straight_down_lights(self) -> None:
+        # Exercise the retained explicit-placement callback independently of
+        # the new default Sun and its non-creating edit button.
+        self.workspace.directional_lights = ()
         positions = ((1.0, 2.0, 3.0), (7.0, 8.0, 9.0))
 
         for position in positions:
@@ -129,7 +133,7 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             [light.name for light in self.workspace.directional_lights],
-            ["Directional light 1", "Directional light 2"],
+            ["Sun light 1", "Sun light 2"],
         )
         self.assertEqual(
             [light.position for light in self.workspace.directional_lights],
@@ -142,10 +146,6 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
         self.assertEqual(
             [light.level_index for light in self.workspace.directional_lights],
             [self.workspace.current_level.index] * 2,
-        )
-        self.assertIn(
-            "Current lights: 2",
-            self.workspace.add_directional_light_button.toolTip(),
         )
 
     def test_delete_from_viewer_removes_only_the_selected_light(self) -> None:
@@ -262,6 +262,10 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
             door_body_reconstructions=(),
             directional_lights=(light,),
             global_scale=self.workspace.global_scale,
+            first_person_eye_height_meters=(
+                self.workspace._generation_settings.first_person_eye_height_meters
+            ),
+            sun_orbit=self.workspace.sun_orbit,
         )
 
 

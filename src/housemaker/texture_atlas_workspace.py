@@ -2665,6 +2665,7 @@ class TextureAtlasWorkspace(QWidget):
     surface_texture_rename_requested = Signal(str, str)
     surface_texture_repeat_size_changed = Signal(str, float)
     object_place_requested = Signal(str)
+    objects_place_requested = Signal(object)
     object_instance_place_requested = Signal(str)
     object_delete_requested = Signal(object)
     external_glb_import_requested = Signal()
@@ -6789,11 +6790,11 @@ class TextureAtlasWorkspace(QWidget):
             if source_id in self._sources_by_object_id:
                 self.surface_assign_requested.emit(source_id)
         elif self._active_source_kind == "object":
-            if (
-                source_id in self._sources_by_object_id
-                or source_id in self._placeable_objects_by_id
-            ):
-                self.object_place_requested.emit(source_id)
+            object_ids = self._selected_placeable_object_ids()
+            if len(object_ids) > 1:
+                self.objects_place_requested.emit(object_ids)
+            elif object_ids:
+                self.object_place_requested.emit(object_ids[0])
 
     def _request_selected_object_instance_placement(self) -> None:
         """Request an instance of the active available object source."""
@@ -7524,7 +7525,7 @@ class TextureAtlasWorkspace(QWidget):
         self.place_assign_button.setText(
             "Assign" if self._active_source_kind == "surface" else "Place"
         )
-        can_place_object = (
+        can_place_active_object = (
             self._active_source_kind == "object"
             and object_id is not None
             and (source is not None or object_id in self._placeable_objects_by_id)
@@ -7532,9 +7533,19 @@ class TextureAtlasWorkspace(QWidget):
         can_assign_surface = (
             self._active_source_kind == "surface" and source is not None
         )
-        self.place_assign_button.setEnabled(can_place_object or can_assign_surface)
+        placeable_object_ids = self._selected_placeable_object_ids()
+        self.place_assign_button.setEnabled(bool(placeable_object_ids) or can_assign_surface)
+        self.place_assign_button.setToolTip(
+            "Place the selected objects together in a side-by-side grid."
+            if len(placeable_object_ids) > 1
+            else (
+                "Assign the selected texture to the selected surfaces."
+                if can_assign_surface
+                else "Place the selected object in the scene."
+            )
+        )
         self.place_instance_button.setEnabled(
-            can_place_object
+            can_place_active_object
         )
         self.delete_object_button.setEnabled(
             self._active_source_kind == "object"
@@ -7763,6 +7774,21 @@ class TextureAtlasWorkspace(QWidget):
     def _selected_object_source(self) -> AtlasObjectTextureSource | None:
         object_id = self._selected_object_id()
         return None if object_id is None else self._sources_by_object_id.get(object_id)
+
+    def _selected_placeable_object_ids(self) -> tuple[str, ...]:
+        """Keep the available Object rows, including geometry-only records."""
+
+        if self._active_source_kind != "object":
+            return ()
+        return tuple(
+            object_id
+            for object_id in self._selected_source_ids("object")
+            if not self._is_surface_texture_source_id(object_id)
+            and (
+                object_id in self._sources_by_object_id
+                or object_id in self._placeable_objects_by_id
+            )
+        )
 
     def _select_object_row(self, object_id: str) -> bool:
         normalized_id = str(object_id)
