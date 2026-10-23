@@ -262,6 +262,7 @@ from housemaker.global_scale_workspace import (
 )
 from housemaker.landing_geometry import find_landing_snap, stair_section_landing_z
 from housemaker.landing_workspace import CanvasLandingUndoState, LandingWorkspaceMixin
+from housemaker.lazy_loading_state import RuntimeLoadingData
 from housemaker.level_coordinates import (
     build_doorway_world_outline_positions,
     build_level_base_z_lookup,
@@ -418,6 +419,9 @@ from housemaker.scene_object_placement import build_object_placement_grid_offset
 from housemaker.scene_surface_cache import build_scene_surface_geometry_signature
 from housemaker.pvs_state import PvsBakeData
 from housemaker.pvs_workspace import PvsWorkspaceMixin
+from housemaker.room_export_workspace import RoomExportWorkspaceMixin
+from housemaker.camera_start_workspace import CameraStartWorkspaceMixin
+from housemaker.room_zones import build_room_zones
 from housemaker.sunlight_workspace import SunlightWorkspaceMixin
 from housemaker.pvs_runtime import write_pvs_runtime_module
 from housemaker.settings_widget import (
@@ -1073,6 +1077,7 @@ class _PreAtlasExportScene:
     placed_models: tuple[PlacedGeneratedModel, ...]
     instance_source_models: tuple[PlacedGeneratedModel, ...]
     surface_source_ids: dict[str, str]
+    room_placements: tuple[PlacedGeneratedModel, ...] | None = None
 
     @property
     def required_source_ids(self) -> tuple[str, ...]:
@@ -1318,6 +1323,9 @@ class _AtlasDrawCallEstimateThread(QThread):
                 self._atlases,
                 surface_source_ids=pre_atlas_scene.surface_source_ids,
                 instance_source_ids=self._instance_source_ids,
+                room_layout=build_room_zones(
+                    self._scene_snapshot.levels, self._scene_snapshot.stairs
+                ),
             )
         except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
             if self.isInterruptionRequested():
@@ -1931,6 +1939,8 @@ class StairEditorHeightFilter(QObject):
 class BlueprintWorkspace(
     SunlightWorkspaceMixin,
     PvsWorkspaceMixin,
+    RoomExportWorkspaceMixin,
+    CameraStartWorkspaceMixin,
     OpeningProportionsWorkspaceMixin,
     GlobalScaleWorkspaceMixin,
     LandingWorkspaceMixin,
@@ -1951,8 +1961,11 @@ class BlueprintWorkspace(
         )
         self.current_project_path: str | None = None
         self.global_scale = GlobalScale()
+        self.runtime_loading = RuntimeLoadingData()
+        self._init_camera_start_state()
         self.object_export_ids: dict[str, str] = {}
         self._init_pvs_state()
+        self._init_room_export_state()
         self._init_opening_proportions()
         self.levels: list[LevelData] = create_default_levels()
         self.outer_wall_marks: tuple[OuterWallMark, ...] = ()
@@ -2391,6 +2404,8 @@ class BlueprintWorkspace(
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._room_overlay_timer.stop()
+        self._cancel_camera_start_placement()
         self._cancel_and_join_pvs_bake()
         self._confirm_mesh_updates_timer.stop()
         self._cancel_pending_object_placement_mesh_updates()
@@ -3442,6 +3457,7 @@ class BlueprintWorkspace(
             self.canvas.set_highlight_non_right_angles
         )
         right_side_layout.addWidget(self.highlight_non_right_angles_checkbox)
+        self._add_show_rooms_control(right_side_layout)
         # Room analysis belongs beside the level dimensions it can update.
         right_side_layout.addWidget(
             self.merged_generation_workspace.ceiling_height_section
@@ -4638,6 +4654,8 @@ class BlueprintWorkspace(
         plan_image_buttons_layout.addWidget(self.image_correction_button)
         levels_layout.addLayout(plan_image_buttons_layout)
         self._add_pvs_controls(levels_layout)
+        self._add_material_streaming_controls(levels_layout)
+        self._add_camera_start_controls(levels_layout)
 
         default_wall_options = PlanWallDetectionOptions()
         self.plan_wall_controls_group = QGroupBox("Automatic wall placement")
@@ -13642,16 +13660,6 @@ class BlueprintWorkspace(
         ):
             return
 
-        default_path = Path.cwd() / "housemaker_export.glb"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export",
-            str(default_path),
-            "GLB Files (*.glb)",
-        )
-        if not file_path:
-            return
-
         # Export is an explicit completion boundary, so include any doorway
         # dimensions that were still waiting for their debounce interval.
         self._finish_level_transform_drag()
@@ -13661,10 +13669,11 @@ class BlueprintWorkspace(
         self._commit_landing_mesh_update()
         self._commit_pending_object_placement_mesh_update()
         self._commit_pending_surface_texture_mesh_update()
-        export_path = Path(file_path)
-        if export_path.suffix.lower() != ".glb":
-            export_path = export_path.with_suffix(".glb")
-
+        self._last_room_export_plan = None
+        self._last_room_export_layout = None
+        self._last_room_export_input_atlas_ids = ()
+        self._last_material_streaming_policy = None
+        self._last_room_export_placements = ()
         try:
             validated_build = self._build_model_with_stable_dependencies(
                 lambda: self._build_generated_model("Export failed")
@@ -13692,6 +13701,12 @@ class BlueprintWorkspace(
             generated_model, pvs_visibility = self._prepare_pvs_export_model(
                 generated_model, source_placements, instance_placements,
             )
+            material_export, room_assets = self._prepare_export_material_packs(
+                generated_model
+            )
+            export_path, material_directory = self._temporary_runtime_export_paths()
+            self._write_export_material_packs(material_export, material_directory)
+            generated_model = material_export.stripped_model
             exported_path = export_glb_file(generated_model, export_path)
             manifest_path = write_runtime_scene_manifest(
                 exported_path,
@@ -13705,12 +13720,17 @@ class BlueprintWorkspace(
                 first_person_eye_height_meters=(
                     self._generation_settings.first_person_eye_height_meters
                 ),
+                room_assets=room_assets,
+                **({"material_streaming": self._last_material_streaming_policy}
+                   if self._last_material_streaming_policy is not None else {}),
                 **({"visibility": pvs_visibility} if pvs_visibility is not None else {}),
             )
-            if pvs_visibility is not None:
-                pvs_runtime_path = write_pvs_runtime_module(exported_path)
-                self._pvs_export_note += f"\nSaved PVS runtime helper to:\n{pvs_runtime_path}"
-        except (OSError, ValueError) as error:
+            pvs_runtime_path = write_pvs_runtime_module(exported_path)
+            self._pvs_export_note += f"\nSaved PVS runtime helper to:\n{pvs_runtime_path}"
+            self._publish_room_export_atlases(
+                refresh_visibility=pvs_visibility is not None
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
 
@@ -13724,6 +13744,8 @@ class BlueprintWorkspace(
             self,
             "Export complete",
             f"Saved GLB to:\n{exported_path}\n\nSaved scene data to:\n{manifest_path}"
+            + f"\n\nSaved {len(getattr(material_export, 'all_packs', material_export.packs))} "
+            + f"preview/full material GLB(s) to:\n{material_directory}"
             + (f"\n\n{self._pvs_export_note}" if self._pvs_export_note else ""),
         )
 
@@ -19940,12 +19962,14 @@ class BlueprintWorkspace(
             materialized_atlases = self.texture_atlas_workspace.prepare_export_atlases(
                 pre_atlas_scene.required_source_ids
             )
-            if not materialized_atlases:
-                return pre_atlas_scene.model
+            materialized_atlases, room_layout = self._prepare_room_export_atlases(
+                materialized_atlases, placements=pre_atlas_scene.room_placements
+            )
             return apply_texture_atlases_to_export(
                 pre_atlas_scene.model,
                 materialized_atlases,
                 surface_source_ids=pre_atlas_scene.surface_source_ids,
+                room_layout=room_layout,
             )
         except (OSError, TypeError, ValueError) as error:
             if failure_title is not None:
@@ -20007,6 +20031,7 @@ class BlueprintWorkspace(
             placed_models=placed_models,
             instance_source_models=instance_source_models,
             surface_source_ids=self._build_atlas_surface_source_ids(),
+            room_placements=(*authored_models, *instance_models),
         )
         generated_model = (
             base_model
@@ -22419,6 +22444,8 @@ class BlueprintWorkspace(
         self._pending_viewer_preview_dependency_signature = None
         self._pending_viewer_preview_dependency_signature_revision = -1
         self._viewer_preview_revision += 1
+        self._schedule_room_overlay_refresh()
+        self._sync_camera_start_marker()
         self._scheduled_viewer_refresh_preserve_camera = bool(
             self._scheduled_viewer_refresh_preserve_camera and preserve_camera
         )
@@ -22571,6 +22598,7 @@ class BlueprintWorkspace(
                 global_scale=self.global_scale,
                 visibility=self._pvs_visibility,
                 object_export_ids=self._ensure_numbered_object_ids(),
+                runtime_loading=self.runtime_loading,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -31570,6 +31598,7 @@ class BlueprintWorkspace(
             plan_wall_generation=project_data.plan_wall_generation,
             global_scale=project_data.global_scale,
             visibility=project_data.visibility,
+            runtime_loading=project_data.runtime_loading,
         )
         if project_data.visibility_warning:
             self.pvs_status_label.setText(project_data.visibility_warning)
@@ -31593,12 +31622,15 @@ class BlueprintWorkspace(
         visibility: PvsBakeData | None = None,
         sun_orbit: SunOrbitData | None = None,
         object_export_ids: dict[str, str] | None = None,
+        runtime_loading: RuntimeLoadingData | None = None,
     ) -> None:
         """Install one project while coalescing expensive dependent refreshes."""
 
         if self._is_applying_project_state:
             raise RuntimeError("A project is already being applied.")
         self._cancel_and_join_pvs_bake()
+        self._cancel_camera_start_placement()
+        self.runtime_loading = runtime_loading or RuntimeLoadingData()
         self._pvs_visibility = None
         self.merged_generation_workspace.reset_ceiling_height_analysis()
         self._is_applying_project_state = True
@@ -31655,6 +31687,8 @@ class BlueprintWorkspace(
         """Replay expensive project consumers once after signal coalescing."""
 
         self._ensure_numbered_object_ids()
+        self._sync_material_streaming_controls()
+        self._sync_camera_start_marker()
         self._surface_texture_binding_snapshot = (
             self._build_surface_texture_binding_snapshot()
         )
@@ -32027,6 +32061,7 @@ class BlueprintWorkspace(
     ) -> None:
         """Display the current level, optionally retaining the shared 2D view."""
 
+        self.canvas.set_room_overlays(())
         merged_workspace = getattr(self, "merged_generation_workspace", None)
         if merged_workspace is not None:
             merged_workspace.set_ceiling_height_levels(
@@ -32073,6 +32108,9 @@ class BlueprintWorkspace(
         self._update_blueprint_name_label()
         self._update_open_space_controls()
         self._update_plan_wall_generation_controls_state()
+        self._schedule_room_overlay_refresh()
+
+        self._sync_camera_start_marker()
 
     def _remember_current_plan_image_revision(self) -> None:
         """Keep the loaded raster's identity for subsequent metadata imports."""

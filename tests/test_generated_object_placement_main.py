@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import trimesh
 from PySide6.QtWidgets import QApplication
 
@@ -1231,7 +1232,10 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         ):
             result = self.workspace._build_generated_model(None)
 
-        self.assertIs(result, composed_model)
+        self.assertIsNotNone(result)
+        assert result is not None
+        np.testing.assert_allclose(result.mesh.bounds, composed_model.mesh.bounds)
+        self.assertAlmostEqual(result.mesh.area, composed_model.mesh.area)
         model_getter.assert_called_once_with("visible")
         compose.assert_called_once()
         self.assertIs(compose.call_args.args[0], base_model)
@@ -1403,7 +1407,15 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertEqual(len(result.scene.geometry), 2)
+        self.assertAlmostEqual(
+            result.mesh.area, base_model.mesh.area + object_model.mesh.area
+        )
+        object_parts = [
+            mesh for mesh in result.scene.geometry.values()
+            if mesh.metadata.get("housemaker_object_id") == "chair"
+        ]
+        self.assertEqual(len(object_parts), 1)
+        self.assertEqual(len(object_parts[0].faces), len(object_model.mesh.faces))
         self.assertGreaterEqual(result.mesh.bounds[1][0], target_x + 0.24)
         self.assertGreaterEqual(result.mesh.bounds[1][1], target_y + 0.24)
 

@@ -75,6 +75,7 @@ from housemaker.camera_indicators import (
     update_projection_camera_indicator_items,
 )
 from housemaker.camera_models import CameraPose
+from housemaker.camera_start_viewer import CameraStartViewerMixin
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
     CANVAS_OPENING_WINDOW,
@@ -5036,7 +5037,9 @@ def build_scene_object_placement_group_candidate(
     )
 
 
-class GlbViewerWidget(QWidget):
+class GlbViewerWidget(CameraStartViewerMixin, QWidget):
+    camera_start_placed = Signal(object)
+    camera_start_placement_cancelled = Signal()
     landing_placement_requested = Signal(object)
     landing_placement_changed = Signal(bool)
     landing_placement_cancelled = Signal()
@@ -5162,6 +5165,7 @@ class GlbViewerWidget(QWidget):
         point_light_intensity: float = DEFAULT_POINT_LIGHT_INTENSITY,
     ) -> None:
         super().__init__(parent)
+        self._init_camera_start_viewer()
         self.model: GeneratedModel | None = None
         self._first_person_ground_index: FirstPersonGroundIndex | None = None
         self.grid_item: gl.GLGridItem | None = None
@@ -5664,6 +5668,7 @@ class GlbViewerWidget(QWidget):
             )
 
         self._build_ui()
+        self._connect_camera_start_input()
         self._connect_tour_input()
         self._connect_hover_point_light_input()
         self._connect_rectangle_placement_input()
@@ -5804,6 +5809,7 @@ class GlbViewerWidget(QWidget):
         return self.select_placed_object(object_id)
 
     def begin_landing_placement(self, *, fallback_plane_z: float = 0.0) -> bool:
+        self.cancel_camera_start_placement()
         if not math.isfinite(float(fallback_plane_z)):
             raise ValueError("Landing placement height must be finite.")
         self.cancel_landing_placement(notify=False)
@@ -6186,6 +6192,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm one scene-hit point placement for a directional light."""
 
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         normalized_fallback = (
             None if fallback_plane_z is None else float(fallback_plane_z)
@@ -6300,6 +6307,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm scene-hit point placement without coupling the viewer to tour state."""
 
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         normalized_kind = str(kind).strip().lower()
         if normalized_kind not in TOUR_POINT_KINDS:
@@ -9320,6 +9328,7 @@ class GlbViewerWidget(QWidget):
         )
 
     def begin_surface_vertex_placement(self) -> bool:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Arm continuous vertex-and-edge drawing on Canvas surfaces."""
 
@@ -10192,6 +10201,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm shared colored placement feedback for one opening kind."""
 
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         if not self._window_editing_enabled:
             return False
@@ -11018,6 +11028,7 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Arm floor-hover placement with actual meshes or cube placeholders."""
 
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         normalized_request_id = str(request_id).strip()
         if not self._window_editing_enabled or not normalized_request_id:
@@ -11227,6 +11238,7 @@ class GlbViewerWidget(QWidget):
         return self._architectural_trim_placement_kind is not None
 
     def begin_architectural_trim_placement(self, kind: str) -> bool:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Arm one mutually exclusive wall-edge trim insertion mode."""
 
@@ -11578,6 +11590,7 @@ class GlbViewerWidget(QWidget):
         return True
 
     def begin_window_placement(self) -> bool:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Arm rectangle drawing on any visible wall or planar ceiling slope."""
 
@@ -25008,6 +25021,8 @@ class GlbViewerWidget(QWidget):
         self._orbiting_point_light_position = None
         self._release_textured_mesh_gl_resources()
         self.view.clear()
+        self._camera_start_items = []
+        self._refresh_camera_start_items()
         self._orbiting_point_light_marker_item = None
         self._orbiting_point_light_marker_radius = None
         self.grid_item = None

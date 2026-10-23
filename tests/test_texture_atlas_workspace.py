@@ -2449,6 +2449,8 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             {
                 "atlas_id",
                 "atlas_type",
+                "room_id",
+                "room_name",
                 "name",
                 "resolution",
                 "image_path",
@@ -8568,7 +8570,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(packed_data.atlases), 1)
         created_atlas = packed_data.atlases[0]
         self.assertEqual(created_atlas.name, "[OBJECT] Atlas")
-        self.assertEqual(created_atlas.resolution, 2048)
+        self.assertEqual(created_atlas.resolution, 512)
         self.assertEqual(packed_data.selected_atlas_id, created_atlas.atlas_id)
         self.assertIsNotNone(created_atlas.placement_for_object(half_source.object_id))
 
@@ -8974,7 +8976,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             created_atlas.placement_for_object(pending_plain.object_id)
         )
 
-    def test_pbr_sort_without_any_atlas_creates_selected_2048_non_pbr_atlas(
+    def test_pbr_sort_without_any_atlas_creates_selected_512_non_pbr_atlas(
         self,
     ) -> None:
         source = _source("plain", directory=self._temporary_directory.name)
@@ -8997,7 +8999,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(packed_data.atlases), 1)
         created_atlas = packed_data.atlases[0]
         self.assertEqual(created_atlas.name, "[OBJECT] [NON-PBR] Atlas")
-        self.assertEqual(created_atlas.resolution, 2048)
+        self.assertEqual(created_atlas.resolution, 512)
         self.assertEqual(packed_data.selected_atlas_id, created_atlas.atlas_id)
         self.assertIsNotNone(created_atlas.placement_for_object(source.object_id))
         self.assertEqual(selection_changes.call_count, 1)
@@ -9387,7 +9389,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(assigned, (source.object_id,))
         self.assertEqual(len(self.workspace.get_data().atlases), 1)
         self.assertEqual(self.workspace.selected_atlas.name, "[OBJECT] Atlas")
-        self.assertEqual(self.workspace.selected_atlas.resolution, 2048)
+        self.assertEqual(self.workspace.selected_atlas.resolution, 512)
         self.assertIsNotNone(
             self.workspace.selected_atlas.placement_for_object(source.object_id)
         )

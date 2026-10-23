@@ -133,6 +133,8 @@ class GlobalScaleWorkspaceMixin:
             self.global_scale,
             floor_z=build_level_base_z_lookup(self.levels)[self.current_level.index],
         )
+        if hasattr(self, "_sync_camera_start_marker"):
+            self._sync_camera_start_marker()
         if self._position_sunlight_above_levels():
             self._sync_directional_light_views()
         if self.tour_preview_viewer is not None:

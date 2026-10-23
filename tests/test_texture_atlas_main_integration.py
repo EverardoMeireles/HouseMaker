@@ -3877,11 +3877,17 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             )
         ]
         self.assertGreater(len(materialless_surface_names), 0)
+        # Room batching intentionally merges and renames unassigned surfaces.
+        # Check the actual floor/ceiling faces, not pre-batch geometry names.
+        materialless_normals = np.vstack([
+            result.scene.geometry[name].face_normals
+            for name in materialless_surface_names
+        ])
         self.assertTrue(
-            any("floor" in name for name in materialless_surface_names)
+            np.any(materialless_normals[:, 2] > 0.99)
         )
         self.assertTrue(
-            any("ceiling" in name for name in materialless_surface_names)
+            np.any(materialless_normals[:, 2] < -0.99)
         )
         self.assertAlmostEqual(
             sum(mesh.area for mesh in result.scene.geometry.values()),

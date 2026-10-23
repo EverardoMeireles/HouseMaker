@@ -129,6 +129,8 @@ def write_runtime_scene_manifest(
     first_person_eye_height_meters: float = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
     visibility: PvsBakeData | None = None,
     sun_orbit: SunOrbitData | None = None,
+    room_assets: Mapping[str, object] | None = None,
+    material_streaming: Mapping[str, object] | None = None,
 ) -> Path:
     """Write the R3F runtime companion JSON next to an exported GLB."""
 
@@ -170,6 +172,8 @@ def write_runtime_scene_manifest(
         first_person_eye_height_meters=eye_height_meters,
         visibility=visibility,
         sun_orbit=sun_orbit,
+        room_assets=room_assets,
+        material_streaming=material_streaming,
     )
     if glb_bytes != original_glb_bytes:
         _write_bytes_atomically(normalized_glb_path, glb_bytes)
@@ -191,6 +195,8 @@ def build_runtime_scene_manifest(
     first_person_eye_height_meters: float = DEFAULT_FIRST_PERSON_EYE_HEIGHT_METERS,
     visibility: PvsBakeData | None = None,
     sun_orbit: SunOrbitData | None = None,
+    room_assets: Mapping[str, object] | None = None,
+    material_streaming: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a versioned runtime manifest for scene runtime-only features."""
 
@@ -284,6 +290,14 @@ def build_runtime_scene_manifest(
         manifest["visibility"] = visibility.to_runtime_dict(
             glb_sha256=manifest["asset"]["sha256"]
         )
+    if room_assets is not None:
+        # Already in physical Y-up coordinates; scaling here would apply the
+        # global multipliers twice. Copy to keep caller-owned state untouched.
+        manifest["roomAssets"] = json.loads(json.dumps(dict(room_assets), allow_nan=False))
+    if material_streaming is not None:
+        policy = json.loads(json.dumps(dict(material_streaming), allow_nan=False))
+        manifest["materialStreaming"] = policy
+        manifest["firstPersonCamera"].update(policy.get("initialCamera", {}))
     return manifest
 
 

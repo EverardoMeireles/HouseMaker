@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 import tempfile
@@ -20,6 +21,7 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPolygonF,
     QRegion,
@@ -106,6 +108,7 @@ if TYPE_CHECKING:
     from housemaker.wall_llm_verification import WallAdditionProposal
 
 # ### Constants ###
+ROOM_OVERLAY_ALPHA = 64
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
 CANVAS_PANEL_COLOR = QColor("#252a31")
 EDGE_COLOR = QColor("#63c0ff")
@@ -522,6 +525,32 @@ class StairHit:
 
 
 @dataclass(frozen=True)
+class CanvasRoomProfile:
+    """Read-only image-space room boundary, including unpainted slab holes."""
+
+    room_id: str
+    exterior: tuple[tuple[float, float], ...]
+    holes: tuple[tuple[tuple[float, float], ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        room_id = str(self.room_id).strip()
+        if not room_id:
+            raise ValueError("Canvas rooms require a stable room ID.")
+        rings = []
+        for ring in (self.exterior, *self.holes):
+            points = tuple(tuple(float(value) for value in point) for point in ring)
+            if len(points) < 3 or any(
+                len(point) != 2 or not all(math.isfinite(value) for value in point)
+                for point in points
+            ):
+                raise ValueError("Canvas room rings require at least three finite XY points.")
+            rings.append(points)
+        object.__setattr__(self, "room_id", room_id)
+        object.__setattr__(self, "exterior", rings[0])
+        object.__setattr__(self, "holes", tuple(rings[1:]))
+
+
+@dataclass(frozen=True)
 class CanvasDirectionalLightProfile:
     """One directional-light authoring point in blueprint image coordinates."""
 
@@ -627,6 +656,8 @@ class _DirectionalLightCanvasDrag:
 
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
+    camera_start_placement_requested = Signal(float, float)
+    camera_start_placement_cancelled = Signal()
     landing_placement_requested = Signal(float, float)
     landing_placement_changed = Signal(bool)
     landing_placement_cancelled = Signal()
@@ -710,6 +741,8 @@ class BlueprintCanvas(QWidget):
             self._advance_non_right_angle_highlight
         )
         self.rooms: list[RoomData] = []
+        self._room_overlays: tuple[CanvasRoomProfile, ...] = ()
+        self._room_overlays_visible = False
         self.doorways: list[DoorwayData] = []
         self.windows: list[WindowData] = []
         self.open_spaces: list[OpenSpaceData] = []
@@ -805,6 +838,9 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_guides: list[SnapGuide] = []
         self.level_context: LevelData | None = None
         self._camera_indicator_pose: CameraPose | None = None
+        self._camera_start_placement_active = False
+        self._camera_start_marker: tuple[float, float] | None = None
+        self._camera_start_yaw_degrees = 0.0
         self._directional_light_profiles: tuple[
             CanvasDirectionalLightProfile,
             ...,
@@ -1528,6 +1564,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Landing placement and transforms ###
     def begin_landing_placement(self) -> bool:
+        self.cancel_camera_start_placement()
         if self.blueprint_image is None or self.level_context is None:
             return False
         self.cancel_window_placement()
@@ -1745,10 +1782,79 @@ class BlueprintCanvas(QWidget):
             painter.drawPolygon(self._landing_widget_polygon(preview))
         painter.restore()
 
+    # ### Runtime FPS starting-point authoring ###
+    def start_camera_start_placement(self) -> bool:
+        """Place an export-only camera anchor, without editing wall geometry."""
+
+        if self.blueprint_image is None:
+            return False
+        self.cancel_landing_placement()
+        self.cancel_directional_light_placement()
+        self.cancel_window_placement()
+        self.cancel_open_space_placement()
+        self._cancel_stair_placement_for_other_mode()
+        self.stop_plan_image_erasing()
+        self._reset_doorway_placement()
+        self._reset_doorway_pointer_state()
+        self._reset_vertex_selection_gesture()
+        self._cancel_placed_object_edit_drag(restore_initial=True)
+        self._clear_active_vertex_chain_for_selection()
+        self._camera_start_placement_active = True
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.update()
+        return True
+
+    def cancel_camera_start_placement(self, *, notify: bool = True) -> bool:
+        if not self._camera_start_placement_active:
+            return False
+        self._camera_start_placement_active = False
+        self.unsetCursor()
+        self.update()
+        if notify:
+            self.camera_start_placement_cancelled.emit()
+        return True
+
+    def set_camera_start_marker(
+        self,
+        image_point: tuple[float, float] | None,
+        yaw_degrees: float = 0.0,
+    ) -> None:
+        point = None if image_point is None else tuple(float(v) for v in image_point)
+        if point is not None and (len(point) != 2 or not all(map(math.isfinite, point))):
+            raise ValueError("A camera starting point needs two finite coordinates.")
+        if not math.isfinite(yaw_degrees):
+            raise ValueError("The camera starting direction must be finite.")
+        if point == self._camera_start_marker and float(yaw_degrees) == self._camera_start_yaw_degrees:
+            return
+        self._camera_start_marker = point
+        self._camera_start_yaw_degrees = float(yaw_degrees)
+        self.update()
+
+    def _paint_camera_start_marker(self, painter: QPainter) -> None:
+        if self._camera_start_marker is None:
+            return
+        center = self._image_to_widget(*self._camera_start_marker)
+        # Image Y runs down, opposite to the canonical world Y axis.
+        radians = math.radians(self._camera_start_yaw_degrees)
+        tip = center + QPointF(math.cos(radians) * 22.0, -math.sin(radians) * 22.0)
+        painter.save()
+        painter.setPen(QPen(QColor(25, 35, 50), 5.0))
+        painter.drawLine(center, tip)
+        painter.setPen(QPen(QColor(80, 220, 255), 2.5))
+        painter.drawLine(center, tip)
+        painter.setBrush(QColor(80, 220, 255))
+        painter.setPen(QPen(QColor(25, 35, 50), 2.0))
+        painter.drawEllipse(center, 7.0, 7.0)
+        painter.setPen(QColor(20, 100, 125))
+        painter.drawText(center + QPointF(10.0, 16.0), "FPS start")
+        painter.restore()
+
     # ### Directional-light placement and profiles ###
     def start_directional_light_placement(self) -> bool:
         """Arm a one-shot directional-light point placement on the plan."""
 
+        self.cancel_camera_start_placement()
         self._cancel_directional_light_drag()
         if self.blueprint_image is None:
             return False
@@ -1790,6 +1896,51 @@ class BlueprintCanvas(QWidget):
 
         return self._cancel_directional_light_drag()
 
+    # ### Non-interactive detected-room overlays ###
+    def set_room_overlays(self, profiles: Sequence[CanvasRoomProfile]) -> bool:
+        """Replace derived room fills without changing walls or selection."""
+
+        normalized = tuple(profiles)
+        if not all(isinstance(profile, CanvasRoomProfile) for profile in normalized):
+            raise TypeError("Room overlays require CanvasRoomProfile values.")
+        if normalized == self._room_overlays:
+            return False
+        self._room_overlays = normalized
+        self.update()
+        return True
+
+    def set_room_overlays_visible(self, visible: bool) -> bool:
+        visible = bool(visible)
+        if visible == self._room_overlays_visible:
+            return False
+        self._room_overlays_visible = visible
+        self.update()
+        return True
+
+    def _paint_room_overlays(self, painter: QPainter) -> None:
+        if not self._room_overlays_visible:
+            return
+        painter.save()
+        painter.setClipRect(self._image_display_rect())
+        for profile in self._room_overlays:
+            path = QPainterPath()
+            path.setFillRule(Qt.FillRule.OddEvenFill)
+            for ring in (profile.exterior, *profile.holes):
+                points = QPolygonF([self._image_to_widget(*point) for point in ring])
+                path.addPolygon(points)
+                path.closeSubpath()
+            hue = int.from_bytes(
+                hashlib.sha256(profile.room_id.encode()).digest()[:2], byteorder="big"
+            ) % 360
+            color = QColor.fromHsv(hue, 175, 235, ROOM_OVERLAY_ALPHA)
+            border = QColor(color)
+            border.setAlpha(150)
+            painter.setBrush(color)
+            painter.setPen(QPen(border, 1.0))
+            painter.drawPath(path)
+        painter.restore()
+
+    # ### Directional-light profiles ###
     def set_directional_light_profiles(
         self,
         profiles: Iterable[CanvasDirectionalLightProfile],
@@ -2115,6 +2266,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Plan-image erasing ###
     def start_plan_image_erasing(self, output_path: str | Path) -> bool:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Enter persistent erase mode with one owner-provided output revision."""
 
@@ -2431,6 +2583,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Open-space placement ###
     def start_open_space_placement(self) -> bool:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Start a one-shot rectangle drag for the current level."""
 
@@ -2525,6 +2678,7 @@ class BlueprintCanvas(QWidget):
     ) -> None:
         """Start endpoint placement followed by optional curve refinement."""
 
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         self.cancel_window_placement()
         self.cancel_directional_light_placement()
@@ -2681,6 +2835,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Window placement ###
     def start_window_placement(self) -> bool:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Arm one-click placement of a centered window on the nearest wall."""
 
@@ -2744,6 +2899,7 @@ class BlueprintCanvas(QWidget):
 
     # ### Doorway placement ###
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
+        self.cancel_camera_start_placement()
         self.cancel_landing_placement()
         """Begin placing one doorway using the selected hole dimensions."""
         self._cancel_window_pointer_state(restore_initial=True)
@@ -2913,6 +3069,9 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Escape and self.cancel_camera_start_placement():
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Escape and (
             self.cancel_landing_placement() or self._cancel_landing_drag()
         ):
@@ -3210,6 +3369,18 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self._camera_start_placement_active:
+            if event.button() == Qt.MouseButton.RightButton:
+                self.cancel_camera_start_placement()
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.LeftButton:
+                point = self._widget_to_image(event.position())
+                if point is not None:
+                    self.cancel_camera_start_placement(notify=False)
+                    self.camera_start_placement_requested.emit(point.x(), point.y())
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.RightButton and (
             self.cancel_landing_placement() or self._cancel_landing_drag()
         ):
@@ -4162,6 +4333,7 @@ class BlueprintCanvas(QWidget):
         painter.fillRect(display_rect, CANVAS_PANEL_COLOR)
         painter.drawImage(display_rect, self.blueprint_image)
 
+        self._paint_room_overlays(painter)
         self._paint_open_spaces(painter)
         self._paint_edges(painter)
         self._paint_generated_wall_preview(painter)
@@ -4185,6 +4357,7 @@ class BlueprintCanvas(QWidget):
         self._paint_landings(painter)
         self._paint_directional_light_profiles(painter)
         self._paint_directional_light_hover(painter)
+        self._paint_camera_start_marker(painter)
         self._paint_outer_wall_reference_points(painter)
         self._paint_vertex_selection_marquee(painter)
         self._paint_plan_image_erase_selection(painter)

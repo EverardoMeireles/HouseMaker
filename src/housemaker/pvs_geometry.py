@@ -71,8 +71,8 @@ def partition_glb_for_pvs(
     """Split static triangles by centroid, retaining complete original triangles.
 
     ``world_transform`` affects physical bounds/grid membership, never the
-    source transforms or vertex streams. Ordinary object subtrees keep their
-    exact names and receive one whole-object descriptor. Instance prototypes,
+    source transforms or vertex streams. Ordinary objects and room-owned static
+    batches keep their names and receive one whole-subtree descriptor. Instance prototypes,
     half meshes, doors, animated/skinned and unsupported geometry stay intact
     and always visible. Running again with the same grid is a byte-level no-op.
     """
@@ -84,8 +84,8 @@ def partition_glb_for_pvs(
     nodes = document.get("nodes", [])
     meshes = document.get("meshes", [])
     names = Counter(_node_name(node, index) for index, node in enumerate(nodes))
-    object_members: dict[int, list[tuple[_NodeFrame, tuple[_Primitive, ...] | None]]] = defaultdict(list)
-    excluded_object_roots: set[int] = set()
+    whole_members: dict[int, list[tuple[_NodeFrame, tuple[_Primitive, ...] | None]]] = defaultdict(list)
+    excluded_whole_roots: set[int] = set()
     static_nodes: list[tuple[_NodeFrame, tuple[_Primitive, ...]]] = []
     clusters: list[PvsGeometryCluster] = []
     animated_nodes = _animated_node_indices(document)
@@ -97,13 +97,15 @@ def partition_glb_for_pvs(
         mesh = meshes[mesh_index]
         if not isinstance(mesh, dict):
             continue
-        object_root = _object_root(document, frame)
+        whole_root = _object_root(document, frame)
+        if whole_root is None:
+            whole_root = _room_surface_root(document, frame)
         excluded = _is_protected(document, frame, animated_nodes)
         primitives = _read_mesh_primitives(document, binary, mesh)
-        if object_root is not None:
-            object_members[object_root].append((frame, primitives))
+        if whole_root is not None:
+            whole_members[whole_root].append((frame, primitives))
             if excluded or primitives is None:
-                excluded_object_roots.add(object_root)
+                excluded_whole_roots.add(whole_root)
             continue
         if excluded or primitives is None:
             continue
@@ -126,7 +128,7 @@ def partition_glb_for_pvs(
     # transform groups. An unlisted descendant deliberately protects its parent
     # from culling, so ambiguous names must leave the entire object visible.
     frame_by_index = {frame.index: frame for frame in frames}
-    for root, members in sorted(object_members.items()):
+    for root, members in sorted(whole_members.items()):
         root_frame = frame_by_index[root]
         root_name = _node_name(nodes[root], root)
         subtree = tuple(
@@ -134,7 +136,7 @@ def partition_glb_for_pvs(
             if frame.index == root or root in frame.ancestors
         )
         if (
-            root in excluded_object_roots
+            root in excluded_whole_roots
             or any(
                 not isinstance(nodes[frame.index].get("name"), str)
                 or not nodes[frame.index]["name"]
@@ -500,6 +502,25 @@ def _is_object_atlas(document: dict, frame: _NodeFrame) -> bool:
         for index in (*frame.ancestors, frame.index)
         for data in _metadata(document, index)
     )
+
+
+def _room_surface_root(document: dict, frame: _NodeFrame) -> int | None:
+    """Keep exporter-created room batches intact instead of undoing batching."""
+
+    if _is_object_atlas(document, frame):
+        return None
+    for index in (*frame.ancestors, frame.index):
+        for data in _metadata(document, index):
+            room_ids = data.get("housemaker_room_ids")
+            if (
+                isinstance(data.get("housemaker_room_id"), str)
+                and data["housemaker_room_id"]
+            ) or (
+                isinstance(room_ids, (tuple, list)) and room_ids
+                and all(isinstance(value, str) and value for value in room_ids)
+            ):
+                return index
+    return None
 
 
 def _is_protected(document: dict, frame: _NodeFrame, animated_nodes: frozenset[int]) -> bool:

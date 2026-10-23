@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -49,6 +50,7 @@ from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
+from housemaker.room_zones import RoomZoneLayout, room_ids_for_surface
 from housemaker.surface_ao_baking import (
     SurfaceAmbientOcclusionBakeCancelled,
     SurfaceAmbientOcclusionReceiver,
@@ -72,6 +74,8 @@ SURFACE_ID_METADATA_KEY = "housemaker_surface_id"
 OBJECT_ID_METADATA_KEY = "housemaker_object_id"
 ATLAS_ID_METADATA_KEY = "housemaker_atlas_id"
 ATLAS_TYPE_METADATA_KEY = "housemaker_atlas_type"
+ROOM_IDS_METADATA_KEY = "housemaker_room_ids"
+ROOM_ID_METADATA_KEY = "housemaker_room_id"
 UV_TOLERANCE = 1e-6
 GEOMETRY_EPSILON = 1e-12
 MAX_TILED_SURFACE_TRIANGLES = 2_000_000
@@ -411,6 +415,7 @@ def estimate_texture_atlas_draw_calls(
     *,
     surface_source_ids: Mapping[str, str] | None = None,
     instance_source_ids: Sequence[str] = (),
+    room_layout: RoomZoneLayout | None = None,
 ) -> AtlasDrawCallEstimate:
     """Estimate the exporter output without remapping UVs or loading images.
 
@@ -452,12 +457,13 @@ def estimate_texture_atlas_draw_calls(
 
     _half_contexts, half_context_by_node = _collect_half_model_contexts(model.scene)
     numbered_context_by_node = _collect_numbered_object_contexts(model.scene)
-    used_atlas_ids: set[str] = set()
+    used_atlas_ids: set[tuple[str, tuple[str, ...]]] = set()
+    room_passthrough_keys: set[tuple[object, ...]] = set()
     half_primitive_count = 0
     glass_primitive_count = 0
     passthrough_primitive_count = 0
     for node_name in sorted(model.scene.graph.nodes_geometry, key=str):
-        _transform, geometry_name = model.scene.graph.get(node_name)
+        transform, geometry_name = model.scene.graph.get(node_name)
         geometry = model.scene.geometry.get(geometry_name)
         if not isinstance(geometry, trimesh.Trimesh) or not len(geometry.faces):
             continue
@@ -467,7 +473,11 @@ def estimate_texture_atlas_draw_calls(
         )
         atlas_id = None if source_id is None else atlas_id_by_source_id.get(source_id)
         is_half = node_name in half_context_by_node
-        for _face_indices, material in _iter_face_material_groups(geometry):
+        structural_layout = (
+            room_layout if not is_half
+            and not geometry.metadata.get(OBJECT_ID_METADATA_KEY) else None
+        )
+        for face_indices, material in _iter_face_material_groups(geometry):
             if is_half:
                 half_primitive_count += 1
             elif is_housemaker_glass_material(material):
@@ -478,7 +488,18 @@ def estimate_texture_atlas_draw_calls(
             ):
                 passthrough_primitive_count += 1
             elif atlas_id is not None:
-                used_atlas_ids.add(atlas_id)
+                for _faces, room_ids in _group_faces_by_room(
+                    geometry, face_indices, _normalize_transform(transform), structural_layout,
+                ):
+                    used_atlas_ids.add((atlas_id, room_ids))
+            elif structural_layout is not None:
+                for _faces, room_ids in _group_faces_by_room(
+                    geometry, face_indices, _normalize_transform(transform), structural_layout,
+                ):
+                    room_passthrough_keys.add((
+                        room_ids, None if material is None else hash(material),
+                        _valid_uv(geometry) is not None,
+                    ))
             else:
                 passthrough_primitive_count += 1
 
@@ -486,7 +507,9 @@ def estimate_texture_atlas_draw_calls(
         atlas_batch_count=len(used_atlas_ids),
         half_primitive_count=half_primitive_count,
         glass_primitive_count=glass_primitive_count,
-        passthrough_primitive_count=passthrough_primitive_count,
+        passthrough_primitive_count=(
+            passthrough_primitive_count + len(room_passthrough_keys)
+        ),
     )
 
 
@@ -495,6 +518,7 @@ def apply_texture_atlases_to_export(
     atlases: Sequence[MaterializedTextureAtlas],
     *,
     surface_source_ids: Mapping[str, str] | None = None,
+    room_layout: RoomZoneLayout | None = None,
 ) -> GeneratedModel:
     """Apply all texture Atlases and any valid cached Atlas-AO bakes."""
 
@@ -502,6 +526,7 @@ def apply_texture_atlases_to_export(
         model,
         atlases,
         surface_source_ids=surface_source_ids,
+        room_layout=room_layout,
         surface_ao_bake_atlas_ids=frozenset(),
         surface_ao_preview_atlas_ids=frozenset(),
     )
@@ -685,6 +710,7 @@ def _apply_texture_atlases_to_export(
     atlases: Sequence[MaterializedTextureAtlas | SurfaceAmbientOcclusionAtlasContext],
     *,
     surface_source_ids: Mapping[str, str] | None,
+    room_layout: RoomZoneLayout | None = None,
     surface_ao_bake_atlas_ids: frozenset[str],
     surface_ao_preview_atlas_ids: frozenset[str],
     cancellation_check: Callable[[], bool] | None = None,
@@ -700,6 +726,8 @@ def _apply_texture_atlases_to_export(
 
     if not isinstance(model, GeneratedModel):
         raise TypeError("Texture Atlas export requires a GeneratedModel.")
+    if room_layout is not None and not isinstance(room_layout, RoomZoneLayout):
+        raise TypeError("Room batching requires a RoomZoneLayout.")
     normalized_atlases = tuple(atlases)
     valid_atlas_types = (
         (MaterializedTextureAtlas, SurfaceAmbientOcclusionAtlasContext)
@@ -708,7 +736,7 @@ def _apply_texture_atlases_to_export(
     )
     if not all(isinstance(atlas, valid_atlas_types) for atlas in normalized_atlases):
         raise TypeError("Texture Atlas export inputs are invalid.")
-    if not normalized_atlases:
+    if not normalized_atlases and room_layout is None:
         return model, {}
     if not isinstance(model.scene, trimesh.Scene):
         raise TypeError("Texture Atlas export requires a triangle-mesh scene.")
@@ -724,12 +752,9 @@ def _apply_texture_atlases_to_export(
     half_parts_by_marker: dict[object, list[_HalfModelPart]] = {
         marker_name: [] for marker_name in half_contexts
     }
-    atlas_parts: dict[str, list[trimesh.Trimesh]] = {
-        item.atlas.atlas_id: [] for item in normalized_atlases
-    }
-    atlas_source_ids: dict[str, set[str]] = {
-        item.atlas.atlas_id: set() for item in normalized_atlases
-    }
+    atlas_parts: dict[tuple[str, tuple[str, ...]], list[trimesh.Trimesh]] = {}
+    atlas_source_ids: dict[tuple[str, tuple[str, ...]], set[str]] = {}
+    room_passthrough_parts: dict[tuple[object, ...], list[trimesh.Trimesh]] = {}
     materialized_by_id = {item.atlas.atlas_id: item for item in normalized_atlases}
     atlas_materials: dict[str, PBRMaterial] = {}
     shared_glass_materials: dict[str, object] = {}
@@ -818,9 +843,20 @@ def _apply_texture_atlases_to_export(
             numbered_object_contexts[numbered_context.object_id] = numbered_context
             numbered_object_parts.setdefault(numbered_context.object_id, [])
 
-        for material_group_index, (face_indices, material) in enumerate(
-            _iter_face_material_groups(geometry)
-        ):
+        structural_layout = (
+            room_layout if instance_source_id is None and half_context is None
+            and not geometry.metadata.get(OBJECT_ID_METADATA_KEY) else None
+        )
+        material_groups = (
+            (room_faces, material, room_ids)
+            for face_indices, material in _iter_face_material_groups(geometry)
+            for room_faces, room_ids in _group_faces_by_room(
+                geometry, face_indices, world_transform,
+                structural_layout if binding is None
+                and not is_housemaker_glass_material(material) else None,
+            )
+        )
+        for material_group_index, (face_indices, material, room_ids) in enumerate(material_groups):
             fragment = _build_face_fragment(geometry, face_indices, material)
             is_glass = is_housemaker_glass_material(material)
             mirror_plane = None
@@ -913,6 +949,11 @@ def _apply_texture_atlases_to_export(
                 continue
 
             fragment.apply_transform(world_transform)
+            if structural_layout is not None and not is_glass:
+                material_key = None if material is None else hash(material)
+                key = (room_ids, material_key, _valid_uv(fragment) is not None)
+                room_passthrough_parts.setdefault(key, []).append(fragment)
+                continue
             passthrough_index += 1
             name = _reserve_name(
                 f"{node_name}_part_{passthrough_index}",
@@ -984,6 +1025,7 @@ def _apply_texture_atlases_to_export(
                 atlas_source_ids=atlas_source_ids,
                 object_ao_targets=object_ao_targets,
                 numbered_object_parts=numbered_object_parts,
+                room_layout=room_layout,
             )
 
     for pending_source in pending_instance_source_parts:
@@ -1084,7 +1126,7 @@ def _apply_texture_atlases_to_export(
     )
 
     batched_count = 0
-    for atlas_id, parts in atlas_parts.items():
+    for (atlas_id, room_ids), parts in sorted(atlas_parts.items()):
         if not parts:
             continue
         atlas_item = materialized_by_id[atlas_id]
@@ -1096,15 +1138,17 @@ def _apply_texture_atlases_to_export(
         combined = _combine_textured_parts(parts, material)
         combined.metadata[ATLAS_ID_METADATA_KEY] = atlas_id
         combined.metadata["housemaker_atlas_source_ids"] = sorted(
-            atlas_source_ids[atlas_id]
+            atlas_source_ids[(atlas_id, room_ids)]
         )
         atlas_metadata: dict[str, object] = {}
         if atlas_item.atlas.atlas_type is not None:
             atlas_metadata[ATLAS_ID_METADATA_KEY] = atlas_id
             atlas_metadata[ATLAS_TYPE_METADATA_KEY] = atlas_item.atlas.atlas_type
             combined.metadata[ATLAS_TYPE_METADATA_KEY] = atlas_item.atlas.atlas_type
+        _add_room_metadata(atlas_metadata, room_ids)
+        _add_room_metadata(combined.metadata, room_ids)
         name = _reserve_name(
-            f"housemaker_atlas_{atlas_id}",
+            f"housemaker_atlas_{atlas_id}{_room_name_suffix(room_ids)}",
             occupied_names,
         )
         output_scene.add_geometry(
@@ -1113,6 +1157,16 @@ def _apply_texture_atlases_to_export(
             node_name=name,
             metadata=atlas_metadata or None,
         )
+        batched_count += 1
+
+    for index, (key, parts) in enumerate(room_passthrough_parts.items()):
+        room_ids = key[0]
+        combined = _combine_room_passthrough_parts(parts)
+        metadata: dict[str, object] = {}
+        _add_room_metadata(metadata, room_ids)
+        _add_room_metadata(combined.metadata, room_ids)
+        name = _reserve_name(f"room_static_{index}{_room_name_suffix(room_ids)}", occupied_names)
+        output_scene.add_geometry(combined, geom_name=name, node_name=name, metadata=metadata or None)
         batched_count += 1
 
     if (
@@ -1375,6 +1429,9 @@ def _append_instance_source_models_to_scene(
         }
         if len(atlas_types) == 1:
             root_metadata[ATLAS_TYPE_METADATA_KEY] = next(iter(atlas_types))
+        atlas_ids = {part.atlas_id for part in parts if part.atlas_id is not None}
+        if len(atlas_ids) == 1:
+            root_metadata[ATLAS_ID_METADATA_KEY] = next(iter(atlas_ids))
         root_transform = _normalize_transform(
             (root_transforms_by_source_id or {}).get(source_id, np.eye(4))
         )
@@ -1401,6 +1458,8 @@ def _append_instance_source_models_to_scene(
                 )
             child_metadata = copy.deepcopy(part.node_metadata)
             if part.atlas_id is not None:
+                child_metadata[ATLAS_ID_METADATA_KEY] = part.atlas_id
+                fragment.metadata[ATLAS_ID_METADATA_KEY] = part.atlas_id
                 atlas_type = materialized_by_id[part.atlas_id].atlas.atlas_type
                 if atlas_type is not None:
                     child_metadata[ATLAS_TYPE_METADATA_KEY] = atlas_type
@@ -1529,6 +1588,8 @@ def _append_half_model_meshes_to_scene(
         child_metadata.pop(HALF_MESH_EXTRAS_KEY, None)
         child_metadata.update(copy.deepcopy(context.metadata))
         if part.atlas_id is not None:
+            child_metadata[ATLAS_ID_METADATA_KEY] = part.atlas_id
+            part.fragment.metadata[ATLAS_ID_METADATA_KEY] = part.atlas_id
             atlas_type = materialized_by_id[part.atlas_id].atlas.atlas_type
             if atlas_type is not None:
                 child_metadata[ATLAS_TYPE_METADATA_KEY] = atlas_type
@@ -1918,6 +1979,71 @@ def _report_surface_ao_progress(
 
 
 # ### Atlas-bound fragment routing ###
+def _group_faces_by_room(mesh, face_indices, world_transform, layout):
+    """Keep cross-room triangles shared instead of guessing centroid ownership."""
+
+    if layout is None:
+        return ((face_indices, ()),)
+    world_vertices = trimesh.transform_points(
+        np.asarray(mesh.vertices, dtype=float),
+        GLTF_Y_UP_TO_Z_UP_TRANSFORM @ world_transform,
+    )
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    grouped: dict[tuple[str, ...], list[int]] = {}
+    for face_index in face_indices:
+        points = world_vertices[faces[face_index]]
+        minimum_z, maximum_z = float(points[:, 2].min()), float(points[:, 2].max())
+        levels = {
+            room.level_index for room in layout.rooms
+            if room.floor_z_meters - 1e-6 <= maximum_z
+            and room.top_z_meters + 1e-6 >= minimum_z
+        }
+        normal = np.cross(points[1] - points[0], points[2] - points[0])
+        room_ids = tuple(sorted({
+            room_id for level_index in sorted(levels)
+            for room_id in room_ids_for_surface(layout, level_index, points, normal)
+        }))
+        grouped.setdefault(room_ids, []).append(int(face_index))
+    return tuple((np.asarray(indices, dtype=np.int64), rooms) for rooms, indices in grouped.items())
+
+
+def _add_room_metadata(metadata: dict[str, object], room_ids: tuple[str, ...]) -> None:
+    if room_ids:
+        metadata[ROOM_IDS_METADATA_KEY] = list(room_ids)
+        if len(room_ids) == 1:
+            metadata[ROOM_ID_METADATA_KEY] = room_ids[0]
+
+
+def _room_name_suffix(room_ids: tuple[str, ...]) -> str:
+    if not room_ids:
+        return ""
+    digest = hashlib.sha256(json.dumps(room_ids).encode("utf-8")).hexdigest()[:16]
+    return f"_room_{digest}"
+
+
+def _combine_room_passthrough_parts(parts: Sequence[trimesh.Trimesh]) -> trimesh.Trimesh:
+    material = getattr(parts[0].visual, "material", None)
+    if _valid_uv(parts[0]) is not None:
+        return _combine_textured_parts(parts, material)
+    vertices, faces, normals, colors = [], [], [], []
+    offset = 0
+    for part in parts:
+        vertices.append(np.asarray(part.vertices, dtype=float))
+        faces.append(np.asarray(part.faces, dtype=np.int64) + offset)
+        normals.append(np.asarray(part.vertex_normals, dtype=float))
+        if material is None:
+            colors.append(np.asarray(part.visual.vertex_colors, dtype=np.uint8))
+        offset += len(part.vertices)
+    kwargs = (
+        {"visual": TextureVisuals(uv=None, material=material)}
+        if material is not None else {"vertex_colors": np.vstack(colors)}
+    )
+    return trimesh.Trimesh(
+        vertices=np.vstack(vertices), faces=np.vstack(faces),
+        vertex_normals=np.vstack(normals), process=False, **kwargs,
+    )
+
+
 def _route_bound_atlas_fragment(
     pending: _PendingAtlasPart,
     remapped: trimesh.Trimesh,
@@ -1925,10 +2051,11 @@ def _route_bound_atlas_fragment(
     atlas_id: str,
     uses_surface_ao: bool,
     half_parts_by_marker: dict[object, list[_HalfModelPart]],
-    atlas_parts: dict[str, list[trimesh.Trimesh]],
-    atlas_source_ids: dict[str, set[str]],
+    atlas_parts: dict[tuple[str, tuple[str, ...]], list[trimesh.Trimesh]],
+    atlas_source_ids: dict[tuple[str, tuple[str, ...]], set[str]],
     object_ao_targets: dict[str, list[ObjectAmbientOcclusionTarget]],
     numbered_object_parts: dict[str, list[_InstanceSourcePart]],
+    room_layout: RoomZoneLayout | None,
 ) -> None:
     """Route one remapped fragment and collect its object-AO receiver."""
 
@@ -1970,9 +2097,9 @@ def _route_bound_atlas_fragment(
                 atlas_pixel_bounds=_placement_pixel_bounds(pending.placement),
             )
         )
-    if pending.double_sided:
-        remapped = _duplicate_reverse_wound_atlas_fragment(remapped)
     if numbered_context is not None:
+        if pending.double_sided:
+            remapped = _duplicate_reverse_wound_atlas_fragment(remapped)
         numbered_object_parts[numbered_context.object_id].append(
             _InstanceSourcePart(
                 fragment=remapped,
@@ -1984,8 +2111,21 @@ def _route_bound_atlas_fragment(
             )
         )
         return
-    atlas_parts[atlas_id].append(remapped)
-    atlas_source_ids[atlas_id].add(pending.source_id)
+    # Split only after the original Atlas-wide AO unwrap. UV1 still addresses
+    # the unchanged cached AO image; room grouping cannot invalidate its layout.
+    for face_indices, room_ids in _group_faces_by_room(
+        remapped, np.arange(len(remapped.faces)), np.eye(4),
+        room_layout if pending.is_surface else None,
+    ):
+        part = (
+            remapped if len(face_indices) == len(remapped.faces)
+            else _build_face_fragment(remapped, face_indices, remapped.visual.material)
+        )
+        if pending.double_sided:
+            part = _duplicate_reverse_wound_atlas_fragment(part)
+        batch_key = (atlas_id, room_ids)
+        atlas_parts.setdefault(batch_key, []).append(part)
+        atlas_source_ids.setdefault(batch_key, set()).add(pending.source_id)
 
 
 # ### Material helpers ###
@@ -2298,7 +2438,7 @@ def _build_face_fragment(
         )
         if vertex_colors.shape == (len(mesh.vertices), 4):
             kwargs["vertex_colors"] = vertex_colors[referenced_vertices]
-    return trimesh.Trimesh(
+    fragment = trimesh.Trimesh(
         vertices=np.ascontiguousarray(vertices),
         faces=np.ascontiguousarray(faces),
         vertex_normals=np.ascontiguousarray(vertex_normals),
@@ -2307,6 +2447,11 @@ def _build_face_fragment(
         process=False,
         **kwargs,
     )
+    for attribute_name, raw_values in mesh.vertex_attributes.items():
+        values = np.asarray(raw_values)
+        if values.ndim > 0 and len(values) == len(mesh.vertices):
+            fragment.vertex_attributes[attribute_name] = values[referenced_vertices].copy()
+    return fragment
 
 
 def _valid_uv(mesh: trimesh.Trimesh) -> np.ndarray | None:

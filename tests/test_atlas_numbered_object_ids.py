@@ -169,6 +169,7 @@ def test_same_named_objects_keep_distinct_roots_uuid_extras_and_one_material(
             "housemaker_object_name": "My cupboard",
             "housemaker_export_object_id": f"Object {number}",
             "housemaker_atlas_type": ATLAS_TYPE_OBJECT,
+            "housemaker_atlas_id": "objects",
         }
         assert len(root["children"]) == 1
         child = document["nodes"][root["children"][0]]

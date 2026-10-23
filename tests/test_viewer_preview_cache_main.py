@@ -26,6 +26,7 @@ from housemaker.generation_state import GeneratedObjectPlacement
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, create_default_levels
+from tests.runtime_export_helpers import mock_material_export
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -905,6 +906,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         export_path = Path(self._temporary_directory.name) / "scene.glb"
 
         with (
+            mock_material_export(self.workspace, export_model),
             patch.object(
                 self.workspace,
                 "_show_unpacked_scene_texture_export_error",

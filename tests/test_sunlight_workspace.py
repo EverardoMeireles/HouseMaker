@@ -20,6 +20,7 @@ from housemaker.level_coordinates import (
     level_image_to_world_xy,
 )
 from housemaker.main import BlueprintWorkspace
+from tests.runtime_export_helpers import mock_material_export
 from housemaker.models import (
     GROUND_LEVEL_INDEX,
     Edge,
@@ -391,14 +392,16 @@ def test_runtime_export_passes_orbit_config_without_baking_current_phase_into_li
     workspace.sun_orbit_speed_spinbox.setValue(11.5)
     initial = workspace.directional_lights
     export_path = tmp_path / "sunlight.glb"
+    generated_model = object()
     with (
+        mock_material_export(workspace, generated_model),
         patch.object(workspace, "_sync_atlas_object_texture_sources"),
         patch.object(workspace, "_show_unpacked_scene_texture_export_error", return_value=False),
         patch.object(workspace, "_show_mixed_scene_atlas_export_error", return_value=False),
         patch("housemaker.main.QFileDialog.getSaveFileName",
               return_value=(str(export_path), "GLB Files (*.glb)")),
         patch.object(workspace, "_build_model_with_stable_dependencies",
-                     return_value=(object(), ("revision",))),
+                     return_value=(generated_model, ("revision",))),
         patch.object(workspace, "_build_export_placed_models", return_value=((), ())),
         patch("housemaker.main.export_glb_file", return_value=export_path),
         patch("housemaker.main.write_runtime_scene_manifest",

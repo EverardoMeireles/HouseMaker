@@ -8,9 +8,11 @@ import hashlib
 import json
 import struct
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from itertools import product
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import trimesh
@@ -45,6 +47,8 @@ from housemaker.pvs_geometry import (
     partition_glb_for_pvs,
 )
 from housemaker.pvs_state import PvsBakeData, PvsCell, PvsCluster
+from housemaker.room_atlas_export import prepare_room_export_atlases
+from housemaker.room_zones import build_room_zones
 from housemaker.scene_surface_cache import build_scene_surface_geometry_signature
 from housemaker.surface_geometry import build_fixed_surfaces
 
@@ -109,6 +113,8 @@ class PvsSceneSnapshot:
     authoring_signature: str
     make_floors_double_sided: bool = False
     make_ceilings_double_sided: bool = False
+    output_directory: Path | None = None
+    placement_level_indices: tuple[tuple[str, int], ...] = ()
 
 
 def _export_placement_groups(authored_models, instance_models):
@@ -139,10 +145,25 @@ def _build_snapshot_model(snapshot: PvsSceneSnapshot):
     model = compose_placed_generated_models(base, placed) if placed else base
     if sources:
         model = compose_generated_model_instance_sources(model, sources)
-    if snapshot.materialized_atlases:
+    layout = build_room_zones(snapshot.levels, snapshot.stairs)
+    # Old callers can bake without retaining generated Atlas assets. The real
+    # workspace captures its owned asset directory, just like normal export.
+    destination = (
+        TemporaryDirectory(prefix="housemaker-pvs-atlases-")
+        if snapshot.output_directory is None
+        else nullcontext(snapshot.output_directory)
+    )
+    with destination as output_directory:
+        plan = prepare_room_export_atlases(
+            snapshot.materialized_atlases, layout,
+            (*snapshot.authored_models, *snapshot.instance_models),
+            output_directory=output_directory,
+            placement_level_indices=dict(snapshot.placement_level_indices),
+        )
         model = apply_texture_atlases_to_export(
-            model, snapshot.materialized_atlases,
+            model, plan.atlases,
             surface_source_ids=dict(snapshot.surface_source_ids),
+            room_layout=layout,
         )
     return base, model
 
@@ -403,6 +424,15 @@ class PvsWorkspaceMixin:
             *(str(item.source_object_id) for item in sources), *surface_source_ids.values(),
         )))
         atlases = self.texture_atlas_workspace.prepare_export_atlases(required)
+        levels_by_object = {
+            record.object_id: record.placement.level_index
+            for record in self.generation.get_generated_object_records()
+            if record.placement is not None
+        }
+        levels_by_object.update(
+            (instance.instance_id, instance.placement.level_index)
+            for instance in self.generation.get_generated_object_instances()
+        )
         return PvsSceneSnapshot(
             levels, tuple(copy.deepcopy(self.stairs)),
             tuple(self.surface_texture_generation.get_surface_material_sources().items()),
@@ -412,6 +442,8 @@ class PvsWorkspaceMixin:
             self._build_pvs_authoring_signature(),
             self._generation_settings.make_floors_double_sided,
             self._generation_settings.make_ceilings_double_sided,
+            Path(self.texture_atlas_workspace._asset_directory),
+            tuple(sorted(levels_by_object.items())),
         )
 
     def _handle_bake_visibility_clicked(self):

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.main import BlueprintWorkspace
 from housemaker.settings_widget import FIRST_PERSON_EYE_HEIGHT_SETTING_KEY
+from tests.runtime_export_helpers import mock_material_export
 
 # ### Temporary Main workspaces ###
 _application = QApplication.instance() or QApplication([])
@@ -141,7 +142,9 @@ def test_export_forwards_current_eye_height_to_runtime_manifest(
     workspace, _settings = create_workspace()
     workspace.settings_widget.first_person_eye_height_spinbox.setValue(eye_height)
     export_path = tmp_path / "house.glb"
+    generated_model = object()
     with (
+        mock_material_export(workspace, generated_model),
         patch.object(workspace, "_sync_atlas_object_texture_sources"),
         patch.object(
             workspace, "_show_unpacked_scene_texture_export_error", return_value=False
@@ -156,7 +159,7 @@ def test_export_forwards_current_eye_height_to_runtime_manifest(
         patch.object(
             workspace,
             "_build_model_with_stable_dependencies",
-            return_value=(object(), ("revision",)),
+            return_value=(generated_model, ("revision",)),
         ),
         patch.object(workspace, "_build_export_placed_models", return_value=((), ())),
         patch("housemaker.main.export_glb_file", return_value=export_path),

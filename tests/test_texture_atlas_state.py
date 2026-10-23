@@ -1661,8 +1661,8 @@ class TextureAtlasStateTests(unittest.TestCase):
 
     def test_rejects_unsafe_or_unsupported_values(self) -> None:
         data = TextureAtlasData()
-        with self.assertRaisesRegex(ValueError, "2048 or 4096"):
-            data.create_atlas("Wrong", 1024)
+        with self.assertRaisesRegex(ValueError, "512, 1024, 2048 or 4096"):
+            data.create_atlas("Wrong", 256)
         atlas = data.create_atlas("Safe", 2048, atlas_id="atlas-a")
         with self.assertRaisesRegex(ValueError, "project-relative"):
             data.assign_object(

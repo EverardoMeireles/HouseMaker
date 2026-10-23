@@ -20,6 +20,7 @@ from housemaker.directional_light_state import (
 from housemaker.door_state import DoorLibraryData
 from housemaker.generation_state import GenerationData
 from housemaker.global_scale import GlobalScale
+from housemaker.lazy_loading_state import RuntimeLoadingData
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
     DEFAULT_CANVAS_OFFSET_PIXELS,
@@ -131,9 +132,12 @@ class ProjectData:
     visibility_warning: str | None = None
     sun_orbit: SunOrbitData = field(default_factory=SunOrbitData)
     object_export_ids: dict[str, str] = field(default_factory=dict)
+    runtime_loading: RuntimeLoadingData = field(default_factory=RuntimeLoadingData)
 
     def __post_init__(self) -> None:
         self.object_export_ids = normalize_object_export_ids(self.object_export_ids)
+        if not isinstance(self.runtime_loading, RuntimeLoadingData):
+            raise TypeError("Project runtime loading must contain validated settings.")
         if not isinstance(self.sun_orbit, SunOrbitData):
             raise TypeError("Project sun orbit must contain validated settings.")
         if self.visibility is not None and not isinstance(self.visibility, PvsBakeData):
@@ -170,8 +174,11 @@ def save_project(
     visibility: PvsBakeData | None = None,
     sun_orbit: SunOrbitData | None = None,
     object_export_ids: dict[str, str] | None = None,
+    runtime_loading: RuntimeLoadingData | None = None,
 ) -> Path:
     normalized_object_export_ids = normalize_object_export_ids(object_export_ids)
+    if runtime_loading is not None and not isinstance(runtime_loading, RuntimeLoadingData):
+        raise TypeError("Project runtime loading must contain validated settings.")
     if sun_orbit is not None and not isinstance(sun_orbit, SunOrbitData):
         raise TypeError("Project sun orbit must contain validated settings.")
     if visibility is not None and not isinstance(visibility, PvsBakeData):
@@ -189,6 +196,7 @@ def save_project(
         "visibility": None if visibility is None else visibility.to_dict(),
         "sun_orbit": (sun_orbit or SunOrbitData()).to_dict(),
         "object_export_ids": normalized_object_export_ids,
+        "runtime_loading": (runtime_loading or RuntimeLoadingData()).to_dict(),
         "plan_wall_generation": (
             plan_wall_generation or PlanWallDetectionOptions()
         ).to_dict(),
@@ -506,6 +514,7 @@ def load_project(path: str | Path) -> ProjectData:
         global_scale=GlobalScale.from_dict(payload.get("global_scale")),
         visibility=visibility,
         visibility_warning=visibility_warning,
+        runtime_loading=RuntimeLoadingData.from_dict(payload.get("runtime_loading")),
     )
 
 

@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 # ### Constants ###
-ATLAS_RESOLUTIONS = frozenset({2048, 4096})
+ATLAS_RESOLUTIONS = frozenset({512, 1024, 2048, 4096})
 OBJECT_TEXTURE_RESOLUTIONS = frozenset({512, 1024, 2048})
 ATLAS_BASE_CELL_SIZE = 512
 MAX_ATLAS_COUNT = 1_000
@@ -324,11 +324,17 @@ class TextureAtlasRecord:
     surface_ao_geometry_signature: str | None = None
     surface_ao_intensity: float = 1.0
     atlas_type: str | None = None
+    room_id: str | None = None
+    room_name: str | None = None
 
     def __post_init__(self) -> None:
         _validate_atlas_id(self.atlas_id)
         self.atlas_type = normalize_atlas_type(self.atlas_type)
         self.name = normalize_atlas_name(self.name, self.atlas_type)
+        self.room_id = _normalize_atlas_room_text(self.room_id, "Room ID", 512)
+        self.room_name = _normalize_atlas_room_text(
+            self.room_name, "Room name", MAX_ATLAS_NAME_LENGTH,
+        )
         _validate_atlas_resolution(self.resolution)
         if len(self.placements) > MAX_ATLAS_OBJECT_COUNT:
             raise ValueError("Texture atlas contains too many texture sources.")
@@ -388,6 +394,8 @@ class TextureAtlasRecord:
             "atlas_id": self.atlas_id,
             "name": self.name,
             "atlas_type": self.atlas_type,
+            "room_id": self.room_id,
+            "room_name": self.room_name,
             "resolution": int(self.resolution),
             "image_path": self.image_path,
             "surface_ao_image_path": self.surface_ao_image_path,
@@ -432,6 +440,8 @@ class TextureAtlasRecord:
             ),
             surface_ao_intensity=payload.get("surface_ao_intensity", 1.0),
             atlas_type=payload.get("atlas_type"),
+            room_id=payload.get("room_id"),
+            room_name=payload.get("room_name"),
         )
 
     def clear_surface_ambient_occlusion(self) -> bool:
@@ -1400,6 +1410,22 @@ def _iter_base_grid_positions(
 
 
 # ### Validation helpers ###
+def _normalize_atlas_room_text(
+    value: object, description: str, maximum_length: int,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"Atlas {description.lower()} must be a string.")
+    normalized = value.strip()
+    if (
+        not normalized or len(normalized) > maximum_length
+        or any(ord(character) < 32 for character in normalized)
+    ):
+        raise ValueError(f"Atlas {description.lower()} is invalid.")
+    return normalized
+
+
 def _normalize_packing_mode(value: object) -> str:
     packing_mode = str(value).strip().lower()
     if packing_mode not in ATLAS_PACKING_MODES:
@@ -1636,7 +1662,7 @@ def _quadrant_pixel_offset(
 
 def _validate_atlas_resolution(resolution: object) -> None:
     if isinstance(resolution, bool) or int(resolution) not in ATLAS_RESOLUTIONS:
-        raise ValueError("Texture atlas resolution must be 2048 or 4096.")
+        raise ValueError("Texture atlas resolution must be 512, 1024, 2048 or 4096.")
 
 
 def _validate_texture_resolution(resolution: object) -> None:

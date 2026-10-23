@@ -32,6 +32,7 @@ from housemaker.models import (
 from housemaker.project_io import ProjectData
 from housemaker.pvs_workspace import _build_snapshot_model
 from housemaker.surface_geometry import build_fixed_surfaces
+from tests.runtime_export_helpers import mock_material_export
 from tests.test_pvs_state import _bake
 from tests.test_scene_export import _source_model
 
@@ -515,6 +516,7 @@ def test_export_forwards_the_validated_partitioned_bake_to_runtime_json(
             "_prepare_pvs_export_model",
             return_value=(partitioned_model, bake),
         ) as prepare,
+        mock_material_export(workspace, partitioned_model),
         patch("housemaker.main.export_glb_file", return_value=export_path) as export,
         patch(
             "housemaker.main.write_runtime_scene_manifest",

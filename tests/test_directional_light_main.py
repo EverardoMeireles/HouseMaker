@@ -21,6 +21,7 @@ from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.viewer import GlbViewerWidget
+from tests.runtime_export_helpers import mock_material_export
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -221,6 +222,7 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
         generated_model = object()
 
         with (
+            mock_material_export(self.workspace, generated_model),
             patch.object(
                 self.workspace,
                 "_sync_atlas_object_texture_sources",
@@ -266,6 +268,7 @@ class DirectionalLightMainIntegrationTests(unittest.TestCase):
                 self.workspace._generation_settings.first_person_eye_height_meters
             ),
             sun_orbit=self.workspace.sun_orbit,
+            room_assets={},
         )
 
 

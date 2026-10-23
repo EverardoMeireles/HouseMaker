@@ -136,6 +136,7 @@ OBJECT_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_MISSING_ROLE = Qt.ItemDataRole.UserRole + 1
 NEW_SOURCE_ATTENTION_ROLE = Qt.ItemDataRole.UserRole + 2
 INLINE_RENAME_TEXT_ROLE = Qt.ItemDataRole.UserRole + 3
+ATLAS_SECTION_LABEL_ROLE = Qt.ItemDataRole.UserRole + 4
 PREVIEW_MARGIN_PIXELS = 16.0
 PREVIEW_BACKGROUND_COLOR = QColor(31, 34, 39)
 PREVIEW_EMPTY_COLOR = QColor(50, 54, 61)
@@ -1449,14 +1450,54 @@ class _NewSourceAttentionDelegate(QStyledItemDelegate):
         )
 
 
+# ### Atlas room-section headings (attached to real rows) ###
+class _AtlasSectionDelegate(_NewSourceAttentionDelegate):
+    """Draw a heading above a group's first Atlas without adding fake rows."""
+
+    def _section_height(self, option, index) -> int:
+        return option.fontMetrics.height() + 10 if index.data(ATLAS_SECTION_LABEL_ROLE) else 0
+
+    def sizeHint(self, option, index):  # type: ignore[override]
+        size = super().sizeHint(option, index)
+        size.setHeight(size.height() + self._section_height(option, index))
+        return size
+
+    def paint(self, painter, option, index) -> None:  # type: ignore[override]
+        height = self._section_height(option, index)
+        row_option = QStyleOptionViewItem(option)
+        if height:
+            heading_rect = option.rect.adjusted(0, 0, 0, -option.rect.height() + height)
+            painter.save()
+            painter.fillRect(heading_rect, option.palette.brush(QPalette.ColorRole.Window))
+            painter.setPen(option.palette.color(QPalette.ColorRole.Text))
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(
+                heading_rect.adjusted(6, 0, -4, -2),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                str(index.data(ATLAS_SECTION_LABEL_ROLE)),
+            )
+            painter.restore()
+            row_option.rect.setTop(row_option.rect.top() + height)
+        super().paint(painter, row_option, index)
+
+    def updateEditorGeometry(self, editor, option, index) -> None:  # type: ignore[override]
+        row_option = QStyleOptionViewItem(option)
+        row_option.rect.setTop(row_option.rect.top() + self._section_height(option, index))
+        super().updateEditorGeometry(editor, row_option, index)
+
+
 class _TextureAtlasRenameList(QListWidget):
     """List whose selected rows use Windows-style delayed-click renaming."""
 
     item_rename_committed = Signal(str, str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, parent: QWidget | None = None, *, atlas_sections: bool = False
+    ) -> None:
         super().__init__(parent)
-        delegate = _NewSourceAttentionDelegate(self)
+        delegate = (_AtlasSectionDelegate if atlas_sections else _NewSourceAttentionDelegate)(self)
         delegate.name_committed.connect(self.item_rename_committed.emit)
         self.setItemDelegate(delegate)
         self.setEditTriggers(
@@ -5095,7 +5136,7 @@ class TextureAtlasWorkspace(QWidget):
         atlas_column_layout.setContentsMargins(0, 0, 0, 0)
 
         atlas_column_layout.addWidget(QLabel("Atlases"))
-        self.atlas_list = _TextureAtlasRenameList()
+        self.atlas_list = _TextureAtlasRenameList(atlas_sections=True)
         self.atlas_list.setObjectName("texture_atlas_list")
         self.atlas_list.currentItemChanged.connect(self._handle_atlas_selection_changed)
         self.atlas_list.item_rename_committed.connect(
@@ -7091,7 +7132,16 @@ class TextureAtlasWorkspace(QWidget):
         self._is_syncing = True
         self.atlas_list.clear()
         selected_row = -1
-        for row, atlas in enumerate(self._data.atlases):
+        def section(atlas):
+            if atlas.atlas_type == ATLAS_TYPE_SURFACE:
+                return (0, "", ""), "Surface atlases"
+            if atlas.room_id:
+                label = atlas.room_name or atlas.room_id
+                return (1, label.casefold(), atlas.room_id), label
+            return (2, "", ""), "Shared / unassigned object atlases"
+
+        previous_section = None
+        for row, atlas in enumerate(sorted(self._data.atlases, key=lambda value: section(value)[0])):
             item = QListWidgetItem(
                 f"{atlas.name} · {atlas.resolution} x {atlas.resolution} · "
                 f"{len(atlas.placements)} texture"
@@ -7099,6 +7149,10 @@ class TextureAtlasWorkspace(QWidget):
             )
             item.setData(ATLAS_ID_ROLE, atlas.atlas_id)
             item.setData(INLINE_RENAME_TEXT_ROLE, atlas.name)
+            section_key, section_label = section(atlas)
+            if section_key != previous_section:
+                item.setData(ATLAS_SECTION_LABEL_ROLE, section_label)
+            previous_section = section_key
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
             self.atlas_list.addItem(item)
             if atlas.atlas_id == selected_atlas_id:

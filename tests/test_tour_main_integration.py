@@ -23,6 +23,7 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.level_coordinates import build_level_base_z_lookup
 from housemaker.main import TOUR_CURVE_EYE_HEIGHT_METERS, BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
+from tests.runtime_export_helpers import mock_material_export
 from housemaker.tour_state import (
     TourCurveData,
     TourData,
@@ -1473,6 +1474,7 @@ class TourMainIntegrationTests(unittest.TestCase):
                 return_value=((), ()),
             ),
             patch("housemaker.main.export_glb_file", return_value=export_path),
+            mock_material_export(self.workspace, generated_model),
             patch(
                 "housemaker.main.write_runtime_scene_manifest",
                 return_value=manifest_path,
@@ -1488,8 +1490,13 @@ class TourMainIntegrationTests(unittest.TestCase):
             instance_placements=(),
             tours=(tour,),
             door_body_reconstructions=(),
-            directional_lights=(),
+            directional_lights=self.workspace.directional_lights,
             global_scale=self.workspace.global_scale,
+            sun_orbit=self.workspace.sun_orbit,
+            first_person_eye_height_meters=(
+                self.workspace._generation_settings.first_person_eye_height_meters
+            ),
+            room_assets={},
         )
 
 
